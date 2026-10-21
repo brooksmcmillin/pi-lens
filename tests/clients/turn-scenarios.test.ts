@@ -21,17 +21,16 @@
  * runs, but this host does not have the tool it drives (scenario 2 shells out
  * to a real knip).
  *
- * Live as of this revision: scenario 1 (#1627 merged) and scenario 2 (#1637
- * merged 2026-08-18). Pending: scenario 3 on PR #1633, still open, and
+ * Live as of this revision: scenario 1 (#1627 merged), scenario 2 (#1637
+ * merged 2026-08-18) and scenario 3 (#1633 merged 2026-08-19). Pending:
  * scenario 4 on nothing — that blind spot has no fix in flight.
  */
 
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { KnipClient } from "../../clients/knip-client.js";
+import { withRepoBinOnPath } from "../support/real-pi-harness.js";
 import {
 	defineTurnScenario,
 	runTurnScenario,
@@ -90,22 +89,9 @@ const gitleaksStaleReplay = defineTurnScenario({
  * #1637's fix — pruning knip's glob cache before each run — lives inside
  * `KnipClient.analyze`, the layer the stub removed.
  *
- * The availability probe mirrors `tests/clients/knip-cache-consumer-staleness.ts`'s:
- * the suite redirects `PI_LENS_HOME` to a per-worker temp dir, so the managed
- * install has to be found through the real home directory and put on PATH.
- */
-const managedKnipBinDir = (() => {
-	const dir = path.join(
-		os.homedir(),
-		".pi-lens",
-		"tools",
-		"node_modules",
-		".bin",
-	);
-	return fs.existsSync(dir) ? dir : null;
-})();
-
-/**
+ * Pin the repository's real binary directory absolutely: Husky's relative
+ * node_modules/.bin entry stops resolving when KnipClient uses the fixture cwd.
+ *
  * Probe the BINARY, not the directory that usually holds it.
  *
  * The managed-tools directory can exist while knip itself is absent — a host
@@ -117,10 +103,7 @@ const managedKnipBinDir = (() => {
  * PATH the scenario will use answers the question that actually matters.
  */
 function knipUnavailableReason(): string | undefined {
-	const env = { ...process.env };
-	if (managedKnipBinDir) {
-		env.PATH = `${managedKnipBinDir}${path.delimiter}${env.PATH ?? ""}`;
-	}
+	const env = withRepoBinOnPath(process.env);
 	try {
 		if (
 			spawnSync("knip", ["--version"], {
@@ -146,9 +129,7 @@ const knipStaleCache = defineTurnScenario({
 	harnessOptions: () => ({ knipClient: new KnipClient(false) }),
 	async run(h) {
 		const originalPath = process.env.PATH;
-		if (managedKnipBinDir) {
-			process.env.PATH = `${managedKnipBinDir}${path.delimiter}${originalPath ?? ""}`;
-		}
+		process.env.PATH = withRepoBinOnPath({ PATH: originalPath }).PATH;
 		try {
 			h.write(
 				"package.json",
@@ -216,15 +197,13 @@ const knipStaleCache = defineTurnScenario({
 	},
 });
 
-// ── Scenario 3 — dependency-drift replay (#1631, PR #1633 open) ──────────────
+// ── Scenario 3 — dependency-drift replay (#1631, fixed by PR #1633) ──────────
 
 const dependencyDriftReplay = defineTurnScenario({
 	id: "dependency-drift-replay",
 	incident:
 		"a blocker on the consumer file replayed for 50 minutes after the missing export was added to its dependency by a bash script",
 	issue: "#1631",
-	pendingOn:
-		"#1631 / PR #1633 — cached cross-file blockers are not revalidated against out-of-band dependency changes",
 	async run(h) {
 		h.write("src/worktree.ts", "export const other = 1;\n");
 		h.edit(

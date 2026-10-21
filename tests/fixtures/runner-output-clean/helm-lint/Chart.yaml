@@ -1,0 +1,4 @@
+apiVersion: v2
+name: smoke
+version: 0.1.0
+icon: https://example.com/icon.png

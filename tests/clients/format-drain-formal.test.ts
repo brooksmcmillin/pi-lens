@@ -959,6 +959,7 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 			getAllDiagnostics: vi.fn(() => new Map()),
 			getDiagnosticBinding: vi.fn(() => undefined),
 			notify: {
+				announceCreated: () => undefined,
 				open: (
 					fp: string,
 					content: string,

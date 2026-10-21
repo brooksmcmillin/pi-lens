@@ -566,6 +566,50 @@ describe("#2423 — classification contract", () => {
 		).toMatchObject({ kind: "write", provenance: "bash-derived" });
 	});
 
+	// #4623: this module owns the bash-replay marker. The classifier and the
+	// behavior-record guard in `runtime-tool-result.ts` both ask it, so a marker
+	// value changed in one place could no longer leave the other behind. Each
+	// row is a value some caller could plausibly set; only the exact `"bash"`
+	// string marks a replay, never a truthy or look-alike value.
+	it.each<[string, unknown, boolean]>([
+		["the exact bash value", "bash", true],
+		["another case", "BASH", false],
+		["trailing whitespace", "bash ", false],
+		["another replay source", "opaque-script", false],
+		["a boolean", true, false],
+		["a number", 1, false],
+		["a one-element array", ["bash"], false],
+		["a boxed string", Object("bash"), false],
+		["null", null, false],
+		["undefined", undefined, false],
+	])(
+		"answers the bash-replay marker for %s, and the classifier agrees",
+		async (_label, marker, isReplay) => {
+			const {
+				classifyMutatingTool,
+				isBashDerivedReplay,
+				PI_LENS_SYNTHETIC_MUTATION_FIELD,
+			} = await import("../../clients/mutating-tool.js");
+			const event = {
+				toolName: "write",
+				input: { path: "/a.ts" },
+				[PI_LENS_SYNTHETIC_MUTATION_FIELD]: marker,
+			};
+			expect(isBashDerivedReplay(event)).toBe(isReplay);
+			expect(classifyMutatingTool(event)?.provenance).toBe(
+				isReplay ? "bash-derived" : "builtin",
+			);
+		},
+	);
+
+	it("answers no bash-replay marker for an input that is not an event", async () => {
+		const { isBashDerivedReplay } =
+			await import("../../clients/mutating-tool.js");
+		for (const input of [undefined, null, "bash", 42, ["bash"], {}]) {
+			expect(isBashDerivedReplay(input)).toBe(false);
+		}
+	});
+
 	it("keeps the adapter order deterministic and first-match-wins", async () => {
 		const { MUTATION_SHAPE_ADAPTERS } =
 			await import("../../clients/mutating-tool.js");

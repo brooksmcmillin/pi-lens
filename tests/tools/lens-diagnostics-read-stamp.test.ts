@@ -117,7 +117,10 @@ function makeClient(root: string, file: string) {
 		getOperationSupport: () => ({}),
 		serverId: "typescript",
 		root,
-		notify: { open: vi.fn(async () => {}) },
+		notify: {
+			announceCreated: () => undefined,
+			open: vi.fn(async () => {}),
+		},
 		waitForDiagnostics: vi.fn(async () => undefined),
 		getDiagnostics: vi.fn((fp: string) =>
 			fp === file

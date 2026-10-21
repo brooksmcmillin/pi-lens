@@ -411,7 +411,12 @@ describe("#2523 AC2 bounded() requires BOTH bounds", () => {
 		// below pass vacuously — the failure mode that made round 1's test
 		// worthless.
 		expect(dependantCount(signal)).toBeUndefined();
-		AbortSignal.any([signal, new AbortController().signal]);
+		// Node 24 adds a composite to its sources' list only once the composite
+		// has an abort listener; Node 22 adds it on creation.
+		AbortSignal.any([signal, new AbortController().signal]).addEventListener(
+			"abort",
+			() => {},
+		);
 		expect(dependantCount(signal)).toBe(1);
 
 		const listenersBefore = getEventListeners(signal, "abort").length;

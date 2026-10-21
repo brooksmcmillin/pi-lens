@@ -41,10 +41,11 @@ jobs:
   classify:
     name: Classify failed Unit tests
     # pull_request runs, PLUS push-to-master runs (#2668). A master
-    # `push` carries an empty `pull_requests` array (there is no PR to look
-    # one up from), so the classifier is given --allow-missing-pr and skips
-    # every PR-comment step on that path -- classification and the one-shot
-    # rerun still run in full. See "Reading a master infra-kill" below for
+    # `push` has no PR to look one up from (its `pull_requests` array is empty
+    # or, #4382, lists other repositories' namesake PRs), so PR_NUMBER stays
+    # empty, the classifier is given --allow-missing-pr and skips every
+    # PR-comment step on that path -- classification and the one-shot rerun
+    # still run in full. See "Reading a master infra-kill" below for
     # how to tell that apart from a real red on master.
     #
     # Same-repo runs only: a fork PR's workflow_run also carries an empty
@@ -74,6 +75,24 @@ jobs:
     # MAX_AUTO_RERUN_ATTEMPT). The master lane never reaches it -- there is
     # no PR to hold a marker -- so this gate was its only blocker.
     #
+    # #4672: a CANCELLED `CI` run is judged here too, on master pushes only.
+    # A required check went red on master's tip (run 39380875926) because
+    # `TLA+ models (shard 4/4)` was cancelled in its own teardown after its
+    # model check had concluded success -- and nothing recovered it, because
+    # this job required `conclusion == 'failure'`, so the run got no verdict
+    # and no rerun (a human reran it by hand). The classifier now judges that
+    # shape and reruns it at most once, under the SAME attempt bound above
+    # (attempts 1 and 2, attempt 3 is a human's call). Two limits stay:
+    #   - `push` on `master` only. A pull_request run cancelled by
+    #     `concurrency.cancel-in-progress` is superseded by a newer run that
+    #     owns the verdict; rerunning it would spend quota on a head nothing
+    #     waits on. `classifyCancelledRun` in
+    #     scripts/lib/ci-failure-classifier.mjs enforces the same gate from
+    #     inside, so a bare CLI invocation cannot route around this `if:`.
+    #   - every step of every cancelled job must have concluded `success`.
+    #     A job killed mid-test is a real incomplete run; the classifier
+    #     SKIPS it (no label, no rerun) and says why.
+    #
     # Reading a master infra-kill vs a real red:
     #   - This job fires for a first or second attempt (run_attempt <= 2) of
     #     a FAILED "CI" run, so it runs on every master red, infra or not.
@@ -95,7 +114,10 @@ jobs:
         github.event.workflow_run.event == 'pull_request' ||
         (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master')
       ) &&
-      github.event.workflow_run.conclusion == 'failure' &&
+      (
+        github.event.workflow_run.conclusion == 'failure' ||
+        (github.event.workflow_run.conclusion == 'cancelled' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master')
+      ) &&
       github.event.workflow_run.run_attempt <= 2
     runs-on: ubuntu-latest
     # refs #3123: bounds a hang against GitHub's 360-min default.
@@ -112,8 +134,16 @@ jobs:
       GITHUB_REPOSITORY: ${{ github.repository }}
       RUN_ID: ${{ github.event.workflow_run.id }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
-      RUN_EVENT: ${{ github.event.workflow_run.event }}
+      # #4382: `pull_requests` lists PRs by head branch and sha across forks, so
+      # a master push run named other repositories' PRs (brooksmcmillin/pi-lens
+      # #23) and the comment write 403ed. Only a pull_request run takes a
+      # number, and only from an entry of THIS repository whose head sha is the
+      # run's own head; otherwise the value is empty.
+      PR_NUMBER: >-
+        ${{ github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.pull_requests[0].head.sha == github.event.workflow_run.head_sha &&
+        startsWith(github.event.workflow_run.pull_requests[0].url, format('https://api.github.com/repos/{0}/pulls/', github.repository)) &&
+        github.event.workflow_run.pull_requests[0].number || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -126,7 +156,9 @@ jobs:
           args=(--run "$RUN_ID" --sha "$HEAD_SHA" --skip-missing-job)
           if [[ -n "$PR_NUMBER" ]]; then
             args+=(--pr "$PR_NUMBER")
-          elif [[ "$RUN_EVENT" == "push" ]]; then
+          else
+            # No PR of this repository for the run (a push, or a PR run whose
+            # head moved on): classify and rerun, skip every PR write (#4382).
             args+=(--allow-missing-pr)
           fi
           output="$(node scripts/classify-ci-failure.mjs "${args[@]}")"
@@ -136,8 +168,9 @@ jobs:
               gh pr edit "$PR_NUMBER" --add-label 'ci:infra' --remove-label 'ci:real'
             elif grep -q -- '^CI failure classifier skipped:.*only advisory jobs failed' <<<"$output"; then
               # #3801: a run that failed only on advisory jobs (a not-ready heavy
-              # gate, the Windows run) is neither infra nor a real failure of the
-              # change: neither verdict label, and any stale one is cleared.
+              # gate, a CodeQL language leg) is neither infra nor a real failure of
+              # the change: neither verdict label, and any stale one is cleared.
+              # #4518: `Unit tests Windows` is not on that list any more; it gates.
               gh pr edit "$PR_NUMBER" --remove-label 'ci:real' --remove-label 'ci:infra'
             else
               gh pr edit "$PR_NUMBER" --add-label 'ci:real' --remove-label 'ci:infra'
@@ -182,7 +215,23 @@ jobs:
       pull-requests: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+      # `finalize-rerun` has no checkout step, so `gh pr edit` found no git
+      # remote to resolve the repository from and the terminal label swap
+      # never ran: run 38956598286 (2026-10-16, attempt 2 green) failed with
+      # `failed to run git: fatal: not a git repository` (refs #4382). The
+      # label swap needs a repository source; GH_REPO is the one the sibling
+      # clear-stale-verdict-labels job already uses.
+      GH_REPO: ${{ github.repository }}
+      # #4382: `pull_requests` lists PRs by head branch and sha across forks, so
+      # a master push run named other repositories' PRs (brooksmcmillin/pi-lens
+      # #23) and the comment write 403ed. Only a pull_request run takes a
+      # number, and only from an entry of THIS repository whose head sha is the
+      # run's own head; otherwise the value is empty.
+      PR_NUMBER: >-
+        ${{ github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.pull_requests[0].head.sha == github.event.workflow_run.head_sha &&
+        startsWith(github.event.workflow_run.pull_requests[0].url, format('https://api.github.com/repos/{0}/pulls/', github.repository)) &&
+        github.event.workflow_run.pull_requests[0].number || '' }}
       RUN_EVENT: ${{ github.event.workflow_run.event }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:

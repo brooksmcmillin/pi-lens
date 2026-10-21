@@ -95,12 +95,14 @@ import {
 // hand-built fixture archives are pinned for the test, the same way the test
 // supplies the bytes: the assertion (installed / refused) is the production
 // check's, not the fixture's.
+const originalArch = Object.getOwnPropertyDescriptor(process, "arch")!;
 const pins = createArchivePinScope({ TOOLS, resolveArchiveUrl });
 function pinFixture(toolId: string, body: Buffer): void {
-	pins.pin(toolId, body, { platform: "linux" });
+	pins.pin(toolId, body, { platform: "linux", arch: "x64" });
 }
 afterEach(() => {
 	pins.restoreAll();
+	Object.defineProperty(process, "arch", originalArch);
 });
 
 afterAll(() => {
@@ -112,6 +114,8 @@ afterAll(() => {
 });
 
 beforeEach(() => {
+	// These archives model Linux x64, independently of the machine running extraction.
+	Object.defineProperty(process, "arch", { ...originalArch, value: "x64" });
 	process.env.PI_LENS_TEST_PLATFORM = "linux";
 	delete process.env.PI_LENS_DISABLE_TOOL_INSTALL;
 });

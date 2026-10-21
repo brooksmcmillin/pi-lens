@@ -29,12 +29,9 @@ import {
 	_resetPackageManagerCache,
 	allAvailableGlobalBinDirs,
 	detectNodePackageManager,
-	execArgs,
 	findGlobalBinary,
 	findLocalBinAt,
 	findNodeToolBinary,
-	formatRunScript,
-	globalInstallArgs,
 	installArgs,
 	pmBinary,
 	resolveNodePackageManager,
@@ -218,11 +215,6 @@ describe("command builders", () => {
 		expect(runScriptArgs("build")).toEqual(["run", "build"]);
 	});
 
-	it("formatRunScript renders a bare display command", () => {
-		expect(formatRunScript("pnpm", "build")).toBe("pnpm run build");
-		expect(formatRunScript("bun", "test")).toBe("bun run test");
-	});
-
 	it("installArgs uses install for npm and add for the rest", () => {
 		expect(installArgs("npm", "biome")).toEqual(["install", "biome"]);
 		expect(installArgs("pnpm", "biome")).toEqual(["add", "biome"]);
@@ -276,50 +268,6 @@ describe("command builders", () => {
 		]);
 	});
 
-	it("globalInstallArgs spells the global install per manager", () => {
-		expect(globalInstallArgs("npm", "typescript-language-server")).toEqual([
-			"install",
-			"-g",
-			"typescript-language-server",
-		]);
-		expect(globalInstallArgs("pnpm", "typescript-language-server")).toEqual([
-			"add",
-			"-g",
-			"typescript-language-server",
-		]);
-		expect(globalInstallArgs("bun", "typescript-language-server")).toEqual([
-			"add",
-			"-g",
-			"typescript-language-server",
-		]);
-		// yarn classic uses `global add`.
-		expect(globalInstallArgs("yarn", "typescript-language-server")).toEqual([
-			"global",
-			"add",
-			"typescript-language-server",
-		]);
-	});
-
-	it("execArgs maps to each manager's package runner", () => {
-		setPlatform("linux"); // pin platform — the Windows spelling is asserted below
-		expect(execArgs("npm", "pkg")).toEqual({
-			command: "npx",
-			args: ["--no", "pkg"],
-		});
-		expect(execArgs("bun", "pkg", ["--stdio"])).toEqual({
-			command: "bun",
-			args: ["x", "pkg", "--stdio"],
-		});
-		expect(execArgs("pnpm", "pkg")).toEqual({
-			command: "pnpm",
-			args: ["dlx", "pkg"],
-		});
-		expect(execArgs("yarn", "pkg")).toEqual({
-			command: "yarn",
-			args: ["dlx", "pkg"],
-		});
-	});
-
 	it("pmBinary is the bare name on Unix", () => {
 		setPlatform("linux");
 		expect(pmBinary("npm")).toBe("npm");
@@ -332,7 +280,6 @@ describe("command builders", () => {
 		expect(pmBinary("pnpm")).toBe("pnpm.cmd");
 		expect(pmBinary("yarn")).toBe("yarn.cmd");
 		expect(pmBinary("bun")).toBe("bun.exe");
-		expect(execArgs("npm", "pkg").command).toBe("npx.cmd");
 	});
 });
 

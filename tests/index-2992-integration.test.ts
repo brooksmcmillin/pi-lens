@@ -1,6 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 import { removeTempDirSync } from "./clients/test-utils.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 import {
@@ -32,12 +40,10 @@ describe("#2992 read bridge lifecycle", () => {
 	let filePath: string;
 	let previousHome: string | undefined;
 	let homeAtSetup: string | undefined;
-	let setupCount = 0;
 
 	beforeEach(() => {
 		homeAtSetup = process.env.PI_LENS_HOME;
 		previousHome = process.env.PI_LENS_HOME;
-		setupCount++;
 		const probeRoot = path.join(process.cwd(), ".probe-home");
 		fs.mkdirSync(probeRoot, { recursive: true });
 		probeHome = path.join(probeRoot, "pi-lens-2992-home");
@@ -66,6 +72,15 @@ describe("#2992 read bridge lifecycle", () => {
 		vi.restoreAllMocks();
 	});
 
+	// #2912 recurrence: a cross-test PI_LENS_HOME leak redirects the real
+	// instance registry and makes an unrelated worker observe an extra root.
+	// Assert the restoration after the last case, so the check does not depend
+	// on whether a sibling case ran first (#4561 shuffle F1: a `setupCount > 1`
+	// position counter reds whenever this claim's case runs first).
+	afterAll(() => {
+		expect(process.env.PI_LENS_HOME).toBe(workerHome);
+	});
+
 	it("records a stale read through the real bridge before authorizing an edit", async () => {
 		// #2992 recurrence: a stale host context must not turn a read into a
 		// false zero-read edit block. Keep the real ReadGuard and ledger; inject
@@ -91,6 +106,12 @@ describe("#2992 read bridge lifecycle", () => {
 		const readBridge = (globalThis as Record<symbol, unknown>)[
 			Symbol.for("pi-lens:read-bridge")
 		] as { recordRead(entry: unknown): void };
+		const { getDegradationSummary, resetDegradationLedger } =
+			await import("../clients/degradation-ledger.js");
+		// Recurrence (#4561, shuffle seed 202): a sibling case records the same
+		// `extension-ctx-stale` kind into the module-scope ledger, so this case's
+		// absolute count observed its rows too. Start from a fresh session ledger.
+		resetDegradationLedger();
 		for (let i = 0; i < 100; i++) {
 			readBridge.recordRead({
 				filePath,
@@ -99,8 +120,6 @@ describe("#2992 read bridge lifecycle", () => {
 			});
 		}
 
-		const { getDegradationSummary, resetDegradationLedger } =
-			await import("../clients/degradation-ledger.js");
 		const staleRows = getDegradationSummary().find(
 			(group) => group.kind === "extension-ctx-stale",
 		);
@@ -262,7 +281,10 @@ describe("#2992 read bridge lifecycle", () => {
 	it("keeps the next test from inheriting PI_LENS_HOME (#2912)", () => {
 		// #2912 recurrence: a cross-test PI_LENS_HOME leak redirects the real
 		// instance registry and makes an unrelated worker observe an extra root.
-		expect(setupCount).toBeGreaterThan(1);
+		// `beforeEach` reads the ambient home, so any case ordered before this one
+		// must already have restored its own; the `afterAll` above makes the same
+		// claim hold when this case runs last (#4561 F1: a position counter here
+		// reded whenever it ran first).
 		expect(homeAtSetup).toBe(workerHome);
 	});
 });

@@ -38,9 +38,12 @@ import {
 	createLSPClient,
 	handleNotifyChange,
 	handleNotifyOpen,
+	handleNotifySave,
+	sentContentFor,
 	type LSPClientState,
 } from "../../../clients/lsp/client.js";
 import { stopLSP } from "../../../clients/lsp/launch.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
 import {
 	negotiateSaveOptions,
 	TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL,
@@ -423,6 +426,127 @@ function notifyRecorder(client: Awaited<ReturnType<typeof createLSPClient>>) {
 		},
 	};
 }
+
+/**
+ * #3405 r1: `notify.save` is the save for bytes the server already holds — the
+ * service sends it when it debounced a saved touch's push (an unsaved push of
+ * the same bytes landed just before). Recurrence: a cold `lsp_diagnostics`
+ * query lost its save that way (clangd 22.1.0 received didOpen, never didSave).
+ */
+describe("a save with no content push (#3405 r1)", () => {
+	let state: LSPClientState;
+
+	beforeEach(() => {
+		state = createMockState();
+		state.saveOptions = { includeText: true };
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const openUnsaved = (content = "const x = 1;\n") =>
+		handleNotifyOpen(state, TEST_FILE, content, "typescript", false, true);
+
+	it("sends only didSave, without text, for a document the server holds", async () => {
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(true);
+		// No re-push: clangd does not republish identical bytes, and a re-push
+		// clears the cached answer the touch then waits on.
+		expect(sentMethods(state)).toEqual(["textDocument/didSave"]);
+		// No text even under includeText: a push queued before this entry may
+		// have replaced the bytes its caller read.
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+		});
+	});
+
+	// R7: an unsuccessful open leaves no landed-content record to mark. A
+	// later explicit save retains its boolean outcome without inventing content.
+	it("does not forge content evidence after an unsuccessful open", async () => {
+		vi.mocked(state.connection.sendNotification).mockRejectedValueOnce(
+			new Error("stream write failed"),
+		);
+		await expect(openUnsaved()).resolves.toBe(false);
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(true);
+		expect(sentContentFor(state, TEST_FILE)).toBeUndefined();
+	});
+
+	// R7: debt-only duplicate suppression must never consume an explicit save.
+	it.each(["owed-first", "explicit-first"])(
+		"keeps an explicit save when coalescing %s",
+		async (order) => {
+			await openUnsaved();
+			await handleNotifySave(state, TEST_FILE);
+			vi.mocked(state.connection.sendNotification).mockClear();
+			const debt = order === "owed-first";
+			await Promise.all([
+				handleNotifySave(state, TEST_FILE, debt),
+				handleNotifySave(state, TEST_FILE, !debt),
+			]);
+			expect(sentMethods(state)).toEqual(["textDocument/didSave"]);
+		},
+	);
+
+	it("hands its save to an unsent push instead of replacing it", async () => {
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		const push = openUnsaved("const x = 2;\n");
+		const save = handleNotifySave(state, TEST_FILE);
+		await Promise.all([push, save]);
+		// The newer bytes still go, and they carry the save: one didChange, one
+		// didSave, in that order.
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didChange",
+			"textDocument/didSave",
+		]);
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+			text: "const x = 2;\n",
+		});
+		await expect(push).resolves.toBe(true);
+	});
+
+	it("sends nothing to a server that declared no save", async () => {
+		state.saveOptions = undefined;
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(false);
+		expect(sentMethods(state)).toEqual([]);
+	});
+
+	it("sends nothing for a document the server does not hold", async () => {
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(false);
+		expect(sentMethods(state)).toEqual([]);
+	});
+
+	// #4532 gap 9 round 5: a save that never left gives its rescan expectation
+	// back. The client now retries such a save (`saveDebouncedPush`), and the
+	// retry raises its OWN expectation, so keeping the failed attempt's binds the
+	// path to one more publication than arrives — the #3482 surplus, which
+	// withholds the rescan the retry does produce. Only a `rescansOnSave` server
+	// raises one at all, so the case is an opengrep-shaped state.
+	it("gives back the rescan expectation of a save that failed to leave", async () => {
+		const rescanner = createMockState({ serverId: "opengrep" });
+		rescanner.saveOptions = { includeText: false };
+		await handleNotifyOpen(
+			rescanner,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+		);
+		const key = normalizeMapKey(TEST_FILE);
+		expect(rescanner.expectedPublicationsBeyondSends.get(key) ?? 0).toBe(0);
+
+		vi.mocked(rescanner.connection.sendNotification).mockRejectedValue(
+			new Error("stream write failed"),
+		);
+		await expect(handleNotifySave(rescanner, TEST_FILE)).resolves.toBe(false);
+		expect(rescanner.expectedPublicationsBeyondSends.get(key) ?? 0).toBe(0);
+	});
+});
 
 describe("didSave through the real createLSPClient init path (#3405)", () => {
 	it("a server advertising save: true receives didSave after didOpen", async () => {

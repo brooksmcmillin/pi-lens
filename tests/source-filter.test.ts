@@ -25,6 +25,18 @@ import { removeTempDirSync } from "./clients/test-utils.js";
  * delegating to the original implementation.
  */
 let existsSyncProbeCount = 0;
+/** Every path `existsSync` was asked about, in call order (#1979). */
+const existsSyncProbedPaths: string[] = [];
+/**
+ * When set, `existsSync` answers like a filesystem that matches names up to
+ * `fold` (case-insensitive on Windows and default macOS, normalization-
+ * insensitive on macOS) for paths under `root`: a name matches any entry of
+ * its directory whose folded form is equal (#1979). `entries` is the
+ * directory's content, supplied by the test.
+ */
+let foldedExists:
+	| { dir: string; entries: string[]; fold: (name: string) => string }
+	| undefined;
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
@@ -32,6 +44,12 @@ vi.mock("node:fs", async (importOriginal) => {
 		...actual,
 		existsSync: (p: fs.PathLike) => {
 			existsSyncProbeCount++;
+			existsSyncProbedPaths.push(String(p));
+			if (foldedExists && path.dirname(String(p)) === foldedExists.dir) {
+				const { fold, entries } = foldedExists;
+				const wanted = fold(path.basename(String(p)));
+				return entries.some((name) => fold(name) === wanted);
+			}
 			return actual.existsSync(p);
 		},
 	};
@@ -891,5 +909,144 @@ describe("per-walk artifact probe memo (refs #191)", () => {
 		expect(cache.has(tsSiblingKey)).toBe(true);
 
 		cleanup();
+	});
+});
+
+// #1979: the walk already holds each directory's listing, so the source-twin
+// probes (up to 7 negative `existsSync` lookups per .js/.mjs/.cjs/.jsx file)
+// are answered from it. On a cold or cloud-backed filesystem each of those
+// lookups was a round trip paid inside the first walk of an over-cap repo.
+describe("walk answers sibling probes from the directory listing (#1979)", () => {
+	const TWIN_EXTENSIONS = /\.(ts|tsx|mts|cts|vue|svelte|coffee)$/;
+
+	function probedTwinPaths(dir: string): string[] {
+		return existsSyncProbedPaths.filter(
+			(p) => p.startsWith(dir) && TWIN_EXTENSIONS.test(p),
+		);
+	}
+
+	function buildJsHeavyFixture(count: number): {
+		dir: string;
+		cleanup: () => void;
+	} {
+		const files: Record<string, string> = {};
+		for (let i = 0; i < count; i++) {
+			files[`lib/m${i}.js`] = `exports.value${i} = ${i};\n`;
+		}
+		return createTempDir(files);
+	}
+
+	it("issues no source-twin existsSync for twin-less .js files, async and sync (recurrence: one probe per candidate extension per file inside the first walk)", async () => {
+		const { dir, cleanup } = buildJsHeavyFixture(40);
+		try {
+			existsSyncProbedPaths.length = 0;
+			const asyncFiles = await collectSourceFilesAsync(dir);
+			expect(asyncFiles).toHaveLength(40);
+			expect(probedTwinPaths(dir)).toEqual([]);
+
+			existsSyncProbedPaths.length = 0;
+			const syncFiles = collectSourceFiles(dir);
+			expect(syncFiles.slice().sort()).toEqual(asyncFiles.slice().sort());
+			expect(probedTwinPaths(dir)).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("keeps every verdict of the listing-free probe, including a twin that is a directory, a broken symlink and a case variant", async () => {
+		const { dir, cleanup } = createTempDir({
+			"src/plain.js": "// no twin",
+			"src/real.ts": "// source",
+			"src/real.js": "// artifact of real.ts",
+			"src/Case.TS": "// different case on a case-sensitive fs",
+			"src/Case.js": "// twin only on a case-insensitive fs",
+			"src/vue-thing.vue": "<template></template>",
+			"src/vue-thing.js": "// artifact of the vue file",
+			"src/dirtwin.ts/index.ts": "// a DIRECTORY named dirtwin.ts",
+			"src/dirtwin.js": "// existsSync(dirtwin.ts) is true for a directory",
+		});
+		try {
+			fs.symlinkSync(
+				path.join(dir, "src", "missing-target.ts"),
+				path.join(dir, "src", "ghost.ts"),
+			);
+			fs.writeFileSync(path.join(dir, "src", "ghost.js"), "// ghost twin");
+
+			const jsFiles = [
+				"plain.js",
+				"real.js",
+				"Case.js",
+				"vue-thing.js",
+				"dirtwin.js",
+				"ghost.js",
+			].map((name) => path.join(dir, "src", name));
+			// Oracle: the pre-#1979 listing-free probe, per file.
+			const expectedKept = jsFiles
+				.filter((file) => !isBuildArtifact(file))
+				.sort();
+			expect(expectedKept.map((f) => path.basename(f))).toContain("ghost.js");
+			expect(expectedKept.map((f) => path.basename(f))).not.toContain(
+				"dirtwin.js",
+			);
+
+			const keptJs = (files: string[]) =>
+				files.filter((f) => f.endsWith(".js")).sort();
+			expect(keptJs(await collectSourceFilesAsync(dir))).toEqual(expectedKept);
+			expect(keptJs(collectSourceFiles(dir))).toEqual(expectedKept);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("still finds a twin that differs only in case on a case-insensitive filesystem", async () => {
+		const { dir, cleanup } = createTempDir({
+			"src/Widget.TS": "// source, different case",
+			"src/widget.js": "// artifact on a case-insensitive fs",
+			"src/other.js": "// no twin at all",
+		});
+		try {
+			foldedExists = {
+				dir: path.join(dir, "src"),
+				entries: ["Widget.TS", "widget.js", "other.js"],
+				fold: (name) => name.toLowerCase(),
+			};
+			const asBefore = ["widget.js", "other.js"].filter(
+				(name) => !isBuildArtifact(path.join(dir, "src", name)),
+			);
+			expect(asBefore).toEqual(["other.js"]);
+
+			const keptJs = (files: string[]) =>
+				files.filter((f) => f.endsWith(".js")).map((f) => path.basename(f));
+			expect(keptJs(await collectSourceFilesAsync(dir))).toEqual(["other.js"]);
+			expect(keptJs(collectSourceFiles(dir))).toEqual(["other.js"]);
+		} finally {
+			foldedExists = undefined;
+			cleanup();
+		}
+	});
+
+	it("still finds a twin whose name differs only in Unicode normalization (macOS)", async () => {
+		const nfd = "cafe\u0301";
+		const nfc = "caf\u00e9";
+		const { dir, cleanup } = createTempDir({
+			[`src/${nfd}.ts`]: "// source, decomposed name",
+			[`src/${nfc}.js`]: "// artifact, precomposed name",
+			"src/other.js": "// no twin at all",
+		});
+		try {
+			foldedExists = {
+				dir: path.join(dir, "src"),
+				entries: [`${nfd}.ts`, `${nfc}.js`, "other.js"],
+				fold: (name) => name.normalize("NFC"),
+			};
+			const keptJs = (files: string[]) =>
+				files.filter((f) => f.endsWith(".js")).map((f) => path.basename(f));
+			expect(isBuildArtifact(path.join(dir, "src", `${nfc}.js`))).toBe(true);
+			expect(keptJs(await collectSourceFilesAsync(dir))).toEqual(["other.js"]);
+			expect(keptJs(collectSourceFiles(dir))).toEqual(["other.js"]);
+		} finally {
+			foldedExists = undefined;
+			cleanup();
+		}
 	});
 });

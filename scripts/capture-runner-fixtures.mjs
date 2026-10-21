@@ -14,11 +14,19 @@
  *
  * Usage:
  *   node scripts/capture-runner-fixtures.mjs [runnerId ...] [--bin-dir DIR]
+ *   node scripts/capture-runner-fixtures.mjs --records-only [runnerId ...]
  *
  * Binaries are resolved as, in order: `<bin-dir>/<tool>[.exe|.bat]`, pi-lens's
  * own managed tool dirs, then bare `<tool>` on PATH. A tool that resolves
  * nowhere is REPORTED AND SKIPPED, never silently omitted: a capture run that
  * found no binaries must not look like a successful refresh.
+ *
+ * `--records-only` is the retrofit for fixtures captured before #4473 and
+ * #4522: it re-runs only the availability probe and the clean run against the
+ * real binary and merges those records into the existing envelopes, leaving the
+ * recorded work bytes byte-identical. Re-capturing the work bytes from a newer
+ * build would silently retarget the parser evidence a version-specific fixture
+ * (fish 3.3.1's `~`-prefixed argv header) exists to hold.
  */
 
 import { execFileSync } from "node:child_process";
@@ -26,10 +34,73 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveBin } from "./capture-runner-output.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 const smoke = (dir) => `tests/fixtures/tool-smoke/${dir}`;
+
+/** `--output.<format>.path=` for every golangci-lint format except json. */
+const GOLANGCI_OTHER_FORMATS_OFF = [
+	"text",
+	"tab",
+	"html",
+	"checkstyle",
+	"code-climate",
+	"junit-xml",
+	"teamcity",
+	"sarif",
+].map((format) => `--output.${format}.path=`);
+
+/**
+ * The availability probes a runner's checker sends, when they are not the
+ * default `[<tool> --version]`. The capture runs each one against the real
+ * binary and records the answer, so the replay never has to guess whether the
+ * tool accepted its own probe (#4473).
+ */
+const PROBE_OVERRIDES = {
+	"cue-vet": [{ command: "cue", argv: ["version"] }],
+	"go-vet": [{ command: "go", argv: ["version"] }],
+	"zig-check": [{ command: "zig", argv: ["version"] }],
+	"rust-clippy": [
+		// The runner resolves the PATH candidate by spawning `cargo --version`
+		// before it asks clippy anything (clients/rust-client.ts), and a host
+		// without a Rust toolchain reds the replay when that probe is unrecorded
+		// (#4522 F7). Both probes are recorded, each answered by its own command.
+		{ command: "cargo", argv: ["--version"] },
+		{ command: "cargo", argv: ["clippy", "--version"] },
+	],
+	"helm-lint": [{ command: "helm", argv: ["version", "--short"] }],
+	markdownlint: [{ command: "markdownlint-cli2", argv: ["--no-globs", "-"] }],
+	// fish-indent probes the formatter for every case, and `fish` itself for the
+	// syntax cases its `fish --no-execute` lane drives.
+	"fish-indent": [
+		{ command: "fish_indent", argv: ["--version"] },
+		{ command: "fish", argv: ["--version"] },
+	],
+	// biome explains one rule before it lints (a second probe, and not a
+	// version one).
+	"biome-check-json": [
+		{ command: "biome", argv: ["--version"] },
+		{ command: "biome", argv: ["explain", "noUnusedVariables"] },
+	],
+	// cpp-check probes its compiler candidates in order until one answers, so
+	// the record carries each candidate's real answer on the capture host.
+	"cpp-check": [
+		{ command: "clang++", argv: ["--version"] },
+		{ command: "g++", argv: ["--version"] },
+		{ command: "clang", argv: ["--version"] },
+		{ command: "gcc", argv: ["--version"] },
+		{ command: "cc", argv: ["--version"] },
+		{ command: "c++", argv: ["--version"] },
+		{ command: "cl", argv: ["--version"] },
+	],
+};
+
+/** Where a runner's clean capture workspace lives. */
+export function cleanWorkspaceFor(runner) {
+	return `tests/fixtures/runner-output-clean/${runner}`;
+}
 
 /**
  * One capture. `argv` mirrors the runner's own invocation; `file` is the
@@ -73,6 +144,247 @@ export const CAPTURES = [
 			"unix",
 			"bad.html",
 		],
+	},
+	{
+		// The runner prefers clang++, then g++, then c++; any of them emits the
+		// `file:line:col: error:` shape, so a host with g++ captures it.
+		runner: "cpp-check",
+		tool: "g++",
+		workspace: smoke("cpp"),
+		file: "main.cpp",
+		argv: ["-fsyntax-only", "main.cpp"],
+	},
+	{
+		runner: "cue-vet",
+		tool: "cue",
+		versionArgs: "version",
+		workspace: smoke("cue-vet"),
+		file: "bad.cue",
+		argv: ["vet", "-c=false", "."],
+	},
+	{
+		runner: "dotnet-build",
+		tool: "dotnet",
+		workspace: smoke("csharp"),
+		file: "Program.cs",
+		argv: ["build", "toolsmoke.csproj", "--nologo", "--verbosity", "minimal"],
+	},
+	{
+		runner: "dart-analyze",
+		tool: "dart",
+		workspace: smoke("dart"),
+		file: "bad.dart",
+		argv: ["analyze", "--format=machine", "bad.dart"],
+	},
+	{
+		runner: "javac",
+		tool: "javac",
+		versionArgs: "-version",
+		workspace: smoke("java"),
+		file: "Bad.java",
+		argv: ["-Xlint:none", "-proc:none", "Bad.java"],
+	},
+	{
+		// ktlint is a launcher script over `java -jar`, so a JDK must be on PATH.
+		runner: "ktlint",
+		tool: "ktlint",
+		workspace: smoke("kotlin"),
+		file: "Bad.kt",
+		argv: ["--reporter=json", "Bad.kt"],
+	},
+	{
+		// Needs Ruby on PATH; the gem's launcher is a Ruby script.
+		runner: "rubocop",
+		tool: "rubocop",
+		workspace: smoke("ruby"),
+		file: "bad.rb",
+		argv: ["--format", "json", "--no-color", "bad.rb"],
+	},
+	{
+		runner: "rust-clippy",
+		tool: "cargo",
+		workspace: smoke("rust"),
+		file: "src/main.rs",
+		argv: ["clippy", "--message-format=json", "-q"],
+	},
+	{
+		// Needs Erlang on PATH: gleam shells out to `escript` even for `check`.
+		runner: "gleam-check",
+		tool: "gleam",
+		workspace: smoke("gleam"),
+		file: "src/smoke.gleam",
+		argv: ["check"],
+	},
+	{
+		// The Mix path (`mix.exs` present). tool-smoke/elixir keeps bad.ex at the
+		// project root, which `mix compile` never reads, so this capture uses
+		// tool-smoke/elixir-mix, whose file sits under lib/. `mix --version`
+		// leads with the Erlang banner, so the version comes from Elixir itself.
+		runner: "elixir-check",
+		tool: "mix",
+		// Mix's own banner. The former probe ran a project expression and needed a
+		// compiled project; a capture host with only a bare Mix could not record it.
+		versionArgs: "--version",
+		workspace: smoke("elixir-mix"),
+		file: "lib/bad.ex",
+		argv: ["compile", "--warnings-as-errors"],
+	},
+	{
+		runner: "fish-indent",
+		tool: "fish_indent",
+		workspace: smoke("fish-indent"),
+		file: "unformatted.fish",
+		argv: ["--check", "unformatted.fish"],
+	},
+	{
+		// #4454 — the fish-lsp smoke fixture also has to be something fish_indent
+		// objects to. It was already formatted, so exit 0 and no finding.
+		runner: "fish-indent",
+		case: "smoke-bad",
+		tool: "fish_indent",
+		workspace: smoke("fish"),
+		file: "bad.fish",
+		argv: ["--check", "bad.fish"],
+	},
+	// #4454 — fish_indent --check never reports a syntax error (a missing `end`
+	// or an unterminated quote exits 0 with no output), so the runner also asks
+	// `fish --no-execute`, which parses without running anything. These four
+	// capture its real bytes for the three defects and for the fish-lsp smoke
+	// fixture. The file is already formatted in each, so fish_indent is silent.
+	{
+		runner: "fish-indent",
+		case: "syntax-missing-end",
+		tool: "fish",
+		workspace: smoke("fish-syntax"),
+		file: "missing-end.fish",
+		argv: ["--no-config", "--no-execute", "missing-end.fish"],
+	},
+	{
+		runner: "fish-indent",
+		case: "syntax-unterminated-quote",
+		tool: "fish",
+		workspace: smoke("fish-syntax"),
+		file: "unterminated-quote.fish",
+		argv: ["--no-config", "--no-execute", "unterminated-quote.fish"],
+	},
+	{
+		runner: "fish-indent",
+		case: "syntax-stray-end",
+		tool: "fish",
+		workspace: smoke("fish-syntax"),
+		file: "stray-end.fish",
+		argv: ["--no-config", "--no-execute", "stray-end.fish"],
+	},
+	{
+		// Production hands fish an ABSOLUTE path, and fish 3.3.1 (Ubuntu 22.04)
+		// then prints the header as `~` + that path. Captured with a 3.3.1
+		// binary only: `--bin-dir` selects one fish for every fish-indent
+		// entry, so run this entry alone with that binary and keep the other
+		// fixtures from the newer one.
+		runner: "fish-indent",
+		case: "syntax-stray-end-fish-3.3.1",
+		tool: "fish",
+		workspace: smoke("fish-syntax"),
+		file: "stray-end.fish",
+		argv: ["--no-config", "--no-execute", "__WORKSPACE__/stray-end.fish"],
+	},
+	{
+		runner: "fish-indent",
+		case: "syntax-smoke-bad",
+		tool: "fish",
+		workspace: smoke("fish"),
+		file: "bad.fish",
+		argv: ["--no-config", "--no-execute", "bad.fish"],
+	},
+	{
+		// #4455 — golangci-lint v2 removed `--out-format`; JSON now comes from
+		// `--output.json.path`, and the run stats it prints to stdout would
+		// otherwise trail the JSON document.
+		runner: "golangci-lint",
+		tool: "golangci-lint",
+		workspace: smoke("golangci-lint"),
+		file: "bad.go",
+		argv: [
+			"run",
+			"--output.json.path=stdout",
+			...GOLANGCI_OTHER_FORMATS_OFF,
+			"--show-stats=false",
+			"bad.go",
+		],
+	},
+	{
+		// A project config that prints a text format to stdout puts that text beside
+		// the JSON unless the runner switches the other formats off.
+		runner: "golangci-lint",
+		case: "config-text-stdout",
+		tool: "golangci-lint",
+		workspace: smoke("golangci-lint-text-stdout"),
+		file: "bad.go",
+		argv: [
+			"run",
+			"--output.json.path=stdout",
+			...GOLANGCI_OTHER_FORMATS_OFF,
+			"--show-stats=false",
+			"bad.go",
+		],
+	},
+	{
+		// #4453 — the runner lints the chart ROOT by absolute path, so the capture
+		// spawns with the workspace (the token) and the file is the template the
+		// replay points the runner at.
+		runner: "helm-lint",
+		tool: "helm",
+		versionArgs: "version --short",
+		workspace: smoke("helm"),
+		file: "templates/bad.yaml",
+		argv: ["lint", "__WORKSPACE__"],
+	},
+	{
+		// A template whose file name holds a space: helm prints the name unquoted
+		// inside `(<chart>/templates/my file.yaml:5)`.
+		runner: "helm-lint",
+		case: "space-in-name",
+		tool: "helm",
+		versionArgs: "version --short",
+		workspace: smoke("helm-space-name"),
+		file: "templates/my file.yaml",
+		argv: ["lint", "__WORKSPACE__"],
+	},
+	{
+		// The static build: the dynamic `swiftlint` needs libxml2 and SourceKit.
+		runner: "swiftlint",
+		tool: "swiftlint",
+		// A clean run exists: the binary lints a formatted file and reports `[]`,
+		// warning only that one SourceKit-gated rule was skipped (#4522 F8
+		// measured it; the earlier `cleanUnavailable` fact claimed it aborts on
+		// any file, which its own dirty capture contradicts).
+		workspace: smoke("swiftlint"),
+		file: "bad.swift",
+		argv: ["--reporter", "json", "bad.swift"],
+	},
+	{
+		runner: "go-vet",
+		case: "type-error",
+		tool: "go",
+		versionArgs: "version",
+		workspace: smoke("go"),
+		file: "bad.go",
+		argv: ["vet", "."],
+		// #4451 — a Go type error prints `vet: ./bad.go:8:21: ...`, the prefixed
+		// shape the runner dropped. tool-smoke/go holds a type error, so go never
+		// reaches its analyzers there.
+		note: "type error: go vet prefixes the line with `vet: `",
+	},
+	{
+		// #4451 — the analyzer shape (`bad.go:9:14: ...`, no prefix), from a file
+		// that type-checks.
+		runner: "go-vet",
+		case: "printf-analyzer",
+		tool: "go",
+		versionArgs: "version",
+		workspace: smoke("go-vet-printf"),
+		file: "bad.go",
+		argv: ["vet", "."],
 	},
 	{
 		runner: "markdownlint",
@@ -213,6 +525,27 @@ export const CAPTURES = [
 		argv: ["hcl", "validate", "--json", "--non-interactive"],
 	},
 	{
+		runner: "trivy-config",
+		tool: "trivy",
+		workspace: smoke("trivy-config"),
+		file: "bad.yaml",
+		// The floor `resolveSeverityFloor` defaults to (HIGH, never stricter), so
+		// the capture and the runner ask trivy the same question.
+		argv: [
+			"config",
+			"--quiet",
+			"--format",
+			"json",
+			"--severity",
+			"HIGH,CRITICAL",
+			"bad.yaml",
+		],
+		// A clean run exists: a manifest with no kubernetes resources gives the
+		// ruleset nothing to check, and trivy exits 0 with no results (#4522 F8
+		// measured it; the earlier `cleanUnavailable` fact claimed no clean
+		// manifest exists at all).
+	},
+	{
 		runner: "tflint",
 		tool: "tflint",
 		workspace: smoke("terraform"),
@@ -233,35 +566,24 @@ export const CAPTURES = [
 		file: "bad.yaml",
 		argv: ["-f", "parsable", "bad.yaml"],
 	},
+	{
+		runner: "zig-check",
+		tool: "zig",
+		versionArgs: "version",
+		workspace: smoke("zig"),
+		file: "bad.zig",
+		argv: ["build-exe", "bad.zig", "-fno-emit-bin"],
+	},
 ];
-
-/** Directories searched for a tool binary, in order. */
-function candidateDirs(binDir) {
-	const home = os.homedir();
-	return [
-		binDir,
-		path.join(home, ".pi-lens", "bin"),
-		path.join(home, ".pi-lens", "tools", "node_modules", ".bin"),
-	].filter(Boolean);
-}
-
-/** Absolute path to `name`'s binary, or the bare name to fall back to PATH. */
-export function resolveBin(name, binDir) {
-	for (const dir of candidateDirs(binDir)) {
-		for (const suffix of [".exe", ".bat", ".cmd", ""]) {
-			const candidate = path.join(dir, `${name}${suffix}`);
-			if (fs.existsSync(candidate)) return candidate;
-		}
-	}
-	return name;
-}
 
 function main() {
 	const argv = process.argv.slice(2);
 	let binDir = null;
+	let recordsOnly = false;
 	const only = [];
 	for (let i = 0; i < argv.length; i++) {
 		if (argv[i] === "--bin-dir") binDir = argv[++i];
+		else if (argv[i] === "--records-only") recordsOnly = true;
 		else only.push(argv[i]);
 	}
 
@@ -275,45 +597,130 @@ function main() {
 
 	let captured = 0;
 	const skipped = [];
-	for (const entry of selected) {
-		const bin = resolveBin(entry.bin ?? entry.tool, binDir);
-		const source = path.join(repoRoot, entry.workspace);
-		const workspace = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-capture-"),
-		);
-		try {
-			fs.cpSync(source, workspace, { recursive: true });
-			execFileSync(
-				process.execPath,
-				[
-					path.join(__dirname, "capture-runner-output.mjs"),
-					"--runner",
+	const scratch = [];
+	const tempWorkspace = (source, label) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-capture-"));
+		scratch.push(dir);
+		fs.cpSync(path.join(repoRoot, source), dir, { recursive: true });
+		return { dir, label };
+	};
+
+	try {
+		for (const entry of selected) {
+			const bin = resolveBin(entry.bin ?? entry.tool, binDir);
+			const probes = entry.probe ??
+				PROBE_OVERRIDES[entry.runner] ?? [
+					{ command: entry.tool, argv: ["--version"] },
+				];
+			const cleanWorkspace = entry.clean ?? cleanWorkspaceFor(entry.runner);
+
+			// The records a fixture cannot be replayed without (#4473, #4522).
+			const recordArgs = [
+				...(entry.versionArgs ? ["--version-args", entry.versionArgs] : []),
+				...(entry.shell ? ["--shell", entry.shell] : []),
+				...(binDir ? ["--bin-dir", binDir] : []),
+				...probes.flatMap((probe) => [
+					"--probe",
+					JSON.stringify({ command: probe.command, argv: probe.argv }),
+				]),
+			];
+
+			if (recordsOnly) {
+				// Key on the entry's OWN case. Iterating the directory instead merged
+				// one entry's clean run into every fixture of its runner, so
+				// fish-indent's formatter fixture replayed an entry that ran
+				// `fish --no-execute`, and the clean half of six fixtures was
+				// evidence about an invocation they never send (#4522 F3).
+				const caseName = entry.case ?? "real";
+				const dest = path.join(
+					repoRoot,
+					"tests/fixtures/runner-output",
 					entry.runner,
-					"--tool",
-					entry.tool,
-					"--bin",
-					bin,
-					"--cwd",
-					workspace,
-					"--workspace",
-					entry.workspace,
-					"--file",
-					entry.file,
-					"--case",
-					entry.case ?? "real",
-					...(entry.note ? ["--note", entry.note] : []),
-					...(entry.shell ? ["--shell", entry.shell] : []),
-					"--",
-					...entry.argv,
-				],
-				{ stdio: "inherit" },
-			);
-			captured++;
-		} catch (err) {
-			skipped.push(`${entry.runner}: ${err?.message ?? err}`);
-		} finally {
-			fs.rmSync(workspace, { recursive: true, force: true });
+					`${caseName}.captured.json`,
+				);
+				if (!fs.existsSync(dest)) {
+					skipped.push(`${entry.runner}/${caseName}: no fixture to merge into`);
+					continue;
+				}
+				const workspace = tempWorkspace(entry.workspace, "dirty").dir;
+				const clean = tempWorkspace(cleanWorkspace, "clean").dir;
+				try {
+					execFileSync(
+						process.execPath,
+						[
+							path.join(__dirname, "capture-runner-output.mjs"),
+							"--runner",
+							entry.runner,
+							"--tool",
+							entry.tool,
+							"--bin",
+							bin,
+							"--cwd",
+							workspace,
+							"--file",
+							entry.file,
+							"--merge-into",
+							dest,
+							"--clean-cwd",
+							clean,
+							"--clean-workspace",
+							cleanWorkspace,
+							"--clean-file",
+							entry.file,
+							...recordArgs,
+							"--",
+							...entry.argv,
+						],
+						{ stdio: "inherit" },
+					);
+					captured++;
+				} catch (err) {
+					skipped.push(`${entry.runner}/${caseName}: ${err?.message ?? err}`);
+				}
+				continue;
+			}
+
+			const workspace = tempWorkspace(entry.workspace, "dirty").dir;
+			const clean = tempWorkspace(cleanWorkspace, "clean").dir;
+			try {
+				execFileSync(
+					process.execPath,
+					[
+						path.join(__dirname, "capture-runner-output.mjs"),
+						"--runner",
+						entry.runner,
+						"--tool",
+						entry.tool,
+						"--bin",
+						bin,
+						"--cwd",
+						workspace,
+						"--workspace",
+						entry.workspace,
+						"--file",
+						entry.file,
+						"--case",
+						entry.case ?? "real",
+						...(entry.note ? ["--note", entry.note] : []),
+						"--clean-cwd",
+						clean,
+						"--clean-workspace",
+						cleanWorkspace,
+						"--clean-file",
+						entry.file,
+						...recordArgs,
+						"--",
+						...entry.argv,
+					],
+					{ stdio: "inherit" },
+				);
+				captured++;
+			} catch (err) {
+				skipped.push(`${entry.runner}: ${err?.message ?? err}`);
+			}
 		}
+	} finally {
+		for (const dir of scratch) fs.rmSync(dir, { recursive: true, force: true });
 	}
 
 	console.log(`\n${captured} captured, ${skipped.length} skipped`);

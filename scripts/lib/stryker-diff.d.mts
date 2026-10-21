@@ -34,6 +34,11 @@ export declare const isScriptMutationFile: (file: string) => boolean;
 export declare const isCompiledMutationSource: (file: string) => boolean;
 export declare const isMutationSourceFile: (file: string) => boolean;
 export declare const compiledJsPath: (file: string) => string;
+export declare function importsMutationSource(
+	testFile: string,
+	content: string,
+	sourceFile: string,
+): boolean;
 export declare function mapRelatedTests(
 	changedFiles: string[],
 	options?: {

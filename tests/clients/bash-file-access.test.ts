@@ -12,7 +12,10 @@ import {
 	tokenizeShellCommand,
 	type ReadSpan,
 } from "../../clients/bash-file-access.js";
-import { removeTempDirSync } from "./test-utils.js";
+import { toPosix } from "../../clients/path-utils.js";
+import { ReadGuard } from "../../clients/read-guard.js";
+import { registerSearchReads } from "../../clients/search-read-registration.js";
+import { pinFixtureHome, removeTempDirSync } from "./test-utils.js";
 
 let tmp: string;
 
@@ -161,6 +164,22 @@ describe("extractReadPathsFromCommand — full-file viewers", () => {
 				limit: 2,
 			},
 		);
+	});
+
+	// #4577 R4: an absolute operand names the file the shell opened under the
+	// spelling the command carried, and re-resolving it rewrites that spelling —
+	// on win32 `C:/Users/…/large.ts` became `C:\Users\…` and redded the bash-cap
+	// case that pins the reported path (#4019). A dot segment is the same rewrite
+	// on every platform, and the posix spelling is what a Windows operand looks
+	// like, so this pins the rule on both.
+	it("keeps an absolute operand's spelling instead of re-resolving it (#4577 R4)", () => {
+		const f = touchLines("sub/c.ts", 2);
+		const spelled = toPosix(
+			`${path.dirname(f)}${path.sep}.${path.sep}${path.basename(f)}`,
+		);
+		expect(extractReadPathsFromCommand(`cat ${spelled}`, tmp)).toEqual([
+			{ filePath: spelled, offset: 1, limit: 2 },
+		]);
 	});
 
 	it("registers each file across && / ; segments and dedupes", () => {
@@ -470,6 +489,139 @@ describe("extractGrepSearchReadsFromOutput", () => {
 			{ file: a, startLine: 9, endLine: 9, contextBefore: 2, contextAfter: 2 },
 		]);
 	});
+
+	it.each([
+		[
+			"quoted pattern and bare filename",
+			"grep -n '~/proj/x.ts' ~/proj/x.ts",
+			"home",
+		],
+		[
+			"bare pattern and quoted filename",
+			"grep -n ~/proj/x.ts '~/proj/x.ts'",
+			"~",
+		],
+	])(
+		"binds quoting to the filename token: %s (#4577 R4)",
+		(_label, command, selected) => {
+			// The fixture HOME is outside the deleted root (#4591), so the file
+			// bash's bare `~` names is created under the pin, not under `tmp`.
+			const { home, restore } = pinFixtureHome("bfa-quote-token");
+			fs.mkdirSync(path.join(tmp, ".git"));
+			const homeFile = path.join(home, "proj", "x.ts");
+			fs.mkdirSync(path.dirname(homeFile), { recursive: true });
+			fs.writeFileSync(homeFile, "~/proj/x.ts\n");
+			const literalFile = touchLines(path.join("~", "proj", "x.ts"));
+			fs.writeFileSync(literalFile, `${home}/proj/x.ts\n`);
+			try {
+				const guard = new ReadGuard("r4-collision");
+				// Real bash probe's single-file output. In the mirror, bash expands
+				// the PATTERN; the literal file can contain that pattern too.
+				const output =
+					selected === "home" ? "1:~/proj/x.ts" : `1:${home}/proj/x.ts`;
+				const locations = extractGrepSearchReadsFromOutput(
+					command,
+					tmp,
+					output,
+				);
+				registerSearchReads(guard, locations, {
+					projectRoot: tmp,
+					turnIndex: 1,
+					writeIndex: 0,
+				});
+				const expected = selected === "home" ? homeFile : literalFile;
+				const unseen = selected === "home" ? literalFile : homeFile;
+				// The binding itself: the bare operand resolves to $HOME, the quoted
+				// one to the literal `<cwd>/~/…` file.
+				expect(locations.map((loc) => loc.file)).toEqual([expected]);
+				// `registerSearchReads` credits project-internal files only, and
+				// #4591 puts the fixture HOME outside the project, so the credit is
+				// observable on the in-project branch and the exclusion on the other.
+				// Coverage this cell gives up (named in the PR body): a `~` that expands
+				// to a project-INTERNAL home being credited. The pin cannot place HOME
+				// inside a swept root any more, and no cell pins a raw in-project HOME.
+				if (expected === literalFile)
+					expect(guard.getReadHistory(literalFile)).toHaveLength(1);
+				expect(guard.getReadHistory(unseen)).toHaveLength(0);
+			} finally {
+				restore();
+			}
+		},
+	);
+
+	it.each(["cat", "touch", "rm"])(
+		"keeps identical %s operands distinct by quoting (#4577 R4)",
+		(verb) => {
+			const { home, restore } = pinFixtureHome("bfa-quote-distinct");
+			const homeFile = path.join(home, "proj", "x.ts");
+			fs.mkdirSync(path.dirname(homeFile), { recursive: true });
+			fs.writeFileSync(homeFile, "line1\n");
+			const literalFile = touchLines(path.join("~", "proj", "x.ts"));
+			try {
+				const command = `${verb} '~/proj/x.ts' ~/proj/x.ts`;
+				const actual =
+					verb === "cat"
+						? extractReadPathsFromCommand(command, tmp).map(
+								(span) => span.filePath,
+							)
+						: verb === "touch"
+							? extractWrittenPathsFromCommand(command, tmp)
+							: extractDeletedPathsFromCommand(command, tmp);
+				expect(actual).toEqual([literalFile, homeFile]);
+			} finally {
+				restore();
+			}
+		},
+	);
+
+	// #4577 R2-1: the two grep paths that resolve an operand must receive the
+	// segment's quoting bit like the three other `resolveCandidate` callers. `args`
+	// arrive already `stripQuotes`d, so a quoted `~` here lost its only evidence
+	// and was expanded to `$HOME` — a file grep never opened (bash reads
+	// `<cwd>/~/…`). `$HOME` and the literal file both exist with different bytes,
+	// so a wrong resolver answer is distinguishable from a missing file.
+	it("credits a quoted ~ operand to the literal file, not the home file (#4577 R2-1)", () => {
+		const { home, restore } = pinFixtureHome("bfa-grep-quoted");
+		fs.mkdirSync(path.join(home, "proj"), { recursive: true });
+		fs.writeFileSync(path.join(home, "proj", "x.ts"), "home line\n");
+		const literalFile = touchLines(path.join("~", "proj", "x.ts"), 40);
+		try {
+			expect(os.homedir()).toBe(home);
+			// Single-operand spelling: grep prints `line:text`, so the credited
+			// path comes from `extractGrepSearchFiles` (the operand extraction).
+			expect(
+				extractGrepSearchReadsFromOutput(
+					"grep -n bad '~/proj/x.ts'",
+					tmp,
+					"2:const bad = 9;",
+				).map((loc) => loc.file),
+			).toEqual([literalFile]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("credits a multi-file hit's quoted ~ operand to the literal file (#4577 R2-1)", () => {
+		const { home, restore } = pinFixtureHome("bfa-grep-quoted-multi");
+		fs.mkdirSync(path.join(home, "proj"), { recursive: true });
+		fs.writeFileSync(path.join(home, "proj", "x.ts"), "home line\n");
+		const literalFile = touchLines(path.join("~", "proj", "x.ts"), 40);
+		try {
+			expect(os.homedir()).toBe(home);
+			// Multi-file spelling: grep prefixes each hit with the file it printed,
+			// so this credited path comes from `parseGrepLineWithFile`, the other
+			// site that had lost the bit.
+			expect(
+				extractGrepSearchReadsFromOutput(
+					"grep -n bad '~/proj/x.ts' other.ts",
+					tmp,
+					"~/proj/x.ts:2:const bad = 9;",
+				).map((loc) => loc.file),
+			).toEqual([literalFile]);
+		} finally {
+			restore();
+		}
+	});
 });
 
 describe("parseGrepContextLines", () => {
@@ -596,6 +748,90 @@ describe("extractWrittenPathsFromCommand — bash writes", () => {
 			expect(extractWrittenPathsFromCommand(build(f), tmp)).toContain(f);
 		});
 	}
+
+	// #4576/#4577 M1: a bash operand follows SHELL rules, not host-tool-argument
+	// rules. bash expands a bare leading `~` itself and leaves a quoted one
+	// literal; nothing else the host resolver does (`@` strip, `file://`
+	// conversion, unicode-space fold) applies to a shell word, because the shell
+	// opened the literal file name. Each row below pins one of those rules.
+	it("expands a bare ~ operand to $HOME instead of pinning it under the cwd (#4576)", () => {
+		const { home, restore } = pinFixtureHome("bfa-bare-tilde");
+		fs.mkdirSync(path.join(home, "proj"), { recursive: true });
+		try {
+			expect(os.homedir()).toBe(home);
+			expect(
+				extractWrittenPathsFromCommand("echo x > ~/proj/a.ts", tmp),
+			).toEqual([path.join(home, "proj", "a.ts")]);
+			fs.writeFileSync(path.join(home, "proj", "a.ts"), "line1\n");
+			expect(
+				extractReadPathsFromCommand("cat ~/proj/a.ts", tmp)[0]?.filePath,
+			).toBe(path.join(home, "proj", "a.ts"));
+			// `~user` is not a spelling pi expands; it stays relative to the
+			// cwd, exactly as the host tool resolver leaves it.
+			expect(
+				extractWrittenPathsFromCommand("echo x > ~user/proj/a.ts", tmp),
+			).toEqual([path.join(tmp, "~user", "proj", "a.ts")]);
+		} finally {
+			restore();
+		}
+	});
+
+	// #4577 M1: bash does NOT expand a quoted tilde (`info bash`, Tilde
+	// Expansion: "If a word begins with an unquoted tilde character …"). The
+	// tokenizer drops the quotes, so the segment carries the bit; the pre-fix
+	// resolver expanded all three spellings to $HOME and credited a read of a
+	// file the command never opened.
+	it.each([
+		["single-quoted", "cat '~/proj/a.ts'"],
+		["double-quoted", 'cat "~/proj/a.ts"'],
+	])(
+		"keeps a %s ~ operand literal under the cwd (#4577)",
+		(_label, command) => {
+			const { home, restore } = pinFixtureHome("bfa-quoted-tilde");
+			fs.mkdirSync(path.join(home, "proj"), { recursive: true });
+			const literalFile = touchLines(path.join("~", "proj", "a.ts"));
+			fs.writeFileSync(path.join(home, "proj", "a.ts"), "home line\n");
+			try {
+				expect(os.homedir()).toBe(home);
+				expect(
+					extractReadPathsFromCommand(command, tmp).map((s) => s.filePath),
+				).toEqual([literalFile]);
+			} finally {
+				restore();
+			}
+		},
+	);
+
+	it("keeps a quoted redirect target's ~ literal under the cwd (#4577)", () => {
+		const { home, restore } = pinFixtureHome("bfa-quoted-redirect");
+		fs.mkdirSync(path.join(home, "proj"), { recursive: true });
+		const literalFile = touchLines(path.join("~", "proj", "n.ts"));
+		try {
+			expect(os.homedir()).toBe(home);
+			expect(
+				extractWrittenPathsFromCommand("echo x > '~/proj/n.ts'", tmp),
+			).toEqual([literalFile]);
+		} finally {
+			restore();
+		}
+	});
+
+	// #4577 M1: a shell word is a file name. `@x.ts` is not a file mention, and
+	// a unicode space in a name is that byte, not U+0020. The host resolver
+	// applied both (its `stripAtPrefix` and unicode fold), so the pre-fix code
+	// credited `<cwd>/x.ts` and `<cwd>/a b.ts` — files the command never read.
+	// The names are quoted because the lexer splits words on `\s`, which matches
+	// U+202F; that pre-existing split is a separate defect from this fold.
+	it("reads the literal @-prefixed and unicode-spaced file names the shell opened (#4577)", () => {
+		const atFile = touchLines("@config.ts");
+		const spacedFile = touchLines("a\u202Fb.ts");
+		expect([
+			...extractReadPathsFromCommand("cat @config.ts", tmp).map(
+				(s) => s.filePath,
+			),
+			...extractWrittenPathsFromCommand("tee 'a\u202Fb.ts'", tmp),
+		]).toEqual([atFile, spacedFile]);
+	});
 
 	it("cp source is NOT registered as a write (only the destination)", () => {
 		const dst = pathIn("dst.ts");

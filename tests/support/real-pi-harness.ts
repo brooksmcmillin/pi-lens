@@ -75,6 +75,8 @@ export type RealPi = {
 		extensionLog(): ReadonlyArray<JsonObject>;
 		sessionStartLog(): ReadonlyArray<string>;
 		degradations(): ReadonlyArray<JsonObject>;
+		/** Absolute paths of the per-session state sidecars (`<project data>/sessions/<id>.json`). */
+		sessionSidecars(): ReadonlyArray<string>;
 	};
 };
 type RpcMessage = HarnessEvent;
@@ -547,6 +549,12 @@ export async function withRealPi<T>(
 			childTempDir: () => path.join(harness.home, "tmp"),
 			childEnvironment: () => harness.childEnv,
 			lens: {
+				sessionSidecars: () =>
+					(readdirSync(harness.home, { recursive: true }) as string[])
+						.filter((entry) =>
+							/(^|[\\/])sessions[\\/][^\\/]+\.json$/.test(entry),
+						)
+						.map((entry) => path.join(harness.home, entry)),
 				latencyRows: () => readRows(path.join(harness.home, "latency.log")),
 				extensionLog: () => readRows(path.join(harness.home, "extension.log")),
 				sessionStartLog: () =>

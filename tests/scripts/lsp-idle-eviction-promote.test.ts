@@ -27,7 +27,6 @@ import { gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
 import {
 	COLD_START_MAX_MS,
 	IDLE_EVICTION_MIN_RSS_BYTES,
-	PROMOTE_NIGHTS,
 	addReasons,
 	advanceNights,
 	holdList,
@@ -519,10 +518,6 @@ describe("planPromotions (#3989)", () => {
 		expect(plan.promoted).toEqual([]);
 		expect(plan.serverSource).toBe(FIXTURE_SERVER_TS);
 		expect(plan.state).toEqual({});
-	});
-
-	it("requires PROMOTE_NIGHTS to be the two the issue states", () => {
-		expect(PROMOTE_NIGHTS).toBe(2);
 	});
 });
 

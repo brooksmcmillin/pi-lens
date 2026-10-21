@@ -1,0 +1,571 @@
+## Why
+
+Pre-fix, a save that was still on the wire made an identical touch look uncovered, so the touch re-pushed the same bytes and its `didChange` cleared the server's cached diagnostics.
+
+## Notes for the reviewer
+
+- **The gate makes one decision on one rule.** Skip only when the bytes the server will hold once this document's notify queue drains are this touch's content. Three readers answer it, all on the client that owns the document: the landed record (`getSentContent`, `clients/lsp/client.ts:608`), the path's queue (`hasNotifyInFlight`, `clients/lsp/client.ts:6043`), and the save mark (`recentTouches.savedHash`, `clients/lsp/index.ts:1742`).
+- **Round 4 gives the queue a kind.** Round 3 read the queue as a boolean, so a save-only entry answered "busy" and cost the skip. Every entry now carries `saveOnly` (`clients/lsp/client.ts:681`) beside the `run` it belongs to, and `active` (`clients/lsp/client.ts:734`) keeps the running entry's kind, so the reader sees what is on the wire. A close is not save-only: removing the document is the strongest change to it.
+- **The kind travels with the run.** A coalesced entry keeps `previous.run` when it is stale, so it keeps `previous.saveOnly` too (`clients/lsp/client.ts:4754`). A save merged onto a content entry still reports content; a content entry merged onto a save carries the content. Three cases pin the direction.
+- **Three rounds of review moved that verdict three times.** Round 2 moved it from elapsed time onto the landed record. Round 3 added the two facts the record cannot settle: a send still in flight lands after a skip, and a writer can push without marking a touch. That writer leaves the save mark on older bytes. Round 4 added the kind: only a content send, or a close, makes the record non-final. Every cell names the test or config that pins it.
+- **The pre-#4532 window gate is gone from the code.** The gate pushes a client that cannot report its record or say whether a content send is pending. `GateWindowReopen` is why: that gate can leave a server holding no document for a file on disk. Nine hand-rolled client doubles gained the records their fakes already produced.
+- **One findings family already exists on the base.** The bundled `array-callback-return` rule reports 5 sites in this 418 KB file, and `origin/master` carries the same 5 (transcript under Tests). Fixing them means a 5-site refactor of unrelated callbacks, which a fix round must not deepen. The required gate `npm run astgrep:self-scan` is clean: it runs 14 project self-scan rules, not that bundled one.
+- **Hot path: unchanged by round 4.** The reader already normalized once per question, and round 4 adds no lookup, only a field read. The round-3 measured table stands: ~3.8 µs per touch for record plus queue, O(1) in file size. The old in-window arm paid a ~89 µs whole-document fingerprint at 200 KB.
+- **The TLA+ move is two switches, one scenario axis and one invariant pair.** `SkipNeedsIdle` and `SaveBoundToContent` select the rule; `Record` must fire before `RunFinish` clears the queue, which is the code's own order. Four new configs, two new invariants. Round 4 changes what "idle" counts; see `## TLA+ model` for why that leaves the family's formula, and its constants, alone.
+
+## Change outline
+
+```text
+- shouldSkipNotify                (clients/lsp/index.ts:1677)
+  + sentContentHash -> record and queue, one rule
+    + client.getSentContent(filePath)      <- what LANDED
+    + client.hasNotifyInFlight(filePath)   <- only a CONTENT send still to come  (F1, round 4)
+    - elapsed-window + fingerprint fallback (F3)
+  + saveDebouncedPush(..., sentContentHash)   (clients/lsp/index.ts:1729)
+    ~ recentTouches.saved: boolean -> savedHash?: string             (F2)
+  ~ markTouched: trim by oldest-first count, not by window age       (F4)
+
+- clients/lsp/client.ts
+  + hasNotifyInFlight?(filePath)            (interface + createLSPClient)
+  + sentContentFor / hasNotifyInFlightFor   (one reader, shared with the doubles)
+  + PendingDocumentNotify.saveOnly          <- the entry's kind         (round 4)
+  + DocumentNotifyQueue.active              <- the kind on the wire     (round 4)
+  ~ hasNotifyInFlightFor reads active/pending kinds, never `running`    (round 4)
+  ~ enqueueDocumentNotify keeps the kind of the run a stale entry keeps (round 4)
+
+- formal/lsp-server-content/ServerContent.tla
+  + CONSTANTS SkipNeedsIdle, SaveBoundToContent, SavedTouches, OpenFilePushes, Revert
+  + VARIABLES skipped, serverSaved, touchedSaved; recent.savedHash
+  + SkipNow / OwesSave / QueueIdle; OpenFilePush; Record+RunFinish ordering
+  + SkippedContentHeld, SaveFollowsSavedTouch
+```
+
+## Summary
+
+This closes the gap reported as #4532 gap 9. `shouldSkipNotify` decided "the server already has these bytes" from elapsed time, then compared fingerprints. A touch that outlived the window made the next touch of identical content look stale by time alone, so the identical bytes went out again. Per #4527 that re-push cost a 2335 ms cold `lsp_diagnostics_timeout` on clangd.
+
+The verdict reads what the server will hold when the path's queue drains, and nothing else. The record answers what landed (`clients/lsp/index.ts:1705`), the queue answers whether a **content** send is still to come (`clients/lsp/index.ts:1713`), and the save mark answers which bytes already had their `didSave`:
+
+```text
+		const sentContent = client.getSentContent?.(filePath);
+		if (sentContent === undefined || sentContent.hash !== sentContentHash) {
+			return false;
+		}
+		// F1: the record is final only with no content send left to come. Absent
+		// `hasNotifyInFlight` is not "idle" — it is an unanswerable question.
+		// Round 4: that answer counts content sends only; a running save leaves
+		// the record final, so it still skips here.
+		return client.hasNotifyInFlight?.(filePath) === false;
+```
+
+Round 4 answers Greptile's first finding on that last line. The queue it reads is per document and works one entry at a time, and `notify.save` (`handleNotifySave`, a `didSave` with no content) is such an entry. Counting it as a content send made a slow save look like bytes still to come. The next identical touch re-pushed, `handleNotifyChangeOnce` cleared the cached diagnostics, and a document the server already held restarted its computation. The entry's kind (`saveOnly`, next to the `run` it describes) is now what answers, so only a run that can change the document or remove it counts (`clients/lsp/client.ts:6043`):
+
+```text
+	const queue = state.notifyChangeQueues.get(normalizeMapKey(filePath));
+	return (
+		queue?.active?.saveOnly === false || queue?.pending?.saveOnly === false
+	);
+```
+
+The other direction is the more serious one, and the model is what made it visible. A `didClose` drops the client's record; `recent` survives it. So under the pre-fix gate a reopen inside the window found `recent.fresh` true with a matching fingerprint. It skipped the push and left the server with **no document at all** for a file on disk (`ServerMatchesDisk` red on `GateWindowReopen`). A close is therefore never save-only, and the gate still counts it.
+
+Every acceptance criterion of gap 9 is met. The window no longer drives the verdict, and the record plus its content queue do. Both wrong directions have a red-first test, and the one entry kind that cannot change the answer no longer costs the skip.
+
+Refs #4532 — this closes gap 9 of that umbrella, not the umbrella. Still open there: gaps 1–3, 5–8, 10–13 and the born-after-start language-server config gap; gap 4 has a recorded decision (MCP gets the freshness look). The resync gaps close through the #4535 publisher (#4562), not here.
+
+## Behavior equivalence
+
+Not a refactor. The ordered stages each site passes through, with the population each stage sees (#3166):
+
+| Gate stage | Round 2 population | Round 3 population | Delta |
+|---|---|---|---|
+| `TOUCH_DEBOUNCE_MS <= 0` early return | every touch | every touch (now the ONLY job of that constant) | 0 |
+| no `recentTouches` entry | a file's first push | same | 0 |
+| client identity differs (#3501) | respawn or replacement | same | 0 |
+| Created-since-push (#4320) | same bytes, new import | same | 0 |
+| **content verdict** | any client reporting a record | **record AND queue both answered** | **narrowed to the sound population** |
+| **queue verdict** | not read | **any entry ⇒ push** | **new; narrowed in round 4** |
+| elapsed-window + fingerprint | clients with no record | **no client: the branch is deleted** | **removed** |
+| save suppression | a save went out at some point | **a save went out for THESE bytes** | **narrowed** |
+
+Round 4 narrows the queue stage and nothing else. The population is every entry the per-document queue can hold:
+
+| Queue stage | Round 3 | Round 4 | Delta |
+|---|---|---|---|
+| content entry running or queued | push | push | 0 |
+| close entry running or queued | push (then `closing` drops the touch) | push | 0 |
+| save-only entry running or queued | **push** | **skip** (the record is still final) | **narrowed: Greptile P1** |
+| save-only entry whose run is stale (kind retained from the entry it merged onto) | depended on the merged entry | **merged entry's kind** | **kind retention made explicit** |
+
+The narrowed row is the fix. Failing closed is what keeps a client double honest: it pushes, and the nine doubles that pin a skip now state the record their fake produces.
+
+## Type of change
+
+- [x] Bug fix
+- [ ] New feature (net-new capability)
+- [ ] Enhancement (improvement to existing capability)
+- [ ] Documentation
+
+## Area
+
+- [x] area:lsp
+- [ ] area:dispatch
+- [ ] area:installer
+- [x] area:diagnostics
+- [x] area:perf
+- [ ] area:read-guard
+- [ ] area:project-intelligence
+- [ ] area:observability
+- [ ] area:session
+- [ ] area:config
+- [ ] area:security
+- [x] area:tests
+
+## Checklist
+
+- [x] I have read CONTRIBUTING.md and AGENTS.md
+- [x] The change has tests for both defect directions
+- [x] Targeted test files pass locally after `npm run build`
+- [x] Every NEW regression test is proven RED on pre-fix code
+- [x] The new guard has compile-valid hand-mutation proof, both directions
+- [x] PR title carries the conventional prefix and the issue ref
+- [x] `npm run lint` passes
+- [x] `npm run build:dist` succeeds
+- [x] `package-lock.json` untouched, so it stays in sync
+- [x] AGENTS.md carries the rule: the debounce's one rule, the save mark bound to its content, and the queue's kind
+- [x] `.changelog/4532-gap9-touch-debounce-content-gate.md` updated (`Fixed`, `audience: user`)
+- [x] Commit subject includes the issue number (`refs #4532`)
+
+## Tests
+
+**`tests/clients/lsp/touch-debounce-content-gate.test.ts`** (4 cases) drives the real `LSPService`, the real client, the real per-document notify queue, and a real stdio JSON-RPC wire to the shared fake LSP child. The witness is the trace the *server* received, not pi-lens' own bookkeeping. Round 3 adds one case and holds the clock in the reopen guard (F5).
+
+**`tests/clients/lsp/touch-debounce-fingerprint.test.ts`** (11 cases) drives the real service and the real notify queue over `createMockState`'s mock connection; round 3 adds three cases and gives the fixture the two production readers over its real state, plus two negative fixtures (no record, no queue). Round 4 adds five cases (one P1 witness, three coalescing-kind rows, one cap boundary) and rewrites the F1 race case (Greptile P2).
+
+| Case | What it pins |
+|---|---|
+| `leaves the server's bytes alone when only the elapsed window has passed` | the skip, at an idle queue (wire file) |
+| `pushes changed bytes after the window` | changed content always pushes |
+| `pushes a document again after it was closed and reopened` | a dropped record pushes (F5 holds the clock inside the window) |
+| `sends the save a skipped touch still owes after another writer advanced the record` | **F2**: `openFile` advances the record; the skipped saved touch still sends its `didSave` |
+| `always pushes a client that cannot report the record it holds` | **F3**: fail closed with no record |
+| `pushes when a client can report its record but not its queue` | **F1**: fail closed with no queue answer |
+| `pushes a touch while a send of other bytes is still in flight` | **F1**: only B's send is held; A's push is awaited, then the record names A and the queue is empty (P2 rewrite) |
+| `still skips a repeat touch of identical long content inside the window` | #3480's fingerprint case, now on a recording double |
+| `skips identical content while a save-only send is slow` | **round 4 P1**: a held `didSave` leaves the record final, so the touch skips and the cached diagnostics survive |
+| `reports a pending save as not content-bearing` | round 4: a save-only entry never blocks a skip |
+| `reports a save merged onto content as content-bearing` + `reports content merged onto a save as content-bearing` | round 4: the kind belongs to the run retained, in both merge orders |
+| `bounds touch evidence at 800 and evicts the oldest unrefreshed entry` | **round 4 P3**: the cap's bound, oldest-first eviction, and the refresh that moves a key to the end |
+
+### Red-first: round 4, on `b109e78af` (this round's pre-fix source, this round's tests)
+
+```text
+$ git checkout b109e78af -- clients/lsp/client.ts && npm run build
+$ vitest run tests/clients/lsp/touch-debounce-fingerprint.test.ts
+   × skips identical content while a save-only send is slow 109ms
+AssertionError: expected [ …(2) ] to deeply equal [ Array(1) ]
++   "didChange:// hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
++ const x = 1;
++ // tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt
+   × reports a pending save as not content-bearing 4ms
+AssertionError: expected true to be false // Object.is equality
+ Tests  2 failed | 9 passed (11)
+```
+
+The wire row is Greptile's P1 read from the server's side: pre-fix the touch pushed, so a second
+`didChange` landed for bytes the server already held. The same case read from the harm side, with the
+assertions swapped so the second one runs, on the same pre-fix build:
+
+```text
+AssertionError: expected false to be true // Object.is equality
+- Expected
++ Received
+- true
++ false
+ ❯ tests/clients/lsp/touch-debounce-fingerprint.test.ts:340:43
+  340|   expect(state.pushDiagnostics.has(FILE)).toBe(true);
+```
+
+That is the cached diagnostics the redundant `didChange` cleared.
+
+### Red-first on `a7d6c4a51` (rounds 1-3, kept for the record)
+
+```text
+$ git checkout a7d6c4a51 -- clients/lsp/index.ts clients/lsp/client.ts && npm run build
+$ vitest run tests/clients/lsp/touch-debounce-fingerprint.test.ts -t "pushes a touch while a send of other bytes is still in flight"
+   × pushes a touch while a send of other bytes is still in flight 15ms
+AssertionError: expected 'didChange:// hhhhhhhhhhhhhhhhhhhhhhhh…' to be 'didChange:// hhhhhhhhhhhhhhhhhhhhhhhh…' // Object.is equality
+ Tests  1 failed | 5 skipped (6)
+
+$ vitest run tests/clients/lsp/touch-debounce-fingerprint.test.ts -t "pushes when a client can report its record but not its queue"
+   × pushes when a client can report its record but not its queue 15ms
+AssertionError: expected [ Array(1) ] to deeply equal [ …(2) ]
+ Tests  1 failed | 5 skipped (6)
+```
+
+### Hand-mutation proof (round 4 rows, built output)
+
+Built output (`clients/lsp/client.js`, `clients/lsp/index.js`), mutated by `scripts/mutate.mjs --built`,
+run over `tests/clients/lsp/touch-debounce-fingerprint.test.ts`, restored by the tool (each run printed
+`RED` and its failing titles; `git status --porcelain` showed no residue).
+
+| Row | Mutation | Result |
+|---|---|---|
+| R4-1 | reader ignores the entry kind: `queue.running \|\| queue.pending !== undefined` (the round-3 rule) | **RED** — `skips identical content while a save-only send is slow`, `reports a pending save as not content-bearing` (2 failed \| 9 passed) |
+| R4-2 | the queue is always idle: `return false;` | **RED** — `pushes a touch while a send of other bytes is still in flight`, `reports a save merged onto content as content-bearing`, `reports content merged onto a save as content-bearing` (3 failed \| 8 passed) |
+| R4-3 | kind not retained: `saveOnly: saveOnly` | **RED** — `reports a save merged onto content as content-bearing` (1 failed \| 10 passed) |
+| R4-4 | kind retained from any previous entry: `saveOnly: previous ? previous.saveOnly : saveOnly` | **RED** — `reports content merged onto a save as content-bearing` (1 failed \| 10 passed) |
+| R4-5 | the running entry is not recorded: `queue.active = undefined` | **RED** — `pushes a touch while a send of other bytes is still in flight` (1 failed \| 10 passed) |
+| R4-6 | cap off by one: `RECENT_TOUCH_CAP = 801` | **RED** — `bounds touch evidence at 800 and evicts the oldest unrefreshed entry` (1 failed \| 10 passed) |
+| R4-7 | trim the newest instead of the oldest | **RED** — `bounds touch evidence at 800 and evicts the oldest unrefreshed entry` (1 failed \| 10 passed) |
+| R4-8 | entry not refreshed on re-push (drop `recentTouches.delete(key)`) | **RED** — `bounds touch evidence at 800 and evicts the oldest unrefreshed entry` (1 failed \| 10 passed) |
+| spot R3 | round 3's M-F2: `previous.savedHash !== undefined` (any save suppresses the next) | **RED** — `sends the save a skipped touch still owes after another writer advanced the record` (1 failed \| 3 passed) |
+
+R4-2 and R4-5 both red the rewritten race case: R4-2 proves the case guards the queue read at all,
+R4-5 proves the new `active` field is what carries the kind of the send on the wire.
+
+### Test totals
+
+```text
+$ vitest run tests/clients/lsp/
+ Test Files  167 passed | 4 skipped (171)
+      Tests  2072 passed | 10 skipped (2082)
+
+$ vitest run tests/config/strictness-ratchet.test.ts tests/clients/flake-shape-ratchet.test.ts
+ Test Files  2 passed (2)
+      Tests  115 passed (115)
+```
+
+### Skipped checks and environment blocks
+
+```text
+$ npm run lane:check -- --body PR_BODY.md
+{"base":"origin/master","checks":{"build":0,"targeted":{"status":0,"failed":[],"selected":87,"matched":232,"capped":true},"governance":{"status":1,"failed":["tests/config/heavy-advisory-gate-workflow.test.ts"]},"body":0,"changelog":0,"format":0,"astgrep":0,"depcruise":0},"failedFiles":[{"file":"tests/config/heavy-advisory-gate-workflow.test.ts","verdict":"INCONCLUSIVE"}],"redOnBase":{"status":3,"baseTree":"worktree"},"changed":45,"governance":166,"head":"af1a3eee325b9a5d9d38c39d76b6295a34f05154","uncommitted":0,"findings":[{"kind":"unproven","reason":"selection capped: 232 test files matched, 87 ran; run the full suite or narrow the change"},{"kind":"unproven","reason":"tests/config/heavy-advisory-gate-workflow.test.ts: red-on-base could not attribute the red"}],"verdict":"unproven","exit":3}
+ORCHESTRATOR SUMMARY
+verdict: unproven (exit 3)
+red files: 1; CAUSED-BY-CHANGE: 0; RED-ON-BASE: 0; INCONCLUSIVE: 1 (not evidence of unrelated)
+selection: selected 87, matched 232, capped true
+```
+
+Two further notes on checks that red without gating:
+
+- `typos (advisory)` fails on `tests/clients/lsp/touch-debounce-content-gate.test.ts:293`: the comment says "keeps reding the pre-#4532 gate" (round 3's text). The fix is the one word `reding` → `reading`; it is an intent-free trailing commit, so it is left for the orchestrator rather than adding a second code round.
+- `Red-first on a7d6c4a51` and the 26-config TLA+ table are the round-3 runs. `formal/` is unchanged by round 4 (`git diff --name-only b109e78af..HEAD | grep -c '^formal/'` → 0), so those tables were not re-run; the round-4 reds and mutations above were.
+
+`tests/config/heavy-advisory-gate-workflow.test.ts` fails in its own fixture setup, before any product code:
+
+```text
+Error: Command failed: git init -q -b master
+plegma git guard (issue #231): refusing "git init" against …/pi-lens-scratch/…/base ("init" is not on
+the read-only allow-list, so it is assumed to write). This worker may only change its own worktree …
+```
+
+### Further gates
+
+```text
+$ npm run astgrep:self-scan
+[astgrep-self-scan] clean: 0 finding(s), all present in the baseline (0 allowed entries).
+
+$ npm run lint
+tsc --project tsconfig.json && oxlint ...      (exit 0, no findings)
+
+$ npm run build:dist
+[bundle] wrote self-contained dist/index.js
+
+$ npx oxfmt --check clients/lsp/client.ts clients/lsp/index.ts tests/clients/lsp/touch-debounce-fingerprint.test.ts AGENTS.md .changelog/4532-gap9-touch-debounce-content-gate.md
+All matched files use the correct format.
+```
+
+### A findings family already on the base (not introduced here)
+
+```text
+$ git show origin/master:clients/lsp/index.ts > base-index.ts
+$ vitest/ast-grep: 5 array-callback-return findings (round 2 transcript, same 5 constructs)
+$ grep -cE "spawned\.map\(async|activeClients\.map\(async|openDocuments\.map\(async|\.map\(async \(dependency\)" base-index.ts clients/lsp/index.ts
+base-index.ts: 5
+index.ts: 5
+```
+
+Reading: the base blob carries five findings and this head carries the same five at shifted lines. This diff adds none and removes none.
+
+## TLA+ model
+
+The touched runtime file maps to six families, so the change moves one model family: `formal/lsp-server-content/`. The gate's evidence is not a lifecycle ordering the other five model, and each family's as-built constants encode something else, so none of them moves:
+
+- `TLA+ unaffected: lsp-crash` — the crash/respawn path never reads the touch gate; a respawned client has no record and no queue, so it pushes, which is the model's no-record branch.
+- `TLA+ unaffected: lsp-idle-reset` — eviction and lease ownership do not depend on whether a notify was skipped.
+- `TLA+ unaffected: late-aux-drain` — auxiliary drain timing is unchanged; the gate decides a push, not when an auxiliary settles.
+- `TLA+ unaffected: lsp-diagnostics-freshness` — the publication freshness/aging constants describe what a server answer means, not whether bytes were sent; neither constant encodes the touch gate.
+- `TLA+ unaffected: store-freshness` — the persisted freshness store is not on this path.
+- `TLA+ unaffected: lsp-server-content` (round 4) — the model's queue holds CONTENT entries only: a save rides the content entry that carries it (`pending.saved`, `serverSaved`), so its `QueueIdle` already reads "no content-bearing send". A standalone save-only entry cannot change `server` (`sendDidSaveForHeldDocument` sends no text and no content), so it satisfies neither `SkippedContentHeld` nor `SaveFollowsSavedTouch` differently, and the harm of counting it is the redundant re-push round 3 recorded as unmodelable (finding (b)). No scenario constant changes meaning, so no config and no `formal/switch-pins.json` value moves; a standalone save-only entry is recorded under Residuals as the family's next candidate.
+
+**Round 3 changes the gate the model carries**, so it flips the constants rather than adding an unaffected line:
+
+| Element | Where | What it models |
+|---|---|---|
+| `SkipNeedsIdle` | `formal/lsp-server-content/ServerContent.tla:219` | A skip requires the path's queue idle (as-built TRUE; FALSE is the pre-round-3 rule) |
+| `SkipNow(p)` | `formal/lsp-server-content/ServerContent.tla:219` | `Debounce && p # "res" && (SkipNeedsIdle => QueueIdle) && SkipEvidence(p)` |
+| `QueueIdle` | `formal/lsp-server-content/ServerContent.tla:217` | `pending = NoEntry && running = NoEntry` |
+| `OwesSave(p)` | `formal/lsp-server-content/ServerContent.tla:227` | The save mark names THIS content (`SaveBoundToContent`) |
+| `Record` | `formal/lsp-server-content/ServerContent.tla:315` | Writes only a `sent` entry, and must fire before `RunFinish` clears the queue — the code's own order |
+| `OpenFilePush` | `formal/lsp-server-content/ServerContent.tla:365` | `openFile` advances the record without marking a touch (the F2 writer) |
+| `SkippedContentHeld` | `formal/lsp-server-content/ServerContent.tla:473` | F1: a skip's certificate survives no send it did not supersede |
+| `SaveFollowsSavedTouch` | `formal/lsp-server-content/ServerContent.tla:481` | F2: at quiescence the saved touch's bytes carry a `didSave` |
+
+Four new configs, two of them mutants:
+
+| Config | Expect | Actual | Distinct states |
+|---|---|---|---|
+| `GateSentIdleSkip` | pass | pass | 1,287,264 |
+| `MutGateSkipDuringSend` | violated `SkippedContentHeld` | violated | 6,679 |
+| `GateSentSavedOpenFile` | pass | pass | 2,682,392 |
+| `MutGateSaveMark` | violated `SaveFollowsSavedTouch` | violated | 197,400 |
+
+`Revert` is what makes F1's lost update harmful: it makes the second writer's bytes the initial content again, so disk holds what the skipped touch read while an older send is in flight. Without a revert the skipped touch is stale and the invariant correctly ignores it — that distinction is why the invariant carries `disk # skipped`.
+
+### Verdict table for all 26 `ServerContent.tla` configs
+
+`-workers 1`, `-Xmx6g`, one `-metadir` per run under the lane's `TMPDIR`, each bounded by `timeout 1200`, metadirs deleted afterwards. Expect and actual agree in every row.
+
+| Config | Expect | Actual | Distinct states |
+|---|---|---|---|
+| `GateWindowReopen` | violated `ServerMatchesDisk` | violated | 36 |
+| `MutLossyFp` | violated `ServerMatchesDisk` | violated | 52 |
+| `GateSentReopen` | pass | pass | 60 |
+| `SingleWrite` | pass | pass | 951 |
+| `DebounceFullFp` | pass | pass | 1,560 |
+| `DebounceLossyFp` | pass | pass | 1,560 |
+| `MutGateSkipDuringSend` | violated `SkippedContentHeld` | violated | 6,679 |
+| `MutGateLossyFp` | violated `ServerMatchesDisk` | violated | 9,844 |
+| `GateSentLossyFp` | pass | pass | 26,000 |
+| `MutCascadeResizedMtimeKey` | violated `ServerMatchesDisk` | violated | 94,362 |
+| `MutFixNoCoalesce` | violated `ServerMatchesDisk` | violated | 95,749 |
+| `ArtifactCascadeResizedAnyLanding` | violated `ServerMatchesDisk` | violated | 101,248 |
+| `MutFixNoDrop` | violated `ServerMatchesDisk` | violated | 178,724 |
+| `MutGateSaveMark` | violated `SaveFollowsSavedTouch` | violated | 197,400 |
+| `CascadeEqualLength` | pass | pass | 313,147 |
+| `CascadeSendOrder` | pass | pass | 326,699 |
+| `CascadeResized` | pass | pass | 352,201 |
+| `FixCascadeEqualLength` | pass | pass | 403,828 |
+| `GateWindowRepush` | pass | pass | 460,750 |
+| `GateSentOneWrite` | pass | pass | 596,920 |
+| `FixAllActors` | pass | pass | 968,072 |
+| `GateSentIdleSkip` | pass | pass | 1,287,264 |
+| `TwoWritesEqualLength` | pass | pass | 1,972,476 |
+| `TwoWritesResized` | pass | pass | 2,242,972 |
+| `FixTwoWritesEqualLength` | pass | pass | 2,249,292 |
+| `GateSentSavedOpenFile` | pass | pass | 2,682,392 |
+
+Verdict lines, quoted from the runs. A pass row ends:
+
+```text
+Model checking completed. No error has been found.
+```
+
+A violated row ends:
+
+```text
+Error: Invariant SkippedContentHeld is violated.
+Error: Invariant SaveFollowsSavedTouch is violated.
+```
+
+The round-2 counts moved: `RunFinish` now waits for `Record`, a schedule the model previously admitted and the code never runs.
+
+### What the model found, and what it could not
+
+- **(a) The pre-fix gate is a safety hole, not only an efficiency bug.** `GateWindowReopen` reds: `recent` survives `didClose`, so a reopen of unchanged bytes is skipped and the server is left holding **no document** for a file on disk. `GateSentReopen` is the same schedule under the as-built gate and passes.
+- **(b) The re-push direction cannot red any invariant here.** A redundant `didChange` still leaves `server = disk`, so `GateWindowRepush` passes. The efficiency half is carried by the wire test, not by the model. Round 4's finding is of this kind — the harm is the re-push and the cleared cache, not a server off disk.
+- **(c) Restoring `recent.fresh` is undetectable by any invariant**, so a mutation back to the window gate cannot red; the mutation that reds is the fingerprint comparison (`MutGateLossyFp`).
+- **(d) The round-2 model could not see either round-3 finding.** `ServerMatchesDisk` is a quiescence property, and the drift sweep repairs a divergence before quiescence, so a skip that loses to a pending send cannot red it. F2 was invisible because the model had no save at all. Round 3's invariants judge at the decision, which is what makes `MutGateSkipDuringSend` and `MutGateSaveMark` red.
+- **(e) A stale send can land after a revert and the drift record hides it.** With `Revert`/`OpenFilePushes` the model now reaches the read-to-touch gap `recordFullyCoveredSync` documents as a KNOWN narrowing: the touch read B, disk moved to C, the touch started after that, and its own start-time `at` hides the send from the sweep. It reds `ServerMatchesDisk` on the **as-built** gate. It is `#1783`'s start-time anchor in code this PR does not change, so `GateSentSavedOpenFile` does not list that invariant; see Residuals.
+
+`formal/switch-pins.json` pins `SkipNeedsIdle` and `SaveBoundToContent` to round 3's tests, classifies `SavedTouches`, `OpenFilePushes` and `Revert` as scenario bounds (`NOT_CODE_CHOICE_COUNT` 233 → 236 in `tests/config/tla-switch-pins.test.ts`), and fixes the `ContentGate` `narrowedBy` reason (F7): the code reads `"window"` nowhere now, because a client that cannot report a record is pushed.
+
+## Detection
+
+- Caught by: reviewer probe
+- Should have been caught by: CI unit
+- Gap: exists: tests/clients/lsp/touch-debounce-fingerprint.test.ts
+- Shape: #70
+- Enforcer: none: judgment-only, shape 70 has no tree-wide detector — its population is one decision per seam, and this round's screen is the Class sweep table below
+
+The gap in one line: every debounce test drove the gate through a hand-rolled client double, which has no record and no queue, so the real-client decisions had no witness at any layer, and the record-versus-queue split had no test that could tell them apart. Shape 70's screen is what found both: for each join, list the writers that can store the answer between the join and the next read.
+
+## Blast radius
+
+`module_report --blastRadius` over `clients/lsp/index.ts` and `clients/lsp/client.ts` after the edit:
+
+- `shouldSkipNotify` has exactly two callers: `shouldSkipTouch`, which only `touchFile` calls, and `touchFile` itself. Both are updated here; no third caller exists.
+- `touchFile` is a high-fanout, high-complexity entry. Its callers are the post-write `tool_result` pipeline, the dispatch LSP runner, the diagnostics probe, and the workspace sweep warm-up. The affected population above covers all four.
+- `getSentContent` already existed (round 2) and serves `getTrackedContent` and the rename paths. `hasNotifyInFlight` is new in round 3 and is read only by the gate; `sentContentFor`/`hasNotifyInFlightFor` are the same two reads, exported for the doubles.
+- Round 4 adds two fields to a module-private interface (`saveOnly`, `active`) and one parameter path already existed (`saveOnly` was a parameter since #3405). The only reader of either field is `hasNotifyInFlightFor`; `cancelDocumentNotifyQueues` clears the whole map, so it needs no change.
+- Nine test doubles gained the record their fake already produced: `touch-debounce-fingerprint`, `service-did-save-option`, `service-notify-per-server`, `service-touch-collect`, `silent-clean-confirm`, `workspace-diagnostics-sweep-batch-open`. No `vi.mock` was added, no hand-rolled LSP client or service double was added, and no real spawn was added outside its registered lane.
+- `formal/` and `tests/config/tla-switch-pins.test.ts` have no runtime dependents.
+
+### Hot-path latency
+
+`touchFile` runs per file, so a measured delta is required. Command: `node $TMPDIR/probe/gate-cost.mjs`, 200,000 iterations per row over the **built** primitives (`sentContentFor`, `hasNotifyInFlightFor`, `fingerprintDocumentContent`) with a state holding one record for the path. Round 4 adds no lookup to either reader, so the table is unchanged:
+
+```text
+--- content 1024 B ---
+  round 3 gate: record + queue (2 normalizations)      3832 ns/op
+  round 2 gate: record only (1 normalization)          1930 ns/op
+  pre-#4532 in-window arm: whole-content fingerprint    997 ns/op
+--- content 204800 B ---
+  round 3 gate: record + queue (2 normalizations)      3882 ns/op
+  round 2 gate: record only (1 normalization)          1920 ns/op
+  pre-#4532 in-window arm: whole-content fingerprint   88987 ns/op
+```
+
+Read of the table: round 3 added one `normalizeMapKey` (~1.9 µs, `clients/path-utils.ts` `normalizeMapKey` reaches `realpathSync.native`) and one map read. It is O(1) in file size and adds no hashing; against the old in-window path it removes a whole-document fingerprint (~89 µs at 200 KB). Round 4 reads one more field from the same entry. Against the duplicate push it prevents (2335 ms on clangd, #4527) the added cost is ~0.0001%.
+
+## Observability
+
+covered by existing record `lsp_touch_file` at `clients/lsp/index.ts:4275`
+
+The skip decision this change re-aims is already observed, and the diff adds no new record surface. Its verdicts land in one place: the same `phase: "lsp_touch_file"` row with `skipped: true, reason: "debounced_unchanged_content"` (`clients/lsp/index.ts:4275`) on a skip, and the same row with `skipped: false` plus the per-server timeout/backpressure fields on a push. The decision branches all map onto those two outcomes: a busy content queue pushes, a save-only queue skips (round 4), an unanswered record pushes, and an owed save lands in the row's `savedServerIds`. The diff adds no `catch`, `throw`, `return null`, or degradation branch.
+
+## Class sweep
+
+### Shape: #70 (joined single flight answers for edits after it started)
+
+Population: every reader of the client's landed content record that DECIDES something about those bytes.
+
+```text
+grep -rn "getSentContent?\.(\|getTrackedContent(\|getDiagnosticBinding?\.(\|sentReadStamps.get(" clients/ tools/ index.ts
+```
+
+| Site | What it decides | Verdict |
+|---|---|---|
+| `clients/lsp/index.ts:1713` (this diff) | whether to skip the push | **member, fixed** — now also reads the content queue and the save mark |
+| `clients/lsp/index.ts:2741` `getTrackedContent` | what the client last sent, for #3601 freshness and the mutation net | not a member: it answers "what landed", and its callers compare it with disk, so a pending send makes the answer older, never falsely newer |
+| `clients/runtime-tool-result.ts:255` | whether a held document needs a HEAD-move resync | not a member: a mismatch re-pushes disk's bytes, the safe direction |
+| `tools/lsp-navigation.ts:845` | whether a rename's first-open stamp covers disk | not a member: an older record under-claims coverage, which re-syncs rather than serving a stale answer |
+| `clients/lsp/client.ts:4738`, `4800` | the queue's own read-stamp ordering | not a member: that IS the queue, not a reader of a landed record |
+
+Consolidation verdict: the skip gate stays the one place that owns "hold these bytes or send them". The other four ask what landed and act conservatively when it is stale; folding them onto the queue would make a freshness read wait on a send, which is #3481's stall class, not this rule.
+
+### Shape: #24 (second writer without discriminator) — round 4
+
+Population: every reader of the per-document notify queue that decides something about the document's bytes.
+
+```text
+grep -rn "notifyChangeQueues" clients/ tools/ index.ts mcp/
+```
+
+| Site | What it decides | Verdict |
+|---|---|---|
+| `clients/lsp/client.ts:6049` `hasNotifyInFlightFor` (this diff) | whether a send that can change the document is still to come | **member, fixed** — the entry's `saveOnly` kind is the discriminator, retained with the run |
+| `clients/lsp/client.ts:4824` `cancelDocumentNotifyQueues` | teardown | not a member: it clears the whole map, so no reader can observe a stale kind |
+| `clients/lsp/client.ts:4702`, `4714`, `4753`, `4793` (queue body) | coalescing, close, activation, settlement | not members: writers of the queue, not readers of a kind |
+| `tests/clients/lsp/*` doubles | the fixtures' own queue answers | not members: they call the same reader (`hasNotifyInFlightFor`) over the fixture's real state, or hard-code `false` for a test that never queues |
+
+Consolidation verdict: one discriminator on one entry field, read by one gate; folding it into the queue's own booleans (`running`, `closing`) would push the kind into three places that do not need it.
+
+## Test assessment
+
+- `tests/clients/lsp/touch-debounce-content-gate.test.ts` — 4 cases, real wire. Uniquely pins the send/record and save axes end to end, and the close-then-reopen direction.
+- `tests/clients/lsp/touch-debounce-fingerprint.test.ts` — 11 cases, real queue over a mock connection. Uniquely pins #3480's whole-document fingerprint, the two fail-closed shapes, the transport-held F1 case (a real wire cannot be paused), the round-4 save kind, and the cap boundary.
+- The round-3 F1 race case was **rewritten** (P2), not deleted: it now holds only B's send, awaits A's, and asserts the final record hash and an empty queue, so it no longer leaves A's own send parked at the transport. Its red-first witness is the R4-2 mutation (the queue read ignored), and the harm half stays in the model's `MutGateSkipDuringSend`.
+- The round-4 coalescing rows are three plain `it` cases (a literal title each, so the body can cite them) pinned in both merge directions (R4-3, R4-4), and the cap case in all three of its claims (R4-6, R4-7, R4-8). No case reds on no mutation.
+- The four queue waits are `waitFor` from `tests/clients/interleaving-kit.ts` with a `setImmediate` tick, not `vi.waitFor`: the queue advances on this event loop's microtask chain, which is the kit's documented safe custom yield, and the flake-shape ratchet keeps the file out of the baseline.
+- Nine double-based files gained the record their fake already produced; each keeps its own assertions (call counts on `notify.open`, `notify.save`). No case was removed, and none became redundant: the wire file cannot reach a double-only branch, and the double file cannot see the wire.
+- `tests/config/tla-switch-pins.test.ts` — two new pins and one count (233 → 236), unchanged by round 4.
+
+## Fix round 3
+
+Round 2 moved the gate's verdict onto the client's record of what it last sent and left that record holding two answers it cannot settle alone. **A record is not the server's final state while that path's notify queue still holds a send, and a save mark belongs to the bytes it was set for, not to whatever the record says next.** Both halves are read through the same client that owns the document.
+
+The one evidence rule this round adopts:
+
+> **The skip is taken only when the bytes the server will hold once this document's notify queue drains are exactly this touch's content.**
+
+That one question has three readers, and the verdict is decided in this order:
+
+1. `client.hasNotifyInFlight(filePath)` — a content send for the path that is running or queued (round 4: a save-only entry does not answer here). The landed record is not final while one exists, so the touch pushes. The queue's own entry (last-wins, `enqueueDocumentNotify`) coalesces that push into the running entry, or replaces the unstarted one.
+2. `client.getSentContent(filePath)` — the landed record. Equal to the touch's content keeps the skip; different or absent pushes.
+3. `recentTouches.savedHash` — the content hash a `didSave` already went out for. A skipped saved touch queues a standalone `didSave` through `saveDebouncedPush` unless that mark names exactly this touch's content.
+
+A client that cannot report a record at all fails closed: it pushes, because an unknown record is an unknown final state.
+
+### The state table
+
+Every cell the verdict can see. `C` is this touch's content; the queue is per document, so "in flight" and "queued" are one population (the runner takes the next entry in the same tick the previous settles).
+
+| Sent record vs `C` | Queue for the path | Save mark | Verdict | Decided by | Pinned by |
+|---|---|---|---|---|---|
+| equal | idle | none | **skip** | `shouldSkipNotify` record branch | `leaves the server's bytes alone when only the elapsed window has passed`; model `GateSentOneWrite` |
+| equal | idle | set for `C` | **skip**, no save | `saveDebouncedPush` returns on `savedHash === hash(C)` | `sends no second save for a saved touch over a saved push of the same bytes`; model `GateSentSavedOpenFile` |
+| equal | idle | set for older bytes | **skip + `didSave` only** | `saveDebouncedPush` queues the save and binds `savedHash = hash(C)` | `sends the save a skipped touch still owes after another writer advanced the record`; model `GateSentSavedOpenFile`, `MutGateSaveMark` |
+| equal | content entry in flight or queued | any | **push** (the entry is replaced, so the wire still sees one send) | `hasNotifyInFlight` | `pushes a touch while a send of other bytes is still in flight`; mutation R4-2 |
+| equal | **save-only entry in flight or queued** | any | **skip** (+ `didSave` only when the touch is saved) | `hasNotifyInFlight` reads the entry kind | `skips identical content while a save-only send is slow`; mutations R4-1, R4-5 |
+| equal | close entry in flight or queued | any | **no content send** (the touch is dropped behind the close) | `queue.closing` | `drops a touch that arrives while the close is queued, and still closes` |
+| different | any | any | **push** | `shouldSkipNotify` record branch | `pushes changed bytes after the window`; model `GateSentLossyFp` |
+| absent (no record, or closed since) | any | any | **push** | `sentContent === undefined` | `pushes a document again after it was closed and reopened`; model `GateSentReopen` |
+| no accessor at all (a double) | any | any | **push** (fail closed) | `client.getSentContent === undefined` | `always pushes a client that cannot report the record it holds` |
+| record but no queue answer | unknown | any | **push** (fail closed) | `hasNotifyInFlight === false` is required | `pushes when a client can report its record but not its queue` |
+
+Two cells of the brief's grid are absent from the table because the verdict cannot distinguish them: "in flight with `C`" and "in flight with other bytes" both read as **not final**. The rule is finality, not equality, so the queue accessor is a boolean and never has to carry content. A concurrent touch of the same path re-sends bytes the running entry was already sending, so the wire sees one extra `didChange` inside the concurrency window. It never touches the sequence gap 9 is about — the post-write touch and the dispatch runner's touch are sequential, and the queue is idle when the second one reads it.
+
+### What landed
+
+- **F1 (fixed).** `hasNotifyInFlight?` on `LSPClient` (`clients/lsp/client.ts:608`), read by the gate (`clients/lsp/index.ts:1713`). The transport-held case reds on `a7d6c4a51` and reds under R4-2.
+- **F2 (fixed).** `savedHash` replaces the boolean (`clients/lsp/index.ts:1742`, `clients/lsp/index.ts:1767`); the wire case reds on `a7d6c4a51` and under the R3 spot-check. `tests/clients/lsp/service-did-save-option.test.ts`'s #3405 suite stays green, which is the "never drops a save" invariant it was written for.
+- **F3 (fixed).** The elapsed-window fallback is deleted; both unanswerable questions push. Nine doubles named above gained the record their fake produced, so the population the reviewer measured (0 production clients, 67 double files) is closed by construction rather than by a heuristic.
+- **F4 (fixed).** The trim comment is corrected and the trim drops the oldest entries by count (`clients/lsp/index.ts:1777`), so an entry's age no longer decides whether it is evidence. A trimmed entry costs exactly one redundant re-push.
+- **F5 (fixed).** The reopen guard holds `Date` inside the window (`vi.useFakeTimers({ toFake: ["Date"] })`), so it keeps reading the pre-fix gate on a slow worker.
+- **F6 (fixed).** The Detection block names shape 70 and an honest enforcer, and this body has the `## Residuals` section it points at.
+- **F7 (fixed).** The `ContentGate` pin's `narrowedBy` reason now says the code reads `"window"` nowhere.
+- **F8 (dropped, with its reason).** Above, under Class sweep.
+
+## Fix round 4
+
+Greptile's three findings on `b109e78af`, and the state table written before any edit.
+
+### The state table (written before the edit)
+
+Identity rule: **skip only when the settled document content equals this touch; save-only work cannot change that content.** Closing work remains invalidating because it removes the document.
+
+| Writer / reader | Work represented | Touch conclusion | Witness |
+|---|---|---|---|
+| `clients/lsp/client.ts:4694` queue creation | empty queue | no outstanding content | `still skips a repeat touch of identical long content inside the window` |
+| `clients/lsp/client.ts:4754` pending coalescing | content or save-only; a stale save retains the prior work | retain the prior entry's kind when retaining its run | `reports a save merged onto content as content-bearing`, `reports content merged onto a save as content-bearing`, and `tests/clients/lsp/notify-queue-properties.test.ts` |
+| `clients/lsp/client.ts:4752` pending assignment | replacement content, close, or save-only | only a save-only entry is harmless | `skips identical content while a save-only send is slow` |
+| `clients/lsp/client.ts:4780` runner activation | the pending entry becomes the running one | the active kind must survive the pending slot being cleared | `pushes a touch while a send of other bytes is still in flight`; mutation R4-5 |
+| `clients/lsp/client.ts:4810` runner settlement | the active work completed | no active invalidation | `pushes a touch while a send of other bytes is still in flight` (final hash and empty queue) |
+| `clients/lsp/client.ts:4824` cancellation | pending removed and the map cleared | no future queued work | `tests/clients/lsp/client-internals.test.ts`, `tests/clients/lsp/shutdown-wedged-connection.test.ts` |
+| `clients/lsp/client.ts:6049` in-flight reader | active and pending | report content and close, exclude saves | `skips identical content while a save-only send is slow`, `pushes a touch while a send of other bytes is still in flight` |
+| `clients/lsp/index.ts:1713` gate reader | the boolean finality answer | skip only on `false` and an equal sent hash | this file's suite |
+| `clients/lsp/index.ts:1777` cap trim | 800 entries, oldest-first | evidence is bounded by count, not age | `bounds touch evidence at 800 and evicts the oldest unrefreshed entry` |
+
+Failure space the tests cover: a save running with no pending content; a save running with pending content; content running with a pending save; idle; a close queued; a coalesced save over content and content over save. Cap space: 799, 800 and 801 entries, oldest-entry removal, refresh order, all driven through the real `touchFile`.
+
+The queue kind belongs to each entry; coalescing retains the selected run's kind. The running entry is held until settlement. No new cache or identity primitive is needed.
+
+### What landed
+
+- **P1 (fixed).** `PendingDocumentNotify.saveOnly` + `DocumentNotifyQueue.active`, read by `hasNotifyInFlightFor` (`clients/lsp/client.ts:6049`). Red pre-fix through the real touch path (quoted above); mutations R4-1, R4-2, R4-3, R4-4, R4-5.
+- **P2 (fixed).** The race case holds only B's send, awaits A's completion, then asserts the final record hash and an empty queue. It reds on the pre-fix writer (a7d6c4a51) and under R4-2.
+- **P3 (fixed).** `bounds touch evidence at 800 and evicts the oldest unrefreshed entry` pins the bound, oldest-first eviction and the refresh order; R4-6, R4-7 and R4-8 each red it.
+- Docs and rules: the interface doc (`clients/lsp/client.ts:608`), the reader doc (`clients/lsp/client.ts:6043`), the gate doc (`clients/lsp/index.ts:1677`), AGENTS.md's touch-debounce rule and the changelog fragment now state the kind rule.
+- **Two governance ratchets the first draft of this round redded, both fixed in the lane.** `active` is declared `PendingDocumentNotify | undefined` (a required property with an `undefined` member) because the settle path assigns `undefined` and `exactOptionalPropertyTypes` refuses that on an optional field: the strictness ratchet stays at its pinned 59 (`tests/config/strictness-ratchet.test.ts`). The four new queue waits use `waitFor` from `tests/clients/interleaving-kit.ts` with a `setImmediate` tick instead of `vi.waitFor`, which is a raw wall-clock wait outside fake timers: `tests/clients/flake-shape-ratchet.test.ts` is green with no admission needed.
+
+## Residuals
+
+- **`#1783`'s start-time anchor can still hide a stale send** (model finding (e)). A touch that read B but started after disk moved to C stamps the drift record at its own start time, so the sweep sees nothing to do. This diff does not touch that function; the model simply becomes able to express the schedule. Not filed here: the fix belongs to the drift-record seam, not the touch gate.
+
+```text
+$ git diff origin/master...HEAD -- clients/lsp/index.ts | grep -c recordFullyCoveredSync
+0
+```
+- **The record's own lag is unchanged.** `recordSentContent` runs in the send's continuation, so a second touch landing between the wire write and the record re-pushes identical bytes. Round 3's queue read closes the harmful direction (a send still coming) but not that one; it is an efficiency loss and pre-existing.
+- **The one-record redesign the review named is not this round.** A single record answering "bytes held, at which version, with which save owed, is a send imminent" would collapse `recentTouches`, `documentContentHashes` and the queue into one owner. It is a redesign of the record, not a fix round, and this round does not attempt it.
+- **The TLA+ family has no standalone save-only entry.** `formal/lsp-server-content/` models a save as a field of the content entry that carries it, so round 4's exclusion is not expressible there. The safety invariants are unaffected by construction (a save-only run sends no content), and the harm is the efficiency direction the family already records as unmodelable (finding (b)). Extending the model with a save-only entry is the family's next candidate; it is a formal-lane task, not a fix round.
+- **Five `array-callback-return` sites in `clients/lsp/index.ts`** are pre-existing on `origin/master`; fixing them is a 5-site refactor of unrelated callbacks, out of scope for a fix round.
+
+```text
+$ git show origin/master:clients/lsp/index.ts > base-index.ts
+$ grep -cE "spawned\.map\(async|activeClients\.map\(async|openDocuments\.map\(async|\.map\(async \(dependency\)" base-index.ts clients/lsp/index.ts
+base-index.ts: 5
+clients/lsp/index.ts: 5
+```

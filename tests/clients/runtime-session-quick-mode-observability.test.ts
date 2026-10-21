@@ -70,7 +70,7 @@ function makeDefaultRuntime() {
 		isCurrentSession: () => true,
 		markStartupScanInFlight: () => {},
 		clearStartupScanInFlight: () => {},
-		complexityBaselines: new Map(),
+		complexityBaselines: new Set(),
 		resetForSession: () => {},
 		projectRoot: "",
 		projectRulesScan: { hasCustomRules: false, rules: [] },

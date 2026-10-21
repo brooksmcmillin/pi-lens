@@ -4,13 +4,19 @@ import { pathToFileURL } from "node:url";
 
 export const REPORT_ROOTS = ["clients", "tools", "mcp", "scripts", "tests"];
 
+/**
+ * The ratchet bucket for one repo-relative file: two directory levels below a
+ * report root, or the file's own name at the repo root (`index.ts`, the host
+ * adapter). Any other location returns undefined: the caller reports it as
+ * unclassified rather than dropping it into a bucket nobody ratchets (#4429).
+ */
 function reportDirectory(file) {
 	const normalized = file.split(sep).join("/");
-	const root = REPORT_ROOTS.find(
-		(candidate) =>
-			normalized === candidate || normalized.startsWith(`${candidate}/`),
+	if (!normalized.includes("/")) return normalized;
+	const root = REPORT_ROOTS.find((candidate) =>
+		normalized.startsWith(`${candidate}/`),
 	);
-	if (!root) return "other";
+	if (!root) return undefined;
 	const parts = normalized.split("/");
 	const rootIndex = parts.indexOf(root);
 	const directoryParts = parts.slice(0, -1);
@@ -19,17 +25,35 @@ function reportDirectory(file) {
 	return directoryParts.slice(rootIndex, rootIndex + 4).join("/") || root;
 }
 
+/**
+ * Count tsc diagnostics per bucket. Every line carrying `error TSnnnn` is a
+ * needle hit and must be the located form `file(line,col): error TSnnnn` in a
+ * known bucket; anything else (a global diagnostic such as `error TS2688`
+ * with no location, or a file outside every root) is returned in
+ * `unclassified`, never skipped (#4429).
+ */
 export function parseDiagnostics(output, repoRoot) {
 	const counts = new Map();
+	const unclassified = [];
 	const diagnosticPattern = /^(.*)\((\d+),(\d+)\): error TS\d+/;
 	for (const line of String(output).split(/\r?\n/)) {
+		if (!/\berror TS\d+/.test(line)) continue;
 		const match = diagnosticPattern.exec(line);
-		if (!match) continue;
-		const file = relative(repoRoot, resolve(repoRoot, match[1]));
-		const directory = reportDirectory(file);
+		const directory = match
+			? reportDirectory(relative(repoRoot, resolve(repoRoot, match[1])))
+			: undefined;
+		if (directory === undefined) {
+			unclassified.push(line);
+			continue;
+		}
 		counts.set(directory, (counts.get(directory) ?? 0) + 1);
 	}
-	return Object.fromEntries([...counts].sort(([a], [b]) => a.localeCompare(b)));
+	return {
+		counts: Object.fromEntries(
+			[...counts].sort(([a], [b]) => a.localeCompare(b)),
+		),
+		unclassified,
+	};
 }
 
 export function runCheck(
@@ -50,7 +74,7 @@ export function runCheck(
 		config,
 		exitCode: result.status ?? 1,
 		total: (output.match(/^.*\(\d+,\d+\): error TS\d+/gm) ?? []).length,
-		counts: parseDiagnostics(output, repoRoot),
+		...parseDiagnostics(output, repoRoot),
 	};
 }
 

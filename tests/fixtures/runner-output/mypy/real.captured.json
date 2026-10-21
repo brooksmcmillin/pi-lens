@@ -11,10 +11,38 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/python-types",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.py",
 	"exitCode": 1,
 	"stdout": "bad.py:5:12: error: Incompatible return value type (got \"str\", expected \"int\")  [return-value]\r\nbad.py:8:7: error: Argument 1 to \"greet\" has incompatible type \"int\"; expected \"str\"  [arg-type]\r\n",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "mypy",
+			"argv": [
+				"--version"
+			],
+			"version": "2.4.0",
+			"exitCode": 0,
+			"stdout": "mypy 2.4.0 (compiled: yes)\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/mypy",
+		"file": "bad.py",
+		"argv": [
+			"--no-error-summary",
+			"--show-column-numbers",
+			"bad.py"
+		],
+		"version": "2.4.0",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
 }

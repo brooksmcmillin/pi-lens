@@ -1,15 +1,19 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it } from "vitest";
 import { FactStore } from "../../../../clients/dispatch/fact-store.js";
-import {
-	highComplexityRule,
-	resetHighComplexityThresholds,
-	setHighComplexityThresholds,
-} from "../../../../clients/dispatch/rules/high-complexity.js";
+import { highComplexityRule } from "../../../../clients/dispatch/rules/high-complexity.js";
 import type { FunctionSummary } from "../../../../clients/dispatch/facts/function-facts.js";
 import type { DispatchContext } from "../../../../clients/dispatch/types.js";
 import type { FileKind } from "../../../../clients/file-kinds.js";
+import {
+	EMPTY_PROJECT_CONFIG,
+	type PiLensProjectConfig,
+} from "../../../../clients/project-lens-config.js";
 
-function makeCtx(filePath: string, facts: FactStore): DispatchContext {
+function makeCtx(
+	filePath: string,
+	facts: FactStore,
+	projectConfig?: PiLensProjectConfig,
+): DispatchContext {
 	return {
 		filePath,
 		cwd: "/tmp",
@@ -19,8 +23,16 @@ function makeCtx(filePath: string, facts: FactStore): DispatchContext {
 		autofix: false,
 		deltaMode: false,
 		facts,
+		projectConfig,
 		hasTool: async () => false,
 		log: () => {},
+	};
+}
+
+function ccThresholdConfig(threshold: number): PiLensProjectConfig {
+	return {
+		...EMPTY_PROJECT_CONFIG,
+		rules: { "high-complexity": { threshold } },
 	};
 }
 
@@ -43,10 +55,6 @@ function summaryWithCC(cc: number, depth = 1): FunctionSummary {
 }
 
 describe("highComplexityRule threshold override", () => {
-	beforeEach(() => {
-		resetHighComplexityThresholds();
-	});
-
 	it("flags a function with CC exactly at the default threshold (15)", () => {
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
@@ -68,75 +76,51 @@ describe("highComplexityRule threshold override", () => {
 		expect(diagnostics).toHaveLength(0);
 	});
 
-	it("respects setHighComplexityThresholds — lower threshold flags more", () => {
-		setHighComplexityThresholds(5, 6);
-
+	it("respects a project-config threshold — lower threshold flags more", () => {
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [
-			summaryWithCC(6), // above the new threshold of 5
+			summaryWithCC(6), // above the configured threshold of 5
 		]);
 
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, ccThresholdConfig(5));
 		const diagnostics = highComplexityRule.evaluate(ctx, facts);
 		expect(diagnostics).toHaveLength(1);
 	});
 
-	it("respects setHighComplexityThresholds — higher threshold flags less", () => {
-		setHighComplexityThresholds(50, 6);
-
+	it("respects a project-config threshold — higher threshold flags less", () => {
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [
-			summaryWithCC(20), // below the new threshold of 50
+			summaryWithCC(20), // below the configured threshold of 50
 		]);
 
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, ccThresholdConfig(50));
 		const diagnostics = highComplexityRule.evaluate(ctx, facts);
 		expect(diagnostics).toHaveLength(0);
 	});
 
-	it("depth threshold override fires independently of CC threshold", () => {
-		setHighComplexityThresholds(100, 3); // CC effectively disabled, depth at 3
-
+	it("flags nesting depth at the default depth threshold (6) independently of CC", () => {
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [
-			summaryWithCC(1, 4), // CC=1, depth=4 → depth flag
+			summaryWithCC(1, 6), // CC=1, depth=6 → depth flag
 		]);
 
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, ccThresholdConfig(100));
 		const diagnostics = highComplexityRule.evaluate(ctx, facts);
 		expect(diagnostics).toHaveLength(1);
-		expect(diagnostics[0].message).toMatch(/nesting depth 4/);
+		expect(diagnostics[0].message).toMatch(/nesting depth 6/);
 	});
 
-	it("ignores invalid threshold inputs", () => {
-		setHighComplexityThresholds(5, 3);
-		setHighComplexityThresholds(Number.NaN, Number.POSITIVE_INFINITY);
-		setHighComplexityThresholds(0, -1);
-
+	it("does NOT flag nesting depth below the default depth threshold", () => {
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [
-			summaryWithCC(6, 4),
+			summaryWithCC(1, 5),
 		]);
 
-		const ctx = makeCtx(filePath, facts);
-		const diagnostics = highComplexityRule.evaluate(ctx, facts);
-		expect(diagnostics).toHaveLength(1);
-	});
-
-	it("resetHighComplexityThresholds restores defaults", () => {
-		setHighComplexityThresholds(5, 3);
-		resetHighComplexityThresholds();
-
-		const filePath = "/tmp/a.ts";
-		const facts = new FactStore();
-		// CC=10 is below default (15) → should NOT flag after reset
-		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
-
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, ccThresholdConfig(100));
 		const diagnostics = highComplexityRule.evaluate(ctx, facts);
 		expect(diagnostics).toHaveLength(0);
 	});

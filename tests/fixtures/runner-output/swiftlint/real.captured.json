@@ -1,0 +1,49 @@
+{
+	"provenance": {
+		"runner": "swiftlint",
+		"tool": "swiftlint",
+		"version": "0.65.1",
+		"command": "swiftlint --reporter json bad.swift",
+		"argv": [
+			"--reporter",
+			"json",
+			"bad.swift"
+		],
+		"workspace": "tests/fixtures/tool-smoke/swiftlint",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "bad.swift",
+	"exitCode": 0,
+	"stdout": "[\n  {\n    \"character\" : 10,\n    \"file\" : \"__WORKSPACE__/bad.swift\",\n    \"line\" : 3,\n    \"reason\" : \"Colons should be next to the identifier when specifying a type and next to the key in dictionary literals\",\n    \"rule_id\" : \"colon\",\n    \"severity\" : \"Warning\",\n    \"type\" : \"Colon Spacing\"\n  },\n  {\n    \"character\" : 14,\n    \"file\" : \"__WORKSPACE__/bad.swift\",\n    \"line\" : 2,\n    \"reason\" : \"Lines should not have trailing semicolons\",\n    \"rule_id\" : \"trailing_semicolon\",\n    \"severity\" : \"Warning\",\n    \"type\" : \"Trailing Semicolon\"\n  }\n]\n",
+	"stderr": "Linting Swift files at paths bad.swift\nLinting 'bad.swift' (1/1)\nwarning: Skipping enabled rule 'statement_position' because it requires SourceKit and SourceKit access is prohibited.\nDone linting! Found 2 violations, 0 serious in 1 file.\n",
+	"availability": [
+		{
+			"command": "swiftlint",
+			"argv": [
+				"--version"
+			],
+			"version": "0.65.1",
+			"exitCode": 0,
+			"stdout": "0.65.1\n",
+			"stderr": ""
+		}
+	],
+	"cleanUnavailable": "the shipped swiftlint Linux binary loads libsourcekitdInProc.so from a Swift toolchain and aborts on any file without one, so no clean run exists to capture on a host without Swift",
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/swiftlint",
+		"file": "bad.swift",
+		"argv": [
+			"--reporter",
+			"json",
+			"bad.swift"
+		],
+		"version": "0.65.1",
+		"exitCode": 0,
+		"stdout": "[\n\n]\n",
+		"stderr": "Linting Swift files at paths bad.swift\nLinting 'bad.swift' (1/1)\nwarning: Skipping enabled rule 'statement_position' because it requires SourceKit and SourceKit access is prohibited.\nDone linting! Found 0 violations, 0 serious in 1 file.\n"
+	}
+}

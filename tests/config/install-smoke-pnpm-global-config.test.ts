@@ -257,3 +257,84 @@ describe("install-smoke pnpm global-bin configuration", () => {
 		});
 	}
 });
+
+// #4401, recurrence #4400 / #4314: the RPC session smoke has to run against the
+// PACKED tarball, once plain and once with the snapshot worker forced to fail.
+// Dropping the step, the tarball path or the `--fail-worker` run would leave
+// the host-exit class (#4400) and the failed-warm class (#4314) unseen again.
+describe("install-smoke RPC session smoke (#4401)", () => {
+	const workflow = loadWorkflow();
+
+	it("host-range-smoke runs it plain and failing-worker, on the installed tarball", () => {
+		const jobName = "host-range-smoke";
+		const name = "RPC session smoke";
+		const install = stepIndex(workflow, jobName, "Install tarball");
+		const smoke = stepIndex(workflow, jobName, name);
+		expect(smoke).toBeGreaterThan(install);
+		const lines = executableLines(stepRun(workflow, jobName, name));
+		const pkg = lines.find((line) => line.startsWith("PKG="));
+		expect(pkg).toContain("$RUNNER_TEMP/proj/node_modules/pi-lens");
+		const runs = lines.filter((line) => line.includes("rpc-load-check.mjs"));
+		expect(runs).toHaveLength(2);
+		for (const line of runs) expect(line).toContain('--extension "$PKG"');
+		expect(runs.filter((line) => line.includes("--fail-worker"))).toHaveLength(
+			1,
+		);
+		const step = namedSteps(workflow, jobName)[smoke] as Step & {
+			"timeout-minutes"?: unknown;
+		};
+		expect(step["timeout-minutes"]).toBeLessThan(10);
+	});
+
+	// Recurrence: master went red on the #4409 merge (install-smoke run
+	// 38610594076, pi-load npm-global). These legs run the PUBLISHED pi-lens,
+	// which finds a runner-image `tsc` on PATH only as a bare name and refuses
+	// the TS server (#4414, fixed on master, unreleased). Whether the leg failed
+	// then depended on the image and on timing. A project that carries its own
+	// compiler takes the project path in every release.
+	for (const jobName of ["pi-load", "mise-repro"] as const) {
+		it(`${jobName} gives the smoke project its own typescript before the run`, () => {
+			const lines = executableLines(
+				stepRun(workflow, jobName, "Verify pi-lens loads via RPC"),
+			);
+			const install = lines.findIndex(
+				(line) =>
+					line.includes("scripts/npm-retry.mjs") &&
+					line.includes(" install ") &&
+					line.includes("--ignore-scripts") &&
+					line.includes("typescript@5.9.3"),
+			);
+			const run = lines.findIndex((line) =>
+				line.includes("rpc-load-check.mjs"),
+			);
+			expect(install).toBeGreaterThan(-1);
+			expect(run).toBeGreaterThan(install);
+			// The marker the sibling named-package installs carry for zizmor.
+			expect(
+				stepRun(workflow, jobName, "Verify pi-lens loads via RPC"),
+			).toContain("# pi-lens-ignore: zizmor:adhoc-packages");
+			expect(lines).toContain("printf 'node_modules\\n' > .gitignore");
+		});
+	}
+
+	it("the PR path filter covers the script's import and the seams #4400 and #4314 broke", () => {
+		// Recurrence: #4400 and #4314 reached users because no PR-time check ran
+		// pi-lens as an RPC child, and a file the smoke imports sat outside the
+		// filter (the "Review F3" shape), so a PR touching only it ran no smoke.
+		const on = (workflow as { on?: { pull_request?: { paths?: string[] } } })
+			.on;
+		const paths = on?.pull_request?.paths ?? [];
+		for (const required of [
+			"scripts/rpc-load-check.mjs",
+			"scripts/lib/latency-log-phases.mjs",
+			"scripts/bundle-dist.mjs",
+			"clients/project-snapshot.ts",
+			"clients/project-snapshot-persist-worker.ts",
+			"clients/gzip-stage-write.ts",
+			"clients/review-graph/persist-worker.ts",
+			"clients/review-graph/builder.ts",
+			"clients/lsp-lazy.ts",
+		])
+			expect(paths).toContain(required);
+	});
+});

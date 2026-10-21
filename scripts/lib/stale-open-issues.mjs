@@ -227,11 +227,3 @@ export function shouldPost({ candidates, priorityCoverage }) {
 		priorityCoverage.multiple.length > 0
 	);
 }
-
-export function defaultFetcher(token) {
-	return (url, init) =>
-		fetch(url, {
-			...init,
-			headers: { ...init?.headers, authorization: `Bearer ${token}` },
-		});
-}

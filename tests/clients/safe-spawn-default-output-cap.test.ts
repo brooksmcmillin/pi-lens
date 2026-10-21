@@ -72,7 +72,8 @@ async function runChild(
 	chunks: Chunk[],
 	options: Parameters<typeof safeSpawnAsync>[2] = {},
 ) {
-	const child = makeFakeChild(4242);
+	// No OS identity: exercise handle teardown, not host-dependent group ownership.
+	const child = makeFakeChild();
 	spawnMock.mockImplementation(() => {
 		queueMicrotask(() => {
 			for (const chunk of chunks) child[chunk.stream].emit("data", chunk.text);
@@ -103,7 +104,7 @@ function pinPlatformAndKill(): {
 		value: "linux",
 		configurable: true,
 	});
-	// `child.pid` is fabricated; never send a real signal to a live process.
+	// Intercept any accidental pid-level signal; these cases exercise fake handles.
 	const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 	return {
 		restore: () => {

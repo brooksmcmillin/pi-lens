@@ -64,6 +64,16 @@ const MIXED_SRC = [
 	"",
 ].join("\n");
 
+// `infinite-loop`: the `while (true)` body spans lines 2-4 with no exit.
+const LOOP_SRC = [
+	"export function spin() {",
+	"\twhile (true) {",
+	"\t\tdoWork();",
+	"\t}",
+	"}",
+	"",
+].join("\n");
+
 describe("tree-sitter runner — dispatch filtering (#448)", () => {
 	// The positive review-tier assertion keeps both negative filters below from
 	// passing vacuously if the real query fails to compile.
@@ -92,6 +102,45 @@ describe("tree-sitter runner — dispatch filtering (#448)", () => {
 			.map((d) => d.line);
 		expect(fired).not.toContain("variable-shadowing");
 		expect(debuggerLines).toEqual([3]);
+	}, 30_000);
+
+	// Recurrence: #4482 review r1 F1 — `infinite-loop` anchors at the loop
+	// body's first line (2); deleting the `break;` inside it (line 3) caused the
+	// finding, and the start-line gate dropped it.
+	it("keeps a blocking match whose span contains the edit (#4481 r2)", async () => {
+		const { ctx } = env.addFile("span-inside.ts", LOOP_SRC, {
+			blockingOnly: true,
+			modifiedRanges: [{ start: 3, end: 3 }],
+		});
+		const result = await treeSitterRunner.run(ctx);
+		const loopLines = result.diagnostics
+			.filter((d) => d.rule === "infinite-loop")
+			.map((d) => d.line);
+		expect(loopLines).toEqual([2]);
+	}, 30_000);
+
+	// Recurrence: a span that over-counted a single-line match's end (one line
+	// too many) would re-block the untouched line just above an edit.
+	it("drops a single-line blocking match on the line just above the edit (#4481 r2)", async () => {
+		const { ctx } = env.addFile("adjacent-above.ts", MIXED_SRC, {
+			blockingOnly: true,
+			modifiedRanges: [{ start: 4, end: 4 }],
+		});
+		const result = await treeSitterRunner.run(ctx);
+		expect(
+			result.diagnostics.filter((d) => d.rule === "debugger-statement"),
+		).toEqual([]);
+	}, 30_000);
+
+	it("drops a blocking multi-line match wholly outside the edit (#4481 r2)", async () => {
+		const { ctx } = env.addFile("span-outside.ts", LOOP_SRC, {
+			blockingOnly: true,
+			modifiedRanges: [{ start: 5, end: 5 }],
+		});
+		const result = await treeSitterRunner.run(ctx);
+		expect(
+			result.diagnostics.filter((d) => d.rule === "infinite-loop"),
+		).toEqual([]);
 	}, 30_000);
 
 	// #3041: the tree-sitter runner's `ignore_paths` carve-out (#965) had NO test
@@ -179,7 +228,7 @@ describe("tree-sitter runner — entity extraction skip threshold (#885)", () =>
 		recordEntitySnapshotDiffMock.mockClear();
 		// No modifiedRanges override — e.g. clients/mcp/analyze.ts passes
 		// undefined for full-file analysis. Absent ranges mean "whole file"
-		// (matching isLineInModifiedRanges), never "trivial edit", so the
+		// (matching spanOverlapsModifiedRanges), never "trivial edit", so the
 		// <5-line skip must NOT suppress the snapshot.
 		const { ctx } = env.addFile("full-file-dispatch.ts", MIXED_SRC, {
 			modifiedRanges: undefined,

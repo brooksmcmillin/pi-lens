@@ -328,6 +328,32 @@ describe("session degradation ledger", () => {
 		expect(lines[2]).toBe("  actionable-warnings-deferred-superseded: 1");
 		expect(lines[2]).not.toContain("⚠");
 	});
+
+	// #3952 review (F4): both idle-eviction kinds are the POLICY answering, not
+	// a timer that failed. The decline fires for every non-`transparent` server
+	// on every acquisition (32 of the 49 built-ins), so a `⚠` per server would
+	// mark a nominal session: a tally, like a routine log rotation. Driven
+	// through the ledger's own write path, so the render reads the real record.
+	it("renders both idle-eviction kinds informationally, with no warning marker", () => {
+		recordDegradationOnce({
+			kind: "lsp-idle-eviction-declined",
+			subject: "typos",
+			reason: "no idle-eviction timer: declared unmeasured",
+		});
+		recordDegradation({
+			kind: "lsp-idle-eviction",
+			subject: "ts:/repo:a.ts",
+			reason: "idle LSP client released to bound memory",
+		});
+		const lines = renderDegradationLines();
+		const lineFor = (kind: string) =>
+			lines.find((line) => line.startsWith(`  ${kind}:`));
+		expect(lineFor("lsp-idle-eviction")).toBe("  lsp-idle-eviction: 1");
+		expect(lineFor("lsp-idle-eviction-declined")).toBe(
+			"  lsp-idle-eviction-declined: 1",
+		);
+	});
+
 	it("renders newly wired degradation kinds", () => {
 		recordDegradation({
 			kind: "formatter-failure",

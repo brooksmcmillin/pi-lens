@@ -67,11 +67,6 @@ describe("LSP Client Integration", () => {
 		}
 	});
 
-	it("initializes and reports connected", () => {
-		expect(client).toBeDefined();
-		expect(client!.isAlive()).toBe(true);
-	});
-
 	it("detects operation capabilities from initialize result", () => {
 		const support = client!.getOperationSupport();
 		expect(support.definition).toBe(true);

@@ -639,6 +639,68 @@ describe("M3a: cascade runs vs the cap (#3813)", () => {
 
 const INDETERMINATE_END = "graph unavailable ENDIND: ind-primary.ts";
 
+// #4495 round 3 (R2-2): a pending cascade neighbour whose file changed
+// outside pi since its errors were checked is named once, "changed since
+// checked, not re-checked", and forgotten. The forget is peek-then-commit.
+describe("M3d: the cascade changed-since-checked line vs the cap (#4495)", () => {
+	// Recurrence: forgetting at compose time would drop a line the cap cut,
+	// and the neighbour would then go silent, which reads as resolved.
+	it("a cut changed line keeps its entry and is named on the next turn, then forgotten", async () => {
+		const rig = makeRig("pi-lens-4495-m3d-");
+		const {
+			listCascadePendingNeighbors,
+			recordDeliveredCascadeNeighbor,
+			resetCascadePendingNeighbors,
+		} = await import("../../clients/cascade-format.js");
+		// Earlier tests here deliver cascade sections into the same
+		// process-wide record.
+		resetCascadePendingNeighbors();
+		try {
+			// Written outside pi (not `touch`, which records a pi edit), after
+			// the check below.
+			const neighbor = path.join(rig.cwd, "casc-changed.ts");
+			fs.writeFileSync(neighbor, "export const c = 1;\n");
+			recordDeliveredCascadeNeighbor(
+				neighbor,
+				[
+					{
+						id: "lsp:test:1",
+						message: "pending error",
+						filePath: neighbor,
+						line: 1,
+						column: 1,
+						severity: "error",
+						semantic: "blocking",
+						tool: "lsp",
+					} as Diagnostic,
+				],
+				1,
+				Date.now() - 60_000,
+			);
+			const fillerFile = fillerBlocker(rig, 1000);
+			const first = await endTurn(rig);
+			expect(first).not.toContain("changed since checked");
+			expect(listCascadePendingNeighbors().map((e) => e.filePath)).toEqual([
+				neighbor,
+			]);
+
+			clearFiller(rig, fillerFile);
+			nextTurn(rig, 2);
+			const second = await endTurn(rig);
+			expect(second).toContain(
+				"casc-changed.ts: 1 error(s) changed since checked",
+			);
+			expect(listCascadePendingNeighbors()).toEqual([]);
+
+			nextTurn(rig, 3);
+			expect(await endTurn(rig)).not.toContain("casc-changed.ts");
+		} finally {
+			resetCascadePendingNeighbors();
+			rig.cleanup();
+		}
+	});
+});
+
 describe("M3b: cascade coverage advisories vs the cap (#3813)", () => {
 	it.each(CELLS)(
 		"$cell: an indeterminate run is consumed only when its advisory reached the message",

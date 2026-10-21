@@ -75,6 +75,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "format-layer.log", ""),
+			EVALUATED_FLOOR_OUTCOME: "skipped",
+			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -84,6 +86,41 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			"`php` / `intelephense` — ensureTool(intelephense) failed (npm toolchain present): install failed",
 		);
 		expect(out).toContain("36 passed · 1 failed · 0 setup-failed · 12 skipped");
+	});
+
+	// Recurrence #4514: the four best-effort LSP producers exit 0 under
+	// continue-on-error, so a night that evaluated 21 of 46 rows was invisible
+	// to this notifier by construction. The floor step is the seventh gating
+	// step, and its CLI output reaches the issue as a failing row.
+	it("files a tracker naming the evaluated floor when only that step failed (#4514)", () => {
+		const dir = mkTempDir("pi-lens-tool-smoke-floor-");
+		const ok = (name: string) => ({
+			[`${name}_OUTCOME`]: "success",
+			[`${name}_LOG`]: writeLog(
+				dir,
+				`${name}.log`,
+				"40 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
+			),
+		});
+		const out = runDryRun({
+			...ok("TOOL_LAYER"),
+			...ok("LSP_HANDSHAKE"),
+			...ok("LSP_GATE"),
+			...ok("LENS_FULL"),
+			...ok("FORMAT_LAYER"),
+			...ok("RESOLUTION_LAYER"),
+			EVALUATED_FLOOR_OUTCOME: "failure",
+			EVALUATED_FLOOR_LOG: writeLog(
+				dir,
+				"floor.log",
+				"✗  characterize-lsp  evaluated floor  21  evaluated 21, below the floor of 35\n",
+			),
+		});
+		expect(out).toContain("action=file-or-refresh");
+		expect(out).toContain("Failing layer: **LSP evaluated floor**");
+		expect(out).toContain(
+			"`characterize-lsp` / `evaluated floor` — evaluated 21, below the floor of 35",
+		);
 	});
 
 	it("plans a close when all six gating layers succeeded", () => {
@@ -119,6 +156,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"fmt.log",
 				"10 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
 			),
+			EVALUATED_FLOOR_OUTCOME: "success",
+			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "success",
 			RESOLUTION_LAYER_LOG: writeLog(
 				dir,
@@ -154,6 +193,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+			EVALUATED_FLOOR_OUTCOME: "skipped",
+			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -194,6 +235,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"fmt.log",
 				"1 passed · 0 failed · 0 setup-failed · 0 skipped\n",
 			),
+			EVALUATED_FLOOR_OUTCOME: "success",
+			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "success",
 			RESOLUTION_LAYER_LOG: writeLog(
 				dir,
@@ -223,6 +266,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ok),
 			FORMAT_LAYER_OUTCOME: "success",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ok),
+			EVALUATED_FLOOR_OUTCOME: "skipped",
+			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "failure",
 			RESOLUTION_LAYER_LOG: writeLog(
 				dir,
@@ -256,6 +301,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+			EVALUATED_FLOOR_OUTCOME: "skipped",
+			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -285,6 +332,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+			EVALUATED_FLOOR_OUTCOME: "skipped",
+			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -390,6 +439,8 @@ const RED_ENV = (dir: string) => ({
 	LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 	FORMAT_LAYER_OUTCOME: "skipped",
 	FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+	EVALUATED_FLOOR_OUTCOME: "skipped",
+	EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 	RESOLUTION_LAYER_OUTCOME: "skipped",
 	RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 });
@@ -425,6 +476,8 @@ const GREEN_ENV = (dir: string) => ({
 		"fmt.log",
 		"10 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
 	),
+	EVALUATED_FLOOR_OUTCOME: "success",
+	EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
 	RESOLUTION_LAYER_OUTCOME: "success",
 	RESOLUTION_LAYER_LOG: writeLog(
 		dir,

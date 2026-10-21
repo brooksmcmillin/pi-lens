@@ -2,10 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-	createProjectIgnoreMatcher,
-	readGitignoreDirs,
-} from "../../clients/file-utils.js";
+import { createProjectIgnoreMatcher } from "../../clients/file-utils.js";
 import { collectSourceFiles } from "../../clients/source-filter.js";
 import { removeTempDirSync } from "./test-utils.js";
 
@@ -17,65 +14,6 @@ beforeEach(() => {
 
 afterEach(() => {
 	removeTempDirSync(tmpDir);
-});
-
-describe("readGitignoreDirs", () => {
-	it("returns empty array when no .gitignore exists", () => {
-		expect(readGitignoreDirs(tmpDir)).toEqual([]);
-	});
-
-	it("extracts simple directory names with trailing slash", () => {
-		fs.writeFileSync(
-			path.join(tmpDir, ".gitignore"),
-			"third_party/\nvendor/\nbuild/\n",
-		);
-		const dirs = readGitignoreDirs(tmpDir);
-		expect(dirs).toContain("third_party");
-		expect(dirs).toContain("vendor");
-		expect(dirs).toContain("build");
-	});
-
-	it("extracts bare names without trailing slash", () => {
-		fs.writeFileSync(path.join(tmpDir, ".gitignore"), "dist\n.venv\n");
-		const dirs = readGitignoreDirs(tmpDir);
-		expect(dirs).toContain("dist");
-		expect(dirs).toContain(".venv");
-	});
-
-	it("skips comments and blank lines", () => {
-		fs.writeFileSync(
-			path.join(tmpDir, ".gitignore"),
-			"# ignore vendor\nvendor/\n\n# also this\n",
-		);
-		const dirs = readGitignoreDirs(tmpDir);
-		expect(dirs).toEqual(["vendor"]);
-	});
-
-	it("skips negation patterns", () => {
-		fs.writeFileSync(path.join(tmpDir, ".gitignore"), "!keep/\nvendor/\n");
-		const dirs = readGitignoreDirs(tmpDir);
-		expect(dirs).toEqual(["vendor"]);
-	});
-
-	it("skips wildcard patterns", () => {
-		fs.writeFileSync(
-			path.join(tmpDir, ".gitignore"),
-			"*.log\n**/*.tmp\nvendor/\n",
-		);
-		const dirs = readGitignoreDirs(tmpDir);
-		expect(dirs).toEqual(["vendor"]);
-	});
-
-	it("skips entries with internal path separators", () => {
-		fs.writeFileSync(
-			path.join(tmpDir, ".gitignore"),
-			"third_party/sherpa-onnx\nvendor/\n",
-		);
-		const dirs = readGitignoreDirs(tmpDir);
-		// third_party/sherpa-onnx has an internal slash — skipped
-		expect(dirs).not.toContain("third_party/sherpa-onnx");
-		expect(dirs).toContain("vendor");
-	});
 });
 
 describe("createProjectIgnoreMatcher", () => {

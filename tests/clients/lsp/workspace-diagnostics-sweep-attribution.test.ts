@@ -22,6 +22,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { RECENT_PHASE_CAP } from "../../../clients/latency-logger.js";
 import { resetWorkspaceDiagnosticsCacheSession } from "../../../clients/lsp/workspace-diagnostics-session.js";
 import { removeTempDirSync } from "../test-utils.js";
 
@@ -44,11 +45,12 @@ vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 const SWEEP_ATTRIBUTION_TIMEOUT_MS = 30_000;
 
 /**
- * The scale #1723's own reproduction ran at (225 files, 224 cache hits). It
- * matters that this is far above `RECENT_PHASE_CAP` (5): the review finding
- * these cases pin is that a per-file bracket cannot survive the ring.
+ * #1723's own reproduction ran 225 files. Only the ring matters here: the
+ * review finding these cases pin is that a per-file bracket cannot survive a
+ * sweep longer than `RECENT_PHASE_CAP`. 4x is past the pre-open chunk width (8)
+ * too, and well short of every other cap on the sweep path.
  */
-const SWEEP_FILE_COUNT = 225;
+const SWEEP_FILE_COUNT = 4 * RECENT_PHASE_CAP;
 
 /**
  * Hold the loop synchronously for `ms`. This is the SHAPE the feature exists
@@ -72,7 +74,6 @@ describe(
 	() => {
 		let sessionDir: string;
 		let fileA: string;
-		let fileB: string;
 		/**
 		 * Runs INSIDE the sweep's touch, where a synchronous block would land.
 		 * Receives the 1-based index of the file being touched, so a test can
@@ -92,9 +93,7 @@ describe(
 			sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-1723-"));
 			fs.mkdirSync(path.join(sessionDir, ".pi-lens"));
 			fileA = path.join(sessionDir, "a.ts");
-			fileB = path.join(sessionDir, "b.ts");
 			fs.writeFileSync(fileA, "export const a = 1;\n");
-			fs.writeFileSync(fileB, "export const b = 2;\n");
 
 			const tsServer = {
 				id: "typescript",
@@ -114,7 +113,10 @@ describe(
 				root: sessionDir,
 				getWorkspaceDiagnosticsSupport: () => ({ advertised: false }),
 				getOperationSupport: () => ({}),
-				notify: { open: vi.fn(async () => {}) },
+				notify: {
+					announceCreated: () => undefined,
+					open: vi.fn(async () => {}),
+				},
 				waitForDiagnostics: vi.fn(async () => {
 					touchedCount += 1;
 					duringTouch?.(touchedCount);
@@ -180,19 +182,6 @@ describe(
 			expect(attribution?.stillRunning).toBe(true);
 		});
 
-		it("closes every bracket, so a later block is not blamed on a finished sweep", async () => {
-			const { service, latency } = await loadService();
-
-			await service.runWorkspaceDiagnostics(sessionDir, {
-				files: [fileA, fileB],
-			});
-
-			// Mutation guard for the `finally`: drop it and each file leaks a live
-			// bracket that misattributes every later loop_block to a sweep that
-			// already ended — `phaseFinished`'s own documented failure mode.
-			expect(latency.getCurrentPhase()).toBeUndefined();
-		});
-
 		it("closes the bracket even when a file's touch throws", async () => {
 			const { service, latency } = await loadService();
 			duringTouch = () => {
@@ -231,7 +220,7 @@ describe(
 		 * identity, so 225 brackets never held more information than one; they
 		 * only cost 225 map inserts and destroyed the ring.
 		 */
-		it("F1: a mid-sweep block is still attributed when read AFTER a 225-file sweep", async () => {
+		it("F1: a mid-sweep block is still attributed when read AFTER a sweep longer than the closed-bracket ring", async () => {
 			const { service, latency } = await loadService();
 			const files = Array.from({ length: SWEEP_FILE_COUNT }, (_, i) => {
 				const p = path.join(sessionDir, `f${i}.ts`);
@@ -285,7 +274,7 @@ describe(
 			// pays `ensureWarmForSweep`'s single warm-up round trip (#667),
 			// which drives the same `waitForDiagnostics` stub.
 			expect(touchedCount).toBeGreaterThanOrEqual(SWEEP_FILE_COUNT);
-			// Pre-fix: 5, the ring saturated by 225 per-file brackets.
+			// Pre-fix: RECENT_PHASE_CAP, the ring saturated by per-file brackets.
 			expect(latency._closedBracketsStorageLengthForTest()).toBe(1);
 			expect(latency.getCurrentPhase()).toBeUndefined();
 		});

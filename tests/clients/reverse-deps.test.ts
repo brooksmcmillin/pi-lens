@@ -170,6 +170,49 @@ describe("reverse dependency index", () => {
 		}
 	});
 
+	// #4438 refuted for the cascade: the graph's import facts hold `import()`
+	// and `require()` edges, so a dynamic importer is a reverse dependency and
+	// the cascade re-checks it. Pins the edge the cascade's freshness rests on;
+	// if the graph stops seeing it, the cascade goes stale on this shape.
+	it("lists a dynamic importer and a require caller as reverse dependencies", async () => {
+		const env = setupTestEnvironment("pi-lens-reverse-deps-dynamic-");
+		try {
+			const target = createTempFile(
+				env.tmpDir,
+				"src/dyn.ts",
+				"export const d = 1;\n",
+			);
+			const dynamic = createTempFile(
+				env.tmpDir,
+				"src/lazy.ts",
+				'export const f = () => import("./dyn");\n',
+			);
+			const required = createTempFile(
+				env.tmpDir,
+				"src/req.ts",
+				'const m = require("./dyn");\nexport const r = m;\n',
+			);
+
+			const graph = await buildOrUpdateGraph(
+				env.tmpDir,
+				[target],
+				new FactStore(),
+			);
+			const index = buildReverseDependencyIndexFromGraph({
+				cwd: env.tmpDir,
+				graph,
+			});
+
+			expect(getReverseDepsFromIndex(index, target)).toEqual(
+				[normalizeMapKey(dynamic), normalizeMapKey(required)].sort((a, b) =>
+					a.localeCompare(b),
+				),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("persists and reloads reverse dependencies through the project snapshot", async () => {
 		const env = setupTestEnvironment("pi-lens-reverse-deps-snapshot-");
 		const previousDataDir = process.env.PILENS_DATA_DIR;

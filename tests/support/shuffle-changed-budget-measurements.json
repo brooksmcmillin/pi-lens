@@ -1,0 +1,37 @@
+{
+	"measuredBy": "gh run view <run> --log | grep -a 'shuffle-changed\\] '  (the Changed test files, alone and shuffled step of Targeted tests (advisory))",
+	"issue": 4456,
+	"note": "Seconds copied from the step log. An unfinished start is a LOWER bound: atLeastSeconds is the longest figure measured for it. The route-switch matrix alone took 59.6 s in run 38644123472 and 57.0 s of test time in the targeted run of 38846199394. A start that never ran adds nothing, so planSecondsAtLeast is what the plan cost at least.",
+	"runs": [
+		{
+			"run": 38644123472,
+			"pr": 4411,
+			"files": 9,
+			"seedSeconds": [112.8, 114.5],
+			"aloneSeconds": [2.2, 20.6, 4.1, 14.5, 2.3, 20.6, 59.6],
+			"unfinished": [
+				{
+					"start": "alone tests/tools/lsp-diagnostics-opengrep-disabled-4323.test.ts",
+					"atLeastSeconds": 8.9
+				}
+			],
+			"notRun": ["alone tests/tools/lsp-navigation.test.ts"]
+		},
+		{
+			"run": 38846199394,
+			"pr": 4500,
+			"files": 13,
+			"seedSeconds": [108.7, 107.5],
+			"aloneSeconds": [
+				10.3, 25.9, 21.7, 1.7, 5.8, 2.2, 4.1, 2.4, 4.0, 3.1, 2.5, 1.6
+			],
+			"unfinished": [
+				{
+					"start": "alone tests/tools/diagnostics-route-switch-matrix.test.ts",
+					"atLeastSeconds": 59.6
+				}
+			],
+			"notRun": []
+		}
+	]
+}

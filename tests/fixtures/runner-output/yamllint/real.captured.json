@@ -11,10 +11,38 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/yaml",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.yaml",
 	"exitCode": 1,
 	"stdout": "bad.yaml:5:3: [error] duplication of key \"name\" in mapping (key-duplicates)\r\n",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "yamllint",
+			"argv": [
+				"--version"
+			],
+			"version": "1.38.0",
+			"exitCode": 0,
+			"stdout": "yamllint 1.38.0\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/yamllint",
+		"file": "bad.yaml",
+		"argv": [
+			"-f",
+			"parsable",
+			"bad.yaml"
+		],
+		"version": "1.38.0",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
 }

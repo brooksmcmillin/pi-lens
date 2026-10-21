@@ -26,7 +26,10 @@ import {
 	loadPiLensProjectConfig,
 	type PiLensProjectConfig,
 } from "../../clients/project-lens-config.js";
-import { handleSessionStart } from "../../clients/runtime-session.js";
+import {
+	handleSessionStart,
+	STARTUP_TASK_DEFER_MS,
+} from "../../clients/runtime-session.js";
 import { _resetSlowFsForTests } from "../../clients/slow-fs.js";
 import { _resetSubagentModeForTests } from "../../clients/subagent-mode.js";
 import {
@@ -222,7 +225,7 @@ async function runSessionStart(
 				clearStartupScanInFlight: (name: string) => {
 					inFlightScans.delete(name);
 				},
-				complexityBaselines: new Map(),
+				complexityBaselines: new Set(),
 				resetForSession: () => {},
 				projectRoot: "",
 				projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -323,7 +326,58 @@ async function runSessionStart(
 	}
 }
 
+// The ast-grep-exports defer (STARTUP_TASK_DEFER_MS) is the one long real wait
+// these cases would otherwise sit through. The literal pins the delay: a longer
+// or removed defer reds the boundary checks in `runSessionStartPastExportsDefer`.
+const EXPORTS_DEFER_MS = 5400;
+
+const exportsTaskStarted = (dbg: { mock: { calls: unknown[][] } }): boolean =>
+	dbg.mock.calls.some(([msg]) =>
+		String(msg).includes("session_start task ast-grep-exports: start"),
+	);
+
+/**
+ * `runSessionStart` with setTimeout faked, stepped to the ast-grep-exports
+ * defer boundary by hand, then back on real timers. Only the timer pair is
+ * faked: the scans' fs reads and setImmediate ticks still run for real, and
+ * the settle loops below yield on setImmediate, never on a timer.
+ */
+async function runSessionStartPastExportsDefer(
+	...args: Parameters<typeof runSessionStart>
+): Promise<Awaited<ReturnType<typeof runSessionStart>>> {
+	vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+	const run = await runSessionStart(...args);
+	try {
+		const yieldTick = () =>
+			new Promise<void>((resolve) => setImmediate(resolve));
+		await waitForCondition(
+			() =>
+				run.dbg.mock.calls.some(
+					([msg]) =>
+						msg ===
+						`session_start task ast-grep-exports: scheduled deferMs=${EXPORTS_DEFER_MS}`,
+				),
+			Boolean,
+			{ yieldControl: yieldTick },
+		);
+		await vi.advanceTimersByTimeAsync(EXPORTS_DEFER_MS - 1);
+		await yieldTick();
+		expect(exportsTaskStarted(run.dbg)).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		await waitForCondition(() => exportsTaskStarted(run.dbg), Boolean, {
+			yieldControl: yieldTick,
+		});
+	} catch (error) {
+		await run.env.cleanup();
+		throw error;
+	} finally {
+		vi.useRealTimers();
+	}
+	return run;
+}
+
 afterEach(() => {
+	vi.useRealTimers();
 	delete process.env.PI_LENS_STARTUP_MODE;
 });
 
@@ -335,7 +389,7 @@ it(
 			["writeConfig", "src/config.ts"],
 		]);
 		const scanExports = vi.fn(async () => exports);
-		const { env, astGrepEnsure, dbg } = await runSessionStart(
+		const { env, astGrepEnsure, dbg } = await runSessionStartPastExportsDefer(
 			"full",
 			(tmpDir) =>
 				createTempFile(
@@ -359,6 +413,76 @@ it(
 					),
 				{ timeout: HEAVY_IO_TIMEOUT_MS },
 			);
+		} finally {
+			await env.cleanup();
+		}
+	},
+	TEST_BUDGET_MS,
+);
+
+// #4352: the defer table is keyed by runTask names. A key that matches no task
+// ("ast-grep exports" for "ast-grep-exports") defers nothing, so the export scan
+// started on the next tick and froze the TUI on cold boot. One setImmediate turn
+// shows the difference: every next-tick scan has fired by then, while the 5400
+// ms defer has not elapsed. The eventual run is covered by the ast-grep export
+// path test above.
+it(
+	"defers ast-grep-exports by its taskDeferMs entry, not on the next tick (#4352)",
+	async () => {
+		const { env, astGrepEnsure, dbg } = await runSessionStart(
+			"full",
+			(tmpDir) =>
+				createTempFile(
+					tmpDir,
+					"package.json",
+					JSON.stringify({ type: "module" }),
+				),
+		);
+		try {
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(dbg).not.toHaveBeenCalledWith(
+				expect.stringContaining("session_start task ast-grep-exports: start"),
+			);
+			expect(astGrepEnsure).not.toHaveBeenCalled();
+		} finally {
+			await env.cleanup();
+		}
+	},
+	TEST_BUDGET_MS,
+);
+
+// #4352 round 2: a defer-table key whose task was removed ("project index")
+// defers nothing and never runs. Every key must be a task session_start schedules,
+// and each key keeps its staggered delay. The real seam is the scheduled debug
+// line, which full-mode session_start emits for every task it starts.
+it(
+	"schedules every defer-table key with its staggered delay (#4352)",
+	async () => {
+		const { env, dbg } = await runSessionStart("full", (tmpDir) =>
+			createTempFile(
+				tmpDir,
+				"package.json",
+				JSON.stringify({ type: "module" }),
+			),
+		);
+		try {
+			await new Promise((resolve) => setImmediate(resolve));
+			const scheduled = new Map<string, number>();
+			for (const [msg] of dbg.mock.calls) {
+				const match =
+					/^session_start task (\S+): scheduled deferMs=(\d+)$/.exec(
+						String(msg),
+					);
+				if (match) scheduled.set(match[1], Number(match[2]));
+			}
+			for (const key of Object.keys(STARTUP_TASK_DEFER_MS)) {
+				expect(scheduled.has(key), `defer key ${key} is never scheduled`).toBe(
+					true,
+				);
+			}
+			expect(scheduled.get("call-graph")).toBe(5000);
+			expect(scheduled.get("codebase-model")).toBe(5200);
+			expect(scheduled.get("ast-grep-exports")).toBe(5400);
 		} finally {
 			await env.cleanup();
 		}
@@ -974,7 +1098,7 @@ describe(
 					astGrepEnsure,
 					knipAnalyze,
 					jscpdEnsure,
-				} = await runSessionStart("full", (tmpDir) => {
+				} = await runSessionStartPastExportsDefer("full", (tmpDir) => {
 					createTempFile(
 						tmpDir,
 						"package.json",
@@ -1029,7 +1153,7 @@ describe(
 					knipAnalyze,
 					jscpdEnsure,
 					dbg,
-				} = await runSessionStart("full", (tmpDir) => {
+				} = await runSessionStartPastExportsDefer("full", (tmpDir) => {
 					createTempFile(
 						tmpDir,
 						"package.json",
@@ -1148,7 +1272,7 @@ describe(
 							isCurrentSession: () => true,
 							markStartupScanInFlight: () => {},
 							clearStartupScanInFlight: () => {},
-							complexityBaselines: new Map(),
+							complexityBaselines: new Set(),
 							resetForSession: () => {},
 							projectRoot: "",
 							projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -1253,7 +1377,7 @@ describe(
 							isCurrentSession: () => true,
 							markStartupScanInFlight: () => {},
 							clearStartupScanInFlight: () => {},
-							complexityBaselines: new Map(),
+							complexityBaselines: new Set(),
 							resetForSession: () => {},
 							projectRoot: "",
 							projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -1357,7 +1481,7 @@ describe(
 							isCurrentSession: () => true,
 							markStartupScanInFlight: () => {},
 							clearStartupScanInFlight: () => {},
-							complexityBaselines: new Map(),
+							complexityBaselines: new Set(),
 							resetForSession: () => {},
 							projectRoot: "",
 							projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -1440,7 +1564,7 @@ describe(
 				knipEnsure,
 				knipAnalyze,
 				jscpdEnsure,
-			} = await runSessionStart("full", (tmpDir) => {
+			} = await runSessionStartPastExportsDefer("full", (tmpDir) => {
 				createTempFile(
 					tmpDir,
 					"package.json",
@@ -1450,6 +1574,8 @@ describe(
 			});
 
 			try {
+				// Exactly once: the startup madge scan ensures madge; a deferred madge
+				// probe on top of it was the duplicate this test exists to catch.
 				await vi.waitFor(() => expect(depEnsure).toHaveBeenCalledTimes(1), {
 					timeout: HEAVY_IO_TIMEOUT_MS,
 				});

@@ -34,9 +34,11 @@ import {
 	deserializeWordIndex,
 	removeWordIndexDocumentAsync,
 	scheduleWordIndexPersist,
+	setWordIndexPublishedListener,
 	updateWordIndexDocumentForEdit,
 	WORD_INDEX_MAX_BYTES,
 	type WordIndex,
+	type WordIndexPublishTrigger,
 } from "../word-index.js";
 import { logWordIndex } from "../word-index-logger.js";
 import { createMcpHost } from "./host-shim.js";
@@ -149,6 +151,17 @@ export interface WarmWordIndexLease {
 }
 
 /**
+ * The predicate an entry caches: a queryable index needs the forward map the
+ * per-edit seam replaces postings through. Shared by creation and by the
+ * post-build adoption below so both admit exactly the same shape.
+ */
+function usableWarmWordIndex(
+	index: WordIndex | undefined,
+): WordIndex | undefined {
+	return index?.forward ? index : undefined;
+}
+
+/**
  * Look up (loading from the persisted snapshot on first use per cwd) the warm
  * in-memory word index this analyze facade keeps mutated in place. Exported so
  * `symbolSearch()` (clients/lens-engine.ts) can prefer this live copy over a
@@ -161,9 +174,11 @@ export function acquireWarmWordIndex(cwd: string): WarmWordIndexLease {
 	let entry = warmWordIndexes.get(key);
 	if (!entry) {
 		const snapshot = loadProjectSnapshot(key);
-		const index = deserializeWordIndex(snapshot?.wordIndex) ?? undefined;
+		const index = usableWarmWordIndex(
+			deserializeWordIndex(snapshot?.wordIndex) ?? undefined,
+		);
 		entry = {
-			index: index?.forward ? index : undefined,
+			index,
 			timer: undefined,
 			leases: 0,
 			lastUsedAt: Date.now(),
@@ -190,6 +205,42 @@ export function acquireWarmWordIndex(cwd: string): WarmWordIndexLease {
 		},
 	};
 }
+
+/**
+ * #4583: adopt a just-published index into the warm entry that was created
+ * while that build was still running. Two guards, both load-bearing:
+ *  - only an entry with NO index changes. A live entry is the copy every
+ *    `pilens_analyze` edit is applied to in place and re-persisted on a
+ *    debounce, so replacing it would drop edits that have not landed yet.
+ *  - only the entry for the publishing root changes (the map key), so a build
+ *    for one project never fills another project's empty entry.
+ */
+function adoptPublishedWarmWordIndex(
+	cwd: string,
+	published: WordIndex,
+	trigger: WordIndexPublishTrigger,
+): void {
+	const index = usableWarmWordIndex(published);
+	if (!index) return;
+	const key = path.resolve(cwd);
+	const entry = warmWordIndexes.get(key);
+	if (!entry || entry.index) return;
+	entry.index = index;
+	entry.lastUsedAt = Date.now();
+	scheduleWarmWordIndexIdleEviction(key, entry);
+	logWordIndex({
+		phase: "warm_cache_adopted",
+		cwd: key,
+		trigger,
+		indexedFileCount: index.docCount,
+		tokens: index.postings.size,
+	});
+}
+
+// #4583: the cache owner subscribes to the builders' publish seam at module
+// load, mirroring the NDJSON loggers' own self-registration. A process that
+// never loads this module holds no warm entry, so it has nothing to adopt.
+setWordIndexPublishedListener(adoptPublishedWarmWordIndex);
 
 /**
  * Test-only reset — the module-level warm cache otherwise survives across
@@ -442,6 +493,12 @@ async function warmLspForFile(
 			maxClientWaitMs: WARMUP_CLIENT_WAIT_MS,
 			maxDiagnosticsWaitMs: WARMUP_DIAGNOSTICS_WAIT_MS,
 			source: "mcp-warmup",
+			// #3405: every caller of `analyzeFile` (the MCP hosts' post-write hooks,
+			// warm and cold, and `pilens_analyze`) asks about the bytes on disk now,
+			// and this is the analysis's first push of them, so it is the save. A
+			// save-triggered server (Expert compiles on didSave and on nothing else)
+			// answers an MCP host's edit only because of it.
+			saved: true,
 		});
 	} catch {
 		// Best-effort warm-up; the dispatch runner still tries on its own.

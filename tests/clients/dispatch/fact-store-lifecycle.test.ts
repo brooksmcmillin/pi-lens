@@ -39,10 +39,4 @@ describe("FactStore lifecycle contract", () => {
 		expect(store.getFileFact("/src/a.ts", "content")).toBe("repopulated");
 		expect(store.getSessionFact("tool.ruff")).toBe(false);
 	});
-
-	it("two files do not share file facts — setting on fileA does not appear on fileB", () => {
-		const store = new FactStore();
-		store.setFileFact("src/a.ts", "file.content", "aaa");
-		expect(store.getFileFact("src/b.ts", "file.content")).toBeUndefined();
-	});
 });

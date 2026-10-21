@@ -84,7 +84,8 @@ CONSTANTS
                     \*  "settle": unattributed settled-sweep drift;
                     \*  "bridge": a mutation-bridge write of one line, with no pre-write check of its own;
                     \*  "own": an owned in-process call+write pair, the call licensing the write's advance;
-                    \*  "ownwrite": the same write with no call, the round-4 mutant)
+                    \*  "ownwrite": the same write with no call, the round-4 mutant;
+                    \*  "iread": a whole-file read that names no tool call, a bridge read)
     Spans,          \* edit spans: subset of {1,2}
     ExtWrites,      \* bound on other-writer writes
     ExtKinds,       \* subset of {"replace","delete","insert"}
@@ -152,6 +153,54 @@ Lines == 1..MaxLen
 \* The license switch reuses the existing boolean in the focused configs;
 \* configs without an own-repeat action are unchanged by this abstraction.
 SpendLicense == BridgeNoAdvance
+\* #4387: TRUE (code from #4235 until #4387): an oldText edit's tool_result, an
+\* UNKNOWN-range credit, retires the authorship it was allowed under; FALSE
+\* (code since #4387): the range is moot over a whole-file authorship (the
+\* only kind modelled), so the checked edit advances it like a positional one.
+\* A config selects the old code with `OldTextRetires <- OldTextRetiresPre4387`.
+OldTextRetires == FALSE
+OldTextRetiresPre4387 == TRUE
+\* The zero-read allow over a whole-file authorship injects a whole-file read
+\* (ReadGuard.checkEdit's session_authored arm): TRUE (code before #4235 and
+\* since #4387); FALSE (code from #4235 until #4387, which dropped it for every
+\* authorship to keep a range scope narrow). Without it the own positional
+\* edit's read shadows the authorship, and an edit of another line is refused
+\* (BashAuthoredPre4387.cfg). A config selects it with
+\* `ZeroReadInjects <- ZeroReadInjectsPre4387`.
+ZeroReadInjects == TRUE
+ZeroReadInjectsPre4387 == FALSE
+\* #4387 round 2: the injected read names the authorship's tool call
+\* (`injectCreationRead(filePath, 0, 0, authored.toolCallId)`), so a move keeps
+\* it exactly when it keeps the authorship: its turn is the authorship's, and
+\* it names a call iff the authorship does. FALSE (#4387 round 1): it named
+\* none, so every move dropped it and kept the authorship alone (review F1).
+InjectNamesAuthorship == TRUE
+InjectNamesAuthorshipPre4387R2 == FALSE
+\* #4387 round 2: an oldText edit's UNKNOWN credit records no own-edit read,
+\* so it advances an authorship only when a read that names a tool call is
+\* there to bound it after a move; otherwise it leaves an empty scope, which
+\* vouches for no line (the code's `authoredRanges: []`). FALSE (#4387 round
+\* 1): it advanced over a bridge read alone (S12).
+OldTextNeedsNamedRead == TRUE
+OldTextNeedsNamedReadPre4387R2 == FALSE
+\* #4387 round 2 (review G3): the pipeline's own-path whole-file credit after
+\* a native edit runs only when the pipeline rewrote the bytes
+\* (`preserveNativeAuthorship: mutation.kind !== "write"`). TRUE (code
+\* before): it ran after every oldText edit too, naming no tool call. With no
+\* authorship it made one (Carry); over the edit credit's empty scope it
+\* widened the scope back to the whole file, which keeps the edit's id.
+PipelineCreditsOldText == FALSE
+PipelineCreditsOldTextPre4387R2 == TRUE
+\* #4387 round 3 (review F5, F6): no credit widens an empty scope. A
+\* recognized bash write, a partial bash write and a format drain hold none
+\* of the bytes they credit, so they keep it (AuthKeep, KeepEmpty). A native
+\* write holds the whole file through its creation read, which a move keeps
+\* with the authorship, so its scope is never consulted and it keeps it too.
+\* FALSE (#4387 round 2): all four widened it to the whole file, keeping the
+\* edit's id, so a move then let the authorship vouch for bytes no check
+\* covered (S14, S16).
+KeepEmptyScope == TRUE
+KeepEmptyScopePre4387R3 == FALSE
 NoH == [l \in Lines |-> 0]
 Min(a, b) == IF a < b THEN a ELSE b
 
@@ -192,7 +241,10 @@ vars == <<disk, rev, tok, know, kTurn, reads, ft, written, pendCreate, lastEditO
 guardVars == <<reads, ft, written, pendCreate, lastEditOk, born, turnNo, dr>>
 
 \* g = turn the record was made in (ReadRecord.turnIndex); whole = whole-file view.
-Rec(lo, hi, h, prov) == [lo |-> lo, hi |-> hi, h |-> h, prov |-> prov, g |-> turnNo, whole |-> FALSE]
+\* noid = names no tool call (a bridge read; an injected read before #4387
+\* round 2); inj = injected from the authorship; aid = that authorship named one.
+Rec(lo, hi, h, prov) == [lo |-> lo, hi |-> hi, h |-> h, prov |-> prov, g |-> turnNo, whole |-> FALSE,
+                         noid |-> FALSE, inj |-> FALSE, aid |-> FALSE]
 
 \* The authorship record (writtenThisSession, AuthoredBytes): on = an
 \* entry exists; c = the bytes it was credited over (its content identity);
@@ -200,16 +252,34 @@ Rec(lo, hi, h, prov) == [lo |-> lo, hi |-> hi, h |-> h, prov |-> prov, g |-> tur
 \* writer names none and keeps the id of the bytes it rewrote); ret = it was
 \* retired because another writer changed the bytes (#4131). A retired record
 \* stays (no write resumes it) and moves with its write like a live one.
-NoAuth == [on |-> FALSE, c |-> <<>>, g |-> 0, id |-> FALSE, ret |-> FALSE, lic |-> FALSE]
+\* empty = an empty scope (#4387 round 2): it vouches for no line until a
+\* whole-file write widens it (round 2; since round 3 no credit does,
+\* KeepEmptyScope); a partial credit keeps it empty here,
+\* stricter than the code, which composes the produced lines into it.
+NoAuth == [on |-> FALSE, c |-> <<>>, g |-> 0, id |-> FALSE, ret |-> FALSE, lic |-> FALSE, empty |-> FALSE]
 \* recordWritten by a write that names its transcript entry.
 Auth(c) == IF written.ret THEN written
-           ELSE [on |-> TRUE, c |-> c, g |-> turnNo, id |-> TRUE, ret |-> FALSE, lic |-> FALSE]
+           ELSE [on |-> TRUE, c |-> c, g |-> turnNo, id |-> TRUE, ret |-> FALSE, lic |-> FALSE, empty |-> FALSE]
+\* The same for a credit that names only some lines: an empty scope stays empty.
+AuthPart(c) == IF written.empty THEN [Auth(c) EXCEPT !.empty = TRUE] ELSE Auth(c)
 \* recordWritten by a pi-lens writer: carries the id of the write it rewrote.
 Carry(c) == IF written.ret THEN written
             ELSE IF written.on THEN [written EXCEPT !.c = c]
-            ELSE [on |-> TRUE, c |-> c, g |-> turnNo, id |-> FALSE, ret |-> FALSE, lic |-> FALSE]
+            ELSE [on |-> TRUE, c |-> c, g |-> turnNo, id |-> FALSE, ret |-> FALSE, lic |-> FALSE, empty |-> FALSE]
+\* The same under KeepEmptyScope: a write, a bash write, a partial bash
+\* write, a format drain.
+KeepEmpty(rec) == IF KeepEmptyScope THEN rec ELSE [rec EXCEPT !.empty = FALSE]
+AuthKeep(c) == IF KeepEmptyScope THEN AuthPart(c) ELSE Auth(c)
 \* The zero-read arm's authorship question (ReadGuard.checkEdit).
-Authored == written.on /\ ~written.ret /\ (AuthorIdentity => written.c = disk)
+Authored == written.on /\ ~written.ret /\ ~written.empty /\ (AuthorIdentity => written.c = disk)
+\* A read record names a tool call (`read.toolCallId !== undefined`).
+NamesCall(r) == ~r.noid /\ (~r.prov \/ ProvisionalCredit)
+NamedRead == \E i \in 1..Len(reads) : NamesCall(reads[i])
+\* The zero-read allow's whole-file read of the bytes it just found intact.
+InjRec == [Rec(1, Len(disk), MkH(disk, 1, Len(disk)), FALSE)
+             EXCEPT !.g = IF InjectNamesAuthorship THEN written.g ELSE turnNo,
+                    !.noid = IF InjectNamesAuthorship THEN ~written.id ELSE TRUE,
+                    !.inj = TRUE, !.aid = written.id]
 \* retireChangedAuthorship at the start of a write that carries no bytes of its own.
 Broken == RetireAtWrite /\ written.on /\ (written.ret \/ written.c # disk)
 Retired == [written EXCEPT !.ret = TRUE]
@@ -314,7 +384,7 @@ Reloc(lo, hi) ==
 Verdict(lo, hi) ==
     IF Len(reads) = 0
     THEN IF Authored \/ (MtimeAuthored /\ rev > born)           \* the zero-read authorship check (writtenThisSession)
-           THEN [act |-> "allow", to |-> lo, inject |-> TRUE, why |-> "session_authored"]
+           THEN [act |-> "allow", to |-> lo, inject |-> ZeroReadInjects, why |-> "session_authored"]
            ELSE [act |-> "block", to |-> lo, inject |-> FALSE,
                  why |-> IF written.on THEN "authorship_retired" ELSE "zero_read"]
     ELSE IF FileTimeCheck /\ ft # rev
@@ -336,7 +406,7 @@ Verdict(lo, hi) ==
 VerdictOldText(lo, hi) ==
     IF Len(reads) = 0
     THEN IF Authored \/ (MtimeAuthored /\ rev > born)
-           THEN [act |-> "allow", to |-> lo, inject |-> TRUE, why |-> "session_authored"]
+           THEN [act |-> "allow", to |-> lo, inject |-> ZeroReadInjects, why |-> "session_authored"]
            ELSE [act |-> "block", to |-> lo, inject |-> FALSE, why |-> "zero_read"]
     ELSE [act |-> "allow", to |-> lo, inject |-> FALSE, why |-> "old_text"]
 
@@ -446,6 +516,21 @@ BlockedReadEnd ==
     /\ UNCHANGED <<disk, rev, tok, know, kTurn, ft, written, pendCreate, lastEditOk, born, turnNo,
                    pend, ops, ext, nb, fixedTurn, mutatedTurn, dr, staleAllow, blindAllow, falseBlock>>
 
+\* ---- a read that names no tool call: "iread" (#4387 round 2) ----
+\* A bridge read (read-bridge.ts, io-bridge.ts): another extension's tool
+\* showed the agent the whole file, and the bridge recorded it with no
+\* toolCallId, so every move drops it. A whole-file bridge read stamps
+\* FileTime (#3865). One step: the bridge records after the delivery.
+IdlessRead ==
+    /\ CanOp("iread")
+    /\ reads' = AddRec(reads, [Rec(1, Len(disk), MkH(disk, 1, Len(disk)), FALSE) EXCEPT !.noid = TRUE], TRUE)
+    /\ know' = KnowAll(disk)
+    /\ ft' = rev
+    /\ lastEditOk' = FALSE
+    /\ ops' = ops + 1
+    /\ UNCHANGED <<disk, rev, tok, kTurn, written, pendCreate, born, turnNo, pc, pend,
+                   ext, nb, fixedTurn, mutatedTurn, dr, staleAllow, blindAllow, falseBlock>>
+
 \* ---- edit of lo..lo+span-1 (checkEdit at tool_call, host apply) ----
 \* Positional ("edit"): the guard fully enforces it. oldText ("oedit"): the
 \* host validates the text, so the guard runs the zero-read check alone
@@ -466,8 +551,7 @@ Edit(lo, span, oldText) ==
            ok == inDisk /\ \A d \in 0..(span - 1) : disk[tg + d] = know[lo + d]
            exact == hi <= Len(disk) /\ \A l \in lo..hi : know[l] = disk[l]
            new == [d \in 0..(span - 1) |-> tok + d]
-           injected == IF v.inject THEN AddRec(reads, Rec(1, Len(disk), MkH(disk, 1, Len(disk)), FALSE), TRUE)
-                       ELSE reads
+           injected == IF v.inject THEN AddRec(reads, InjRec, TRUE) ELSE reads
            relocRead == IF v.act = "reloc"
                           THEN Append(injected, Rec(tg, tg + span - 1, MkH(disk, tg, tg + span - 1), FALSE))
                           ELSE injected
@@ -498,10 +582,26 @@ Edit(lo, span, oldText) ==
     /\ ops' = ops + 1
     /\ UNCHANGED <<kTurn, ft, written, pendCreate, born, turnNo, ext, nb, fixedTurn, dr>>
 
-\* tool_result of the edit: recordWritten (FileTime from disk now).
+\* tool_result of the edit: recordWritten (FileTime from disk now). An oldText
+\* edit's credit is UNKNOWN-range (#4387, OldTextRetires above): over an
+\* existing authorship it advances only with a read that names a tool call to
+\* bound it (OldTextNeedsNamedRead), else it leaves an empty scope. With no
+\* authorship the UNKNOWN credit makes none. The pipeline's own-path
+\* whole-file credit after it is PipelineCreditsOldText.
 EditRW ==
     /\ pc = "editRW"
-    /\ ft' = rev /\ written' = Auth(disk) /\ pendCreate' = FALSE
+    /\ ft' = rev /\ pendCreate' = FALSE
+    /\ written' = LET w == IF pend.own THEN AuthPart(disk)
+                           ELSE IF ~written.on THEN written
+                           ELSE IF OldTextRetires THEN Retired
+                           ELSE IF OldTextNeedsNamedRead /\ (~NamedRead \/ written.empty)
+                                THEN [Auth(disk) EXCEPT !.empty = TRUE]
+                           ELSE Auth(disk)
+                  IN IF PipelineCreditsOldText /\ ~pend.own
+                       THEN IF ~w.on THEN Carry(disk)
+                            ELSE IF w.ret THEN w
+                            ELSE [w EXCEPT !.empty = FALSE]
+                       ELSE w
     /\ reads' = LET r0 == IF pendCreate
                             THEN AddRec(reads, Rec(1, Len(disk), MkH(disk, 1, Len(disk)), FALSE), TRUE)
                             ELSE reads
@@ -528,7 +628,7 @@ Write ==
 \* recordWritten before the pipeline: stamps FileTime, injects the creation read.
 WriteRW1 ==
     /\ pc = "writeRW1"
-    /\ ft' = rev /\ written' = Auth(disk) /\ pendCreate' = FALSE
+    /\ ft' = rev /\ written' = AuthKeep(disk) /\ pendCreate' = FALSE
     /\ reads' = IF pendCreate
                   THEN AddRec(reads, Rec(1, IF CreationHandlerEvidence THEN Len(disk) ELSE pend.n,
                                          IF CreationHandlerEvidence THEN MkH(disk, 1, Len(disk))
@@ -573,7 +673,7 @@ BashWrite ==
     /\ CanOp("bash")
     /\ LET c == [l \in 1..N0 |-> tok + l - 1]
        IN /\ disk' = c /\ know' = KnowAll(c)
-          /\ written' = IF Broken THEN Retired ELSE Auth(c)
+          /\ written' = IF Broken THEN Retired ELSE AuthKeep(c)
     /\ rev' = rev + 1 /\ tok' = tok + N0
     /\ ops' = ops + 1 /\ mutatedTurn' = TRUE
     /\ UNCHANGED <<kTurn, reads, ft, pendCreate, lastEditOk, born, turnNo, pc, pend, ext, nb,
@@ -587,7 +687,7 @@ BashWrite ==
 PartialBashWrite ==
     /\ CanOp("pbash") /\ written.on
     /\ disk' = Replace(disk, 1, tok) /\ know' = [know EXCEPT ![1] = tok]
-    /\ written' = IF Broken THEN Retired ELSE Auth(Replace(disk, 1, tok))
+    /\ written' = IF Broken THEN Retired ELSE AuthKeep(Replace(disk, 1, tok))
     /\ rev' = rev + 1 /\ tok' = tok + 1
     /\ ops' = ops + 1 /\ mutatedTurn' = TRUE
     /\ UNCHANGED <<kTurn, reads, ft, pendCreate, lastEditOk, born, turnNo, pc, pend, ext, nb,
@@ -655,7 +755,7 @@ OwnWrite ==
     /\ pc = "ownpending"
     /\ LET c == Replace(disk, 1, tok)
        IN /\ disk' = c /\ know' = [know EXCEPT ![1] = tok]
-          /\ written' = [Auth(c) EXCEPT !.lic = ~SpendLicense]
+          /\ written' = [AuthPart(c) EXCEPT !.lic = ~SpendLicense]
     /\ rev' = rev + 1 /\ tok' = tok + 1 /\ mutatedTurn' = TRUE /\ pc' = "idle"
     /\ UNCHANGED <<kTurn, reads, ft, pendCreate, lastEditOk, born, turnNo, pend, ops, ext,
                    nb, fixedTurn, dr, staleAllow, blindAllow, falseBlock>>
@@ -669,8 +769,8 @@ OwnWriteAgain ==
        IN /\ disk' = c /\ know' = [know EXCEPT ![1] = tok]
           /\ written' = IF written.lic
                          THEN IF SpendLicense
-                              THEN [Auth(c) EXCEPT !.lic = FALSE]
-                              ELSE Auth(c)
+                              THEN [AuthPart(c) EXCEPT !.lic = FALSE]
+                              ELSE AuthPart(c)
                          ELSE Retired
     /\ rev' = rev + 1 /\ tok' = tok + 1 /\ mutatedTurn' = TRUE
     /\ UNCHANGED <<kTurn, reads, ft, pendCreate, lastEditOk, born,
@@ -718,7 +818,7 @@ Turn ==
     /\ IF DrainMode = "atomic" /\ FormatDrain # "none" /\ mutatedTurn /\ ModOk(FormatDrain, disk, 1)
          THEN /\ disk' = Mod(FormatDrain, disk, 1, tok) /\ rev' = rev + 1 /\ tok' = tok + 1
               /\ written' = IF Broken THEN Retired              \* recordWritten after the format
-                             ELSE Carry(Mod(FormatDrain, disk, 1, tok))
+                             ELSE KeepEmpty(Carry(Mod(FormatDrain, disk, 1, tok)))
               /\ ft' = IF FormatStamp THEN rev + 1 ELSE ft
          ELSE UNCHANGED <<disk, rev, tok, ft, written>>
     /\ reads' = IF BlockRelease # "none" THEN SelectSeq(reads, Delivered) ELSE reads
@@ -755,7 +855,7 @@ Drain ==
          THEN /\ disk' = Mod(FormatDrain, disk, 1, tok) /\ rev' = rev + 1 /\ tok' = tok + 1
               /\ IF DrainMode = "unfenced" \/ dr.ep = dr.cur
                    THEN /\ written' = IF Broken THEN Retired
-                                      ELSE Carry(Mod(FormatDrain, disk, 1, tok))
+                                      ELSE KeepEmpty(Carry(Mod(FormatDrain, disk, 1, tok)))
                         /\ ft' = IF FormatStamp THEN rev + 1 ELSE ft
                    ELSE UNCHANGED <<ft, written>>
          ELSE UNCHANGED <<disk, rev, tok, ft, written>>
@@ -795,8 +895,9 @@ Kept(S) == SelectSeq(S, AllHashesMatch)
 BeforePrompt(r) == r.g < turnNo
 \* retainBranch / importBranch keep a record iff its toolCallId is a toolResult
 \* on the new branch. A delivered record's is; a provisional record has none
-\* (it showed the agent nothing), unless ProvisionalCredit (#4185 round 1).
-OnBranch(r) == BeforePrompt(r) /\ (~r.prov \/ ProvisionalCredit)
+\* (it showed the agent nothing), unless ProvisionalCredit (#4185 round 1);
+\* nor does a bridge read, or an injected read before #4387 round 2.
+OnBranch(r) == BeforePrompt(r) /\ NamesCall(r)
 Fork ==
     /\ Idle /\ "fork" \in Bounds /\ nb < MaxBounds /\ ~SettleDue
     /\ IF BranchFilter
@@ -839,7 +940,7 @@ Tree ==
 Next ==
     \/ \E lo \in 1..MaxLen, hi \in 1..MaxLen : ReadCall(FALSE, lo, hi)
     \/ ReadCall(TRUE, 1, MaxLen)
-    \/ ReadExec \/ ReadResult \/ FailedRead \/ BlockedReadCall \/ BlockedReadEnd
+    \/ ReadExec \/ ReadResult \/ FailedRead \/ BlockedReadCall \/ BlockedReadEnd \/ IdlessRead
     \/ \E lo \in 1..MaxLen, s \in Spans, o \in BOOLEAN : Edit(lo, s, o)
     \/ EditRW
     \/ Write \/ WriteRW1 \/ Fix \/ WriteRW2 \/ BashWrite \/ PartialBashWrite \/ BridgeWrite \/ SettledWrite
@@ -860,4 +961,8 @@ NoBlindAllow == ~blindAllow
 \* False block: with hashes available, an edit whose target lines hold
 \* exactly what the agent was shown is never refused.
 NoFalseBlock == ~falseBlock
+
+\* #4387 round 2: a read the guard records from an authorship that names a
+\* tool call names it too, so no move keeps the authorship and drops the read.
+NoIdlessAuthoredRead == \A i \in 1..Len(reads) : reads[i].inj /\ reads[i].aid => ~reads[i].noid
 =============================================================================

@@ -12,7 +12,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import "../../index.js";
 import { TOOL_REGISTRY } from "../../clients/tool-config.js";
 import { MAX_RESULT_BYTES } from "../../tools/render-compact.js";
-import { McpHarness, testTimeoutScale } from "../mcp/harness.js";
+import { McpHarness } from "../mcp/harness.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import { createPiMock } from "../support/pi-mock.js";
 
@@ -37,7 +38,7 @@ function stableRenderedText(
 // The Windows lane declares PI_LENS_TEST_TIMEOUT_SCALE=3 for exactly this: the
 // sweep took 25.6-26.9 s there (and passed or timed out at 30 s from run to
 // run), against ~3 s on Linux (#4019).
-const SWEEP_TIMEOUT_MS = 30_000 * testTimeoutScale;
+const SWEEP_TIMEOUT_MS = scaledTestTimeout(30_000);
 
 const EXACT_PARITY_TOOLS = new Set([
 	"ast_grep_search",
@@ -88,7 +89,7 @@ describe("result contract across registered tool surfaces", () => {
 		bigLines.push("\treturn acc;", "}");
 		fs.writeFileSync(path.join(cwd, "big.ts"), `${bigLines.join("\n")}\n`);
 		process.chdir(cwd);
-		const parityWaitMs = String(10_000 * testTimeoutScale);
+		const parityWaitMs = String(scaledTestTimeout(10_000));
 		const env = {
 			PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS: parityWaitMs,
 			PI_LENS_AUX_GRACE_MS: parityWaitMs,

@@ -203,12 +203,13 @@ describe("shared setup tmp-root sweep, through the real hooks (#2912)", () => {
 		expect(sweepLine("genuine-leak.fixture.ts", "afterAll")).toBe("");
 	});
 
-	it("persists the creating test file for an observed leak and omits an unobserved one (cross-process)", () => {
+	it("persists the creating test file for a raw root and an mkdir sibling, and omits a child's (cross-process)", () => {
 		// #2912 (2026-10-10): the interposer runs in the FIXTURE's fork, so the
 		// creators record only crosses to the serialized owner through this
-		// run-id-scoped file. The raw mkdtemp leak is observed and named; the
-		// mkdir sibling no interposer sees is absent, so the owner labels it as
-		// created outside the test process rather than naming a prefix owner.
+		// run-id-scoped file. #4560 widened it: a fixture sibling a test process
+		// made with `mkdir` at the tmp root is named too (it still never joins the
+		// sweep registry). A child process's own directory has no interposer, so
+		// the owner keeps labelling it as created outside the test process.
 		const creators = tmpHygieneCreators(
 			path.join(REPO, ".probe-home", `tmp-hygiene-creators-${RUN_ID}.log`),
 		);
@@ -217,7 +218,9 @@ describe("shared setup tmp-root sweep, through the real hooks (#2912)", () => {
 		expect(creators.get(rawLeak)).toBe(
 			"fixtures/tmp-teardown/genuine-leak.fixture.ts",
 		);
-		expect(creators.has("pi-lens-2912-genuine-mkdir-sibling")).toBe(false);
+		expect(creators.get("pi-lens-2912-genuine-mkdir-sibling")).toBe(
+			"fixtures/tmp-teardown/genuine-leak.fixture.ts",
+		);
 		// #4307-1: the record is appended at BOTH teardowns -- the file's afterAll
 		// and the pool's SIGTERM -- so `flushTmpRootCreators` dedupes per line. A
 		// regression there doubles the raw record; `tmpHygieneCreators` first-wins
@@ -232,7 +235,7 @@ describe("shared setup tmp-root sweep, through the real hooks (#2912)", () => {
 			.split("\n")
 			.filter((line) => line.length > 0);
 		expect(lines.length).toBeGreaterThan(0);
-		expect(new Set(lines).size).toBe(lines.length);
+		expect(new Set(lines).size, lines.join("|")).toBe(lines.length);
 	});
 
 	it("labels an entry a grandchild process made as created outside the test process", () => {

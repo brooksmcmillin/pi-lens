@@ -19,6 +19,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { githubHeaders } from "./github-rest.mjs";
 
 const LABELS_MANIFEST_PATH = resolve(
 	dirname(fileURLToPath(import.meta.url)),
@@ -147,11 +148,7 @@ export async function fetchOpenIssues(repository, token, fetchImpl = fetch) {
 		const response = await fetchImpl(
 			`https://api.github.com/repos/${repository}/issues?state=open&per_page=${PAGE_SIZE}&page=${page}`,
 			{
-				headers: {
-					Accept: "application/vnd.github+json",
-					Authorization: `Bearer ${token}`,
-					"X-GitHub-Api-Version": "2022-11-28",
-				},
+				headers: githubHeaders(token),
 			},
 		);
 		if (!response.ok)

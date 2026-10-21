@@ -89,7 +89,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			requestWorkspaceDiagnostics: vi.fn(async () => [
 				{
 					filePath: file,
@@ -139,7 +142,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			requestWorkspaceDiagnostics,
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),
@@ -198,7 +204,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			// touchFile's real merge logic (index.ts, not mocked) composes each
 			// spawned client's `getDiagnosticBinding` into the non-enumerable

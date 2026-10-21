@@ -2,8 +2,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Lang, parse } from "@ast-grep/napi";
 import { describe, expect, it } from "vitest";
+import { parseNodes, parseRoot, walkAst } from "../support/ast-census.js";
 import {
 	auditRegistry,
 	listSourceFiles,
@@ -27,10 +27,22 @@ const BOUNDED_HELPERS = new Set([
 ]);
 // Content-keyed, so an exemption must be re-confirmed after an edit.
 const FINITE_REASONS: Readonly<Record<string, string>> = {
+	// #4483: files whose pre-edit linter capture is still running. Each capture
+	// adds its own file before its linters run and deletes it in `finally`.
+	"clients/dispatch/integration.ts#preEditCaptureFacts:3fc075f7":
+		"one key per pre-edit capture still running; the capture deletes its own key in finally once its linters settle (each runner has its own spawn timeout)",
+	// #4403 round 5 (V1): the primaries whose cascade "no language server
+	// answered" line was delivered. Keyed by LSP server id, written only for a
+	// primary a delivered line named, and cleared at session_start.
+	"clients/cascade-format.ts#cascadeCarrySuffix:369e7dcc":
+		"keys are LSP server ids from the server catalog (finite, ~60), one per primary whose line was delivered this session; cleared by resetDispatchBaselines",
 	// #2372: one adapter per live LSPService identity; WeakMap keys are the
 	// bounded process-local service population and entries die with the service.
 	"clients/lsp/capabilities.ts#1e3511a9":
 		"adapter cache is keyed by live LSPService objects and reclaimed with them; it cannot retain path or user-key growth",
+	// #4496: one literal requirement per loaded ast-grep rule object.
+	"clients/dispatch/runners/ast-grep-literal-anchors.ts#satisfied:c607e2fd":
+		"WeakMap keyed by the YamlRule objects the rule loaders cache; entries are reclaimed with those objects, so it cannot grow with files, paths or sessions",
 	// #3968: the runner-id identity leaf — written once per runner definition
 	// that enters a `RunnerRegistry` through `register` (the dispatch
 	// registry's own population, finite and ~50 today), never per file, per
@@ -61,31 +73,13 @@ type Site = {
 	keyAxis: KeyAxis;
 };
 
-function walk(node: any, visit: (node: any) => void): void {
-	visit(node);
-	for (const child of node.children()) walk(child, visit);
-}
-
-/**
- * One parse and ONE pre-order walk per source text. Every predicate below
- * reads this document-ordered node array instead of parsing and walking the
- * tree itself.
- *
- * #3058: the predicates used to take the source STRING, so `scan()` re-parsed
- * and re-walked each whole file up to six times per container occurrence --
- * 302 occurrences over 121 files, ~1,800 whole-file passes. An
- * `@ast-grep/napi` root holds a native tree-sitter arena and every
- * `children()` call materialises a NAPI handle per node, none of which V8
- * accounts for and so none of which it ever feels pressure to collect.
- * Measured 9,207 MB peak RSS against 62 MB of V8 heap. Passing the node array
- * makes the per-call pass structurally impossible to re-introduce: a
- * predicate has no source string to parse and no root to walk.
- */
-export function parseNodes(source: string): any[] {
-	const nodes: any[] = [];
-	walk(parse(Lang.TypeScript, source).root(), (node) => nodes.push(node));
-	return nodes;
-}
+// The one parse and pre-order walk live in `tests/support/ast-census.ts`
+// (#4606 S0), shared with the eviction sweep. Every predicate below reads the
+// document-ordered node array `parseNodes` returns instead of parsing or
+// walking a tree itself: #3058 measured the alternative (a source STRING per
+// predicate, ~1,800 whole-file passes, 9,207 MB peak RSS against 62 MB of V8
+// heap). Keep the predicates on nodes; the seam's own test rejects a second
+// traversal in this file.
 
 function identifier(node: any): string | undefined {
 	return node?.kind() === "identifier" ? node.text() : undefined;
@@ -215,7 +209,7 @@ function axisName(node: any): KeyAxis {
 
 export function determineKeyAxis(expression: string | undefined): KeyAxis {
 	if (!expression) return "undetermined";
-	const root = parse(Lang.TypeScript, expression).root();
+	const root = parseRoot(expression);
 	const expressionNode = root.namedChildren()[0]?.namedChildren()[0];
 	if (
 		!["identifier", "member_expression", "subscript_expression"].includes(
@@ -224,10 +218,10 @@ export function determineKeyAxis(expression: string | undefined): KeyAxis {
 	)
 		return "undetermined";
 	let axis: KeyAxis = "undetermined";
-	walk(root, (node) => {
+	walkAst(root, (node) => {
 		if (
 			axis !== "undetermined" ||
-			!["identifier", "property_identifier"].includes(node.kind())
+			!["identifier", "property_identifier"].includes(String(node.kind()))
 		)
 			return;
 		axis = axisName(node);
@@ -282,7 +276,7 @@ export function hasNamedSizeComparison(nodes: any[], name: string): boolean {
 						"do_statement",
 					].includes(parent.kind())
 				) {
-					walk(parent, (child) => {
+					walkAst(parent, (child) => {
 						if (
 							child.kind() !== "call_expression" ||
 							child.field("function")?.kind() !== "member_expression" ||
@@ -478,10 +472,9 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/degradation-ledger.ts#OVERFLOW_KIND:8cf106dd",
 		"clients/degradation-ledger.ts#groups:218d12e1",
 		"clients/degradation-ledger.ts#onceKeys:b8a478d9",
-		"clients/dispatch/auxiliary-lsp.ts#enabledAuxiliaryLspServerIds:dd3e2650",
+		"clients/dispatch/auxiliary-lsp.ts#isEnabledByConfiguration:dd3e2650",
 		"clients/dispatch/collect-later-tier.ts#COLLECT_LATER_THRESHOLD_MS:6c0d1b78",
 		"clients/dispatch/dispatcher.ts#latencyReports:4e5c8069",
-		"clients/dispatch/integration.ts#getCascadeSessionStats:0753e302",
 		"clients/dispatch/integration.ts#isConfirmedTouch:0876b7da",
 		"clients/dispatch/runners/biome-check.ts#parseBiomeJson:753add48",
 		"clients/dispatch/runners/eslint.ts#makeEslintProbe:a15d1054",
@@ -507,14 +500,14 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/latency-logger.ts#_setRecentPhasesForTest:b45c37e8",
 		"clients/latency-logger.ts#resetCurrentPhaseForSession:9d04beac",
 		"clients/lsp/client.ts#safeSendNotification:63295a96",
-		"clients/lsp/server.ts#PROJECT_BOUNDARY_MARKERS:cc0fbaf1",
+		"clients/lsp/server.ts#PYTHON_EXTENSIONS:cc0fbaf1",
 		"clients/lsp/server.ts#loggedRootCeilingClamps:3e9d9204",
 		"clients/lsp/server.ts#DIRECT_LSP_NEGATIVE_TTL_MS:6f24c89e",
 		"clients/lsp/server.ts#directLspCommandUnavailableUntil:831316db",
 		"clients/opaque-mutation-scan.ts#getOpaqueBaselineStore:feff1538",
 		"clients/opaque-mutation-scan.ts#isGitWorktree:97337298",
 		"clients/package-manager.ts#PROBE_TIMEOUT_MS:ab1ec294",
-		"clients/package-manager.ts#execArgs:b2cb6a98",
+		"clients/package-manager.ts#updateArgs:b2cb6a98",
 		"clients/package-root.ts#1f3e8efd",
 		"clients/project-lens-config.ts#configCache:77a8d572",
 		"clients/project-report.ts#computeDeadWeight:7e342b62",
@@ -540,7 +533,9 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/smells-rollup.ts#shouldCheckSmellsThisTurn:a818f473",
 		"clients/word-index.ts#updateWordIndexDocument:8b5e4c9e",
 		"clients/word-index.ts#isCanonicalWordIndexToken:99249de8",
-		"clients/word-index.ts#deserializeWordIndex:d6d64306",
+		// #4583: `buildStatuses`, the one-entry-per-resolved-cwd build guard; the
+		// content key moved with the publish seam that now sits above it.
+		"clients/word-index.ts#notifyWordIndexPublished:d6d64306",
 		// WeakMap entries are content-keyed by live WordIndex objects and are
 		// reclaimed with those objects; this is not an unbounded path-key cache.
 		"clients/word-index.ts#serializedWordIndexCaches:baa74c91",

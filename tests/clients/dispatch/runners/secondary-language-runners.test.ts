@@ -190,6 +190,27 @@ describe("secondary language fallback runners", () => {
 		expect(observed.output).toContain("[unused_local_variable] unused value");
 	});
 
+	it("renders dart compile errors from an exit-3 run through dispatch (#1937)", async () => {
+		// Prevents the Dart 3.5-era exit table from returning: dart 3.13 exits 3
+		// when the analyzer reports an ERROR, and a table that stops at 2 rejects
+		// the invocation and drops the finding (captured bytes in
+		// tests/fixtures/runner-output/dart-analyze).
+		const observed = await dispatchOutcome(
+			"dart-analyze",
+			"exit-3",
+			(filePath) => ({
+				error: null,
+				status: 3,
+				stdout: `ERROR|COMPILE_TIME_ERROR|INVALID_ASSIGNMENT|${filePath}|3|11|14|A value of type 'String' can't be assigned to a variable of type 'int'.`,
+				stderr: "",
+			}),
+		);
+		expect(observed.status).toBe("failed");
+		expect(observed.semantic).toBe("blocking");
+		expect(observed.diagnostics).toHaveLength(1);
+		expect(observed.output).toContain("[INVALID_ASSIGNMENT]");
+	});
+
 	it("guards dart nonzero unparseable stdout through dispatch (#1816)", async () => {
 		// Prevents a failed dart run whose stdout the parser cannot read from
 		// being rendered as a clean file (#1781 shape).

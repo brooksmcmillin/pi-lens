@@ -37,7 +37,11 @@ vi.mock("../../clients/scan-utils.js", () => ({
 }));
 
 function tmpDir(): string {
-	return setupTestEnvironment("pi-lens-graph-stamp-").tmpDir;
+	// #4560: the cells build real and malformed `.git` shapes themselves,
+	// including FILES, so the shared directory marker must stay out.
+	return setupTestEnvironment("pi-lens-graph-stamp-", {
+		rootMarker: false,
+	}).tmpDir;
 }
 
 /** Minimal hand-built `.git` (normal, non-worktree) repo — no git binary needed. */

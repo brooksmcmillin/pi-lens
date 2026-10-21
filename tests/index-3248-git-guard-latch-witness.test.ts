@@ -49,7 +49,10 @@ import type { Diagnostic } from "../clients/dispatch/types.js";
 import { formatDiagnostics } from "../clients/dispatch/utils/format-utils.js";
 import extension from "../index.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
-import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import {
+	makeContextWithSystemEvent,
+	makeSessionStartEvent,
+} from "./support/host-event-factory.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 const SESSION_ID = "pi-3248-git-guard-latch-session";
@@ -172,12 +175,22 @@ describe("#3248 witness: the commit gate and the banner agree through pi", () =>
 		const endTurn = async () => {
 			await pi.emit("turn_end", {}, makeCtx({ cwd: tmpDir }));
 			const injected = (await pi.emit(
-				"context",
-				{ messages: [{ role: "user", content: "keep working" }] },
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
 				makeCtx({ cwd: tmpDir }),
-			)) as { messages?: Array<{ content: string }> } | undefined;
+			)) as
+				| { messages?: Array<{ role?: string; content: string }> }
+				| undefined;
+			// #4631 round 5 (F2): the transcript leads with the host's system head, so
+			// the golden records the messages pi-lens APPENDED. When this turn
+			// injected at all, that head is still at index 0 — a regression that
+			// dropped it would shift this golden instead of slipping through. A turn
+			// that delivered nothing has no list to check.
+			const delivered = injected?.messages ?? [];
+			if (delivered.length > 0) expect(delivered[0]?.role).toBe("system");
 			return (
-				(injected?.messages ?? [])
+				delivered
+					.slice(1)
 					.map((m) => m.content)
 					.join("\n\n")
 					.replaceAll(tmpDir, "<PROJECT>")
@@ -302,8 +315,8 @@ describe("#3248 witness: the commit gate and the banner agree through pi", () =>
 		);
 		await pi.emit("turn_end", {}, makeCtx({ cwd: tmpDir }));
 		await pi.emit(
-			"context",
-			{ messages: [{ role: "user", content: "keep working" }] },
+			"context_with_system",
+			makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
 			makeCtx({ cwd: tmpDir }),
 		);
 

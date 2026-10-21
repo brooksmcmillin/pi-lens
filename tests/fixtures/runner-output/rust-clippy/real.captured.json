@@ -1,0 +1,59 @@
+{
+	"provenance": {
+		"runner": "rust-clippy",
+		"tool": "cargo",
+		"version": "1.99.0",
+		"command": "cargo clippy --message-format=json -q",
+		"argv": [
+			"clippy",
+			"--message-format=json",
+			"-q"
+		],
+		"workspace": "tests/fixtures/tool-smoke/rust",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "src/main.rs",
+	"exitCode": 101,
+	"stdout": "{\"reason\":\"compiler-message\",\"package_id\":\"path+file://__WORKSPACE__#toolsmoke@0.1.0\",\"manifest_path\":\"__WORKSPACE__/Cargo.toml\",\"target\":{\"kind\":[\"bin\"],\"crate_types\":[\"bin\"],\"name\":\"toolsmoke\",\"src_path\":\"__WORKSPACE__/src/main.rs\",\"edition\":\"2021\",\"doc\":true,\"doctest\":false,\"test\":true},\"message\":{\"rendered\":\"error[E0308]: mismatched types\\n --> src/main.rs:3:23\\n  |\\n3 |     let v: Vec<i32> = \\\"not a vector\\\";\\n  |            --------   ^^^^^^^^^^^^^^ expected `Vec<i32>`, found `&str`\\n  |            |\\n  |            expected due to this\\n  |\\n  = note: expected struct `std::vec::Vec<i32>`\\n          found reference `&'static str`\\n\\n\",\"$message_type\":\"diagnostic\",\"children\":[{\"children\":[],\"code\":null,\"level\":\"note\",\"message\":\"expected struct `std::vec::Vec<i32>`\\nfound reference `&'static str`\",\"rendered\":null,\"spans\":[]}],\"level\":\"error\",\"message\":\"mismatched types\",\"spans\":[{\"byte_end\":128,\"byte_start\":114,\"column_end\":37,\"column_start\":23,\"expansion\":null,\"file_name\":\"src/main.rs\",\"is_primary\":true,\"label\":\"expected `Vec<i32>`, found `&str`\",\"line_end\":3,\"line_start\":3,\"suggested_replacement\":null,\"suggestion_applicability\":null,\"text\":[{\"highlight_end\":37,\"highlight_start\":23,\"text\":\"    let v: Vec<i32> = \\\"not a vector\\\";\"}]},{\"byte_end\":111,\"byte_start\":103,\"column_end\":20,\"column_start\":12,\"expansion\":null,\"file_name\":\"src/main.rs\",\"is_primary\":false,\"label\":\"expected due to this\",\"line_end\":3,\"line_start\":3,\"suggested_replacement\":null,\"suggestion_applicability\":null,\"text\":[{\"highlight_end\":20,\"highlight_start\":12,\"text\":\"    let v: Vec<i32> = \\\"not a vector\\\";\"}]}],\"code\":{\"code\":\"E0308\",\"explanation\":\"Expected type did not match the received type.\\n\\nErroneous code examples:\\n\\n```compile_fail,E0308\\nfn plus_one(x: i32) -> i32 {\\n    x + 1\\n}\\n\\nplus_one(\\\"Not a number\\\");\\n//       ^^^^^^^^^^^^^^ expected `i32`, found `&str`\\n\\nif \\\"Not a bool\\\" {\\n// ^^^^^^^^^^^^ expected `bool`, found `&str`\\n}\\n\\nlet x: f32 = \\\"Not a float\\\";\\n//     ---   ^^^^^^^^^^^^^ expected `f32`, found `&str`\\n//     |\\n//     expected due to this\\n```\\n\\nThis error occurs when an expression was used in a place where the compiler\\nexpected an expression of a different type. It can occur in several cases, the\\nmost common being when calling a function and passing an argument which has a\\ndifferent type than the matching type in the function declaration.\\n\"}}}\n{\"reason\":\"compiler-message\",\"package_id\":\"path+file://__WORKSPACE__#toolsmoke@0.1.0\",\"manifest_path\":\"__WORKSPACE__/Cargo.toml\",\"target\":{\"kind\":[\"bin\"],\"crate_types\":[\"bin\"],\"name\":\"toolsmoke\",\"src_path\":\"__WORKSPACE__/src/main.rs\",\"edition\":\"2021\",\"doc\":true,\"doctest\":false,\"test\":true},\"message\":{\"rendered\":\"For more information about this error, try `rustc --explain E0308`.\\n\",\"$message_type\":\"diagnostic\",\"children\":[],\"level\":\"failure-note\",\"message\":\"For more information about this error, try `rustc --explain E0308`.\",\"spans\":[],\"code\":null}}\n{\"reason\":\"build-finished\",\"success\":false}\n",
+	"stderr": "error: could not compile `toolsmoke` (bin \"toolsmoke\") due to 1 previous error\n",
+	"availability": [
+		{
+			"command": "cargo",
+			"argv": [
+				"--version"
+			],
+			"version": "1.99.0",
+			"exitCode": 0,
+			"stdout": "cargo 1.99.0 (5f94df478 2026-08-27)\n",
+			"stderr": ""
+		},
+		{
+			"command": "cargo",
+			"argv": [
+				"clippy",
+				"--version"
+			],
+			"version": "0.1.99",
+			"exitCode": 0,
+			"stdout": "clippy 0.1.99 (b940084d7e 2026-09-28)\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/rust-clippy",
+		"file": "src/main.rs",
+		"argv": [
+			"clippy",
+			"--message-format=json",
+			"-q"
+		],
+		"version": "1.99.0",
+		"exitCode": 0,
+		"stdout": "{\"reason\":\"compiler-artifact\",\"package_id\":\"path+file://__WORKSPACE__#smoke@0.1.0\",\"manifest_path\":\"__WORKSPACE__/Cargo.toml\",\"target\":{\"kind\":[\"bin\"],\"crate_types\":[\"bin\"],\"name\":\"smoke\",\"src_path\":\"__WORKSPACE__/src/main.rs\",\"edition\":\"2021\",\"doc\":true,\"doctest\":false,\"test\":true},\"profile\":{\"opt_level\":\"0\",\"debuginfo\":2,\"debug_assertions\":true,\"overflow_checks\":true,\"test\":false},\"features\":[],\"filenames\":[\"__WORKSPACE__/target/debug/deps/libsmoke-4584a4ab8dda12e6.rmeta\"],\"executable\":null,\"fresh\":false}\n{\"reason\":\"build-finished\",\"success\":true}\n",
+		"stderr": ""
+	}
+}

@@ -621,6 +621,41 @@ describe("SgRunner", () => {
 			}
 		});
 
+		it("creates the scan root under PI_LENS_TEST_SCANNER_TMPDIR when set", async () => {
+			// #4347: session_start's ast-grep exports scan reaches this root
+			// unawaited, as jscpd does. A test or harness that owns a scanner root
+			// must catch this one too, or a fork killed before the `finally`
+			// strands it in the shared tmpdir.
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-owned-"));
+			const scannerRoot = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-owned-root-"),
+			);
+			vi.stubEnv("PI_LENS_TEST_SCANNER_TMPDIR", scannerRoot);
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 0,
+					error: null,
+					stdout: "[]",
+					stderr: "",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				await new SgRunner().tempScanAsync(
+					root,
+					"owned",
+					"id: owned\nrule: { kind: function_declaration }\n",
+				);
+
+				const args = safeSpawnAsync.mock.calls[0][1] as string[];
+				const scanRoot = path.dirname(args[args.indexOf("--config") + 1]);
+				expect(path.dirname(scanRoot)).toBe(scannerRoot);
+				expect(path.basename(scanRoot)).toMatch(/^pi-lens-temp-owned-/);
+			} finally {
+				vi.unstubAllEnvs();
+				removeTempDirSync(root);
+				removeTempDirSync(scannerRoot);
+			}
+		});
+
 		it("reports invalid generated-rule CLI output instead of an empty success", async () => {
 			const root = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-sg-invalid-"),

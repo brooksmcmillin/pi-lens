@@ -63,6 +63,15 @@ async function seam() {
 	return await import("../../clients/spawn-timeout-cooldown.js");
 }
 
+// Recurrence (#4561, shuffle seed 202): the cooldown map is process-global
+// (`Symbol.for("pi-lens:spawn-timeout-cooldown")`), so `vi.resetModules()`
+// cannot clear it: the cross-lane case and the autofix case both arm
+// `markdownlint-cli2` for every later case, and the seam-unit case asserts the
+// command is cool at entry. One reset per case, on the shared instance.
+beforeEach(async () => {
+	(await seam()).resetSpawnTimeoutCooldowns();
+});
+
 describe("seam unit semantics", () => {
 	beforeEach(() => {
 		vi.resetModules();

@@ -1,0 +1,48 @@
+{
+	"provenance": {
+		"runner": "cue-vet",
+		"tool": "cue",
+		"version": "0.17.1",
+		"command": "cue vet -c=false .",
+		"argv": [
+			"vet",
+			"-c=false",
+			"."
+		],
+		"workspace": "tests/fixtures/tool-smoke/cue-vet",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"version"
+		]
+	},
+	"file": "bad.cue",
+	"exitCode": 1,
+	"stdout": "",
+	"stderr": "a: conflicting values int and \"hello\" (mismatched types int and string):\n    ./bad.cue:18:4\n    ./bad.cue:18:10\n",
+	"availability": [
+		{
+			"command": "cue",
+			"argv": [
+				"version"
+			],
+			"version": "0.17.1",
+			"exitCode": 0,
+			"stdout": "cue version v0.17.1\n\nCUE language version v0.17.1\n\nGo version go1.26.5\n      -buildmode exe\n       -compiler gc\n       -trimpath true\n     CGO_ENABLED 0\n          GOARCH amd64\n            GOOS linux\n         GOAMD64 v1\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/cue-vet",
+		"file": "bad.cue",
+		"argv": [
+			"vet",
+			"-c=false",
+			"."
+		],
+		"version": "0.17.1",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
+}

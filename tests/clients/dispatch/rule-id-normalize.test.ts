@@ -33,8 +33,38 @@ describe("rule-id-normalize", () => {
 		expect(normalizeRuleId("shuck:K006")).toBe("K006");
 	});
 
+	it("strips the Pyright and basedpyright source prefixes (#4629)", () => {
+		// pyright-langserver publishes `source: "Pyright"` and
+		// basedpyright-langserver `source: "basedpyright"` (the captured bytes in
+		// tests/fixtures/lsp-cli-copies); the `pyright` CLI prints the bare code.
+		expect(normalizeRuleId("Pyright:reportAssignmentType")).toBe(
+			"reportAssignmentType",
+		);
+		expect(normalizeRuleId("basedpyright:reportUnusedImport")).toBe(
+			"reportUnusedImport",
+		);
+	});
+
+	it("keeps the prefix of a server that is not on the closed list (#4629)", () => {
+		// Another analyzer's code may spell like Pyright's; stripping every
+		// `<source>:` would merge their findings. The list names the servers whose
+		// analyzer pi-lens also runs as a CLI, spelled as each publishes it.
+		for (const rule of [
+			"ty:invalid-assignment",
+			"pyright:reportAssignmentType",
+			"Basedpyright:reportAssignmentType",
+			"Pylance:reportAssignmentType",
+			"Jedi:unknown",
+		]) {
+			expect(normalizeRuleId(rule)).toBe(rule);
+		}
+	});
+
 	it("keeps a code that merely contains a source token (anchored strip)", () => {
 		expect(normalizeRuleId("notshuck:C001")).toBe("notshuck:C001");
+		expect(normalizeRuleId("notPyright:reportAssignmentType")).toBe(
+			"notPyright:reportAssignmentType",
+		);
 	});
 
 	it("strips the -js suffix", () => {
@@ -62,6 +92,8 @@ describe("rule-id-normalize", () => {
 			"ast-grep:no-eval",
 			"no-eval-js",
 			"ast-grep:no-eval-js",
+			"Pyright:reportAssignmentType",
+			"basedpyright:reportAssignmentType",
 		];
 		for (const form of forms) {
 			const once = normalizeRuleId(form);

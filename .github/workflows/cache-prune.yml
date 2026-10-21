@@ -1,0 +1,80 @@
+name: Cache prune
+
+# #4358. The repository's Actions cache is capped at 10 GB and sat at the cap:
+# five ~600 MB CodeQL overlay base databases, 21 CodeQL trap caches, and npm
+# caches of pull requests that were already merged. At the cap GitHub evicts by
+# last access, so a smoke workflow's new tool-tree cache competes with that
+# stale weight. This workflow removes what nothing restores again; the rules
+# and the dry-run default live in scripts/prune-actions-cache.mjs.
+#
+# `plan` runs on a pull request that edits this file or the script and prints
+# what a real run would delete (a read-only token, nothing changes). `prune`
+# deletes, on the nightly schedule and on a push to master that edits this
+# file or the script (so the merge itself runs the first cleanup). There is no
+# workflow_dispatch: a branch dispatch must not delete shared repository state
+# (#4053), and the push trigger covers the manual run. It runs before the
+# 06:00 UTC smoke workflows so their saves land in freed space.
+
+on:
+  schedule:
+    - cron: '30 4 * * *' # daily 04:30 UTC
+  push:
+    branches: [master]
+    paths: &prune-paths
+      - .github/workflows/cache-prune.yml
+      - scripts/prune-actions-cache.mjs
+  pull_request:
+    paths: *prune-paths
+
+permissions: {}
+
+concurrency:
+  group: cache-prune
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Cache prune plan (dry run)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Two `gh` listings and one paginated branch listing: seconds. 5 minutes is
+    # a hang bound.
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: List the caches a real run would delete
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/prune-actions-cache.mjs
+
+  prune:
+    name: Prune stale caches
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Delete the stale caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/prune-actions-cache.mjs --apply

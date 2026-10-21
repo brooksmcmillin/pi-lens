@@ -204,6 +204,52 @@ describe("DocumentDriftTracker (#1783)", () => {
 		expect(stamp).toBeLessThan(readStartedAt);
 	});
 
+	// #4493: a held document whose record is absent (never stamped, or dropped
+	// again after a server closed it — #4503 stopped the cap evicting one) is
+	// still queued by a HEAD-move resync. With no record at all, the empty
+	// check returned SKIPPED and dropped the queued target, so the server kept
+	// the pre-move bytes.
+	it("resyncs a queued target when the tracker holds no record", async () => {
+		const files = new Map<string, FakeFile>([
+			[k("/repo/moved.ts"), { content: "v2\n", mtimeMs: SYNCED_AT }],
+		]);
+		const tracker = new DocumentDriftTracker();
+		tracker.enqueueResync([k("/repo/moved.ts")]);
+		const { deps, resynced } = makeDeps(files, now);
+
+		const result = await tracker.sweep(deps, { force: true });
+
+		expect(result.queued.get(k("/repo/moved.ts"))).toBe("resynced");
+		expect(resynced).toEqual([
+			{ filePath: k("/repo/moved.ts"), content: "v2\n" },
+		]);
+	});
+
+	// #4493: that queue-only pass ran its window over zero records, and
+	// `% 0` left the cursor NaN, so every later pass checked no record at all
+	// and a drifted document stayed stale for the session.
+	it("still checks records stamped after a pass that held none", async () => {
+		const files = new Map<string, FakeFile>([
+			[k("/repo/moved.ts"), { content: "v2\n", mtimeMs: SYNCED_AT }],
+			[k("/repo/later.ts"), { content: "v1\n", mtimeMs: SYNCED_AT - 10 }],
+		]);
+		const tracker = new DocumentDriftTracker();
+		tracker.enqueueResync([k("/repo/moved.ts")]);
+		const { deps, resynced } = makeDeps(files, now);
+		await tracker.sweep(deps, { force: true });
+		tracker.recordSynced(k("/repo/later.ts"), "v1\n", SYNCED_AT);
+		files.set(k("/repo/later.ts"), { content: "v2\n", mtimeMs: SYNCED_AT + 5 });
+		clock = SYNCED_AT + 1_000;
+
+		const result = await tracker.sweep(deps, { force: true });
+
+		expect(result.resynced).toBe(1);
+		expect(resynced.at(-1)).toEqual({
+			filePath: k("/repo/later.ts"),
+			content: "v2\n",
+		});
+	});
+
 	it("re-stamps a touched-but-identical long file without resyncing it", async () => {
 		const same = `// ${"h".repeat(60)}\nconst x = 1;\n// ${"t".repeat(60)}\n`;
 		const files = new Map<string, FakeFile>([
@@ -540,6 +586,183 @@ describe("DocumentDriftTracker (#1783)", () => {
 		expect(
 			tracker.peek(k(`/repo/cap-${DRIFT_TRACK_CAP + 4}.ts`)),
 		).toBeDefined();
+	});
+
+	// #4503: eviction by insertion order alone unbound a held document at the
+	// cap. A workspace sweep stamps one record per project file and leaves every
+	// one of those documents open, so the 513th stamp dropped the 1st record
+	// while the server still held it: no record was left to compare disk
+	// against, and an untracked edit to that document could never heal.
+	it("never evicts the record of a document a server still holds (#4503)", () => {
+		const held = k("/repo/held.ts");
+		const tracker = new DocumentDriftTracker({
+			holdsDocument: (filePath) => filePath === held,
+		});
+		tracker.recordSynced(held, "v0\n", SYNCED_AT);
+		for (let i = 0; i < DRIFT_TRACK_CAP; i++) {
+			tracker.recordSynced(k(`/repo/swept-${i}.ts`), `v${i}\n`, SYNCED_AT + i);
+		}
+
+		expect(tracker.peek(held)).toBeDefined();
+		expect(tracker.size).toBe(DRIFT_TRACK_CAP);
+		// The oldest record nobody holds is the one that goes, not the oldest.
+		expect(tracker.peek(k("/repo/swept-0.ts"))).toBeUndefined();
+	});
+
+	// #4503 acceptance 2: the set is bounded by the held-document count, not by
+	// an arbitrary constant, and that growth is named once per session.
+	it("lets the tracked set stand above the cap when every record is held (#4503)", () => {
+		const overflows: Array<{ tracked: number; cap: number }> = [];
+		let holdingCalls = 0;
+		const tracker = new DocumentDriftTracker({
+			holdsDocument: () => {
+				holdingCalls += 1;
+				return true;
+			},
+			onCapOverflow: (state) => overflows.push(state),
+		});
+		for (let i = 0; i < DRIFT_TRACK_CAP + 3; i++) {
+			tracker.recordSynced(
+				k(`/repo/all-held-${i}.ts`),
+				`v${i}\n`,
+				SYNCED_AT + i,
+			);
+		}
+
+		expect(tracker.size).toBe(DRIFT_TRACK_CAP + 3);
+		expect(tracker.peek(k("/repo/all-held-0.ts"))).toBeDefined();
+		// One row for the crossing, not one per insert past the cap.
+		expect(overflows).toEqual([
+			{ tracked: DRIFT_TRACK_CAP + 1, cap: DRIFT_TRACK_CAP },
+		]);
+		// The walk that found nobody to evict is remembered: the three inserts
+		// after it ask the holding question zero times instead of re-walking.
+		expect(holdingCalls).toBe(DRIFT_TRACK_CAP + 1);
+
+		// Remembered, not forgotten: one more walk per cap's worth of inserts, so
+		// a document that closed while no pass was looking is still found. The
+		// second walk costs about one population; walking on EVERY insert would
+		// cost about a million calls here.
+		for (let i = 0; i < DRIFT_TRACK_CAP; i++) {
+			tracker.recordSynced(
+				k(`/repo/all-held-later-${i}.ts`),
+				`v${i}\n`,
+				SYNCED_AT + i,
+			);
+		}
+		expect(holdingCalls).toBeGreaterThan(DRIFT_TRACK_CAP + 1);
+		expect(holdingCalls).toBeLessThan(4 * DRIFT_TRACK_CAP);
+		// The second walk found nobody to evict too, and an over-cap set the
+		// session already reported writes no second row (#4503).
+		expect(overflows).toHaveLength(1);
+	});
+
+	// #4503: the above-cap set is not stranded, and the walk's "nobody to
+	// evict" memo is not a permanent leak. A pass that drops an unheld record
+	// re-arms the walk, and the next over-cap insert evicts instead of skipping.
+	it("evicts a released record again once its document closes (#4503)", async () => {
+		let heldOpen = true;
+		const tracker = new DocumentDriftTracker({
+			holdsDocument: (filePath) =>
+				heldOpen || filePath.endsWith("after-close.ts"),
+		});
+		// Enough past the cap that the set is still over it after the pass drops
+		// the 64 records its window reaches, and under one cap's worth of skipped
+		// inserts so the walk is still memoised.
+		for (let i = 0; i < DRIFT_TRACK_CAP + 101; i++) {
+			tracker.recordSynced(
+				k(`/repo/released-${i}.ts`),
+				`v${i}\n`,
+				SYNCED_AT + i,
+			);
+		}
+		expect(tracker.size).toBe(DRIFT_TRACK_CAP + 101);
+
+		// Every document closed, but the memo still says the walk has nothing to
+		// evict, so the insert itself does not pay for a second full walk.
+		heldOpen = false;
+		tracker.recordSynced(k("/repo/after-close.ts"), "v\n", SYNCED_AT + 99);
+		expect(tracker.peek(k("/repo/released-0.ts"))).toBeDefined();
+
+		// The pass drops the records nobody holds (the 64-record window it walks),
+		// which is the proof that re-arms eviction. No stat, no resync.
+		const { deps } = makeDeps(new Map<string, FakeFile>(), now);
+		const pass = await tracker.sweep(deps, { force: true });
+		expect(pass.unheld).toBe(64);
+		expect(pass.checked).toBe(0);
+		expect(tracker.peek(k("/repo/released-0.ts"))).toBeUndefined();
+		// The prewarmed records, plus the held "/repo/after-close.ts" record, less
+		// the 64 the pass dropped.
+		const afterPass = DRIFT_TRACK_CAP + 101 + 1 - 64;
+		expect(tracker.size).toBe(afterPass);
+
+		// Still over the cap, so this insert runs a walk — and the walk finds the
+		// released records the pass has not reached yet. One in, one out.
+		tracker.recordSynced(k("/repo/after-pass.ts"), "v\n", SYNCED_AT + 100);
+		expect(tracker.peek(k("/repo/released-64.ts"))).toBeUndefined();
+		expect(tracker.size).toBe(afterPass);
+	});
+
+	// #4503: the pass and the cap must read ONE answer about holding. The
+	// tracker's standing answer is what both use when a pass supplies none,
+	// otherwise the sweep would stat and resync a view eviction had just deemed
+	// load-bearing (or keep one it deemed droppable).
+	it("asks the tracker's own holding answer when a pass supplies none (#4503)", async () => {
+		const tracker = new DocumentDriftTracker({ holdsDocument: () => false });
+		tracker.recordSynced(k("/repo/unheld.ts"), "v0\n", SYNCED_AT);
+		const files = new Map<string, FakeFile>([
+			[k("/repo/unheld.ts"), { content: "v0\n", mtimeMs: SYNCED_AT }],
+		]);
+		const { deps, events } = makeDeps(files, now);
+
+		const result = await tracker.sweep(deps, { force: true });
+
+		expect(result.unheld).toBe(1);
+		expect(result.checked).toBe(0);
+		expect(events.map((entry) => entry.disposition)).toEqual(["unheld"]);
+		expect(tracker.peek(k("/repo/unheld.ts"))).toBeUndefined();
+	});
+
+	// #4503: the overflow record is the session's answer, not each crossing's. A
+	// set that falls back under the cap and grows past it again writes no second
+	// row, because a row per crossing would grow with every workspace sweep. The
+	// session boundary ({@link DocumentDriftTracker.clear}) re-arms it.
+	it("records the cap crossing at most once per session (#4503)", async () => {
+		const overflows: number[] = [];
+		let held = true;
+		const tracker = new DocumentDriftTracker({
+			holdsDocument: () => held,
+			onCapOverflow: ({ tracked }) => overflows.push(tracked),
+		});
+		const fill = (prefix: string, count: number) => {
+			for (let i = 0; i < count; i++) {
+				tracker.recordSynced(
+					k(`/repo/${prefix}-${i}.ts`),
+					"v\n",
+					SYNCED_AT + i,
+				);
+			}
+		};
+
+		fill("cross-a", DRIFT_TRACK_CAP + 1);
+		expect(overflows).toHaveLength(1);
+
+		// The first generation of documents closes. The pass drops the 64 records
+		// its window reaches and, with them, the walk's "nobody to evict" memo, so
+		// the fill below walks again and crosses the cap a second time.
+		held = false;
+		const { deps } = makeDeps(new Map<string, FakeFile>(), now);
+		const pass = await tracker.sweep(deps, { force: true });
+		expect(pass.unheld).toBe(64);
+		held = true;
+		fill("cross-b", 64);
+		expect(tracker.size).toBe(DRIFT_TRACK_CAP + 1);
+		expect(overflows).toHaveLength(1);
+
+		// The session boundary re-arms it, so the next session's crossing shows.
+		tracker.clear();
+		fill("cross-c", DRIFT_TRACK_CAP + 1);
+		expect(overflows).toHaveLength(2);
 	});
 
 	it("joins an in-flight pass instead of doubling the stat load", async () => {

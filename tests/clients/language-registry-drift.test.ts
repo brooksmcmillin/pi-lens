@@ -40,7 +40,10 @@ import {
 	SCAN_LANGUAGE_PRIORITY,
 } from "../../clients/language-registry.js";
 import { symbolSearchFileMatchesLang } from "../../clients/lens-engine.js";
-import { LANGUAGE_EXTENSIONS } from "../../clients/lsp/language.js";
+import {
+	getLanguageId,
+	LANGUAGE_EXTENSIONS,
+} from "../../clients/lsp/language.js";
 import { getServersForFile } from "../../clients/lsp/server.js";
 import { tsLangForFile } from "../../clients/module-report.js";
 import { TREE_SITTER_EXT_TO_LANG } from "../../clients/project-diagnostics/scanner.js";
@@ -217,6 +220,10 @@ describe("language registry invariants", () => {
 		// last resort, mapped through the kind they classify into.
 		expect(resolveLanguage("infra/Dockerfile.dev")?.id).toBe("dockerfile");
 		expect(resolveLanguage("src/App.tsx")?.id).toBe("typescriptreact");
+		// #4636: a declared `<stem>*<tail>` name is part of the filename tier, so
+		// it outranks the suffix that would otherwise answer `json`.
+		expect(resolveLanguage("web/tsconfig.app.json")?.id).toBe("jsonc");
+		expect(resolveLanguage("web/data.json")?.id).toBe("json");
 	});
 
 	it("routes .cuh through every C++ production projection (#2986)", () => {
@@ -281,6 +288,147 @@ describe("language registry invariants", () => {
 		);
 		expect(unresolved.map(({ pattern }) => pattern.source)).toEqual([]);
 	});
+
+	// #4636: `filenamePatterns` is a second filename tier, so it needs the same
+	// two guards the exact column has. A pattern that is not the closed
+	// `<stem>*<tail>` form (a bare `*`, two stars, a regex, a path separator)
+	// would claim files the extension's owner answers correctly, and the match
+	// rule in `clients/language-registry.ts` would silently decline it or, with
+	// two stars, read only the first.
+	it("keeps every filename pattern a closed single-wildcard form", () => {
+		const malformed = LANGUAGES.flatMap((entry) =>
+			(entry.filenamePatterns ?? []).filter((pattern) => {
+				const stars = pattern.split("*").length - 1;
+				const [stem = "", tail = ""] = pattern.split("*");
+				return (
+					stars !== 1 ||
+					!stem ||
+					!tail ||
+					pattern !== pattern.toLowerCase() ||
+					pattern.includes("/") ||
+					pattern.includes("\\")
+				);
+			}),
+		);
+		expect(malformed, "malformed filenamePattern(s)").toEqual([]);
+	});
+
+	// Same silent-shadowing risk as the exact column (#2424 review, S5), one
+	// tier wider: two entries whose patterns both match one name flip the
+	// answer on an unrelated re-sort, and an exact name another entry declares
+	// is shadowed by whichever tier is consulted first. The match rule is
+	// re-derived here rather than imported, so a regression in the registry's
+	// own matcher cannot make this guard agree with it.
+	//
+	// A generated sample per pattern cannot prove two patterns disjoint: the
+	// sample names the star `app`, so `tsconfig.*.json` and `tsconfig*prod.json`
+	// on different entries both claim `tsconfig.webprod.json` and no sample asks
+	// about it (#4643 review F1, Greptile P2). Compare every cross-entry pair by
+	// the closed form instead: a witness name exists iff the stems are
+	// prefix-compatible and the tails suffix-compatible, and the witness is the
+	// longer stem + filler + the longer tail.
+	const patternsShareOneName = (a: string, b: string): boolean => {
+		const [stemA = "", tailA = ""] = a.split("*");
+		const [stemB = "", tailB = ""] = b.split("*");
+		return (
+			(stemA.startsWith(stemB) || stemB.startsWith(stemA)) &&
+			(tailA.endsWith(tailB) || tailB.endsWith(tailA))
+		);
+	};
+	it("gives every filename pattern exactly one owner", () => {
+		const matches = (pattern: string, filename: string): boolean => {
+			const [stem = "", tail = ""] = pattern.split("*");
+			const name = filename.toLowerCase();
+			return (
+				name.length > stem.length + tail.length &&
+				name.startsWith(stem.toLowerCase()) &&
+				name.endsWith(tail.toLowerCase())
+			);
+		};
+		const samples = LANGUAGES.flatMap((entry) => [
+			...(entry.filenames ?? []).map((filename) => ({
+				entry: entry.id,
+				filename,
+			})),
+			...(entry.filenamePatterns ?? []).map((pattern) => ({
+				entry: entry.id,
+				filename: pattern.replaceAll("*", "app"),
+			})),
+		]);
+		const collisions: string[] = [];
+		for (const { entry, filename } of samples) {
+			const claimants = new Set<string>([entry]);
+			for (const candidate of LANGUAGES) {
+				const exact = (candidate.filenames ?? []).some(
+					(name) => name.toLowerCase() === filename.toLowerCase(),
+				);
+				const patterned = (candidate.filenamePatterns ?? []).some((pattern) =>
+					matches(pattern, filename),
+				);
+				if (exact || patterned) claimants.add(candidate.id);
+			}
+			if (claimants.size > 1) {
+				collisions.push(`${filename}: ${[...claimants].join(", ")}`);
+			}
+		}
+		expect(collisions, "filename(s) claimed by more than one tier").toEqual([]);
+
+		const owners = LANGUAGES.flatMap((entry) =>
+			(entry.filenamePatterns ?? []).map((pattern) => ({
+				entry: entry.id,
+				pattern,
+			})),
+		);
+		const shared: string[] = [];
+		for (let i = 0; i < owners.length; i++) {
+			for (let j = i + 1; j < owners.length; j++) {
+				if (owners[i].entry === owners[j].entry) continue;
+				if (patternsShareOneName(owners[i].pattern, owners[j].pattern)) {
+					shared.push(
+						`${owners[i].pattern} (${owners[i].entry}) vs ${owners[j].pattern} (${owners[j].entry})`,
+					);
+				}
+			}
+		}
+		expect(shared, "pattern pairs that can claim one name").toEqual([]);
+	});
+
+	it("refuses a cross-entry pattern pair no generated sample names (#4643 review F1)", () => {
+		// The pair Greptile's counterexample names: both claim
+		// `tsconfig.webprod.json`, which no `*` -> `app` sample produces.
+		expect(patternsShareOneName("tsconfig.*.json", "tsconfig*prod.json")).toBe(
+			true,
+		);
+		// Every pair the current catalog declares is disjoint: the hyphen and
+		// the dot are not prefix-compatible.
+		expect(patternsShareOneName("tsconfig-*.json", "tsconfig.*.json")).toBe(
+			false,
+		);
+		expect(patternsShareOneName("tsconfig.*.json", "other-*.json")).toBe(false);
+	});
+
+	// The closed catalog for #4636, pinned as a review artifact: these files are
+	// JSONC by convention, and the extension lookup answers `json` for all of
+	// them. Widening it is a decision, not an edit — microsoft/vscode 1.105.0
+	// names exactly these (extensions/typescript-basics/package.json:44-56 and
+	// extensions/json/package.json:50-72).
+	it("pins the JSONC-by-convention catalog on the jsonc entry", () => {
+		const jsonc = LANGUAGES.find((entry) => entry.id === "jsonc");
+		expect(jsonc?.filenames).toEqual([
+			".babelrc.json",
+			".eslintrc.json",
+			"babel.config.json",
+			"jsconfig.json",
+			"tsconfig.json",
+			"typedoc.json",
+		]);
+		expect(jsonc?.filenamePatterns).toEqual([
+			"jsconfig-*.json",
+			"jsconfig.*.json",
+			"tsconfig-*.json",
+			"tsconfig.*.json",
+		]);
+	});
 });
 
 describe("language registry <-> grammar manifest", () => {
@@ -314,6 +462,26 @@ describe("consumer projections track the registry", () => {
 		for (const entry of LANGUAGES) {
 			for (const extension of entry.extensions) {
 				expect(LANGUAGE_EXTENSIONS[extension], `LSP id for ${extension}`).toBe(
+					lspLanguageId(entry),
+				);
+			}
+		}
+	});
+
+	it("projects filename-declared languages (clients/lsp/language.ts)", () => {
+		// #4636: the seam asks the registry's filename tier before its extension
+		// table, so every name an entry DECLARES must reach that entry's LSP id.
+		// Without this, a new `filenames`/`filenamePatterns` member is announced
+		// under whatever suffix it happens to carry (`.json` -> `json`).
+		for (const entry of LANGUAGES) {
+			for (const filename of entry.filenames ?? []) {
+				expect(getLanguageId(`dir/${filename}`), `LSP id for ${filename}`).toBe(
+					lspLanguageId(entry),
+				);
+			}
+			for (const pattern of entry.filenamePatterns ?? []) {
+				const sample = `dir/${pattern.replaceAll("*", "app")}`;
+				expect(getLanguageId(sample), `LSP id for ${pattern}`).toBe(
 					lspLanguageId(entry),
 				);
 			}

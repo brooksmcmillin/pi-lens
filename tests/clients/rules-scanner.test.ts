@@ -2,41 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-	formatRulesForPrompt,
-	scanProjectRules,
-	type RuleScanResult,
-} from "../../clients/rules-scanner.js";
+import { scanProjectRules } from "../../clients/rules-scanner.js";
 import { removeTempDirSync } from "./test-utils.js";
-
-function makeResult(count: number): RuleScanResult {
-	return {
-		hasCustomRules: count > 0,
-		rules: Array.from({ length: count }, (_, i) => ({
-			source: i % 2 === 0 ? ".claude/rules" : ".agents/rules",
-			name: `rule-${i}.md`,
-			filePath: `/tmp/rule-${i}.md`,
-			relativePath: `${i % 2 === 0 ? ".claude/rules" : ".agents/rules"}/rule-${i}.md`,
-		})),
-	};
-}
-
-describe("rules-scanner prompt formatting", () => {
-	it("caps listed rules and includes omitted count", () => {
-		const result = makeResult(30);
-		const text = formatRulesForPrompt(result);
-
-		expect(text).toContain("additional rule file(s) not listed");
-		expect((text.match(/^- `.*`/gm) ?? []).length).toBeLessThanOrEqual(12);
-	});
-
-	it("caps total prompt size", () => {
-		const result = makeResult(50);
-		const text = formatRulesForPrompt(result);
-
-		expect(text.length).toBeLessThanOrEqual(920);
-	});
-});
 
 describe("rules-scanner depth cap (#250/#747 class)", () => {
 	let tmp: string;

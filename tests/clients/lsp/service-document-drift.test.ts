@@ -97,6 +97,7 @@ function makeClient(
 		diagnosticsVersion: 0,
 		getDiagnostics: vi.fn(() => []),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async (filePath: string, content: string) => {
 				await behaviour.onOpen?.(filePath, content);
 				openDocuments.add(path.resolve(filePath));
@@ -755,6 +756,109 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 				group?.latestReasons.some((e) => /resync FAILED/.test(e.reason)),
 			).toBe(true);
 		});
+	});
+
+	// #4503: the record cap evicted by INSERTION order alone, so a workspace
+	// sweep (one touch per project file, every document still held) unbound the
+	// earliest files. The server kept answering from their pre-edit bytes and no
+	// record was left to compare disk against, so an untracked edit to them could
+	// never heal for the life of the server.
+	it("keeps the drift record of a held document past the record cap (#4503)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const { DRIFT_TRACK_CAP } =
+			await import("../../../clients/lsp/document-drift.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const client = makeClient(openDocuments);
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		createLSPClient.mockResolvedValue(client);
+
+		// The document this test holds open, stamped first, so it is the oldest
+		// record the cap reaches for.
+		await service.touchFile(file, ORIGINAL, {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		// One workspace sweep's worth of touches: `DRIFT_TRACK_CAP` more, every
+		// one of those documents still open on the server.
+		for (let i = 0; i < DRIFT_TRACK_CAP; i++) {
+			const swept = path.join(dir, `swept-${i}.ts`);
+			const content = `export const swept${i} = 0;\n`;
+			await fs.writeFile(swept, content, "utf-8");
+			await service.touchFile(swept, content, {
+				diagnostics: "none",
+				clientScope: "primary",
+				source: "lsp_sync",
+			});
+		}
+		expect(openDocuments.has(path.resolve(file))).toBe(true);
+		expect(client.received).toContain(ORIGINAL);
+
+		// The untracked bulk edit: no didChange, so only the drift backstop can
+		// compare the server's view against disk.
+		await bulkEditOnDisk();
+
+		const result = await service.sweepDocumentDrift({ force: true });
+
+		expect(result?.candidates).toBe(1);
+		expect(result?.resynced).toBe(1);
+		expect(client.received).toContain(BULK_EDITED);
+	});
+
+	// #4503 acceptance 2: the tracked set is bounded by the held-document count,
+	// so it can stand above the cap. That growth is named once per session in the
+	// real sink rather than only being observable in memory.
+	it("names the cap crossing once when every tracked record is held (#4503)", async () => {
+		const previousTestMode = process.env.PI_LENS_TEST_MODE;
+		// latency.log writes are off under test mode; the row is read back from
+		// the real sink, as the HEAD-move witness does.
+		process.env.PI_LENS_TEST_MODE = "0";
+		try {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const { DRIFT_TRACK_CAP } =
+				await import("../../../clients/lsp/document-drift.js");
+			const { flushLatencyLog } =
+				await import("../../../clients/latency-logger.js");
+			const { getGlobalPiLensLogDir } =
+				await import("../../../clients/probe-home-state.js");
+			const service = new LSPService();
+			const client = makeClient(new Set<string>());
+			getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+			createLSPClient.mockResolvedValue(client);
+
+			for (let i = 0; i < DRIFT_TRACK_CAP + 2; i++) {
+				const swept = path.join(dir, `capped-${i}.ts`);
+				const content = `export const capped${i} = 0;\n`;
+				await fs.writeFile(swept, content, "utf-8");
+				await service.touchFile(swept, content, {
+					diagnostics: "none",
+					clientScope: "primary",
+					source: "lsp_sync",
+				});
+			}
+			expect(service._driftTrackedCountForTests()).toBe(DRIFT_TRACK_CAP + 2);
+
+			await flushLatencyLog();
+			const log = path.join(getGlobalPiLensLogDir(), "latency.log");
+			const rows = (await fs.readFile(log, "utf-8"))
+				.split("\n")
+				.filter((line) => line.includes('"lsp_document_drift_cap"'))
+				.map(
+					(line) => JSON.parse(line) as { metadata: Record<string, unknown> },
+				);
+
+			// One row for the crossing, not one per insert past the cap.
+			expect(rows.map((row) => row.metadata)).toEqual([
+				{ tracked: DRIFT_TRACK_CAP + 1, cap: DRIFT_TRACK_CAP },
+			]);
+		} finally {
+			if (previousTestMode === undefined) {
+				delete process.env.PI_LENS_TEST_MODE;
+			} else {
+				process.env.PI_LENS_TEST_MODE = previousTestMode;
+			}
+		}
 	});
 
 	it("paces a large recovered Git change through the existing four-file scheduler (#2817 round 2 F1)", async () => {

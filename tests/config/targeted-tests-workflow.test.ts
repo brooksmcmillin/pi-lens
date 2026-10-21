@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
+import { BUDGET_MS } from "../../scripts/ci-shuffle-changed-tests.mjs";
 import {
 	CI_ONLY_PRE_PUSH_TESTS,
 	TEST_TREE_GOVERNANCE_TESTS,
@@ -18,6 +19,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { siblingPin } from "../support/sibling-pin.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const TESTS_ROOT = resolve(ROOT, "tests");
@@ -575,6 +577,16 @@ export function discoveredTreeScanners(): string[] {
 	return discoverTreeScannersFromWalk(readWalkedFiles(walked), readWalkedFile);
 }
 
+/** Registrations that appear in BOTH registry lists, sorted. */
+function bothTreeScanners(registered: readonly string[]): string[] {
+	const counts = new Map<string, number>();
+	for (const file of registered) counts.set(file, (counts.get(file) ?? 0) + 1);
+	return [...counts.entries()]
+		.filter(([, count]) => count > 1)
+		.map(([file]) => file)
+		.sort();
+}
+
 // One census per worker: two assertions read the same walking of ~1,200 files.
 let censusCache: string[] | undefined;
 function census(): string[] {
@@ -591,13 +603,19 @@ function readWorkflow() {
 				name?: string;
 				if?: string;
 				"continue-on-error"?: boolean;
+				"timeout-minutes"?: number;
 				steps?: Array<{
+					name?: string;
+					if?: string;
+					"timeout-minutes"?: number;
+					env?: Record<string, string>;
 					uses?: string;
 					run?: string;
 					with?: Record<string, unknown>;
 				}>;
 			}
 		>;
+		on: Record<string, unknown>;
 	};
 }
 
@@ -623,8 +641,23 @@ describe("targeted advisory workflow contract (#3215)", () => {
 				...TREE_SCANNING_GOVERNANCE_TESTS,
 				...TEST_TREE_GOVERNANCE_TESTS,
 			];
-			expect(expectedRegistry).toEqual([...registered].sort());
-			expect(new Set(registered).size).toBe(registered.length);
+			// #4590: a scanner that walks BOTH trees is registered in BOTH lists,
+			// because each list is armed by a different change kind and the union
+			// cannot see which half a given file needs. The census equality is over
+			// the deduped union, and the both-list population is pinned exactly, so
+			// no other scanner can drift into both lists — #3951's concern (a
+			// tests-only scanner hiding in the production list) still reds.
+			const bothLists = bothTreeScanners(registered);
+			expect(
+				bothLists,
+				"a scanner in both lists is armed by a production change AND a " +
+					"tests/ change; only a scanner that walks both trees may be, and " +
+					"the list is pinned",
+			).toEqual(["tests/config/env-path-key-composition-sweep.test.ts"]);
+			expect(expectedRegistry).toEqual([...new Set(registered)].sort());
+			expect(new Set(registered).size).toBe(
+				registered.length - bothLists.length,
+			);
 
 			// Dead-sweep floors (AGENTS.md shape 10, #1718): the census cannot pass
 			// by discovering nothing. Registered through the sweep-kit seam so the
@@ -692,14 +725,22 @@ describe("targeted advisory workflow contract (#3215)", () => {
 			step.uses?.startsWith("actions/checkout@"),
 		);
 		expect(checkout?.uses).toBe(
-			"actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+			siblingPin(
+				readWorkflow().jobs,
+				"actions/checkout",
+				"targeted-tests-advisory",
+			),
 		);
 		expect(checkout?.with?.["fetch-depth"]).toBe(0);
 		const setupNode = job?.steps?.find((step) =>
 			step.uses?.startsWith("actions/setup-node@"),
 		);
 		expect(setupNode?.uses).toBe(
-			"actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",
+			siblingPin(
+				readWorkflow().jobs,
+				"actions/setup-node",
+				"targeted-tests-advisory",
+			),
 		);
 	});
 
@@ -727,6 +768,47 @@ describe("targeted advisory workflow contract (#3215)", () => {
 		);
 		expect(selector).toContain("GITHUB_STEP_SUMMARY");
 		expect(selector).toContain("cap exceeded");
+	});
+
+	// #4397 recurrence: a PR's new test file that depends on case order passes
+	// in CI's file order and reds on a reorder or a shard split (#4390, #4391).
+	// The step below is the only thing that reorders it before merge, so a
+	// reworded step name, a dropped `env`, or SHAs spliced into `run:` (event
+	// data in a shell string) must red here.
+	it("runs the changed-test shuffle step after the build, with the SHAs in env only (#4397)", () => {
+		const workflow = readWorkflow();
+		const job = workflow.jobs["targeted-tests-advisory"];
+		const steps = job?.steps ?? [];
+		const index = steps.findIndex(
+			(step) => step.name === "Changed test files, alone and shuffled",
+		);
+		expect(index).toBeGreaterThan(-1);
+		const step = steps[index];
+		expect(step.run).toBe(
+			'node scripts/ci-shuffle-changed-tests.mjs --base "$BASE_SHA" --head "$HEAD_SHA"',
+		);
+		expect(step.run).not.toContain("${{");
+		expect(step.env).toMatchObject({
+			BASE_SHA: "${{ github.event.pull_request.base.sha }}",
+			HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
+		});
+		// It follows the build and the selector run: the compiled twins exist.
+		expect(index).toBeGreaterThan(
+			steps.findIndex((other) => other.run === "npm run build"),
+		);
+		expect(index).toBeGreaterThan(
+			steps.findIndex((other) => other.name === "Run targeted tests"),
+		);
+		// A red selector must not skip it, and a cancelled run must.
+		expect(step.if).toBe("${{ !cancelled() }}");
+		// The script's own budget sits a minute under the step cap (the kill and
+		// the summary, #4456), the step cap under the job's (15 min).
+		const stepCap = step["timeout-minutes"] ?? Infinity;
+		expect(stepCap * 60_000).toBeGreaterThanOrEqual(BUDGET_MS + 60_000);
+		expect(stepCap).toBeLessThan(job?.["timeout-minutes"] ?? 0);
+		// pull_request, never pull_request_target: the step runs the PR's code.
+		expect(Object.keys(workflow.on)).toContain("pull_request");
+		expect(Object.keys(workflow.on)).not.toContain("pull_request_target");
 	});
 });
 

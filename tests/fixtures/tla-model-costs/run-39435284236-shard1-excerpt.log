@@ -1,0 +1,8 @@
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:22.7434419Z ok   formal/blocker-pending/CarryOwed.cfg: expected pass, got pass (5.0s)
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:22.8895894Z ok   formal/blocker-pending/CarryGateBTwin.cfg: expected pass, got pass (5.2s)
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:23.0517655Z ok   formal/blocker-pending/CarryGateB.cfg: expected pass, got pass (5.4s)
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:24.2408359Z ok   formal/blocker-pending/MutDeltaClear.cfg: expected violated GateHonest, got violated GateHonest (1.4s)
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:24.2906473Z ok   formal/blocker-pending/MutDeferredInFlight.cfg: expected violated ResolvedHonest, got violated ResolvedHonest (1.5s)
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:24.4217252Z ok   formal/blocker-pending/MutDeltaResolved.cfg: expected violated ResolvedHonest, got violated ResolvedHonest (1.4s)
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:25.6934662Z ok   formal/blocker-pending/MutPromotedClear.cfg: expected violated RecordedKept, got violated RecordedKept (1.5s)
+TLA+ models (shard 1/4)	UNKNOWN STEP	2026-10-20T14:06:25.7214643Z ok   formal/blocker-pending/MutSkipVerdict.cfg: expected violated GateSound, got violated GateSound (1.4s)

@@ -265,6 +265,121 @@ describe("cache-observability — context observations (#1018 follow-up)", () =>
 		).toBeDefined();
 	});
 
+	it("names the request hook and the message the prefix anchors on (#4631)", () => {
+		// A pi 0.87+ request: the hook that sees the full transcript reports which
+		// one it is, and the prefix hash names the SYSTEM head it anchored on, so a
+		// rewritten head is readable instead of a stable-looking conversation.
+		observeCacheContext({
+			sessionId: "s",
+			turnIndex: 0,
+			injectionEnabled: true,
+			existingMessages: [{ role: "system", content: "BASE" }],
+			placement: "append",
+			injectionHook: "context_with_system",
+		});
+		expect(latencyEntries[0].metadata?.injectionHook).toBe(
+			"context_with_system",
+		);
+
+		// A caller that does not name its hook records `null`, never a guess.
+		observeCacheContext({
+			sessionId: "s",
+			turnIndex: 0,
+			injectionEnabled: false,
+			existingMessages: [{ role: "user", content: "private" }],
+		});
+		expect(latencyEntries[1].metadata?.injectionHook).toBeNull();
+
+		observeCachePrefix([{ role: "system", content: "BASE" }], 0, "s");
+		observeCachePrefix(
+			[{ role: "system", content: "BASE\n\nMERGED SECTION" }],
+			1,
+			"s",
+		);
+		const prefixRows = latencyEntries.filter(
+			(entry) => entry.phase === "cache_prefix_break",
+		);
+		expect(prefixRows).toHaveLength(2);
+		for (const row of prefixRows) {
+			expect(row.metadata?.firstMessageRole).toBe("system");
+		}
+	});
+
+	it("sees a rebuilt system head whose sections and tool table changed (#4631, F1)", () => {
+		// pi 1.3.0's `context_with_system` transcript leads with its SYSTEM head:
+		// `content` is empty, the prompt lives in `sections`, and the tool table in
+		// `toolsAdded`. Hashed as `{ role, content }` that head is the constant
+		// `{"role":"system","content":""}`, so a rebuilt head read as a stable
+		// prefix and the miss verdict stayed `unknown` — the #4631 symptom.
+		const head = (over: Record<string, unknown> = {}) => ({
+			role: "system",
+			content: "",
+			sections: {
+				preamble: "You are an expert coding assistant operating inside pi.",
+				rules: "- Use bash for file operations",
+				cwd: "<cwd>\n/proj\n</cwd>",
+			},
+			timestamp: 1792479807686,
+			toolsAdded: [{ name: "read" }, { name: "bash" }],
+			...over,
+		});
+
+		// A SECTION-ONLY rebuild: every other field, `content` included, is
+		// untouched. This is the change the old projection could not see.
+		expect(observeCachePrefix([head()], 0, "sec")).toBe("baseline");
+		expect(
+			observeCachePrefix(
+				[
+					head({
+						sections: {
+							preamble:
+								"You are an expert coding assistant operating inside pi.",
+							rules: "- Use rg instead of grep",
+							cwd: "<cwd>\n/proj\n</cwd>",
+						},
+					}),
+				],
+				1,
+				"sec",
+			),
+		).toBe("changed");
+
+		// A TOOL-TABLE-only rebuild: the prompt is byte-identical, `toolsAdded`
+		// grew the way a `pi_lens_activate_tools` delta grows it.
+		expect(observeCachePrefix([head()], 0, "tool")).toBe("baseline");
+		expect(
+			observeCachePrefix(
+				[
+					head({
+						toolsAdded: [
+							{ name: "read" },
+							{ name: "bash" },
+							{ name: "ast_grep_search" },
+						],
+					}),
+				],
+				1,
+				"tool",
+			),
+		).toBe("changed");
+
+		// Control both ways: an unchanged head must NOT read as a break, or the
+		// signal would trade a permanent "stable" for a permanent "changed".
+		expect(observeCachePrefix([head()], 0, "same")).toBe("baseline");
+		expect(observeCachePrefix([head()], 1, "same")).toBe("unchanged");
+
+		const breakRows = latencyEntries.filter(
+			(entry) =>
+				entry.phase === "cache_prefix_break" &&
+				entry.metadata?.baseline === undefined,
+		);
+		expect(breakRows).toHaveLength(2);
+		for (const row of breakRows) {
+			expect(row.metadata?.firstMessageRole).toBe("system");
+			expect(row.metadata?.previousHash).not.toBe(row.metadata?.currentHash);
+		}
+	});
+
 	it("caps counts and hashes without writing prompt or finding contents", () => {
 		const privateText = "DO_NOT_LOG_THIS_PROMPT_".repeat(20_000);
 		observeCacheContext({

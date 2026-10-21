@@ -19,6 +19,26 @@
     "clients/mcp/analyze.ts": {
       "path": "pr-3799-analyze.ts.txt",
       "oid": "543e9473c69367b8b0838be9e4289d31b00274ad"
+    },
+    "tests/clients/dispatch/dispatcher-flow.test.ts": {
+      "path": "pr-3799-dispatcher-flow.test.ts.txt",
+      "oid": "319fd6e61b5fd28168c7741c8614fb010b8785f3"
+    },
+    "tests/clients/dispatch/integration.test.ts": {
+      "path": "pr-3799-integration.test.ts.txt",
+      "oid": "6fc42f02204b4faa7678bc0de32242bd4ba17f2e"
+    },
+    "tests/clients/dispatch/runners/runner-status-semantics.test.ts": {
+      "path": "pr-3799-runner-status-semantics.test.ts.txt",
+      "oid": "094576d5659907c81a2ed630e193cbe3a387c7ba"
+    },
+    "tests/mcp/analyze-cli.test.ts": {
+      "path": "pr-3799-analyze-cli.test.ts.txt",
+      "oid": "d09708eb41a076ee878a804ccb3a9d13a632a3eb"
+    },
+    "tests/mcp/analyze-coverage-repeat.smoke.test.ts": {
+      "path": "pr-3799-analyze-coverage-repeat.smoke.test.ts.txt",
+      "oid": "0616ca20b8707d78d6588176bae6e86375cc3c92"
     }
   }
 }

@@ -155,6 +155,7 @@ function makeScanner(
 			return true;
 		}),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {
 				stats.opens += 1;
 				if (stats.wedged) return new Promise<void>(() => {});
@@ -202,6 +203,7 @@ function makePrimary(serverId: string) {
 		getDiagnostics: vi.fn(() => []),
 		pingLiveness: vi.fn(async () => true),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			close: vi.fn(async () => {}),

@@ -1,0 +1,28 @@
+# A hardened pod: trivy's kubernetes ruleset reports 0 failures at the
+# HIGH,CRITICAL floor the runner asks for, so this is a real clean run of
+# `trivy config` (trivy 0.76.0). It stays a k8s manifest so the runner's
+# shape check reaches its work spawn.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: nginx@sha256:0f0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        privileged: false
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          cpu: 100m
+          memory: 128Mi

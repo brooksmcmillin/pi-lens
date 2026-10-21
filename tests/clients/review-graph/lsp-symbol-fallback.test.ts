@@ -43,11 +43,16 @@ afterEach(() => {
 	vi.clearAllMocks();
 });
 
+// #4342: the fixtures are `.py` (python is a CORE grammar, bundled with the
+// package), not `.dart`. A dart fixture needed tree-sitter-dart.wasm, which is
+// not core, so a cold grammar cache sent the test to the CDN inside
+// buildOrUpdateGraph; a slow CDN on a loaded shard stalled it past the 5 s test
+// timeout. Python is non-jsts, so it still reaches the zero-symbol LSP fallback.
 describe("review graph LSP symbol fallback (#307)", () => {
 	it("adds hierarchical LSP nodes with provenance and persists them", async () => {
 		const env = setupTestEnvironment("pi-lens-graph-lsp-");
 		try {
-			const file = createTempFile(env.tmpDir, "lib/main.dart", "// opaque\n");
+			const file = createTempFile(env.tmpDir, "lib/main.py", "# opaque\n");
 			process.env.PI_LENS_GRAPH_PERSIST_DEBOUNCE_MS = "100000";
 			vi.mocked(getOpenDocumentSymbols).mockResolvedValue([
 				{
@@ -104,7 +109,7 @@ describe("review graph LSP symbol fallback (#307)", () => {
 	it("recovers native-TS7-shaped flat containment from containerName", async () => {
 		const env = setupTestEnvironment("pi-lens-graph-lsp-flat-");
 		try {
-			const file = createTempFile(env.tmpDir, "lib/main.dart", "// opaque\n");
+			const file = createTempFile(env.tmpDir, "lib/main.py", "# opaque\n");
 			vi.mocked(getOpenDocumentSymbols).mockResolvedValue([
 				{
 					name: "ReviewManager",
@@ -143,7 +148,7 @@ describe("review graph LSP symbol fallback (#307)", () => {
 	it("logs and degrades when no warm/open server is available", async () => {
 		const env = setupTestEnvironment("pi-lens-graph-lsp-cold-");
 		try {
-			const file = createTempFile(env.tmpDir, "lib/main.dart", "// opaque\n");
+			const file = createTempFile(env.tmpDir, "lib/main.py", "# opaque\n");
 			vi.mocked(getOpenDocumentSymbols).mockResolvedValue(undefined);
 			const graph = await buildOrUpdateGraph(
 				env.tmpDir,
@@ -197,15 +202,15 @@ describe("review graph LSP symbol fallback (#307)", () => {
 		// in a warm client — which is exactly when LSP recovery is wanted.
 		const env = setupTestEnvironment("pi-lens-graph-lsp-ir-empty-");
 		try {
-			const content = "// legitimately no declarations\n";
-			const file = createTempFile(env.tmpDir, "lib/main.dart", content);
+			const content = "# legitimately no declarations\n";
+			const file = createTempFile(env.tmpDir, "lib/main.py", content);
 			publishReviewGraphFileIr(env.tmpDir, {
 				filePath: file,
 				contentHash: createHash("sha256").update(content).digest("hex"),
 				complete: true,
 				structural: {
 					kind: "tree-sitter",
-					languageId: "dart",
+					languageId: "python",
 					extracted: { symbols: [], refs: [], imports: [] },
 				},
 			});

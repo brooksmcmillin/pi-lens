@@ -79,8 +79,8 @@ beforeEach(() => {
 		configurable: true,
 	});
 	// Every `process.kill` in these cases is refused, except the liveness probe
-	// (signal 0), which must stay answerable. `child.pid` is fabricated, so a
-	// real signal must never be sent either way.
+	// (signal 0), which must stay answerable. These cases use fake handles;
+	// any accidental pid-level signal must still be intercepted.
 	killSpy = vi.spyOn(process, "kill").mockImplementation(((
 		_pid: number,
 		signal?: string | number,
@@ -110,7 +110,8 @@ afterEach(() => {
 
 /** A fake child whose `kill` throws for the signals named in `refuse`. */
 function childRefusing(refuse: readonly string[]) {
-	const child = makeFakeChild(4242);
+	// No OS identity: exercise handle teardown, not host-dependent group ownership.
+	const child = makeFakeChild();
 	child.kill = vi.fn((signal?: unknown) => {
 		if (refuse.includes(String(signal))) throw new Error(REFUSED);
 		child.killed = true;

@@ -2,7 +2,8 @@
 //
 // `scripts/check-pr-body.mjs` runs in the `PR body (advisory)` job, which
 // checks out the repo and runs plain Node with NO `npm install`. Everything
-// this module imports must therefore come from `node:` only -- `minimatch` and
+// this module imports must therefore come from `node:` or the dependency-free
+// `./defect-shapes.mjs` -- `minimatch` and
 // the other glob packages are unavailable on that lane.
 //
 // A PR that changes a file the checked-in `formal/coverage-map.json` maps to
@@ -16,6 +17,7 @@
 // #3802.
 import fs from "node:fs";
 import path from "node:path";
+import { blankMarkdown } from "./defect-shapes.mjs";
 
 /** Repo-relative location of the checked-in coverage map. */
 const COVERAGE_MAP_PATH = "formal/coverage-map.json";
@@ -415,30 +417,6 @@ export function validateCoverageMap(map, rootDir = process.cwd()) {
 	return errors;
 }
 
-/**
- * The PR body with fenced code blocks (``` or ~~~, closed by a marker at least
- * as long) and HTML comments blanked, so a declaration a reader cannot see
- * rendered never satisfies the rule. Fences are blanked first: GitHub gives a
- * fence precedence over a `<!--` inside it.
- */
-function blankFencesAndComments(body) {
-	let fence = null;
-	const unfenced = String(body ?? "")
-		.split(/\r?\n/)
-		.map((line) => {
-			const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
-			if (marker) {
-				if (!fence) fence = marker;
-				else if (marker[0] === fence[0] && marker.length >= fence.length)
-					fence = null;
-				return "";
-			}
-			return fence ? "" : line;
-		})
-		.join("\n");
-	return unfenced.replace(/<!--[\s\S]*?(?:-->|$)/g, "");
-}
-
 function bodyNamesFamily(lines, family) {
 	const escaped = family.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	// `(?![\w-])` keeps `read-guard` from matching `read-guard-foo`: the family
@@ -467,7 +445,7 @@ export function evaluateTlaCoverage({
 }) {
 	const changed = changedFiles.map(toPosix).sort(compareStrings);
 	const formalChanged = changed.filter((file) => file.startsWith("formal/"));
-	const lines = blankFencesAndComments(body).split(/\r?\n/);
+	const lines = blankMarkdown(body, { indentedCode: false }).split(/\r?\n/);
 	const errors = new Set();
 	const advisories = new Set();
 	const families = new Set(Array.isArray(map?.families) ? map.families : []);

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { htmlCommentEnd } from "./lib/defect-shapes.mjs";
 
 const MAX_WORDS = 30;
 const FILLER_PATTERNS = [
@@ -54,13 +55,10 @@ function blankMarkdown(text) {
 			let masked = "";
 			for (let index = 0; index < line.length;) {
 				if (inComment) {
-					const end = line.indexOf("-->", index);
-					if (end === -1) {
-						inComment = true;
-						break;
-					}
+					const end = htmlCommentEnd(line, index);
+					if (end === -1) break;
 					inComment = false;
-					index = end + 3;
+					index = end;
 					continue;
 				}
 				const start = line.indexOf("<!--", index);

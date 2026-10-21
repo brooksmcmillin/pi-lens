@@ -21,6 +21,19 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency,
 }));
 
+function defer<T = void>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((res) => {
+		resolve = res;
+	});
+	return { promise, resolve };
+}
+
+/** Drain the microtask queue so every queued continuation runs (no timers). */
+async function settle(turns = 50): Promise<void> {
+	for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
 describe("LSPService race hardening", () => {
 	beforeEach(() => {
 		vi.resetModules();
@@ -81,6 +94,89 @@ describe("LSPService race hardening", () => {
 		initialize.restore();
 	});
 
+	/**
+	 * Recurrence (#2372 slice 3, PR #4374 review F1): a caller that arrives
+	 * while the spawn gate is held by a capacity eviction must JOIN the spawn
+	 * already in flight. The unguarded `inFlight` read in `client-registry.ts`
+	 * is the only join for it: the gate re-read runs after the starter's
+	 * `finally` has cleared the entry, so without this read the joiner
+	 * double-spawns (xCreates=2) and the first client is overwritten in the
+	 * client map and never shut down (a leaked process). Through the real
+	 * service: ceiling 2, the victim is evicted to admit a third key while X
+	 * is still mid-spawn.
+	 */
+	it("a joiner behind a capacity-eviction gate joins the in-flight spawn, one client per key", async () => {
+		process.env.PI_LENS_LSP_CLIENT_CEILING = "2";
+		try {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const serverFor: Record<string, unknown> = {};
+			for (const id of ["victim", "xsrv", "ysrv"]) {
+				serverFor[`.f${id[0]}`] = {
+					id,
+					name: id,
+					extensions: [`.f${id[0]}`],
+					root: async () => "C:/repo",
+					spawn: vi.fn(async () => ({ process: {} })),
+				};
+			}
+			getServersForFileWithConfig.mockImplementation((f: string) => [
+				serverFor[f.slice(f.lastIndexOf("."))],
+			]);
+			const xGate = defer();
+			const victimShutdown = defer();
+			createLSPClient.mockImplementation(
+				async ({ serverId }: { serverId: string }) => {
+					if (serverId === "xsrv") await xGate.promise;
+					return {
+						serverId,
+						isAlive: () => true,
+						isBusy: () => false,
+						wasShutdownIntentional: () => false,
+						getExitedAt: () => undefined,
+						diagnosticsVersion: 0,
+						getWorkspaceDiagnosticsSupport: () => ({
+							advertised: false,
+							mode: "push-only",
+							diagnosticProviderKind: "unavailable",
+						}),
+						notify: {
+							open: vi.fn(async () => undefined),
+							change: vi.fn(async () => undefined),
+						},
+						shutdown: vi.fn(async () => {
+							if (serverId === "victim") await victimShutdown.promise;
+						}),
+					};
+				},
+			);
+
+			await service.getClientForFile("C:/repo/v.fv");
+			const pX = service.getClientForFile("C:/repo/a.fx");
+			await settle();
+			// Y holds the spawn gate: its capacity eviction awaits the victim's shutdown.
+			const pY = service.getClientForFile("C:/repo/y.fy");
+			await settle();
+			// B arrives for X while the gate is held. It must join X's spawn.
+			const pB = service.getClientForFile("C:/repo/b.fx");
+			await settle();
+			xGate.resolve();
+			await settle();
+			victimShutdown.resolve();
+			const [rX, , rB] = await Promise.all([pX, pY, pB]);
+
+			const xCreates = createLSPClient.mock.calls.filter(
+				([a]) => a.serverId === "xsrv",
+			).length;
+			expect(xCreates).toBe(1);
+			expect(rB?.client).toBeTruthy();
+			expect(rB?.client).toBe(rX?.client);
+			await service.shutdown({});
+		} finally {
+			delete process.env.PI_LENS_LSP_CLIENT_CEILING;
+		}
+	});
+
 	it("does not orphan the in-flight client when a waiter times out", async () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
@@ -114,10 +210,12 @@ describe("LSPService race hardening", () => {
 		expect(await timedOut).toBeUndefined();
 		const internal = service as unknown as {
 			state: { inFlight: Map<string, unknown>; clients: Map<string, unknown> };
-			clientLeases: Map<string, number>;
+			clientRegistry: {
+				clientLeases: Map<string, number>;
+			};
 		};
 		expect(internal.state.inFlight.size).toBe(1);
-		expect(internal.clientLeases.size).toBe(0);
+		expect(internal.clientRegistry.clientLeases.size).toBe(0);
 
 		initialize.release();
 		await service.getClientForFile(file);
@@ -126,7 +224,7 @@ describe("LSPService race hardening", () => {
 		expect(createLSPClient).toHaveBeenCalledTimes(1);
 		expect(service.getAliveClientCount()).toBe(1);
 		expect(internal.state.inFlight.size).toBe(0);
-		expect(internal.clientLeases.size).toBe(0);
+		expect(internal.clientRegistry.clientLeases.size).toBe(0);
 		await service.shutdown();
 		expect(client.shutdown).toHaveBeenCalledTimes(1);
 		expect(internal.state.clients.size).toBe(0);
@@ -148,7 +246,10 @@ describe("LSPService race hardening", () => {
 			}),
 			getAdvertisedCommands: () => [],
 			getRawCapabilityKeys: () => [],
-			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn().mockResolvedValue(undefined),
+			},
 		};
 		const initialize = suspendAt(createLSPClient, async () => client);
 		const spawn = vi.fn(async () => ({
@@ -243,7 +344,10 @@ describe("LSPService race hardening", () => {
 			}),
 			getAdvertisedCommands: () => [],
 			getRawCapabilityKeys: () => [],
-			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn().mockResolvedValue(undefined),
+			},
 		};
 		const initialize = suspendAt(createLSPClient, async () => client);
 		getServersForFileWithConfig.mockReturnValue([
@@ -309,7 +413,10 @@ describe("LSPService race hardening", () => {
 			}),
 			getAdvertisedCommands: () => [],
 			getRawCapabilityKeys: () => [],
-			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn().mockResolvedValue(undefined),
+			},
 		};
 		const initialize = suspendAt(createLSPClient, async () => client);
 		const internal = service as unknown as {

@@ -26,7 +26,12 @@ const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const WORKFLOW_PATH = ".github/workflows/ci-infra-kill-rerun.yml";
 
 type WorkflowStep = { run?: unknown };
-type WorkflowJob = { env?: unknown; if?: unknown; steps?: unknown };
+type WorkflowJob = {
+	env?: unknown;
+	if?: unknown;
+	steps?: unknown;
+	permissions?: unknown;
+};
 type ClassifyJob = { if?: unknown; steps?: unknown };
 type Workflow = {
 	on?: { pull_request?: { types?: unknown[] } };
@@ -80,7 +85,10 @@ interface WorkflowRunContext {
 	headBranch: string;
 	conclusion: string;
 	runAttempt: number;
+	headSha: string;
 	pullRequestNumber: string;
+	pullRequestUrl: string;
+	pullRequestHeadSha: string;
 }
 
 // Textual substitution of every dotted context path this expression reads,
@@ -97,9 +105,18 @@ const CONTEXT_PATHS: Array<[string, (ctx: WorkflowRunContext) => unknown]> = [
 	["github.event.workflow_run.head_branch", (ctx) => ctx.headBranch],
 	["github.event.workflow_run.conclusion", (ctx) => ctx.conclusion],
 	["github.event.workflow_run.run_attempt", (ctx) => ctx.runAttempt],
+	["github.event.workflow_run.head_sha", (ctx) => ctx.headSha],
 	[
 		"github.event.workflow_run.pull_requests[0].number",
 		(ctx) => ctx.pullRequestNumber,
+	],
+	[
+		"github.event.workflow_run.pull_requests[0].url",
+		(ctx) => ctx.pullRequestUrl,
+	],
+	[
+		"github.event.workflow_run.pull_requests[0].head.sha",
+		(ctx) => ctx.pullRequestHeadSha,
 	],
 ];
 
@@ -115,7 +132,8 @@ function substitute(expr: string, ctx: WorkflowRunContext): string {
 		}
 		out = out.split(path).join(literal);
 	}
-	if (out.includes("github.")) {
+	// A literal like "api.github.com" is not a context reference (#4382).
+	if (/(^|[^\w./])github\.(event|repository)/.test(out)) {
 		throw new Error(
 			`unsubstituted github.* reference survived evaluation: ${out}`,
 		);
@@ -132,6 +150,22 @@ function evaluateIf(expr: string, ctx: WorkflowRunContext): boolean {
 	return Boolean(fn());
 }
 
+// The two GitHub expression functions the PR_NUMBER env uses (#4382), with
+// GitHub's semantics: startsWith is case-insensitive, format fills {n}.
+function evaluateValue(expr: string, context: WorkflowRunContext): unknown {
+	const fn = new Function(
+		"startsWith",
+		"format",
+		`"use strict"; return (${substitute(expr, context)});`,
+	);
+	return fn(
+		(value: string, prefix: string) =>
+			value.toLowerCase().startsWith(prefix.toLowerCase()),
+		(template: string, ...values: string[]) =>
+			template.replace(/\{(\d+)\}/g, (_m, i) => values[Number(i)]),
+	);
+}
+
 const SAME_REPO = "acme/repo";
 const FORK_REPO = "someone-else/repo";
 
@@ -143,7 +177,10 @@ function ctx(overrides: Partial<WorkflowRunContext>): WorkflowRunContext {
 		headBranch: "feature-x",
 		conclusion: "failure",
 		runAttempt: 1,
+		headSha: "aaa111",
 		pullRequestNumber: "123",
+		pullRequestUrl: `https://api.github.com/repos/${SAME_REPO}/pulls/123`,
+		pullRequestHeadSha: "aaa111",
 		...overrides,
 	};
 }
@@ -205,9 +242,33 @@ const ROWS: Array<[string, WorkflowRunContext, boolean]> = [
 		ctx({ event: "push", headBranch: "master", conclusion: "success" }),
 		false,
 	],
+	// #4672: a CANCELLED master push is now judged (and rerun at most once)
+	// when the classifier proves every cancelled job finished its work. Before
+	// this, run 39380875926's cancelled `TLA+ models (shard 4/4)` reddened a
+	// required check on master and nothing recovered it.
 	[
-		"a CANCELLED run (nothing to classify)",
+		"a CANCELLED master push (the #4672 shard teardown race)",
 		ctx({ event: "push", headBranch: "master", conclusion: "cancelled" }),
+		true,
+	],
+	[
+		"a CANCELLED pull_request run (superseded by concurrency, not a race)",
+		ctx({ event: "pull_request", conclusion: "cancelled" }),
+		false,
+	],
+	[
+		"a CANCELLED push to a non-master branch",
+		ctx({ event: "push", headBranch: "not-master", conclusion: "cancelled" }),
+		false,
+	],
+	[
+		"a CANCELLED master push on its THIRD attempt (the same two-rerun bound)",
+		ctx({
+			event: "push",
+			headBranch: "master",
+			conclusion: "cancelled",
+			runAttempt: 3,
+		}),
 		false,
 	],
 	["a schedule-triggered run", ctx({ event: "schedule" }), false],
@@ -277,16 +338,120 @@ describe("ci-infra-kill-rerun.yml classify job gate (#2668 review F3)", () => {
 		expect(evaluateIf(unbounded, thirdAttempt)).toBe(true);
 	});
 
-	// Review round 2, MUT J: the `if:` truth table above cannot see this --
-	// it only pins whether the JOB runs, not what the STEP's own `elif` does
-	// once it has. The `push` arm must appear in the --allow-missing-pr
-	// branch (and no retired event arm may return), or a push run silently
-	// gets neither --pr nor --allow-missing-pr and the classifier throws
-	// (#2668 again).
-	it("the step's --allow-missing-pr branch names push and no retired event (review round 2, MUT J)", () => {
+	// Review round 2, MUT J (reshaped by #4382): the `if:` truth table above
+	// pins whether the JOB runs, not what the STEP does once it has. Every run
+	// that holds no PR of this repository (a push, or a PR run whose head moved
+	// on) must get --allow-missing-pr, or the classifier throws and the rerun
+	// never fires (#2668 again). The arm no longer names an event: the PR_NUMBER
+	// env decides.
+	// #4672 mutation-proof: the cancelled arm must be a CONJUNCTION with the
+	// master-push lane, not `conclusion == 'cancelled'` alone -- a PR run
+	// cancelled by `cancel-in-progress` would otherwise be rerun, spending
+	// quota on a head a newer run already owns.
+	it("mutation-proof: dropping the master-push conjunct from the cancelled arm would rerun a superseded PR run (#4672)", () => {
+		const cancelledPr = ctx({ event: "pull_request", conclusion: "cancelled" });
+		expect(evaluateIf(ifExpr, cancelledPr)).toBe(false);
+		const flat = ifExpr.replace(/\s+/g, " ");
+		const withoutLane = flat.replace(
+			/github\.event\.workflow_run\.conclusion == 'cancelled' && github\.event\.workflow_run\.event == 'push' && github\.event\.workflow_run\.head_branch == 'master'/,
+			"github.event.workflow_run.conclusion == 'cancelled'",
+		);
+		expect(withoutLane).not.toBe(flat);
+		expect(evaluateIf(withoutLane, cancelledPr)).toBe(true);
+	});
+
+	it("the step's --allow-missing-pr branch is the empty-PR_NUMBER arm and no retired event returns (review round 2, MUT J; #4382)", () => {
 		const stepRun = readClassifyStepRun();
-		expect(stepRun).toContain('"$RUN_EVENT" == "push"');
+		expect(stepRun).toMatch(
+			/if \[\[ -n "\$PR_NUMBER" \]\]; then\s+args\+=\(--pr "\$PR_NUMBER"\)\s+else[\s\S]*?args\+=\(--allow-missing-pr\)\s+fi/,
+		);
 		expect(stepRun).not.toContain("repository_dispatch");
+	});
+});
+
+// #4382 recurrence: run 38514228860 crashed with `POST .../issues/23/comments
+// -> HTTP 403` because a master PUSH run's `pull_requests` listed other
+// repositories' namesake PRs (brooksmcmillin/pi-lens#23, floatGray/pi-lens#2:
+// head branch `master`), and PR_NUMBER took `[0].number`. Issue 23 of this
+// repository is a closed issue, not a PR. Both jobs that read PR_NUMBER must
+// derive it with the same expression, which yields a number only for a
+// pull_request run, from an entry of this repository, at the run's own head.
+describe("ci-infra-kill-rerun.yml PR_NUMBER derivation (#4382)", () => {
+	const jobs = loadWorkflow().jobs as Record<string, WorkflowJob>;
+	const prNumberExpr = (job: string): string => {
+		const env = jobs[job]?.env as Record<string, unknown> | undefined;
+		const value = env?.PR_NUMBER;
+		if (typeof value !== "string") {
+			throw new Error(`${WORKFLOW_PATH}: jobs.${job}.env.PR_NUMBER missing`);
+		}
+		const inner = /^\$\{\{([\s\S]*)\}\}$/.exec(value.trim())?.[1];
+		if (inner === undefined) {
+			throw new Error(
+				`${WORKFLOW_PATH}: ${job} PR_NUMBER is not one expression`,
+			);
+		}
+		return inner.trim();
+	};
+
+	const OTHER_REPO_PR =
+		"https://api.github.com/repos/brooksmcmillin/pi-lens/pulls/23";
+	const rows: Array<[string, WorkflowRunContext, string]> = [
+		[
+			"master push listing another repository's PR #23 at the same sha (the 38514228860 payload)",
+			ctx({
+				event: "push",
+				headBranch: "master",
+				pullRequestNumber: "23",
+				pullRequestUrl: OTHER_REPO_PR,
+			}),
+			"",
+		],
+		[
+			"master push listing a PR of THIS repository at the run's own head",
+			ctx({ event: "push", headBranch: "master" }),
+			"",
+		],
+		[
+			"same-repo PR run at the run's own head",
+			ctx({ event: "pull_request" }),
+			"123",
+		],
+		[
+			"PR run whose listed PR head moved on (stale run)",
+			ctx({ event: "pull_request", pullRequestHeadSha: "bbb222" }),
+			"",
+		],
+		[
+			"PR run listing another repository's namesake PR at a matching sha",
+			ctx({
+				event: "pull_request",
+				pullRequestNumber: "23",
+				pullRequestUrl: OTHER_REPO_PR,
+			}),
+			"",
+		],
+	];
+
+	for (const job of ["classify", "finalize-rerun"]) {
+		it.each(rows)(`${job}: %s`, (_name, context, expected) => {
+			expect(String(evaluateValue(prNumberExpr(job), context))).toBe(expected);
+		});
+	}
+
+	it("both jobs derive PR_NUMBER with one expression", () => {
+		expect(prNumberExpr("classify")).toBe(prNumberExpr("finalize-rerun"));
+	});
+
+	// The write set of the classify job: rerun (actions), checkout (contents),
+	// PR comment + labels (pull-requests). No `issues` scope: a comment on a
+	// non-PR issue is refused by design, and the fix is to never target one.
+	it("classify grants exactly the scopes it writes with", () => {
+		const permissions = jobs.classify?.permissions;
+		expect(permissions).toEqual({
+			actions: "write",
+			contents: "read",
+			"pull-requests": "write",
+		});
 	});
 });
 

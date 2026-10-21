@@ -14,6 +14,7 @@
  * - To: await safeSpawnAsync(cmd, args, opts)
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	type ChildProcess,
 	type SpawnOptions,
@@ -50,6 +51,7 @@ export type SpawnFailureType =
 	| "cwd-unresolvable"
 	| "permission-denied"
 	| "spawn-failed"
+	| "trust-refused"
 	| "timeout"
 	| "killed";
 
@@ -520,7 +522,8 @@ function sweepHeldOwnPids(): void {
 	}
 	// No hand-rolled "drop the oldest" block (#2442 / #3091 round 4): the
 	// last-resort eviction, for the case where every held group is still alive
-	// at the ceiling, is `BoundedSet.add`'s own FIFO overflow.
+	// at the ceiling, is `BoundedSet.add`'s own FIFO overflow; the caller
+	// records it (#3096).
 }
 
 /**
@@ -545,7 +548,15 @@ export function holdOwnChildPid(
 	// and its release mutation-inert — the FIFO copy would answer for them.
 	verifiedOwnPids.delete(pid);
 	sweepHeldOwnPids();
-	heldOwnPids.add(pid);
+	const evicted = heldOwnPids.add(pid);
+	if (evicted.length > 0) {
+		incrementDegradationCount({
+			kind: "held-own-pid-evicted",
+			subject: site,
+			reason: `held-pid set full of live groups at ${HELD_OWN_PID_SWEEP_AT}; dropped oldest pid ${evicted.join(",")}, a group kill after its leader dies is refused`,
+			metadata: { evicted: evicted.length },
+		});
+	}
 	return true;
 }
 
@@ -1449,6 +1460,9 @@ const SPAWN_SAMPLER_TEARDOWN_GRACE_MS = 5_000;
 // ASYNC VERSION (Recommended - Non-blocking)
 // ============================================================================
 
+/** Capture-local cancellation; async context prevents interference with concurrent dispatch. */
+export const spawnAbortScope = new AsyncLocalStorage<AbortSignal>();
+
 /**
  * Async spawn with timeout and proper process cleanup.
  *
@@ -1504,9 +1518,14 @@ export async function safeSpawnAsync(
 	// Fall back to the current turn's ambient signal (set from ctx.signal) so an
 	// Esc/abort mid-turn cancels dispatches that didn't thread a signal of their
 	// own — unless the caller opts out (installs, which must run to completion).
-	const abortSignal =
+	const callerSignal =
 		options?.signal ??
 		(options?.ignoreAmbientSignal ? undefined : ambientAbortSignal);
+	const scopedSignal = spawnAbortScope.getStore();
+	const abortSignal =
+		scopedSignal && callerSignal
+			? AbortSignal.any([scopedSignal, callerSignal])
+			: (scopedSignal ?? callerSignal);
 
 	return new Promise((resolve) => {
 		// Check for early abort
@@ -2588,8 +2607,8 @@ export async function findCommandAsync(
 
 	if (result.status !== 0 || result.error) return null;
 
-	// Take first line (first match)
-	return result.stdout.trim().split("\n")[0] || null;
+	// Take the first line (first match). `where` ends lines with CRLF.
+	return result.stdout.trim().split(/\r?\n/)[0] || null;
 }
 
 // ============================================================================
@@ -2753,5 +2772,5 @@ export function findCommand(command: string): string | null {
 
 	if (result.status !== 0) return null;
 
-	return result.stdout.trim().split("\n")[0] || null;
+	return result.stdout.trim().split(/\r?\n/)[0] || null;
 }

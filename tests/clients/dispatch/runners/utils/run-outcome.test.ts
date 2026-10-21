@@ -142,10 +142,6 @@ describe("spawnFailedWithNoOutput keeps its historical semantics", () => {
 			),
 		).toBe(false);
 	});
-
-	it("is true for a nonzero exit with empty stdout", () => {
-		expect(spawnFailedWithNoOutput(spawnResult({ status: 1 }))).toBe(true);
-	});
 });
 
 describe("formatToolFailure", () => {

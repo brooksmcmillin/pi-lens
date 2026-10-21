@@ -50,6 +50,41 @@ describe("rule-policy.matchesRule", () => {
 		expect(evaluateRulePolicy("C006", policyMap)).toEqual({ dropped: true });
 	});
 
+	it("drops both copies of a Pyright finding by the bare code a user lists (#4629)", () => {
+		// The language server renders `Pyright:<code>` (`basedpyright:<code>` for
+		// that fork) and the CLI prints `<code>`; one bare entry reaches all three.
+		const policyMap = { pyright: { disable: ["reportAssignmentType"] } };
+		for (const rule of [
+			"Pyright:reportAssignmentType",
+			"basedpyright:reportAssignmentType",
+			"reportAssignmentType",
+		]) {
+			expect(evaluateRulePolicy(rule, policyMap)).toEqual({ dropped: true });
+		}
+		expect(evaluateRulePolicy("Pyright:reportReturnType", policyMap)).toEqual({
+			dropped: false,
+		});
+	});
+
+	it("does not drop another server's same-named code for a bare Pyright entry (#4629)", () => {
+		const policyMap = { pyright: { disable: ["reportAssignmentType"] } };
+		expect(evaluateRulePolicy("ty:reportAssignmentType", policyMap)).toEqual({
+			dropped: false,
+		});
+	});
+
+	it("keeps the language server's Pyright copy of a rule a bare select entry names (#4629)", () => {
+		// Before the prefixes were listed, `select` kept the CLI copy and dropped
+		// the server's copy of the very rule it names.
+		const policyMap = { pyright: { select: ["reportAssignmentType"] } };
+		expect(
+			evaluateRulePolicy("Pyright:reportAssignmentType", policyMap),
+		).toEqual({ dropped: false });
+		expect(evaluateRulePolicy("Pyright:reportReturnType", policyMap)).toEqual({
+			dropped: true,
+		});
+	});
+
 	it("does NOT drop a different rule", () => {
 		const policyMap = { "no-eval": { disable: ["no-eval"] } };
 		expect(evaluateRulePolicy("no-debugger", policyMap)).toEqual({

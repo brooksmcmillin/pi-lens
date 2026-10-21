@@ -19,6 +19,7 @@ import {
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 import * as yaml from "js-yaml";
+import { escapeMarkdownCell } from "./lib/markdown-cell.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
@@ -62,7 +63,7 @@ function cell(text, max = 140) {
 		.replace(/\s+/g, " ")
 		.trim();
 	if (s.length > max) s = s.slice(0, max - 1).trimEnd() + "…";
-	return s.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
+	return escapeMarkdownCell(s);
 }
 
 function titleCase(lang) {

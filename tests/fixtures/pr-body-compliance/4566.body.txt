@@ -1,0 +1,1281 @@
+<!-- ORCHESTRATOR SUMMARY
+PR [#4566](https://github.com/apmantza/pi-lens/pull/4566), refs #4530; lane 4530-r14; reviewed head 46568757a, base 0390bcc2f.
+Round 14 applies the three findings the r13 verify raised, plus its body correction. Production change: `clients/package-manager.ts` only.
+R13-V1 (MEDIUM) fixed: a relative discovered spelling (`which` echoes `bin/srv`) is now resolved against the LAUNCH cwd before judging, so a trusted but unowned launch refuses the adopted root's binary instead of running it. Real-spawn cell through launchLSP and resolveAndLaunch; marker absent; one bounded refusal row.
+Greptile P1 r4303887682 fixed: an npm shim's extensionless launcher target (yaml-language-server) is a supported target, so a GLOBAL shim is admitted under every trust and an adopted root keeps its global launchers; the same shim whose target is INSIDE the project is still refused. `node.exe`/`.dll`/`$exe` spellings stay fail-closed.
+R13-V3 (gating) fixed at the fixture: the `pi-lens-launch-log-*` root (creator: `tests/clients/lsp/launch.test.ts:119`) is a `registered` setupTestEnvironment root now, swept whenever it still exists, plus the file's tracked-temp afterEach drains writers then removes it again. A raw root was swept only after a sample saw it absent, which a recreated root defeats.
+R13-V2 (LOW, body) applied: the four in-project rows under unknown/untrusted now read `tool-not-found` with the scoped-PATH deciding path; the r13 matrix cell is labelled defence in depth.
+Red-first: 3 failed / 31 passed / 5 skipped with only `clients/package-manager.ts` restored to 46568757a; green: 34 passed / 5 skipped in the two launch suites.
+Mutations (built output, `scripts/mutate.mjs`): M1 relative resolution dropped RED (new cell); M2 extensionless arm dropped RED (2 cells); M3 shim targets never judged RED (new inside-project cell + 3 r13 rows); M4 prior-round `spawnCommand !== command` RED (3 missing-name rows + 1).
+Targeted: 8 files, 148 passed / 5 skipped. Governance: 165 files (tests/config plus every clients sweep/ratchet/gate/conformance), 2764 passed / 3 skipped. Lint, oxfmt, astgrep self-scan, glossary re-pin, changelog fragments and body lint green; `build:dist` rebuilt (three census files import dist/).
+Not run: a local reproduction of the CI shard-2 leak (11 runs at the reviewed head, 0 leftovers — the fix relies on a pinned harness rule, not on a repro), real Windows execution (POSIX shim parse plus the advisory Windows lane), and TLC (no model or as-built constant changed; see the TLA+ line).
+TLA+: unaffected for package-manager-trust — the round derives the judged path spelling and widens which shim target spelling is a target; the modelled trust/root key identity, admission and transitions are unchanged.
+Pushed to refs/heads/fix/4530-global-bin-trust; replied to and resolved thread r4303887682. Next owner: the same reviewer verifies r14.
+-->
+
+## Why
+
+Unknown or declined project trust must prevent global discovery from executing project-provided tools.
+
+## Notes for the reviewer
+
+Public class-level fix; Windows execution remains for CI, with cross-platform shim target and caller-root cells locally. Explicit absolute commands retain the registry's existing executable contract. The same reviewer should verify the changed target judge and scope identity.
+
+## Review round 14
+
+The round-13 verify raised three findings on this branch and one body claim. This round applies exactly those remedies: two owner-side branches in `clients/package-manager.ts`, the fixture the CI red names, and the body correction. It adds no helper, record, cache, timer, spawn site or exemption.
+
+| id | severity | Finding | Disposition |
+|---|---|---|---|
+| R13-V1 | MEDIUM | A relative PATH entry (`PATH=bin:…`) let a trusted, unowned session run the adopted root's binary: `which` printed `bin/srv`, the judge resolved that spelling against the session cwd, and the child resolved it against the launch cwd | fixed: `commandResolvesIntoProject` resolves a non-absolute `resolvedCommand` against its own `cwd` argument before classifying, and reads a shim at that same path; real-spawn cell through `launchLSP` and `resolveAndLaunch` |
+| r4303887682 (Greptile P1) | — | Passing `true` sent launches through a shim parser that only recognised `.js`/`.mjs`/`.cjs`, so a valid global `.cmd` naming an extensionless launcher read as project code and an adopted root refused it | fixed: an extensionless basename is a supported target beside the JS suffixes; the target is still judged by `reaches()`, so one inside the project stays refused and every other spelling (`.exe`, `.dll`, a stray `$exe`) stays fail-closed |
+| R13-V3 | HIGH (gating) | Exact head `46568757a` was RED: `Unit tests (shard 2/5)` job 117465922377 leaked `pi-lens-launch-log-ev9RHp` | fixed at the fixture: the root is registered (`setupTestEnvironment`), which the harness sweeps whenever it still exists; the raw root it replaced was swept only after a sample saw it absent, which a recreated root defeats |
+| R13-V2 | LOW (body) | The 30-row table's "in-project path" rows for unknown/untrusted actually end at `tool-not-found`, because the scoped PATH drops the entry before the finder runs | fixed below; the r13 matrix cell is labelled defence in depth, because its finder double hands the classifier an input the scoped launch route does not produce |
+
+### The judged spelling and the spawned spelling
+
+R13-V1 is a new defect on this branch's own seam, so the round carries the census the fixer contract asks for: every site that judges a discovered spelling, and where the same spelling is spawned.
+
+| site | spelling source | judged against | spawned with |
+|---|---|---|---|
+| `clients/lsp/launch.ts:877` launch gate | `findBinaryOnPath` returns `which`/`where` stdout verbatim, so a relative PATH entry yields `bin/srv` | **was** `process.cwd()`, because `realpathOrResolve` resolves against it; **now** the launch `cwd` | `trySpawn(spawnCommand, args, cwd, env, needsShell)` at `clients/lsp/launch.ts:927`, with the launch `cwd` |
+| `clients/package-manager.ts:549` global-bin target judge | `path.join(binDir, name)`, absolute | the caller `cwd` | the caller's own spawn |
+| `clients/lsp/client-registry.ts:903` adopted-root local binary | `server.command` / `projectLocalCommand` / `availabilityKey` | absolute → `isProjectLocalBinPath(root)`; relative → `findLocalBinUpwards(localCommand, root)` | refusal only |
+| `clients/lsp/launch.ts:594` `isProjectLocalLspBinary` | the resolved spelling | the project's own bin dirs under `cwd` | the same spawn |
+
+Ordered stages one relative discovered spelling passes through at the launch gate, with the count each stage sees in the new real-spawn cell:
+
+| stage | count |
+|---|---|
+| `findBinaryOnPath` candidates from `which` | 1 (`bin/srv`) |
+| accepted by `isAcceptedCommandFile` | 1 (it stats the same relative path `which` searched) |
+| found by the global-bin fallback | 0 |
+| matched by `isProjectLocalLspBinary` | 0 |
+| judged by `commandResolvesIntoProject` | 1 |
+| refused by `refuseUntrustedLspExecution` with `owned = false` | 1 |
+| spawned | 0 |
+
+The new code calls one external seam and starts nothing:
+
+| call | if it throws | if it never returns |
+|---|---|---|
+| `fs.readFileSync(commandPath, "utf8")` (shim text) | caught, `return true`: the shim stays refused | synchronous read; no timer, retry or await added |
+| `path.resolve(cwd, resolvedCommand)` | typed `string`, so a non-string cannot reach it | synchronous |
+| `content.matchAll(...)` | not reachable: the argument is the string just read | synchronous |
+
+### Round-14 red-first transcript
+
+Saved the fixed `clients/package-manager.ts`, restored only that path from `46568757a`, rebuilt, ran the two launch suites, then restored the fixed file and rebuilt. `git status --porcelain` after the restore listed only this round's files.
+
+```text
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > refuses a relative PATH entry that resolves into the adopted root (#4566 r14)
+AssertionError: expected { …(7) } to be an instance of SpawnFailureError
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > spawns a global npm shim whose target is an extensionless script under unknown trust (#4566 r14)
+SpawnFailureError: LSP project-local binary refused: project trust is unknown
+Caused by: Error: project trust is unknown
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > spawns a global npm shim whose target is an extensionless script under trusted trust (#4566 r14)
+SpawnFailureError: LSP project-local binary refused: project trust is trusted
+Caused by: Error: project trust is trusted
+ Test Files  2 failed (2)
+      Tests  3 failed | 31 passed | 5 skipped (39)
+```
+
+The refused direction of the new shim branch is not red pre-fix by construction: a shim target inside the project was refused before (fail-closed) and is refused now (judged). It is pinned by the mutation below, which admits every shim target and reds it.
+
+Green at the fixed head, same two files:
+
+```text
+ Test Files  2 passed (2)
+      Tests  34 passed | 5 skipped (39)
+```
+
+### Round-14 mutations
+
+`scripts/mutate.mjs --built`, one expression per run, each restored before the next. M3 and M4 report the new cell beside older witnesses; no mutation stayed green.
+
+| id | mutation | red |
+|---|---|---|
+| M1 | drop the relative resolution (`path.isAbsolute(resolvedCommand)` replaced by `true`) | 1 failed / 33 passed / 5 skipped: the new relative-path cell |
+| M2 | drop the extensionless arm (`\|\| !base.includes(".")` removed; `--allow-comment` because the needle carries a string literal) | 2 failed / 32 passed / 5 skipped: both new shim cells (unknown, trusted) |
+| M3 | never judge a shim target (`return scripts.some(` → `return false && scripts.some(`) | 4 failed / 30 passed / 5 skipped: the new inside-project cell plus the three r13 matrix rows |
+| M4 | prior-round spot-check: `spawnCommand !== command` → `true` in `clients/lsp/launch.ts` | 4 failed / 30 passed / 5 skipped: the three uninstalled-name rows and the POSIX process-group cell |
+
+```text
+mutation: clients/package-manager.js (path.isAbsolute(resolvedCommand) -> true)
+failed test titles: × refuses a relative PATH entry that resolves into the adopted root (#4566 r14) 382ms
+RED
+mutation: clients/package-manager.js (|| !base.includes(".") -> )
+failed test titles: × spawns a global npm shim whose target is an extensionless script under unknown trust (#4566 r14) 72ms; × spawns a global npm shim whose target is an extensionless script under trusted trust (#4566 r14) 65ms
+RED
+mutation: clients/package-manager.js (return scripts.some( -> return false && scripts.some()
+failed test titles: × classifies targets independently of unknown trust (#4566 r13) 134ms; × classifies targets independently of untrusted trust (#4566 r13) 134ms; × classifies targets independently of trusted trust (#4566 r13) 123ms; × refuses a global npm shim whose extensionless target is the project's script (#4566 r14) 115ms
+RED
+mutation: clients/lsp/launch.js (spawnCommand !== command && -> true &&)
+failed test titles: × spawns LSP servers in their own process group on POSIX 1091ms; × reports an uninstalled bare server name as tool-not-found under unknown 336ms; × reports an uninstalled bare server name as tool-not-found under untrusted 384ms; × reports an uninstalled bare server name as tool-not-found under trusted 349ms
+RED
+```
+
+### R13-V3: the fixture that owned the leak
+
+The creator line is the redaction fixture's root:
+
+```text
+tests/clients/lsp/launch.test.ts:119:		const fixture = setupTestEnvironment("pi-lens-launch-log-");
+```
+
+Before this round it was a raw `fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-launch-log-"))`. The setup's interposer records both kinds, but the sweep treats them differently (`tests/support/tmp-root-registry.ts`): a `registered` root is removed whenever it still exists, while an `observed` raw root is removed only when a sample saw it absent and something recreated it. This test removed the root itself in its `finally`, so a writer that recreated the directory before the setup's afterEach sample left an observed root no sweep would touch, and the hygiene owner saw `live owners: none`.
+
+Now the root is harness-owned: `setupTestEnvironment` registers it as `registered`, the file's `useTrackedTempDirs("pi-lens-launch-")` afterEach drains the known writers and removes every matching root over three ticks, and the afterAll/SIGTERM sweep removes it again if it exists. That covers each exit the leak needs: a throw before `finally` (the root still exists at teardown), a throw between the unmocks and the removal (same), and a queued writer that recreates the directory (registered, so swept).
+
+Pinned by `tests/support/tmp-root-registry.test.ts:46` ("removes a registered root that still exists, whatever happened to its test") and `tests/support/tmp-root-registry.test.ts:298` ("registers setupTestEnvironment roots as harness-owned"). I could not reproduce the CI red here either: the r13 verify's 11 runs at the reviewed head left no entry, and the CI-order pair on the fixed head (`launch.test.ts` 19 passed / 5 skipped, then `tmp-fixture-hygiene.test.ts` 47 passed, in one TMPDIR) left 0 `pi-lens-launch-*` entries. So this round makes no environmental claim: it removes the state the mechanism could not sweep, and the shard on the pushed head is the deciding run.
+
+### R13-V2: the corrected table rows
+
+Four rows of the round-13 specification described a deciding path that never runs. Under unknown and untrusted trust the scoped PATH drops a project PATH entry before `which`/`where` sees it, so the bare name resolves to nothing and the launcher reports `tool-not-found`; the target classifier never sees a project path on that route. The effect the table promised (no execution) holds; the named path did not. The four rows are corrected in place, and the round-13 matrix cell now says it is defence in depth: its finder double returns a project path that the scoped launch route does not yield.
+
+
+## Review round 13
+
+Pre-edit specification: classify a resolved executable target independently of trust; apply trust and root ownership only at the existing launch permission gate. An unresolved bare name has no target. Global discovery keeps its existing session-trust admission; launch owns adopted-root permission.
+
+| Trust | projectCodeAllowed | Target | Expected launch verdict | Deciding path |
+|---|---|---|---|---|
+| unknown | true | in-project path | tool-not-found | scoped PATH drops the project entry → bare name resolves to nothing → missing-command spawn failure |
+| unknown | true | outside symlink into node_modules/.bin or .venv/bin | trust-refused | target classification → refuseUntrustedLspExecution |
+| unknown | true | cmd/ps1 project script | trust-refused | target classification → refuseUntrustedLspExecution |
+| unknown | true | global binary outside | spawn | target classification → refuseUntrustedLspExecution |
+| unknown | true | unresolved bare name | tool-not-found | missing-command spawn failure |
+| unknown | false | in-project path | tool-not-found | scoped PATH drops the project entry → bare name resolves to nothing → missing-command spawn failure |
+| unknown | false | outside symlink into node_modules/.bin or .venv/bin | trust-refused | target classification → refuseUntrustedLspExecution |
+| unknown | false | cmd/ps1 project script | trust-refused | target classification → refuseUntrustedLspExecution |
+| unknown | false | global binary outside | spawn | target classification → refuseUntrustedLspExecution |
+| unknown | false | unresolved bare name | tool-not-found | missing-command spawn failure |
+| untrusted | true | in-project path | tool-not-found | scoped PATH drops the project entry → bare name resolves to nothing → missing-command spawn failure |
+| untrusted | true | outside symlink into node_modules/.bin or .venv/bin | trust-refused | target classification → refuseUntrustedLspExecution |
+| untrusted | true | cmd/ps1 project script | trust-refused | target classification → refuseUntrustedLspExecution |
+| untrusted | true | global binary outside | spawn | target classification → refuseUntrustedLspExecution |
+| untrusted | true | unresolved bare name | tool-not-found | missing-command spawn failure |
+| untrusted | false | in-project path | tool-not-found | scoped PATH drops the project entry → bare name resolves to nothing → missing-command spawn failure |
+| untrusted | false | outside symlink into node_modules/.bin or .venv/bin | trust-refused | target classification → refuseUntrustedLspExecution |
+| untrusted | false | cmd/ps1 project script | trust-refused | target classification → refuseUntrustedLspExecution |
+| untrusted | false | global binary outside | spawn | target classification → refuseUntrustedLspExecution |
+| untrusted | false | unresolved bare name | tool-not-found | missing-command spawn failure |
+| trusted | true | in-project path | spawn | target classification → refuseUntrustedLspExecution |
+| trusted | true | outside symlink into node_modules/.bin or .venv/bin | spawn | target classification → refuseUntrustedLspExecution |
+| trusted | true | cmd/ps1 project script | spawn | target classification → refuseUntrustedLspExecution |
+| trusted | true | global binary outside | spawn | target classification → refuseUntrustedLspExecution |
+| trusted | true | unresolved bare name | tool-not-found | missing-command spawn failure |
+| trusted | false | in-project path | trust-refused | target classification → refuseUntrustedLspExecution |
+| trusted | false | outside symlink into node_modules/.bin or .venv/bin | trust-refused | target classification → refuseUntrustedLspExecution |
+| trusted | false | cmd/ps1 project script | trust-refused | target classification → refuseUntrustedLspExecution |
+| trusted | false | global binary outside | spawn | target classification → refuseUntrustedLspExecution |
+| trusted | false | unresolved bare name | tool-not-found | missing-command spawn failure |
+
+Failure list: trusted adopted-root symlink and npm shim bypass; pending availability flight whose latch is evicted before a same-key joiner arrives; retained missing-name and genuine-global controls. Round 14 corrected the four in-project rows above (see "R13-V2: the corrected table rows").
+
+
+### Round-13 dispositions and implementation
+
+| Finding | Disposition | Independent effect |
+|---|---|---|
+| r4302959649 HIGH: trusted session bypasses adopted-root ownership | fixed | real outside links into both project bin layouts no longer execute; both launchLSP and resolveAndLaunch refuse |
+| r4302959651 MEDIUM: latch eviction loses a joiner's transient outcome | fixed | both callers receive the transient callback after four caller roots churn the cap-eight latch map |
+
+The saved table above remains the specification. The recovered tests recreate the reviewer's probes inside this worktree: the real-link case drives both production entry points; the availability property drives allAvailableGlobalBinDirs while pnpm is pending and three sibling roots evict its latch. The matrix adds cmd/ps1 and genuine-global controls through the existing child-process boundary double. The missing-name cells cover all three trust answers with ownership both true and false. Real Windows execution remains for CI.
+
+The launch call opts into independent classification at `clients/lsp/launch.ts:877`; the existing classifier owns realpath and npm shim target interpretation at `clients/package-manager.ts:703`. Global discovery retains its default trust admission. The change adds no helper or second ownership rule. The shared probe returns its classified verdict at `clients/package-manager.ts:192`, and a flight joiner reads that outcome at `clients/package-manager.ts:292`. Memo hits still read their own latch; pending-flight answers no longer depend on a replaceable latch. Session reset still clears these existing session stores. No durable record format changes.
+
+Recovered-state audit (same root/trust key expressions as round 10):
+
+| Actor | Identity / writes | Timing / reader |
+|---|---|---|
+| isAvailable | captured trustScope + normalizeFilePath(cwd) + manager | latch memo before await; shared result after await |
+| getLatch | same captured key; creates bounded entry | eviction can replace the object while a probe is pending |
+| probeAvailability | captures latch; noteAvailable / noteUnavailable | settles flight with available/outcome/cause, including after eviction |
+| packageManagerProbeFlights | same captured key | all joiners receive one result object |
+| _resetPackageManagerCache | clears latches and flights, bumps generation | session_start preserves existing reset semantics |
+| launchLSP | resolved command + explicit cwd | classification before existing trust/ownership admission |
+| findGlobalBinary | command + explicit cwd | existing session-trust discovery policy; launch still owns root admission |
+
+| External seam | If it throws | If it never returns |
+|---|---|---|
+| probeToolAsync / safeSpawnAsync | existing failure classifier and flight rejection path; unchanged | existing 5000 ms subprocess budget |
+| logAvailabilityDecision | existing logger boundary; unchanged | existing buffered sink; no new await |
+| onTransient | caller rejection remains unchanged | synchronous caller callback; no new timer or retry |
+| command target filesystem inspection | existing classifier fallback; unchanged | synchronous filesystem inspection; no new walk or read beyond the existing classifier |
+| refuseUntrustedLspExecution | intentional trust-refused result | synchronous admission; no external wait |
+
+The property uses fc.scheduler() with seed 456613, 20 runs, both missing and transient results, and join-before-eviction / join-after-eviction orderings. The scheduler chooses the order of two request gates; an additional ordering input guarantees the churn-before-join case remains in the generated population. Probe settlement waits for both request groups. Real sink I/O stays outside the scheduled region. It asserts the caller effect and then flushes/reads the real latency sink. The final pnpm record has phase `availability_decision`, metadata outcome `transient`, cause `probe-timeout`, classifiedBy `probe` for timeout; genuine absence has outcome `missing`, cause `not-found`. The real link cells read back exactly one `lsp-registry-decision` row with project-local-binary and the existing ownership refusal reason.
+
+The real-launch suite now sets a private session cwd before each cell. With the resume brief's TMPDIR inside the checkout, a sibling “global” fixture otherwise lives inside the ambient session project and is correctly filtered. This fixture correction preserves the intended two-root geometry. The first recovered run had five extra old-cell failures from that geometry; the corrected red below has only the four reported-defect witnesses. The unrelated broader resolver suite also had failures; attribution remains unproven below.
+
+### Round-13 red-first transcript
+
+Kept the tests, saved the fixed sources in private scratch, restored only the two production sources from 0390bcc2f, built, and ran the three named files with TMPDIR inside the worktree, PI_LENS_TEST_MAX_WORKERS=2 and --configLoader runner. Restored both sources and rebuilt afterwards. This is the final corrected fixture run:
+
+```text
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > refuses a trusted adopted root through an outside link into node_modules/.bin (#4566 r13)
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > refuses a trusted adopted root through an outside link into .venv/bin (#4566 r13)
+AssertionError: expected { …(7) } to be an instance of SpawnFailureError
+ FAIL  |default| tests/clients/package-manager-availability-latch.test.ts > keeps transient details for a flight joiner after latch eviction (#4566 r13)
+Error: Property failed after 1 tests
+Counterexample: [schedulerFor()`
+Shrunk 0 time(s)
+Caused by: AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > classifies targets independently of trusted trust (#4566 r13)
+AssertionError: promise resolved "{ …(7) }" instead of rejecting
+ Test Files  3 failed (3)
+      Tests  4 failed | 33 passed | 5 skipped (42)
+```
+
+### Round-13 mutations
+
+Attempted the required scripts/mutate.mjs first. It refused before editing because its synchronous Git status subprocess reports EPERM, including with /usr/bin/git. No RED is claimed from that attempt:
+
+```text
+mutate.mjs: spawnSync /usr/bin/git EPERM
+```
+
+Used bounded direct built-output mutations instead: saved original JS, changed exactly one expression, ran named files under timeout 180 with two workers, and restored original bytes before the next mutation. Every mutation remained valid JavaScript and reached behavior assertions. M2 and M3 red only the new property. No source mutation or journal remains.
+
+| Mutation | Direction / witness | Verdict |
+|---|---|---|
+| M1: omit independent-classification flag at launch | unowned project target wrongly admitted; real links + matrix | RED |
+| M2: derive a shared flight outcome from the joiner's replacement latch | timeout disclosure lost after eviction; property | RED |
+| M3: report every unavailable result as transient | genuine absence falsely disclosed as transient; property | RED |
+| M4: classify every discovered target as project-reaching | sole fresh global answer refused; matrix | RED |
+| M5: remove spawnCommand !== command | prior-round spot-check plus rewritten missing-name assertion proof | RED |
+
+```text
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > refuses a trusted adopted root through an outside link into node_modules/.bin (#4566 r13)
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > refuses a trusted adopted root through an outside link into .venv/bin (#4566 r13)
+AssertionError: expected { …(7) } to be an instance of SpawnFailureError
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > classifies targets independently of trusted trust (#4566 r13)
+AssertionError: promise resolved "{ …(7) }" instead of rejecting
+ Test Files  2 failed (2)
+      Tests  3 failed | 27 passed | 5 skipped (35)
+```
+
+```text
+ FAIL  |default| tests/clients/package-manager-availability-latch.test.ts > keeps transient details for a flight joiner after latch eviction (#4566 r13)
+Error: Property failed after 1 tests
+Counterexample: [schedulerFor()`
+Shrunk 0 time(s)
+Caused by: AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times
+ Test Files  1 failed (1)
+      Tests  1 failed | 6 passed (7)
+```
+
+```text
+ FAIL  |default| tests/clients/package-manager-availability-latch.test.ts > keeps transient details for a flight joiner after latch eviction (#4566 r13)
+Error: Property failed after 1 tests
+Counterexample: [schedulerFor()`
+Shrunk 1 time(s)
+Caused by: AssertionError: expected "vi.fn()" to be called +0 times, but got 4 times
+ Test Files  1 failed (1)
+      Tests  1 failed | 6 passed (7)
+```
+
+```text
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > classifies targets independently of unknown trust (#4566 r13)
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > classifies targets independently of untrusted trust (#4566 r13)
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > classifies targets independently of trusted trust (#4566 r13)
+AssertionError: promise rejected "SpawnFailureError: LSP project-local bina… { kind: '…' }" instead of resolving
+ FAIL  |default| tests/clients/lsp/launch.test.ts > lsp launch > skips a directory returned by the command finder
+ Test Files  1 failed (1)
+      Tests  4 failed | 12 passed | 5 skipped (21)
+```
+
+```text
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > reports an uninstalled bare server name as tool-not-found under unknown
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > reports an uninstalled bare server name as tool-not-found under untrusted
+AssertionError: expected SpawnFailureError: LSP project-local bina… { kind: '…' } to match object { kind: 'tool-not-found' }
+ FAIL  |lsp-spawn-heavy| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > reports an uninstalled bare server name as tool-not-found under trusted
+AssertionError: expected 'trust-refused' to be 'tool-not-found' // Object.is equality
+ Test Files  1 failed (1)
+      Tests  3 failed | 11 passed (14)
+```
+
+The property was then broadened from a scheduled settlement to two scheduler-owned request gates, with join-before/after-eviction orderings and 20 generated cases. The final property stays green and still kills the lost-outcome mutation; its shrunk schedule is:
+
+```text
+ FAIL  |default| tests/clients/package-manager-availability-latch.test.ts > keeps transient details for a flight joiner after latch eviction (#4566 r13)
+Error: Property failed after 3 tests
+{ seed: 456613, path: "2", endOnFailure: true }
+Counterexample: [schedulerFor()`
+-> [task${2}] promise::same-key joiner resolved
+-> [task${1}] promise::sibling roots resolved`,true,true]
+Shrunk 0 time(s)
+
+Hint: Enable verbose mode in order to have the list of all failing values encountered during the run
+ ❯ buildError ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2469:16
+ ❯ asyncThrowIfFailed ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2481:8
+
+Caused by: AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times
+ ❯ tests/clients/package-manager-availability-latch.test.ts:359:28
+ ❯ AsyncProperty.run ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:1217:19
+ ❯ asyncPropertyExecution ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2564:14
+ ❯ asyncRunIt ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2557:15
+ ❯ tests/clients/package-manager-availability-latch.test.ts:305:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 6 passed (7)
+
+```
+
+Final scheduled property, opposite direction (M3), still reds only the new witness:
+
+```text
+ FAIL  |default| tests/clients/package-manager-availability-latch.test.ts > keeps transient details for a flight joiner after latch eviction (#4566 r13)
+Error: Property failed after 1 tests
+{ seed: 456613, path: "0:0", endOnFailure: true }
+Counterexample: [schedulerFor()`
+-> [task${2}] promise::same-key joiner resolved
+-> [task${1}] promise::sibling roots resolved`,false,false]
+Shrunk 1 time(s)
+
+Hint: Enable verbose mode in order to have the list of all failing values encountered during the run
+ ❯ buildError ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2469:16
+ ❯ asyncThrowIfFailed ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2481:8
+
+Caused by: AssertionError: expected "vi.fn()" to be called +0 times, but got 4 times
+ ❯ tests/clients/package-manager-availability-latch.test.ts:358:29
+ ❯ AsyncProperty.run ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:1217:19
+ ❯ asyncPropertyExecution ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2564:14
+ ❯ asyncRunIt ../../../Desktop/pi-lens/node_modules/fast-check/lib/fast-check.js:2557:15
+ ❯ tests/clients/package-manager-availability-latch.test.ts:305:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 6 passed (7)
+
+```
+
+### Round-13 formal evidence
+
+Added FlightDetails and LaunchPermission in the existing package-manager-trust family, with production witness pins for SharedVerdict and IndependentClassification. LaunchPermission checks both NoUnownedProjectExecution and NoDroppedAllowed. The earlier PackageManagerRootKey pin remains unchanged.
+
+Cached Java runtime: /home/akis/.cache/pi-free-tlc/jdk-21.0.12.1+1-jre/bin/java. Breadth-first TLC was blocked by java.rmi.server.ExportException / java.net.SocketException: Operation not permitted. Depth-first TLC needs no socket and completes. Every depth-first command used timeout 1200, -workers 1, -XX:ActiveProcessorCount=1, -Xmx256m, -Djava.io.tmpdir=<worktree>/.tmp-r13, and a distinct metadir there; no parallel TLC processes.
+
+```sh
+timeout 1200 <java> -Djava.io.tmpdir=<worktree>/.tmp-r13 -XX:ActiveProcessorCount=1 -Xmx256m -cp <cached-tla2tools.jar> tlc2.TLC -dfid 10 -workers 1 -metadir <worktree>/.tmp-r13/<run> -config formal/package-manager-trust/<config>.cfg formal/package-manager-trust/<module>.tla
+```
+
+| Config / module | Exit | Result |
+|---|---|---|
+| EvictedLatch / FlightDetails | 12 | NoLostTransient violated |
+| SharedVerdict / FlightDetails | 0 | complete, 7 distinct states |
+| TrustedShortcut / LaunchPermission | 12 | NoUnownedProjectExecution violated |
+| IndependentClassification / LaunchPermission | 0 | complete, 19 distinct states |
+
+```text
+Finished computing initial states: 1 states generated, with 1 of them distinct.
+Starting level 2: 1 states generated, 1 distinct states found.
+Starting level 3: 2 states generated, 2 distinct states found.
+Starting level 4: 5 states generated, 4 distinct states found.
+Starting level 5: 13 states generated, 6 distinct states found.
+Error: Invariant NoLostTransient is violated.
+24 states generated, 7 distinct states found.
+Finished in 00s at (2026-10-17 20:33:56)
+```
+
+```text
+Finished computing initial states: 1 states generated, with 1 of them distinct.
+Starting level 2: 1 states generated, 1 distinct states found.
+Starting level 3: 2 states generated, 2 distinct states found.
+Starting level 4: 5 states generated, 4 distinct states found.
+Starting level 5: 13 states generated, 6 distinct states found.
+Starting level 6: 24 states generated, 7 distinct states found.
+Model checking completed. No error has been found.
+35 states generated, 7 distinct states found.
+Finished in 00s at (2026-10-17 20:34:08)
+```
+
+```text
+Finished computing initial states: 12 states generated, with 12 of them distinct.
+Starting level 2: 12 states generated, 12 distinct states found.
+Error: Invariant NoUnownedProjectExecution is violated.
+16 states generated, 16 distinct states found.
+Finished in 00s at (2026-10-17 20:36:47)
+```
+
+```text
+Finished computing initial states: 12 states generated, with 12 of them distinct.
+Starting level 2: 12 states generated, 12 distinct states found.
+Starting level 3: 24 states generated, 24 distinct states found.
+Model checking completed. No error has been found.
+48 states generated, 24 distinct states found.
+Finished in 00s at (2026-10-17 20:36:34)
+```
+
+### Round-13 validation and limits
+
+Final targeted command after restoring every mutation (last rerun started 20:42:21, duration 11.03s; same 98/5 result):
+
+```sh
+TMPDIR=<worktree>/.tmp-r13 PI_LENS_TEST_MAX_WORKERS=2 timeout 180 node_modules/.bin/vitest run tests/clients/package-manager.test.ts tests/clients/package-manager-availability-latch.test.ts tests/clients/command-file-selection.test.ts tests/clients/lsp/launch.test.ts tests/clients/lsp/launch-global-binary-trust-4530.test.ts tests/clients/lsp/lsp-registry-trust.test.ts tests/config/tla-switch-pins.test.ts --configLoader runner
+```
+
+```text
+ Test Files  7 passed (7)
+      Tests  98 passed | 5 skipped (103)
+```
+
+One named governance file ran (the formal switch pins). The resume brief delegates the full governance batch to the orchestrator; no whole tests/config or full-suite run occurred. Setup warned that 23 grammar downloads were unavailable and continued; none of these tests required those missing grammars. Module-report used the available TypeScript grammar.
+
+The wider eight-file attempt included tests/clients/global-binary-trust-4530.test.ts and returned 9 failures / 135 passed / 5 skipped. Its failed cells include global-prefix discovery, installer runtime/version probes, target refusal evidence, capacity evidence and caller-root availability. No RED-ON-BASE claim: the required attribution command failed before running comparisons:
+
+```text
+red-on-base: --base origin/master is not a commit
+usage: node scripts/red-on-base.mjs <test files…> [--base ref] [--repeat N]
+```
+
+The temporary broad-suite session-cwd experiment reduced two fixture-population failures but left seven others; it was reverted. That file has no round-13 diff. The orchestrator must rerun it and attribute every remaining red outside this restricted execution environment. No exact-head CI read, publish, PR edit, or Git commit occurred.
+
+Before/after moduleReport(file, cwd, {blastRadius:true, callGraph:true}) on both production files returned available=true, semantic.source=none, callGraph available=false / reason=review-graph-missing and no blastRadius payload. Final raw module reports:
+
+```json
+{"file":"clients/package-manager.ts","available":true,"semantic":{"source":"none","references":false,"implementations":false},"callGraph":{"available":false,"reason":"review-graph-missing","callers":[],"callees":[],"truncated":false,"coverage":{"status":"unavailable","complete":false}}}
+{"file":"clients/lsp/launch.ts","available":true,"semantic":{"source":"none","references":false,"implementations":false},"callGraph":{"available":false,"reason":"review-graph-missing","callers":[],"callees":[],"truncated":false,"coverage":{"status":"unavailable","complete":false}}}
+```
+
+Explicit caller census supplies the cold-graph limitation:
+
+```text
+launchLSP
+  + commandResolvesIntoProject(resolved, cwd, true)
+    = realpathOrResolve / projectReach / npm shim target parser
+  = refuseUntrustedLspExecution
+    = admitProjectSuppliedTsserver (trust + session ownership)
+findGlobalBinary
+  = commandResolvesIntoProject(resolved, cwd) (existing default trust policy)
+allAvailableGlobalBinDirs / resolveNodePackageManager
+  = isAvailable
+    + probeAvailability -> {available, outcome, cause}
+      = classifier + latch writes + availability_decision sink
+    - post-flight read of caller's replaceable latch
+    + post-flight read of shared classified outcome
+```
+
+Hot-path probe: node .tmp-r13/bench.mjs, seven batches of 100 calls, median milliseconds/call through commandResolvesIntoProject, trusted session, 512-byte and 65536-byte cmd shim. Before uses its unchanged default policy (the old launch behavior), after passes true as launch now does. No new read primitive or constant; this invokes the existing classifier once per discovered launch:
+
+```text
+{"bytes":512,"before_ms":0.0007295799999999986,"after_ms":0.7020346599999999,"delta_ms":0.7013050799999999}
+{"bytes":65536,"before_ms":0.00027929999999969367,"after_ms":0.7257281899999998,"delta_ms":0.7254488900000001}
+```
+
+The added ~0.7 ms is the required trusted-session target classification, below the 5 ms advisory threshold; no additional classifier work for unknown/untrusted launches. This measures the judge, not complete server startup. The shared-flight change adds a small result object on cold probes, with no new retained cache or walk.
+
+### Round-13 mock-dependent caller checks
+
+Enumerated module mocks with a multiline vi.mock/vi.doMock matcher for package-manager.js and lsp/launch.js over every tests/**/*.test.ts: 39 files. Ran three serial batches of 13 named files, timeout 180 per batch, TMPDIR inside this worktree, two workers, --configLoader runner. No exports were added or removed; the classifier's additional argument is optional. The exact file population was:
+
+```text
+tests/clients/availability-latching-siblings.test.ts
+tests/clients/biome-client-dedupe.test.ts
+tests/clients/biome-install-evidence.test.ts
+tests/clients/dependency-checker-batch-race.test.ts
+tests/clients/dependency-checker-batch-telemetry.test.ts
+tests/clients/dependency-checker-madge-memo-reset.test.ts
+tests/clients/dependency-checker-madge-resolution.test.ts
+tests/clients/dependency-checker-madge-warning-inert.test.ts
+tests/clients/dependency-checker-scan-project-cycles.test.ts
+tests/clients/dependency-checker-single-file-cycle-base.test.ts
+tests/clients/dependency-checker-state-generation.test.ts
+tests/clients/dispatch/runners/runner-helpers.test.ts
+tests/clients/dotnet-root-markers.test.ts
+tests/clients/jscpd-client.test.ts
+tests/clients/lsp/classic-repair-rearm.test.ts
+tests/clients/lsp/docker-official-fallback.test.ts
+tests/clients/lsp/lean-server.test.ts
+tests/clients/lsp/lsp-registry-trust.test.ts
+tests/clients/lsp/lua-tree-binary.test.ts
+tests/clients/lsp/managed-bin-fastpath.test.ts
+tests/clients/lsp/managed-fallback-after-trust-refusal-4515.test.ts
+tests/clients/lsp/resolve-and-launch-fallback.test.ts
+tests/clients/lsp/runtime-install-discovery.test.ts
+tests/clients/lsp/server-init-overrides.test.ts
+tests/clients/lsp/server-policy.test.ts
+tests/clients/lsp/sweep-warmup-fallback-family.test.ts
+tests/clients/lsp/tsserver-project-trust.test.ts
+tests/clients/lsp/typescript-native-lsp.test.ts
+tests/clients/lsp/typos-server-init.test.ts
+tests/clients/lsp/windows-startup-repair.test.ts
+tests/clients/mcp/review-rebuild.test.ts
+tests/clients/scanner-linked-worktree-exclusion.test.ts
+tests/clients/sg-runner.test.ts
+tests/clients/test-runner-client.test.ts
+tests/clients/test-runner-pytest-summary.test.ts
+tests/clients/test-runner-python-environment.test.ts
+tests/clients/test-runner-spawn-cwd.test.ts
+tests/clients/test-runner-worktree-isolation.test.ts
+tests/clients/tool-tier-degraded-selection.test.ts
+```
+
+Batch 1:
+
+```text
+ Test Files  13 passed (13)
+      Tests  136 passed (136)
+```
+
+Batch 2:
+
+```text
+ FAIL  |default| tests/clients/lsp/classic-repair-rearm.test.ts > classic TypeScript repair guard re-arms at session_start (#1570) > retries the repair after resetLSPService({reason: 'session_start'}), not just once per process
+AssertionError: expected [] to have a length of 1 but got +0
+ FAIL  |default| tests/clients/lsp/classic-repair-rearm.test.ts > classic TypeScript repair guard re-arms at session_start (#1570) > does not re-arm the repair guard for a non-session_start reset (e.g. pipeline_crash)
+AssertionError: expected [] to have a length of 1 but got +0
+ FAIL  |default| tests/clients/lsp/runtime-install-discovery.test.ts > runtime-install / discovery server wiring (#241) > TypeScriptServer discovers a global wrapper with installs disabled but refuses it without a compiler (#4299)
+AssertionError: expected "vi.fn()" to be called with arguments: [ 'typescript-language-server', …(1) ]
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > falls back to file directory when go root markers are missing
+AssertionError: expected '/home/akis/.plegma/work/sub-mvco7e4b-1' to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > falls back to file directory when json root markers are missing
+AssertionError: expected '/home/akis/.plegma/work/sub-mvco7e4b-1' to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > falls back to file directory when yaml root markers are missing
+AssertionError: expected '/home/akis/.plegma/work/sub-mvco7e4b-1' to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > falls back to file directory when docker root markers are missing
+AssertionError: expected '/home/akis/.plegma/work/sub-mvco7e4b-1' to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > falls back to file directory for standalone cpp/zig/elixir/gleam/typst files
+AssertionError: expected '/home/akis/.plegma/work/sub-mvco7e4b-1' to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > falls back to the file directory for standalone ruby files
+AssertionError: expected '/home/akis/.plegma/work/sub-mvco7e4b-1' to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > skips managed TypeScript install when lsp install is disabled
+AssertionError: expected { process: undefined, …(2) } to be undefined
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > repairs an incompatible managed TypeScript compiler for the classic fallback
+AssertionError: expected "vi.fn()" to be called with arguments: [ Array(2) ]
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > attempts the classic TypeScript repair at most once per process
+AssertionError: expected { process: { …(5) }, …(2) } to be undefined
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > never reinstalls the classic TypeScript compiler when install is disabled
+AssertionError: expected "vi.fn()" to be called with arguments: [ 'typescript', …(1) ]
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > skips managed TypeScript install when install is disallowed for file
+AssertionError: expected { process: undefined, …(2) } to be undefined
+ FAIL  |default| tests/clients/lsp/server-policy.test.ts > lsp server policy > falls back to the file directory for standalone python files
+AssertionError: expected '/home/akis/.plegma/work/sub-mvco7e4b-1' to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ Test Files  3 failed | 10 passed (13)
+      Tests  15 failed | 218 passed (233)
+```
+
+Batch 3:
+
+```text
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 listNestedLinkedWorktreeRoots > lists the linked worktrees strictly under the scan root, by real path, and nothing else
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 listNestedLinkedWorktreeRoots > answers [] for a directory that is not a git checkout
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 listNestedLinkedWorktreeRoots > resolves a symlinked spelling of the scan root to the same nested roots
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > excludes a worktree under a name no list knows, next to the built-in exclusions
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > reports no excluded worktree when the root has none
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > excludes it under the project's own [tool.vulture] without touching its thresholds
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > merges the project's own exclude list instead of replacing it
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > keeps every entry of a project exclude list whose patterns hold a glob class
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > does not split a project exclude entry that holds a comma, and counts the leak
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > passes the project's config through untouched when it has no worktree to exclude
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > does not override an exclude it cannot read, and counts the leak
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > escapes glob metacharacters in a worktree path and drops, with a count, one a comma would split
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > leaves a worktree outside the scanned root alone
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 vulture excludes every linked worktree under the scanned root > excludes a worktree nested under a package subdirectory that is the scan root
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > ignores a worktree under a name no list knows, next to the built-in ignores
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > merges a worktree into the ignore list of the project's own .jscpd.json
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > merges a worktree into the ignore list of a package.json jscpd field
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > reads only .jscpd.json when both it and package.json carry a config, as jscpd does
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > ignores only the worktree when the project's config sets no ignore list
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > passes the project's config through untouched when it has no worktree to ignore
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > does not override a config it cannot parse, and counts the leak
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4117 jscpd excludes every linked worktree under the scanned root > drops, with a count, a worktree whose path a glob or a comma would misread
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > trivy fs --skip-dirs > skips a worktree under a name no list knows, next to the scratch-tree globs
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > trivy fs --skip-dirs > adds nothing when the root holds no linked worktree
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > trivy fs --skip-dirs > names the worktree relative to the root through a symlinked spelling of it
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > trivy fs --skip-dirs > drops, with a count, a worktree whose path trivy would split or read as a glob
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > trivy fs --skip-dirs > uses Windows separator rules and caps command-line growth
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > opengrep scan --exclude > does not add one wcmatch pattern per linked worktree
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > opengrep scan --exclude > adds nothing when the root holds no linked worktree
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > gitleaks [allowlist] paths and the nested-repository backstop > does not let a prunable registration hide a plain directory at its old path
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > gitleaks [allowlist] paths and the nested-repository backstop > allowlists everything under a worktree under a name no list knows, and nothing beside it
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > gitleaks [allowlist] paths and the nested-repository backstop > adds nothing beyond the secrets-lane names when the root holds no linked worktree
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > gitleaks [allowlist] paths and the nested-repository backstop > builds the entry from the root's own spelling when the root is a symlink
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > gitleaks [allowlist] paths and the nested-repository backstop > matches a worktree path with regex metacharacters literally
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > gitleaks [allowlist] paths and the nested-repository backstop > demotes a finding that still comes back from inside a worktree, with the reason on the record
+ FAIL  |default| tests/clients/scanner-linked-worktree-exclusion.test.ts > #4132 gitleaks, trivy and opengrep leave every linked worktree under the scanned root out of their scan > gitleaks [allowlist] paths and the nested-repository backstop > classifies a finding in a worktree under a symlinked spelling of the root the same way
+Error: spawnSync git EPERM
+ FAIL  |default| tests/clients/test-runner-client.test.ts > test-runner-client > does not infer vitest from vite config alone
+AssertionError: expected 'vitest' not to be 'vitest' // Object.is equality
+ FAIL  |default| tests/clients/test-runner-client.test.ts > test-runner-client > does not use global pytest fallback for non-Python files
+AssertionError: expected { runner: 'vitest', config: { …(6) } } to be null
+ FAIL  |default| tests/clients/test-runner-client.test.ts > test-runner-client > detectRunner — hoisted monorepo node_modules > finds jest hoisted two levels up (scoped package nesting)
+AssertionError: expected 'vitest' to be 'jest' // Object.is equality
+ FAIL  |default| tests/clients/test-runner-client.test.ts > test-runner-client > getTestRunTarget — editing a test file directly (#547 follow-up) > prefers failed-first over self when the edited test file is itself in the failed set
+AssertionError: expected +0 to be 1 // Object.is equality
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > project tsserver.js trust gate (#4296) > runs pi-lens-managed TypeScript, never the project's tsserver.js, under unknown trust
+AssertionError: expected undefined to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > project tsserver.js trust gate (#4296) > skips the project's tsserver.js under untrusted trust
+AssertionError: expected undefined to be '/home/akis/.plegma/work/sub-mvco7e4b-…' // Object.is equality
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > starts the classic server from the tsserver.js beside a PATH tsc in a trusted project
+AssertionError: expected [ Array(1) ] to deeply equal []
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > names the missing compiler, not trust, when tsc is on no PATH entry (trusted)
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > names the missing compiler, not trust, when tsc is on no PATH entry (unknown)
+AssertionError: expected 'project-local LSP binary refused: mar…' to match /no absolute TypeScript compiler/
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > does not resolve a compiler from a PATH entry inside an adopted root
+AssertionError: expected [ Array(1) ] to deeply equal []
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / project only / unrelated-tools=false
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / project only / unrelated-tools=true
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / outside only / unrelated-tools=false
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / outside only / unrelated-tools=true
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / both / unrelated-tools=false
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / both / unrelated-tools=true
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / outside only / unrelated-tools=false
+AssertionError: expected [ Array(1) ] to have a length of +0 but got 1
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / nowhere / unrelated-tools=false
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: trusted / nowhere / unrelated-tools=true
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / nowhere / unrelated-tools=false
+AssertionError: expected [ Array(1) ] to have a length of +0 but got 1
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / project only / unrelated-tools=false
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / project only / unrelated-tools=true
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / outside only / unrelated-tools=true
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / both / unrelated-tools=false
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / both / unrelated-tools=true
+AssertionError: expected [ …(2) ] to have a length of 1 but got 2
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > compiler notice table: unknown / nowhere / unrelated-tools=true
+AssertionError: expected [ …(2) ] to have a length of 1 but got 2
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > retains both notices for a refused directory tsc candidate
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > retains both notices for a refused non-executable tsc candidate
+AssertionError: expected [ …(2) ] to have a length of 1 but got 2
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > names the compiler, not trust, when the PATH tsc ships no tsserver.js
+AssertionError: expected 'project-local LSP binary refused: mar…' not to match /mark the project trusted/
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > excludes a project PATH compiler before discovery and records the refusal (unknown trust)
+AssertionError: expected [ …(2) ] to deeply equal [ Array(1) ]
+ FAIL  |default| tests/clients/lsp/tsserver-project-trust.test.ts > bare tsc PATH hit reaches the TypeScript server (#4414) > emits one trust notice for several refused PATH entries (husky's relative entry)
+AssertionError: expected [ …(2) ] to deeply equal [ Array(1) ]
+ FAIL  |default| tests/clients/lsp/typos-server-init.test.ts > TyposServer.spawn initialization (#967) > injects the bundled config when the project has no typos config
+AssertionError: expected 'undefined' to be 'string' // Object.is equality
+ Test Files  4 failed | 9 passed (13)
+      Tests  68 failed | 508 passed (576)
+```
+
+Totals for these caller checks: 32 files passed / 7 failed, 862 tests passed / 83 failed. These counts overlap the core seven-file run and are not a unique-test total. Every remaining failure is unproven, not declared environmental or unrelated. The failures include root-position expectations with worktree-local TMPDIR, TypeScript repair/ownership fixtures and Git-dependent scanner fixtures. They were not changed in this round. The exact failing files from these runs plus the broader resolver run were supplied together to red-on-base:
+
+```text
+tests/clients/global-binary-trust-4530.test.ts
+tests/clients/lsp/classic-repair-rearm.test.ts
+tests/clients/lsp/runtime-install-discovery.test.ts
+tests/clients/lsp/server-policy.test.ts
+tests/clients/lsp/tsserver-project-trust.test.ts
+tests/clients/lsp/typos-server-init.test.ts
+tests/clients/scanner-linked-worktree-exclusion.test.ts
+tests/clients/test-runner-client.test.ts
+red-on-base: --base origin/master is not a commit
+usage: node scripts/red-on-base.mjs <test files…> [--base ref] [--repeat N]
+```
+
+Attribution exited 2 before running any comparison. A direct shell Git read resolves origin/master to 5c78d5da50682b2f1ff66e79fb8855f484ca2935; Node's synchronous Git call reports EPERM even when status is 0 and stdout contains the result, so the attribution script's “not a commit” message does not establish an absent ref. No failing test is marked RED-ON-BASE. The orchestrator must rerun and attribute all eight files before merge.
+
+### Round-13 preflight state
+
+- npm run build: exit 0, both initial red and restored green builds.
+- Final targeted: 7 files passed, 98 tests passed, 5 platform skips; the final broadened property also passes alone (7/7).
+- check-pr-body --lint-local PR_BODY.md: exit 0. Warning: gh could not read the issue labels, so Detection requirement checking was skipped, not passed. The filled Detection section remains in the body.
+- check-changelog-fragments: exit 0, `changelog fragments OK (87 entries in .changelog/)`.
+- oxfmt --check over every changed supported file: exit 0, `All matched files use the correct format.`
+- git diff --check: exit 0. All six added formal files are unignored (git check-ignore -v printed no matches).
+- astgrep:self-scan: exit 1; scan could not execute, not a rule verdict.
+
+```text
+[astgrep-self-scan] scan failed to run: spawnSync ast-grep EPERM
+```
+
+Required lane:check was attempted, exit 1. It reported a failed dist build and then crashed in its report function before writing any JSON record or ORCHESTRATOR SUMMARY. No lane-clean claim or fabricated gate record:
+
+```text
+spawnSync npm EPERM
+[lane-check] dist/ missing or stale (dist/clients/lsp/server-traits.js); running npm run build:dist...
+
+spawnSync npm EPERM
+[lane-check] dist build failed; run `npm run build:dist` to rebuild dist/.
+<ref *1> Error: spawnSync git EPERM
+```
+
+The orchestrator must run build:dist, self-scan, lane:check, the delegated governance batch, and exact-head CI before merge. Its publish authority targets fix/4530-global-bin-trust; this worker made no Git or GitHub mutation. Scratch under .tmp-r13 and the private probe home are removed before handback. PR_BODY.md and COMMIT_MSG.txt are handoff-only and must not be committed.
+
+### Round-13 class sweep and test assessment
+
+Shape: trust shortcut bypassing ownership admission; shared async result collapsing verdict details into replaceable side state. Searched expression and literals across clients/, tools/, mcp/, scripts/, scripts/lib/, tests/support/ and index.ts:
+
+```sh
+rg -n 'commandResolvesIntoProject|ProbeFlights|latch.getOutcome' clients tools mcp scripts scripts/lib tests/support index.ts --glob '*.ts' --glob '*.mjs'
+rg -n 'createAvailabilityProbeFlight|isTransientDecision|trusted' clients/package-manager.ts clients/lsp/launch.ts
+```
+
+| Population | Verdict |
+|---|---|
+| commandResolvesIntoProject callers | launch opts into classification; global discovery retains session-trust policy |
+| dispatcherProbeFlights | shares raw probe result, classifies after await; not boolean side-state |
+| securityProbeFlights | shares probe plus binaryPath; not boolean side-state |
+| toolchainProbeFlights | shares classified sweep including sawTransient |
+| checkerProbeFlights / cwdProbeFlights | share probe results before per-caller classification |
+| globalBinDirProbeFlights | directory-only result; transient disclosure belongs to availability, no latch read |
+| packageManagerProbeFlights | sole boolean-plus-replaceable-latch member; fixed here |
+| formatters latch.getOutcome | synchronous local latch read; no shared flight boundary |
+
+Consolidation verdict: keep target interpretation on commandResolvesIntoProject and ownership on existing admission. Keep independent probe owners distributed because each already returns its own complete raw/classified result; extracting a helper would relocate these lines without concentrating policy. No new helper, persistent primitive, cache, timer, or exemption.
+
+No test was removed or relaxed to hide a failure. launch.test.ts uniquely pins the 3-trust × 2-ownership target matrix. launch-global-binary-trust-4530.test.ts uniquely pins actual nonexecution, both real launch entry points, real refusal rows, and missing-name controls. package-manager-availability-latch.test.ts uniquely pins the cap-evicted joiner with scheduler-owned join and eviction requests, both classification directions, and the real decision sink. formal/switch-pins.json binds both as-built constants to those executable witnesses. Existing launch doubles stay at the child-process boundary; no clients module mock or new real-spawn site was added.
+
+Proposed contract change (maintainer decision): extend the existing target/root trust screen to ask whether a trusted-session shortcut also bypasses independent root ownership, and whether async joiners obtain verdict details from the shared result rather than an evictable side record. AGENTS.md remains unchanged because rule changes require a human decision.
+
+
+## Review round 12
+
+The Windows advisory job 117411208499 was red at fe73cb98e on one cell this branch added in round 7, and on nothing else:
+
+```text
+tests/clients/lsp/launch.test.ts > lsp launch > skips a directory returned by the command finder
+AssertionError: expected [ …(2) ] to include 'C:\Users\runneradmin\AppData\Local\Te…'
+ ❯ tests/clients/lsp/launch.test.ts:264:2
+```
+
+| id | Finding | Disposition |
+|---|---|---|
+| W1 | The cell wrote its accepted command as the extensionless `valid`. `computeNeedsShell` treats an extensionless path on Windows as a shell case, so `spawn` got the quoted command string `"<path>"` and never the path the assertion looks for. Production was right; the fixture was shaped for one platform and tested a platform-specific acceptance rule | fixed: the fixture is `valid.exe` on win32 and stays `valid` elsewhere, chosen from `process.platform` at the fixture, not from a second platform predicate |
+
+This round changes one test fixture and nothing else. It adds no guard, branch, filter, cap or fallback, so it carries no mutation table of its own; the branch's 17 built-output mutations stay RED.
+
+Sweep for the same shape, over every launch and global-binary cell this branch adds (`rg -n '#!/bin/sh|#!/usr/bin/env|mode: 0o755'` plus a grep for finder doubles across the PR's changed test files):
+
+| population | members | verdict |
+|---|---|---|
+| Finder doubles (`execFileSync: vi.fn`) | `tests/clients/lsp/launch.test.ts` only | one member, the cell above; fixed |
+| Mocked `spawn` command-identity assertions | `launch.test.ts` (four cells), `command-file-selection.test.ts` | `launch.test.ts`'s other cells already name a win32 suffix (`.exe`, `.cmd`, `.ps1`) or assert only a call count; `command-file-selection.test.ts` already branches on `process.platform` at every fixture and is not a launcher |
+| Real-spawn suites (`global-binary-trust-4530`, `launch-global-binary-trust-4530`, `tsserver-project-trust` shim cells) | whole-file or describe-level | `describe.skipIf(process.platform === "win32")`, or a fixture that already branches on `process.platform` |
+| Extensionless fixture reaching only `isAcceptedCommandFile` (no shell-wrap) | `launch.test.ts` "isolates concurrent adopted and owned launch permission" | not a member: it asserts a call count, never the command string |
+
+A Windows shell wrap on an extensionless command is the shape to screen for: it reaches a test only where the assertion reads the spawned command itself. No second member exists on this branch.
+
+Linux cannot execute the Windows cell. Evidence from this head is that the file passes locally with the fixture in place (transcript in "Tests"), and the advisory Windows job on the pushed head decides.
+
+## Review round 11
+
+The round-10 verify found one HIGH regression from round 10's own launch gate and two LOW members of the same shape. This round applies its prescribed remedies only; nothing else changed.
+
+| id | severity | Finding | Disposition |
+|---|---|---|---|
+| R10-1 | HIGH | `launchLSP` judged a bare command name that resolved to nothing as project-reaching (`realpathOrResolve("pyright-langserver")` is `<cwd>/pyright-langserver`), so every uninstalled server was refused as `trust-refused`, recorded a trust row, and skipped pi-lens's own managed install | fixed: the target is judged only when a resolver named one (`spawnCommand !== command`), with a cell for the absent-name case |
+| R10-2 (one-line part) | LOW | `isOnPath` and `absoluteCommandPath` built their scoped env from `process.cwd()` while the served root was in scope, so an adopted root outside the session kept its own PATH entries | fixed: both carry the caller's root, each with a cell that reds when the argument is dropped |
+| R10-2 (rest) | LOW | `runtimeInstallSpawnOptions` and `resolveJavaRuntimeEnv` still call `trustScopedSpawnEnv()` with no root; the child env itself is correct (`launchLSP` scopes with `cwd`), and carrying the root needs it plumbed through the registry's install closures | accepted residual, LOW, not filed: reach is bounded to pi-lens's own probes and runtime-install spawns, and the fix is a mechanism change rather than a one-liner |
+| R10-3 | LOW | `tests/clients/ruff-client-dedupe.test.ts` wrote `${process.cwd()}\\ruff-managed-test.py`, which on POSIX is a filename character, so the file landed beside the worktree | fixed: the fixture writes inside the file's own registered tmp root |
+
+Red first, on the round-10 production build with the round-11 tests kept:
+
+```text
+### launchLSP, uninstalled bare name, unknown trust
+AssertionError: expected 'trust-refused' to be 'tool-not-found' // Object.is equality
+Expected: "tool-not-found"
+Received: "trust-refused"
+
+### resolveAndLaunch, same input (A/B on the pre-fix build)
+resolveAndLaunch THREW name=SpawnFailureError kind=trust-refused in 351ms
+  message: LSP project-local binary refused: project trust is unknown
+lsp-registry-decision rows: ["project-local-binary:g1:pi-lens-4566-not-installed"]
+
+### same probe on the fixed build
+resolveAndLaunch -> undefined in 333ms
+lsp-registry-decision rows: []
+
+### LSP runtime availability, adopted root, unknown trust
+AssertionError: expected "vi.fn()" to not be called at all, but actually been called 1 times
+ ❯ tests/clients/global-binary-trust-4530.test.ts:773:23
+    773|   expect(install).not.toHaveBeenCalled();
+```
+
+Mutation evidence, each compile-valid on the built tree:
+
+| id | mutation | red |
+|---|---|---|
+| M1 | drop `spawnCommand !== command` from the launch gate | `expected 'trust-refused' to be 'tool-not-found'` (the new launch cell) |
+| M2 | `isOnPath` scopes by `process.cwd()` again | `expected "vi.fn()" to not be called at all, but actually been called 1 times` |
+| M3 | `absoluteCommandPath` scopes by `process.cwd()` again | `does not resolve a compiler from a PATH entry inside an adopted root`: `expected [ "project-local LSP binary refused: mark the project trusted in pi or upgrade pi" ] to deeply equal []` |
+
+The compiler cell also pins the honest post-fix answer: the only ledger word is `typescript-compiler:` / "no absolute TypeScript compiler (tsserver.js) was resolved", never a refusal of a compiler that the scoped lookup never saw.
+
+## Review round 10
+
+State table v2 (written before implementation). Rule: judge every discovered command's executable target against the caller's explicit project root; unknown and untrusted roots never admit project targets, and only Windows treats PATH key spellings as equivalent.
+
+The following table is a Cartesian specification: each row applies for both caller-root = process.cwd() and caller-root != process.cwd(); the latter never changes the verdict. Unknown and untrusted have identical admission, but retain their own recorded trust answer.
+
+| Target relative to caller root | Trusted | Unknown | Untrusted | Enforcing sites |
+|---|---|---|---|---|
+| Any project-tree path, including bin/, dependency scripts, root files | admit | refuse | refuse | commandResolvesIntoProject in findGlobalBinary and discovered-command launchLSP gate |
+| Outside project tree | admit | admit | admit | same target judge; existing executable acceptance |
+| Dangling | absent | absent | absent | isAcceptedCommandFile before delivery |
+| Windows cmd/ps1 shim with project script target | admit if valid | refuse | refuse | commandResolvesIntoProject reads npm shim target |
+| Unreadable or unparseable Windows script shim | existing validity contract | refuse | refuse | commandResolvesIntoProject fail-closed script-target verdict |
+
+| Seam | Root source | Enforcing site / expected effect |
+|---|---|---|
+| findGlobalBinary | explicit cwd, default process.cwd() only for omitted argument | allAvailableGlobalBinDirs and target judge use cwd |
+| launchLSP spawn and retry | options.cwd | discovered commands use target judge; explicit absolute commands keep registry contract |
+| findNodeToolBinary | cwd | forwards cwd to global rung |
+| resolveLocalFirstAsync | cwd | forwards cwd to the global lookup rung |
+| resolveNodePackageManager | cwd | availability probe environment and cache/flight key carry cwd |
+| PATH composers | caller root where scoped | normalizeSearchPath removes empty entries; setTrustScopedPath omits emptied PATH |
+| POSIX environment with Path and PATH | caller root | reads and writes PATH only, leaves Path untouched |
+| Windows environment with Path and PATH | caller root | case-insensitive selection and synchronized spellings |
+
+Failure list: F1 arbitrary project target and retry; F2 adopted-root resolver and scope isolation; F3 cmd/ps1 script targets including Windows path spelling; F4 Python composition and case-insensitive full writer census; F5 launch PATH emptied when node is project-local; F6 retain unknown-trust knip arrangement; F7 one round-9 heading; G1 POSIX key collision; G2 exact URL hostname.
+
+<!--
+ORCHESTRATOR SUMMARY — lane 4530-r9, PR #4566 (branch fix/4530-global-bin-trust)
+
+Head: c40ca054b (pushed after this body was prepared). One commit on top of ecca96abb.
+
+Fixed 4 Greptile P1s + the P2 and the CI red. Each disposition is in "Review round 9":
+- r4302336501 P1 empty PATH runs project commands — fixed; a scoped PATH with nothing left removes the
+  key, and every composer joins through normalizeSearchPath (four hand-rolled joins deleted).
+- r4302336504 P1 pip private-prefix rung skipped the scope — fixed; env built from the scoped env.
+- r4302336512 P1 global link target not judged — fixed; findGlobalBinary and launchLSP judge the
+  resolved target, one trust-refusal subject per target per session.
+- r4302336513 P1 availability latch keyed by manager only — fixed; latch and probe flight keyed by the
+  shared trust scope, so a turn_start flip re-probes.
+- r4302336519 P2 missing transcripts — fixed; red-first and six compile-valid mutations quoted.
+
+CI red root cause: NOT the hypothesised dev-host trust record (in a Vitest process trust is always
+unknown; the probe is quoted). Both tests reach knip only through pi-lens's managed install on a dev
+box; CI has none, and the checkout's own knip is a project-local binary, refused by design. The two
+tests now plant the checkout's trust, with the recurrence in a comment. No production change.
+
+Evidence: 8 new cells; production reverted to ecca96abb reds 7 (trust suite) + 1 (launch suite);
+6/6 mutations RED; round-7 guard spot-check still RED (8 cells).
+Gates: lint 0, fmt 0, knip 0, gov-check 0 (181 files, 2888 passed, 3 skipped).
+Not run: the full suite (CI owns it), npm run lane:check (gov-check.sh is the lane's pre-push run).
+
+Decisions for the orchestrator: none blocking. The launch-PATH cell I first wrote was unreachable and
+is deleted (stated in Test assessment); no residual issue follows from it.
+-->
+
+Closes #4530.
+
+Developed in a private fork first and moved here once the maintainer decided the fix needs no advisory. The branch keeps its full round history.
+
+## Rounds on this branch
+
+| Round | Head / work state | Verdict | Next owner |
+|---|---|---|---|
+| r13 | 0390bcc2f plus uncommitted edits | both findings fixed; 98 targeted tests pass; 4 new mutations and prior-round spot-check RED; gates unproven | orchestrator reruns blocked checks and publishes, then same reviewer verifies |
+| r14 | 3446d8e4a (8a2be2d2e code, 3446d8e4a cell comment) | R13-V1, R13-V3 and the Greptile P1 fixed, R13-V2 corrected in this body; 3 red-first, 4 mutations RED; 165 governance files green | same reviewer verifies r14 |
+
+- 6a2ba1453 (r1): scope global binary and package-manager lookups by project trust. Under unknown trust the npm prefix probe runs from HOME with the trust-scoped environment, so a project `.npmrc` cannot redirect it.
+- f6da328fd, 453b82636 (r2–r3): scope linked PATH lookups; reconcile the PATH trust regression guards.
+- 79b67cc8b, 9bb4d48e0 (r4–r5): one compiler trust notice; keep the missing-compiler advice.
+- c98f13116 (r6): validate refused compiler files; one shared PATHEXT parse (`getPathExts`).
+- 3730b6b17 (r7): fold all 11 command-file selection sites onto `isAcceptedCommandFile`.
+- 13cd129e6 (r8): print the project-PATH refusal notice once per session (latched on the degradation-ledger generation, like `lsp/launch.ts`); the `trust-refusal` ledger row stays per refused entry.
+- ecca96abb: executable stubs in the #4300 trust-startup cells, and the shard weights regenerated from three master runs.
+- c40ca054b (r9): close the four Greptile P1 gaps — no empty PATH for a child, the pip
+  private-prefix rung built from the scoped env, the global command's real target judged,
+  and the availability latch/probe keyed by trust. Folds the composed-PATH siblings onto
+  one join seam, and plants trust in two knip tests that only ran on a dev box.
+- a82a09699 (r10): carry caller roots — judge discovered commands by their executable targets,
+  isolate and bound the package-manager probe scopes, keep POSIX PATH key identity, and normalize
+  Python child environments.
+- fe73cb98e (r11): judge only resolved targets (an absent bare command is not project reach), scope
+  the LSP runtime-availability and bare-compiler probes by the served root, and write the Ruff
+  fixture inside its own tmp root.
+- 0390bcc2f (r12): name the round-7 finder fixture `valid.exe` on win32, because Windows shell-wraps an
+  extensionless command and the cell asserts the spawned path itself.
+- uncommitted (r13): independent launch target classification and flight-owned availability outcomes; bounded proof and limitations above.
+- 8a2be2d2e (r14): resolve a relative discovered spelling against the launch root before judging it (R13-V1); accept an npm shim's extensionless launcher target while still refusing one inside the project (Greptile r4303887682); make the `pi-lens-launch-log-*` fixture harness-registered so a recreated root is swept (R13-V3).
+- 1cd985813, 5878c8684: master merges. The conflicts were the mock-export baseline (regenerated with `VI_MOCK_EXPORT_REGEN=1`) and one renamed `bounded-container-guard` identity (`updateArgs:e94f9156`).
+
+## Verification
+
+- A read-only verify of r6 and r7 found the code merge-ready. All 12 r7 assertions red on r6 production and green at head. Mutation A (`existsSync` acceptance) reds 15 cells; mutation B (drop X_OK) reds 4.
+- Full suite on the merged tree at 5878c8684, run locally: 1502 of 1513 files passed, 9 skipped, with 4 failures. ecca96abb fixes all four. Three were the #4300 trust-startup cells, which reached this branch through the master merge and planted a non-executable `oxlint` stub that this change now refuses. The fourth was shard-weights drift (15.09% against the 15% bound). Both files pass on master and fail at 5878c8684 with only these changes; at ecca96abb they pass 62 of 62. Governance suite at ecca96abb: 180 files, 2849 passed.
+
+
+### Round-10 dispositions
+
+F1–F6: fixed in commit a82a09699018b6e5695265576eea2b55e2ec6dd2.
+F7: fixed in this body.
+G1–G2: fixed in a82a09699; bot threads replied and resolved.
+
+The worker's sandboxed lane:check went red on the Ruff fixture, which writes `process.cwd() + "\\ruff-managed-test.py"` (a sibling of the worktree on POSIX) and hit the sandbox's read-only boundary. The file is unchanged from c40ca054b. Outside the sandbox, on a82a09699, `ruff-client-dedupe` and `lsp/launch` pass (17 passed, 5 skipped), and the pre-push gate passed 86 files / 2275 tests before the orchestrator pushed. This round makes no merge-ready claim; the verify decides.
+
+## Review round 9
+
+The earlier round added scoped PATH omission, shared PATH composition, global-target checks, a private-prefix interpreter environment, and trust-scoped package-manager probes. Its verification reopened target breadth, caller-root propagation, Windows shim interpretation, Python composition, and coverage gaps. This round supersedes its narrow launch-target verdict and its claim that the emptied launch PATH is unreachable. The two previous round-9 headings are consolidated here.
+
+## Change outline
+
+```text
+- launchLSP / findNodeToolBinary / resolveLocalFirstAsync / formatter and test-runner callers
+  + findGlobalBinary(command, extension, callerRoot)
+    + allAvailableGlobalBinDirs(callback, callerRoot)
+      + isAvailable / globalBinDirsFor / trustScopedSpawnEnv(callerRoot)
+        + availabilityKey(trust, callerRoot, manager)
+    + commandResolvesIntoProject(command, callerRoot)
+      + real target containment; npm cmd/ps1 script target containment
+- launchLSP discovered-command spawn
+  - dependency-bin-only real-target check
+  + commandResolvesIntoProject
+- augmentPythonEnvironment
+  - private PATH join
+  + normalizeSearchPath
+- trustScopedSpawnEnv / setTrustScopedPath
+  + POSIX PATH-only environment key handling
+```
+
+## Summary
+
+Refs #4530. Global and local-first discovery carry the caller's project root through target admission and package-manager availability. LSP discovery uses the shared target judge, including its retry lookup. Windows npm script shims are admitted by their script target, with uninspectable script targets refused until trust is granted. Root-bearing caches retain the existing eight-entry budget through BoundedFifoMap; reset still clears caches and flights. Python environment composition uses the shared empty-entry normalizer. POSIX environment keys remain case-sensitive.
+
+Earlier rounds also require regular command files, executable on POSIX; preserve interpreter-script acceptance; scope installer/runtime child environments; and retain bounded trust-refusal notices. No release, dependency, or lockfile changes.
+
+## Behavior equivalence
+
+Trusted lookups and explicit absolute LSP commands preserve their existing admission. The state table enumerates the changed unknown/untrusted discovery behavior.
+
+## Type of change
+
+- [x] Bug fix
+
+## Area
+
+- [x] area:lsp
+- [x] area:dispatch
+- [x] area:installer
+- [x] area:security
+- [x] area:tests
+
+## Checklist
+
+- [x] Read repository and fixer contracts.
+- [x] Regression tests drive real resolvers and launchers.
+- [x] TypeScript sources are authoritative; compiled twins are generated.
+- [x] Existing changelog fragment extended; the live trust invariant already states the target rule, so `AGENTS.md` needs no edit for this round.
+- [x] Final local checks are recorded below; the exact-head CI read follows the push.
+
+## Tests
+
+Round-10 regressions expand project target placement, caller-root isolation, npm cmd/ps1 script targets, POSIX PATH key identity, Python composition, and the reachable emptied launch PATH. The root-isolation case runs across platforms. The shim vector uses cmd-shim v6.0.0 source at npm/cmd-shim@25724bfea794ebec14432278b1a4d223cc158f83, including the emitted `%dp0%` and `$basedir` spellings. Unparseable and unreadable shims have explicit refusal cells; an outside script has an admission cell.
+
+The pre-edit state table and initial red transcript preceded production edits. These matching regression failures ran against c40ca054b; the full initial transcript, including two corrected fixture-edit failures, stays in the lane report:
+
+```text
+     × refuses a global bin link whose target is inside the project 320ms
+     × keeps the POSIX PATH distinct from Path (#4566 G1) 3ms
+     × judges the script target of an npm cmd shim (#4566 F3) 3ms
+     × judges the script target of an npm ps1 shim (#4566 F3) 2ms
+     × normalizes the Python environment PATH (#4566 F4) 1ms
+     × re-probes package-manager availability when trust changes mid-session 5ms
+     × never launches a server whose real target is inside project bin 366ms
+     × never launches a server whose real target is inside project node_modules/pkg/bin 362ms
+     × never launches a server whose real target is inside project . 351ms
+```
+
+### Round-11 evidence
+
+Three cells carry this round, each driving production:
+
+- `tests/clients/lsp/launch-global-binary-trust-4530.test.ts`: an uninstalled bare server name under unknown trust throws `tool-not-found`, records no `lsp-registry-decision` row, and `resolveAndLaunch` returns undefined instead of throwing.
+- `tests/clients/global-binary-trust-4530.test.ts`: `resolveAndLaunch` reaches its runtime-install gate with the served root, so a PATH entry inside an adopted root outside the session is not searched; the injected installer is not called.
+- `tests/clients/lsp/tsserver-project-trust.test.ts`: a bare compiler planted in an adopted root's own PATH entry is not resolved, and the only ledger word is the missing-compiler row rather than a trust refusal.
+
+```
+Two PR suites + LSP launch suites + ruff fixture: Test Files 7 passed; Tests 129 passed | 5 skipped (134)
+gov-check: exit 0 (Test Files 184 passed; Tests 2956 passed | 3 skipped; 80 governance files + tests/config)
+Pre-push gate at fe73cb98e: Test Files 82 passed | 4 skipped (86); Tests 1503 passed | 13 skipped (1516)
+```
+
+### Round-12 evidence
+
+```text
+npx vitest run tests/clients/lsp/launch.test.ts tests/clients/lsp/launch-global-binary-trust-4530.test.ts tests/clients/global-binary-trust-4530.test.ts
+ Test Files  3 passed (3)
+      Tests  69 passed | 5 skipped (74)
+
+gov-check: exit 0 (Test Files  181 passed;Tests  2862 passed | 8 skipped; 77 governance files + tests/config)
+```
+
+The Windows-only behaviour this round fixes cannot be observed on Linux; the red transcript above is from the advisory Windows job at fe73cb98e, and the same job on the pushed head is the deciding run.
+
+F5 adds coverage of the existing PATH-omission rule; its compile-valid mutation must fail the new launch cell. F6 preserves the unknown-trust knip arrangement by using the fixture cwd. F7 consolidates body headings. G2 uses the URL parser's exact hostname; it changes a network test double rather than runtime execution policy.
+
+### Mutation evidence
+
+17 bounded built-output mutation variants are RED; the final predicate binding is rechecked in both directions, and a prior-round target guard is RED again. One initial Python mutation was REFUSED because its text did not match the built formatting; its corrected compile-valid rerun is RED.
+
+```text
+launch-target 1 mutation-table: | clients/lsp/launch.js | 1 | RED | × never launches a server whose real target is inside project node_modules/.bin 397ms × never launches a server whose real target is inside project bin 375ms × never launches a server whose real target is inside project node_modules/pkg/bin 378ms × never launches a server whose real target is inside project . 380ms FAIL  \|lsp-spawn-heavy\| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > never launches a server whose real target is inside project node_modules/.bin FAIL  \|lsp-spawn-heavy\| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > never launches a server whose real target is inside project bin FAIL  \|lsp-spawn-heavy\| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > never launches a server whose real target is inside project node_modules/pkg/bin FAIL  \|lsp-spawn-heavy\| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > never launches a server whose real target is inside project . |
+root-key 1 mutation-table: | clients/package-manager.js | 1 | RED | × isolates availability by the caller root (#4566 F2) 16ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > isolates availability by the caller root (#4566 F2) |
+availability-root 1 mutation-table: | clients/package-manager.js | 1 | RED | × re-probes package-manager availability when trust changes mid-session 12ms × isolates availability by the caller root (#4566 F2) 5ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > re-probes package-manager availability when trust changes mid-session FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > isolates availability by the caller root (#4566 F2) |
+global-target-root 1 mutation-table: | clients/package-manager.js | 1 | RED | × refuses a global bin link whose target is inside the project 323ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > refuses a global bin link whose target is inside the project |
+node-global-root 1 mutation-table: | clients/package-manager.js | 1 | RED | × refuses a global bin link whose target is inside the project 340ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > refuses a global bin link whose target is inside the project |
+local-first-root 1 mutation-table: | clients/dispatch/runners/utils/runner-helpers.js | 1 | RED | × refuses a global bin link whose target is inside the project 672ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > refuses a global bin link whose target is inside the project |
+shim-parse 1 mutation-table: | clients/package-manager.js | 1 | RED | × judges the script target of an npm cmd shim (#4566 F3) 9ms × judges the script target of an npm ps1 shim (#4566 F3) 2ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm cmd shim (#4566 F3) FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm ps1 shim (#4566 F3) |
+shim-unknown 1 mutation-table: | clients/package-manager.js | 1 | RED | × judges the script target of an npm cmd shim (#4566 F3) 11ms × judges the script target of an npm ps1 shim (#4566 F3) 7ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm cmd shim (#4566 F3) FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm ps1 shim (#4566 F3) |
+shim-unreadable 1 mutation-table: | clients/package-manager.js | 1 | RED | × judges the script target of an npm cmd shim (#4566 F3) 11ms × judges the script target of an npm ps1 shim (#4566 F3) 7ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm cmd shim (#4566 F3) FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm ps1 shim (#4566 F3) |
+shim-target-pass 1 mutation-table: | clients/package-manager.js | 1 | RED | × judges the script target of an npm cmd shim (#4566 F3) 6ms × judges the script target of an npm ps1 shim (#4566 F3) 2ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm cmd shim (#4566 F3) FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm ps1 shim (#4566 F3) |
+shim-target-drop 1 mutation-table: | clients/package-manager.js | 1 | RED | × judges the script target of an npm cmd shim (#4566 F3) 8ms × judges the script target of an npm ps1 shim (#4566 F3) 3ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm cmd shim (#4566 F3) FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > judges the script target of an npm ps1 shim (#4566 F3) |
+posix-read 1 mutation-table: | clients/package-manager.js | 1 | RED | × keeps the POSIX PATH distinct from Path (#4566 G1) 5ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > keeps the POSIX PATH distinct from Path (#4566 G1) |
+posix-write 1 mutation-table: | clients/package-manager.js | 1 | RED | × keeps the POSIX PATH distinct from Path (#4566 G1) 8ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > keeps the POSIX PATH distinct from Path (#4566 G1) |
+empty-launch 1 mutation-table: | clients/package-manager.js | 1 | RED | × omits an emptied launch PATH when node is project-local (#4566 F5) 11ms FAIL  \|lsp-spawn-heavy\| tests/clients/lsp/launch-global-binary-trust-4530.test.ts > launchLSP global lookups honour project trust (#4530) > omits an emptied launch PATH when node is project-local (#4566 F5) |
+mutation-table: | clients/package-manager.js | 1 | RED | × bounds caller-root availability and global-directory evidence (#4566 F2) 181ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > bounds caller-root availability and global-directory evidence (#4566 F2) |
+mutation-table: | clients/package-manager.js | 1 | RED | × bounds caller-root availability and global-directory evidence (#4566 F2) 211ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > bounds caller-root availability and global-directory evidence (#4566 F2) |
+mutation-table: | clients/package-manager.js | 1 | RED | × judges the script target of an npm cmd shim (#4566 F3) 8ms × judges the script target of an npm ps1 shim (#4566 F3) 2ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > judges the script target of an npm cmd shim (#4566 F3) FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > judges the script target of an npm ps1 shim (#4566 F3) |
+mutation-table: | clients/package-manager.js | 1 | RED | × judges the script target of an npm cmd shim (#4566 F3) 8ms × judges the script target of an npm ps1 shim (#4566 F3) 3ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > judges the script target of an npm cmd shim (#4566 F3) FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > judges the script target of an npm ps1 shim (#4566 F3) |
+mutation-table: | clients/package-manager.js | 1 | RED | × refuses a global bin link whose target is inside the project 316ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > refuses a global bin link whose target is inside the project |
+mutation-table: | clients/python-environment.js | 1 | RED | × normalizes the Python environment PATH (#4566 F4) 4ms FAIL  \|default\| tests/clients/global-binary-trust-4530.test.ts > round 9: scoped PATH, command targets, and the availability latch (#4530) > normalizes the Python environment PATH (#4566 F4) |
+```
+
+### Validation
+
+The supplied gov-check.sh cannot create its internally forced home TMPDIR in this sandbox. A scratch copy preserves the supplied writable TMPDIR; every build, self-scan, selection, and test command is unchanged. Initial execution completed 187 files and exposed six actionable local failures; the corrected checks are re-run below. npm's download cache is also pinned under lane scratch for build:dist.
+
+Final direct validation:
+
+```text
+Required resolver / launcher / knip suites: Test Files 10 passed; Tests 128 passed | 6 skipped
+Mock-dependent suites: Test Files 23 passed; Tests 681 passed
+Merged glossary census: Test Files 1 passed; Tests 7 passed
+gov-check: exit 0 (Test Files  187 passed;Tests  3178 passed | 9 skipped; 83 governance files + tests/config; log /home/akis/.plegma/tmp/sub-mvccyukv-34/4530-r10/gov-clean/gov-vitest.log)
+npm run lint: exit 0
+Commit hooks: lockfile, changelog, lint and formatter checks passed
+```
+
+The exact gov-check.sh entry point failed before testing because it replaces TMPDIR with a read-only sandbox-home path. Its scratch copy changes only that assignment and passes every original check. Both build and build:dist passed. The first lane:check could not acquire its lock in the read-only default home; its outer gate rerun uses the brief's lane-local probe home, with the normal Vitest worker-home setup intact. The capped selection and the failed attribution remain explicit rather than implying full-suite coverage.
+
+The availability/global-directory capacity witness flushes and reads the real latency sink: phase `availability_decision`, tool `npm`, classifiedBy `probe`; revisiting an evicted caller root emits the tenth npm availability record and performs the tenth global-directory query after nine distinct roots.
+
+### Lane gate record
+
+```json
+{"base":"origin/master","checks":{"build":0,"targeted":{"status":1,"failed":["tests/clients/ruff-client-dedupe.test.ts","tests/clients/runtime-turn-test-worktree-root.test.ts","tests/clients/biome-config-decorator-metadata.test.ts","tests/config/tmp-fixture-hygiene.test.ts"],"selected":129,"matched":476,"capped":true},"governance":{"status":0,"failed":[]},"body":0,"changelog":0,"format":0,"astgrep":0,"depcruise":0},"failedFiles":[{"file":"tests/clients/ruff-client-dedupe.test.ts","verdict":"CAUSED-BY-CHANGE"},{"file":"tests/clients/runtime-turn-test-worktree-root.test.ts","verdict":"RED-ON-BASE"},{"file":"tests/clients/biome-config-decorator-metadata.test.ts","verdict":"RED-ON-BASE"},{"file":"tests/config/tmp-fixture-hygiene.test.ts","verdict":"INCONCLUSIVE"}],"redOnBase":{"status":1,"baseTree":"git-archive"},"changed":81,"governance":165,"head":"a82a09699018b6e5695265576eea2b55e2ec6dd2","uncommitted":0,"findings":[{"kind":"unproven","reason":"selection capped: 476 test files matched, 129 ran; run the full suite or narrow the change"},{"kind":"red-caused","reason":"tests/clients/ruff-client-dedupe.test.ts reds on the change"},{"kind":"unproven","reason":"tests/config/tmp-fixture-hygiene.test.ts: red-on-base could not attribute the red"}],"verdict":"red-caused","exit":1}
+```
+
+No push, remote PR-body edit, bot reply, or bot-thread resolution occurred after this gate.
+
+Round-14 gate (head `3446d8e4a`, body `PR_BODY.md`):
+
+```json
+{"base":"origin/master","checks":{"build":0,"targeted":{"status":1,"failed":["tests/clients/runtime-turn-test-worktree-root.test.ts"],"selected":130,"matched":476,"capped":true},"governance":{"status":0,"failed":[]},"body":0,"changelog":0,"format":0,"astgrep":0,"depcruise":0},"failedFiles":[{"file":"tests/clients/runtime-turn-test-worktree-root.test.ts","verdict":"RED-ON-BASE"}],"redOnBase":{"status":0,"baseTree":"git-archive"},"changed":88,"governance":165,"head":"3446d8e4a4b1fa86600d1a232e132a21ceff7cca","uncommitted":0,"findings":[{"kind":"unproven","reason":"selection capped: 476 test files matched, 130 ran; run the full suite or narrow the change"}],"verdict":"unproven","exit":3}
+```
+
+```text
+ORCHESTRATOR SUMMARY
+branch: (detached)
+head: 3446d8e4a4b1fa86600d1a232e132a21ceff7cca
+verdict: unproven (exit 3)
+red files: 1; CAUSED-BY-CHANGE: 0; RED-ON-BASE: 1; INCONCLUSIVE: 0 (not evidence of unrelated)
+governance files: 165; steps run: 8
+selection: selected 130, matched 476, capped true
+selection capped: run the full suite or narrow the change
+unproven: selection capped: 476 test files matched, 130 ran; run the full suite or narrow the change
+uncommitted: 0 file(s)
+```
+
+The one red is `tests/clients/runtime-turn-test-worktree-root.test.ts`, which the gate's own red-on-base run attributes `RED-ON-BASE` against a `git archive` of `origin/master`. The cap is the 88-file branch diff (all fourteen rounds) against this lane's 130-test budget; the change's own files, the 165 governance files and the best import matches ran. This round does not upgrade that to a clean claim.
+
+### Round-14 evidence
+
+```text
+# red-first, only clients/package-manager.ts restored to 46568757a
+ Test Files  2 failed (2)
+      Tests  3 failed | 31 passed | 5 skipped (39)
+
+# fixed head, same two files
+ Test Files  2 passed (2)
+      Tests  34 passed | 5 skipped (39)
+
+# targeted: both launch suites + global-binary-trust, package-manager, the
+# availability latch, command-file selection, lsp-registry-trust, switch pins
+ Test Files  8 passed (8)
+      Tests  148 passed | 5 skipped (153)
+
+# governance: tests/config/*.test.ts + every clients sweep/ratchet/gate/conformance
+ Test Files  165 passed (165)
+      Tests  2764 passed | 3 skipped (2767)
+
+# CI order for the R13-V3 fixture, one TMPDIR, fixed head
+ tests/clients/lsp/launch.test.ts            Tests  19 passed | 5 skipped (24)
+ tests/config/tmp-fixture-hygiene.test.ts    Tests  47 passed (47)
+ $TMPDIR/pi-lens-launch-*                    0 entries
+```
+
+`npm run lint` exit 0, `oxfmt --check` on the changed files exit 0, `npm run astgrep:self-scan` reports `clean: 0 finding(s)`, `node scripts/check-changelog-fragments.mjs` reports `changelog fragments OK (87 entries in .changelog/)`, and `node scripts/check-pr-body.mjs --lint-local PR_BODY.md` passes.
+
+The glossary census moved with the code: `clients/package-manager.ts`'s pinned `path` population goes 29 → 31 for the two added spellings (`path.isAbsolute`, `path.resolve`), re-pinned with its reason in `tests/config/glossary-synonym-sweep.test.ts`. No master commit since the merge base `edd5287b3` touches `clients/package-manager.ts`, `clients/lsp/launch.ts` or the two launch suites (`git log --oneline edd5287b3..origin/master -- <files>` prints nothing), so the head count is the merged count.
+
+Three governance files failed the first batch only because `dist/` was stale: `lsp-clean-behavior-census`, `lsp-first-publish-census` and `lsp-idle-eviction-measurement` could not import `dist/clients/lsp/server-traits.js`. `npm run build:dist` rebuilt it and the rerun passed.
+
+## Blast radius
+
+`moduleReport` with `blastRadius: true` and `callGraph: true` ran before edits on clients/package-manager.ts and clients/lsp/launch.ts. Both returned available=true, fresh for structure. Both reported semantic.source=none and callGraph unavailable: review-graph-missing; blast-radius payloads were absent because the graph cache was cold. The caller census and call-tree diff above supply the affected population. Post-edit reports have the same explicit graph limitation.
+
+Command-judge timing, median milliseconds per call over seven batches of 100 calls, measured through commandResolvesIntoProject with the original c40ca054b predicate body in the same module shell and the final predicate (bench-trust.mjs, lane scratch):
+
+```text
+{"bytes":512,"before_ms":0.51284201,"after_ms":0.5787154599999996,"delta_ms":0.06587344999999967}
+{"bytes":65536,"before_ms":0.5481640200000015,"after_ms":0.5997616799999992,"delta_ms":0.05159765999999766}
+
+```
+
+The additional script-target inspection costs 0.052–0.066 ms for these inputs. The final implementation constructs its caller-root classifier once per judgment. This measures the judge, not complete server startup.
+
+The call-tree diff above lists the root-bearing call chain. The exported functions keep optional defaults for session-only callers. Formatters, Biome, test-runner selection, local-first resolution, and LSP launch now pass their existing explicit root. Session-only ast-grep and installer callers keep their session root. No durable record shape changes.
+
+### Round-14 call-tree diff
+
+```text
+commandResolvesIntoProject(resolvedCommand, cwd, classifyRegardlessOfTrust)
+  + const commandPath = path.isAbsolute(resolvedCommand) ? resolvedCommand : path.resolve(cwd, resolvedCommand)
+  - const target = normalizeFilePath(realpathOrResolve(resolvedCommand))
+  + const target = normalizeFilePath(realpathOrResolve(commandPath))
+  + the shim text is read at commandPath (was resolvedCommand)
+  + shim targets: every quoted `%~dp0`/`%dp0%`/`$basedir` spelling is collected; JS-suffixed
+    and extensionless basenames are judged; no supported spelling still refuses
+  callers unchanged: findGlobalBinary (absolute spelling) and launchLSP (discovered or explicit), both pass a cwd
+```
+
+No caller signature changed; `clients/lsp/launch.ts`, `clients/safe-spawn.ts` and `formal/` are untouched. The function stays synchronous and bounded: one array per `.cmd`/`.ps1` judgement, on a path that already read the shim file.
+
+## Observability
+
+covered by existing record `trust-refusal` at `clients/package-manager.ts:769`.
+covered by existing record `lsp-registry-decision` at `clients/lsp/launch.ts:458`.
+
+covered by existing record `availability_decision` at `clients/dispatch/runners/utils/availability-policy.ts:882`.
+
+Round 11 adds no record and removes a false one: an absent bare command no longer writes a `project-local-binary` `lsp-registry-decision` row, so the row population means "a target that exists was judged", which is what the state table's dangling row already said. The two new cells read that ledger back and assert its absence, and the compiler cell asserts the surviving `typescript-compiler` row instead.
+
+The global-link regression reads the real degradation ledger and requires exactly one target-refusal row after both resolver surfaces decline the same target. Existing package-manager availability decisions record probe outcomes. Shim inspection failure follows the same bounded trust-refusal record; the message now describes inability to admit the target without asserting that unknown script text is known to be in the project.
+
+TLA+ unaffected: format-drain — formatter resolution now carries cwd; queue ordering, drain timing, and mutation ownership are unchanged.
+TLA+ unaffected: instance-reaper — launch admission changes before spawning; process ownership and teardown are unchanged.
+TLA+ unaffected: file-locks — installer command admission and environments do not alter install-lock ownership or heartbeat.
+TLA+ unaffected: session-lifecycle — host trust adoption and session transitions are unchanged; package-manager trust scope is modelled separately.
+
+The new package-manager-trust model, coverage-map row, and switch pin carry the changed cache identity. The root-free configuration violates NoCrossRootAnswer; the caller-root configuration completes with 1,792 distinct states and no error.
+
+Round 14 adds no record and removes none. The relative-path refusal writes the existing `lsp-registry-decision` / `project-local-binary` row through `refuseUntrustedLspExecution`, and the new real-spawn cell reads that row back and requires exactly one; the extensionless-shim admission writes nothing, and the inside-project refusal writes the same single row, which its cell asserts. Nothing new to flush, bound or reset.
+
+## Class sweep
+
+Shape: a trust judgment anchored to the wrong root or the wrong file: the command file instead of its executable target (round 9), the process's root instead of the served root, and an absent name instead of a resolved target (round 11). AGENTS.md "LSP, trust, and process execution" records the carried-root and target rule.
+
+```sh
+rg -n 'findGlobalBinary|allAvailableGlobalBinDirs|commandResolvesIntoProject|trustScopedSpawnEnv' clients tools mcp scripts scripts/lib tests/support index.ts
+rg -n -i 'path.*(=|:)|delimiter' clients tools mcp scripts scripts/lib tests/support index.ts --glob '*.ts' --glob '*.mjs'
+rg -n -i '(env|environment|process).*path|path.*(env|environment)' clients tools mcp index.ts --glob '*.ts'
+```
+
+| Caller population | Root / verdict |
+|---|---|
+| package-manager findNodeToolBinary | forwards cwd |
+| runner-helpers resolveLocalFirstAsync | forwards cwd |
+| LSP initial and retry global lookup | forwards options.cwd |
+| formatters Biome / Prettier | forwards cwd |
+| biome-client | forwards resolveCwd |
+| test-runner-client resolveExec | forwards cwd |
+| sg-runner and runner-helpers isSgAvailableAsync | session-only API; default session cwd |
+| installer getNpmGlobalBinCandidates | session-only API; default session cwd |
+| availability latch and global-directory probe/cache | captured trust scope and caller-root key |
+| lsp isOnPath (runtime availability, bundle runtime) | served root (`spec.cwd`) |
+| lsp absoluteCommandPath (bare compiler) | served root passed by `findTsserverPath` |
+| lsp runtimeInstallSpawnOptions, resolveJavaRuntimeEnv | process root; named LOW residual above |
+| launchLSP discovered-command judge | the resolved target only; an absent bare name is judged by nothing |
+
+Case-insensitive composer census (F4/G1):
+
+| Composer | Verdict |
+|---|---|
+| package-manager setTrustScopedPath / trustScopedSpawnEnv | platform-correct key identity; omit emptied PATH |
+| installer getToolEnvironment | normalizeSearchPath |
+| installer addBinToPath and its process.env writer | normalizeSearchPath |
+| lsp server tryGemInstall | normalizeSearchPath |
+| lsp jvm-runtime resolveJavaRuntimeEnv | normalizeSearchPath |
+| dispatch runner-helpers getManagedToolEnvironment | normalizeSearchPath |
+| python-environment augmentPythonEnvironment | folded onto normalizeSearchPath |
+| lsp launch buildAugmentedPath | splitPathEntries/combinePathValuesForPlatform remove empty entries before the append; setTrustScopedPath owns final omission |
+
+Consolidation verdict: fold discovery target admission onto commandResolvesIntoProject and carry cwd through the existing lookup seam; fold Python composition onto normalizeSearchPath. The launch append stays distributed because its platform-aware deduplication already strips empty entries and final omission belongs to setTrustScopedPath. No new predicate helper is introduced. Earlier regular-file/executable acceptance remains on isAcceptedCommandFile.
+
+### Round-14 class sweep
+
+Shape: a judgment made on a spelling that is resolved somewhere else — the target that runs is not the target that was judged (R13-V1) — or on a target the parser refuses to recognise, which then reads as project code (Greptile P1). Both members are contained in this PR.
+
+```sh
+grep -rn "commandResolvesIntoProject\|isProjectLocalBinPath\|commandSearchReachesProject\|findBinaryOnPath(" clients tools mcp scripts index.ts --include=*.ts --include=*.mjs
+grep -rn "findGlobalBinary\|allAvailableGlobalBinDirs" clients tools mcp scripts index.ts --include=*.ts --include=*.mjs
+```
+
+| population | verdict |
+|---|---|
+| `commandResolvesIntoProject` callers (2) | the launch gate now hands it a launch-cwd-resolved path; the global-bin judge already passes an absolute one; both pass a cwd |
+| `isProjectLocalBinPath` callers (2) | directory questions against an absolute root; the client-registry relative branch already resolves through `findLocalBinUpwards(root)` |
+| `commandSearchReachesProject` caller (1) | judges PATH entries against `spec.cwd`; entries, not command spellings |
+| shim parsers (2) | `commandResolvesIntoProject` (fixed here) and `isCmdShimValid` / `bypassPs1OnWindows`, which only check that a `.js`/`.mjs`/`.cjs` target exists before spawning a shim: no trust decision, unchanged |
+| `findGlobalBinary` / `allAvailableGlobalBinDirs` callers (9) | each passes an explicit cwd or is session-only (`installer`, `sg-runner`), unchanged by this round |
+
+Consolidation verdict: stay distributed on one owner. Both new branches live in `commandResolvesIntoProject`, the seam that already owns "the target that runs"; extracting a spelling resolver would move two lines and hand the owner a second entry point. `isCmdShimValid` stays separate because it answers existence for a spawn, not trust for an admission. No new helper, so the net-count rule is not engaged.
+
+## Test assessment
+
+- global-binary-trust-4530: real resolver target/root tests, root-isolated availability, shim interpretation, environment keys, shared composition, ledger deduplication; no test removed.
+- lsp/launch-global-binary-trust-4530: broadens one target test and adds emptied-PATH launch coverage; no spawn site added.
+- lsp/launch: finder fixture now locates its accepted command outside the unknown-trust root, preserving its acceptance assertion; round 12 gives that fixture a PATHEXT suffix on win32 so the assertion reads the spawned path rather than Windows' shell-wrapped command string.
+- dispatch/runners/runner-helpers and test-runner-client: root-bearing call assertions; test-runner mock forwards the full real signature.
+- knip-cache-consumer-staleness and turn-scenarios: retain unknown trust with fixture cwd, restoring cwd in finally.
+- bounded-container-guard: removes the two stale raw-Map admissions after both maps use BoundedFifoMap; no new exemption.
+- glossary-synonym-sweep: re-pins the changed path identifier population in both directions.
+- formal switch pins and coverage map: link the root-identity model to the production resolver witness.
+
+Round 14: `launch-global-binary-trust-4530` gains the real-spawn relative-PATH cell (both production entry points, a marker file, the ledger read); `launch.test` gains the two extensionless-shim cells and converts the redaction fixture's root to `setupTestEnvironment`; `tmp-root-registry` needed no change, because its registered-root rule is the pin. No test was removed, skipped or weakened. One assertion I corrected during red-first (`expect(spawn).not.toHaveBeenCalled()`) was over-strict against the availability probe's own `which` spawn; it now names the shim path, so it still fails if the shim itself is spawned.
+
+## Detection
+
+Caught by: reviewer probe
+Should have been caught by: this layer
+Gap: none: a spelling's resolution root cannot be inferred from syntax; the round-14 table enumerates every judge and the root each one uses
+Shape: new: trust judgment anchored to the wrong root or executable target
+Enforcer: none: judgment-only, the caller and composer tables enumerate the full population and shared seams enforce admission
+
+## Remote CI read (exact head)
+
+One `node scripts/ci-verdict.mjs 4566` read at `3446d8e4a`, two minutes after the push (one read, no polling). The summary lines and the five shard lines are quoted verbatim; the advisory rows between them are elided at `...`:
+
+```text
+Gating: 33 checks, 0 failing
+Advisory (never gates): 23 checks, 0 red
+Merge state: MERGEABLE
+...
+Unit tests (shard 1/5)                                    in_progress  -   ...
+Unit tests (shard 2/5)                                    queued       -   ...
+Unit tests (shard 3/5)                                    in_progress  -   ...
+Unit tests (shard 4/5)                                    queued       -   ...
+Unit tests (shard 5/5)                                    in_progress  -   ...
+Unit tests Windows (advisory)                             PENDING      -   -
+ci.yml run 39062135379 is queued (2 min old) for 3446d8e4a4b1fa86600d1a232e132a21ceff7cca: wait for the registered run to finish; no re-arm is needed
+ci-verdict: exit 3 (pending)
+```
+
+Pending, not green: the read landed while `ci.yml` run 39062135379 was still running its shards, so the shard-2 cell that redded `46568757a` has not answered yet. The gating set carries 0 failures and the merge state is MERGEABLE at the pushed head; the orchestrator's later read (or merge train) is the deciding one. No other red is open from this round.
+
+Round 13 read at 0390bcc2f, before this round:
+
+```text
+Gating: 8 checks, 0 failing
+Advisory (never gates): 3 checks, 0 red
+Merge state: UNKNOWN
+ci.yml run 39038915142 is queued (0 min old) for 0390bcc2f4e2b97348d3c1d28291921811f61211: wait for the registered run to finish; no re-arm is needed
+ci-verdict: exit 3 (pending)
+```
+
+Pending, not green: the read landed on the push minute, so every `ci.yml` job (Lint & type-check, Unit tests, three Install tests, knip, oxfmt, TLA+) was still `absent` from the new run and is now queued under run 39038915142. `Unit tests Windows (advisory)` and the two CodeQL advisory checks are pending. The merge gate needs a later read.
+
+## Residuals
+
+- Accepted LOW residual, not filed: `runtimeInstallSpawnOptions` (`clients/lsp/server.ts`) and `resolveJavaRuntimeEnv` (`clients/lsp/jvm-runtime.ts`) still build their scoped environment from `process.cwd()`. The launched child's own environment is correct, because `launchLSP` scopes it with the served root, so the reach is pi-lens's own runtime-availability probe and runtime-install spawn, only for a root that `enforceLspRootCeiling` returned from outside the session. Carrying the root there means plumbing it through the registry's install closures, which is a mechanism change rather than a one-line call-site fix.
+The round-13 CI leak is not locally reproducible: 11 runs at the reviewed head left no `pi-lens-launch-log-*` entry, and the CI order (`launch.test.ts`, then `tmp-fixture-hygiene.test.ts`, one TMPDIR) is clean here too. This round does not call the red environmental; it removes the state the registry rule could not sweep, and shard 2 on the pushed head is the deciding run. Windows native execution of the shim cells and the full suite remain for exact-head CI.

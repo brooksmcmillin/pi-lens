@@ -25,3 +25,17 @@ export function loadAstGrepNapi(): Promise<AstGrepNapi> {
 		return import("@ast-grep/napi");
 	}
 }
+
+/**
+ * #4346: the same module, loaded synchronously, for a caller that cannot
+ * await (the workspace-diagnostics cache's lookup classifies a created file
+ * inline). `undefined` when the addon does not load; that caller fails closed.
+ * Nothing is memoized here: `require` caches a successful load itself.
+ */
+export function loadAstGrepNapiSync(): AstGrepNapi | undefined {
+	try {
+		return _require("@ast-grep/napi") as AstGrepNapi;
+	} catch {
+		return undefined;
+	}
+}

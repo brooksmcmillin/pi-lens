@@ -26,6 +26,7 @@
 // available there. tests/config/workflow-pull-request-reachability.test.ts
 // pins this reader against js-yaml over every workflow in the tree.
 import { matchGlob } from "./tla-coverage.mjs";
+import { blankHtmlComments } from "./defect-shapes.mjs";
 
 const WORKFLOW_PATH = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const RUN_ID = /(?:\/actions\/runs\/|\brun[ -]?id\b[^\d\n]{0,4})(\d{8,})/i;
@@ -241,9 +242,11 @@ export function classifyWorkflowEdit(text, file) {
 // as whole tokens, never as a pattern built from the name.
 const namesOf = (file) => [file.slice(file.lastIndexOf("/") + 1), file];
 
-// HTML comments are the one place prose could satisfy the rule invisibly.
-const blankComments = (body) =>
-	String(body ?? "").replace(/<!--[\s\S]*?(?:-->|$)/g, "");
+// HTML comments are the one place prose could satisfy the rule invisibly. The
+// comment-end rule is the shared one (#4565): a private copy here recognised
+// `-->` alone, so a body whose comment ends at `--!>` or `<!-->` read as
+// hidden even though the reader sees the text after it.
+const blankComments = (body) => blankHtmlComments(body);
 
 function quotesRunId(lines, file) {
 	const names = namesOf(file);

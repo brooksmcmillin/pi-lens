@@ -1,0 +1,30 @@
+{
+	"strictness": 2,
+	"commentTypes": ["logic", "syntax", "style"],
+
+	"autoReview": ["open"],
+	"triggerOnDrafts": false,
+	"excludeAuthors": ["apmantza", "dependabot[bot]"],
+
+	"ignorePatterns": "package-lock.json",
+
+	"instructions": "This repo has a contract in AGENTS.md ('Recurring defect shapes'). Review against it. Do not comment on lint-enforced style. A finding needs a code path or a test that demonstrates it. Reviews run on PR open only: request a review with @greptileai when wanted.",
+
+	"customContext": {
+		"files": [
+			{
+				"path": "AGENTS.md",
+				"description": "Repo contract: recurring defect shapes and contributing rules. Review changes against these shapes.",
+				"scope": ["**/*"]
+			}
+		]
+	},
+
+	"statusCheck": false,
+	"includeSequenceDiagram": false,
+	"sequenceDiagramSection": {
+		"included": false,
+		"collapsible": true,
+		"defaultOpen": false
+	}
+}

@@ -65,6 +65,7 @@ import {
 	ADVISORY_ONLY_MARKER,
 	buildCommentBody,
 	buildMarker,
+	classifyCancelledRun,
 	classifyFailureLog,
 	describeKernelKillEvidence,
 	MAX_AUTO_RERUN_ATTEMPT,
@@ -1067,7 +1068,15 @@ describe("runClassifier orchestration against a mocked, STATEFUL GitHub API (#21
 				return jsonResponse({
 					head_sha: "deadbeef",
 					run_attempt: runAttempt,
-					pull_requests: [{ number: 42 }],
+					// The shape GitHub serves (#4382): only an entry of this
+					// repository at the run's own head names the run's PR.
+					pull_requests: [
+						{
+							number: 42,
+							url: "https://api.github.com/repos/acme/repo/pulls/42",
+							head: { sha: "deadbeef" },
+						},
+					],
 				});
 			}
 			if (url.endsWith("/actions/runs/999/jobs")) {
@@ -1747,6 +1756,74 @@ describe("runClassifier orchestration against a mocked, STATEFUL GitHub API (#21
 		expect(comments).toHaveLength(1);
 	});
 
+	// #4382 recurrence (run 38514228860: a comment write 403ed and the classify
+	// step died before the rerun verdict). The CLI suite covers the first-call
+	// and upsert refusals; these two cover the seams it cannot reach: a refusal
+	// of ONLY the duplicate-reconcile re-read, and a refused failure comment.
+	describe("a refused PR comment never stops the classifier (#4382)", () => {
+		const forbidden = () =>
+			jsonResponse({ message: "Resource not accessible by integration" }, 403);
+
+		it("a 403 on the post-upsert reconcile read keeps the result and reports one commentWarning", async () => {
+			const rawLog = fixture("infra-kill-wrapper-killed.real.log");
+			let commentReads = 0;
+			const fetcher = async (url: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				if (url.endsWith("/actions/runs/999")) {
+					return jsonResponse({ head_sha: "deadbeef", pull_requests: [] });
+				}
+				if (url.endsWith("/actions/runs/999/jobs")) {
+					return jsonResponse({
+						jobs: [{ id: 111, name: "Unit tests", conclusion: "failure" }],
+					});
+				}
+				if (url.endsWith("/actions/jobs/111/logs")) return textResponse(rawLog);
+				if (url.endsWith("/rerun-failed-jobs")) return jsonResponse({}, 201);
+				if (method === "GET" && url.includes("/issues/42/comments")) {
+					commentReads++;
+					return commentReads === 1 ? jsonResponse([]) : forbidden();
+				}
+				if (method === "POST" && url.includes("/issues/42/comments")) {
+					return jsonResponse({ id: 900, body: "x" }, 201);
+				}
+				throw new Error(`unmocked URL in test: ${method} ${url}`);
+			};
+			const result = await runClassifier({
+				fetcher,
+				owner: "acme",
+				repo: "repo",
+				runId: 999,
+				prNumber: 42,
+			});
+			expect(result.rerunTriggeredThisPass).toBe(true);
+			expect(result.commentWarning).toContain("HTTP 403");
+		});
+
+		it("a 403 while commenting a classification failure leaves the original error as the thrown one", async () => {
+			const fetcher = async (url: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				if (url.endsWith("/actions/runs/999")) {
+					return jsonResponse({ head_sha: "deadbeef", pull_requests: [] });
+				}
+				if (url.endsWith("/actions/runs/999/jobs")) {
+					return jsonResponse({ message: "boom" }, 500);
+				}
+				if (url.includes("/issues/42/comments")) return forbidden();
+				throw new Error(`unmocked URL in test: ${method} ${url}`);
+			};
+			await expect(
+				runClassifier({
+					fetcher,
+					owner: "acme",
+					repo: "repo",
+					runId: 999,
+					prNumber: 42,
+					sha: "deadbeef",
+				}),
+			).rejects.toThrow("HTTP 500");
+		});
+	});
+
 	// #2668: a master-push run's workflow_run event carries an empty
 	// pull_requests array -- there is no PR at all, not merely an unresolved
 	// lookup. allowMissingPr lets classification and the rerun proceed
@@ -1842,6 +1919,295 @@ describe("runClassifier orchestration against a mocked, STATEFUL GitHub API (#21
 			const commentCalls = api.calls.filter((c) => c.url.includes("/comments"));
 			expect(commentCalls).toEqual([]);
 		});
+	});
+});
+
+// #4672: a CANCELLED `CI` run on master, where every cancelled job finished its
+// own work before the job lost its teardown race with `timeout-minutes`, must be
+// classified (and rerun at most once) instead of ignored. The witness is master
+// push run 39380875926 (head e3767bd78): `TLA+ models (shard 4/4)` was
+// `cancelled` at 735 s against a 720 s cap with every step `success`, the
+// aggregate reddened the required `TLA+ models` check, and this lane never
+// looked at it because it required `conclusion == 'failure'`.
+describe("classifyCancelledRun: the cancelled-shard teardown race (#4672)", () => {
+	// The real job rows of that run's TLA shards, captured verbatim (see
+	// tests/fixtures/ci-shard-verdict/tla-cancelled-complete.real.json).
+	const realJobs = (
+		JSON.parse(
+			readFileSync(
+				join(
+					here,
+					"..",
+					"fixtures",
+					"ci-shard-verdict",
+					"tla-cancelled-complete.real.json",
+				),
+				"utf8",
+			),
+		) as {
+			jobs: Array<{ name: string; conclusion: string; steps?: unknown[] }>;
+		}
+	).jobs;
+	const masterCancelledRun = {
+		id: 39380875926,
+		event: "push",
+		head_branch: "master",
+		conclusion: "cancelled",
+		head_sha: "e3767bd78",
+		run_attempt: 1,
+		pull_requests: [],
+	};
+
+	it("accepts the real cancelled-complete master push as infra-kill, naming the race", () => {
+		const judged = classifyCancelledRun({
+			run: masterCancelledRun,
+			jobs: realJobs,
+		});
+		expect(judged.eligible).toBe(true);
+		if (!judged.eligible) return;
+		expect(judged.kind).toBe("infra-kill");
+		expect(judged.detail).toContain("no failing assertion");
+		expect(judged.detail).toContain("TLA+ models (shard 4/4)");
+		expect(judged.detail).toContain("every step concluded success");
+		expect(judged.detail).toContain("teardown race");
+	});
+
+	// The direction that must be refused, both because the run was killed
+	// mid-work and because a superseded PR run is not this lane's business.
+	it("refuses a job cancelled inside its work step", () => {
+		const jobs = JSON.parse(JSON.stringify(realJobs)) as Array<{
+			name: string;
+			steps: Array<{ name: string; conclusion: string }>;
+		}>;
+		const shard = jobs.find((job) => job.name === "TLA+ models (shard 4/4)");
+		const step = shard?.steps.find((entry) =>
+			entry.name.startsWith("Model-check formal/"),
+		);
+		expect(step).toBeDefined();
+		step!.conclusion = "cancelled";
+		const judged = classifyCancelledRun({ run: masterCancelledRun, jobs });
+		expect(judged.eligible).toBe(false);
+		if (judged.eligible) return;
+		expect(judged.reason).toContain("cancelled mid-work, not in teardown");
+		expect(judged.reason).toContain("Model-check formal/");
+	});
+
+	it("refuses a job row with no readable steps (unreadable evidence is not a pass)", () => {
+		const judged = classifyCancelledRun({
+			run: masterCancelledRun,
+			jobs: [
+				{ id: 1, name: "TLA+ models (shard 2/4)", conclusion: "cancelled" },
+			],
+		});
+		expect(judged.eligible).toBe(false);
+		if (judged.eligible) return;
+		expect(judged.reason).toContain("no readable steps");
+	});
+
+	it.each([
+		[
+			"a pull_request run cancelled by concurrency",
+			{
+				...masterCancelledRun,
+				event: "pull_request",
+				head_branch: "feature-x",
+			},
+		],
+		[
+			"a push to a non-master branch",
+			{ ...masterCancelledRun, head_branch: "not-master" },
+		],
+		["a schedule-triggered run", { ...masterCancelledRun, event: "schedule" }],
+	])("refuses %s", (_label, run) => {
+		const judged = classifyCancelledRun({ run, jobs: realJobs });
+		expect(judged.eligible).toBe(false);
+		if (judged.eligible) return;
+		expect(judged.reason).toContain("only a push to master");
+	});
+
+	it("refuses a cancelled run that reports no cancelled job at all", () => {
+		const judged = classifyCancelledRun({
+			run: masterCancelledRun,
+			jobs: [
+				{ id: 1, name: "Lint & type-check", conclusion: "success", steps: [] },
+			],
+		});
+		expect(judged.eligible).toBe(false);
+		if (judged.eligible) return;
+		expect(judged.reason).toContain("no cancelled job to judge");
+	});
+
+	// The witness run's aggregate row (`TLA+ models`) concluded `failure`
+	// BECAUSE the shard was cancelled -- that is the defect #4672 fixes. A gate
+	// on failed jobs would refuse the very shape this branch exists for, so the
+	// judgment must ignore failed rows and say that the rerun re-reads them.
+	it("judges the cancelled job even when the aggregate failed because of it", () => {
+		const aggregate = realJobs.filter(
+			(job) => job.name === "TLA+ models" && job.conclusion === "failure",
+		);
+		expect(aggregate).toHaveLength(1);
+		const judged = classifyCancelledRun({
+			run: masterCancelledRun,
+			jobs: realJobs,
+		});
+		expect(judged.eligible).toBe(true);
+		if (!judged.eligible) return;
+		expect(judged.detail).toContain(
+			"other red job(s) are re-read by the rerun",
+		);
+	});
+});
+
+describe("runClassifier on a cancelled master run (#4672)", () => {
+	function jsonResponse(body: unknown, status = 200) {
+		return {
+			ok: status >= 200 && status < 300,
+			status,
+			json: async () => body,
+			text: async () => JSON.stringify(body),
+		};
+	}
+
+	const realJobs = (
+		JSON.parse(
+			readFileSync(
+				join(
+					here,
+					"..",
+					"fixtures",
+					"ci-shard-verdict",
+					"tla-cancelled-complete.real.json",
+				),
+				"utf8",
+			),
+		) as { jobs: unknown[] }
+	).jobs;
+
+	/** A cancelled master push: no PR, no logs to read, one rerun endpoint. */
+	function makeCancelledApi({
+		runAttempt = 1,
+		event = "push",
+		headBranch = "master",
+		jobs = realJobs,
+	}: {
+		runAttempt?: number;
+		event?: string;
+		headBranch?: string;
+		jobs?: unknown[];
+	} = {}) {
+		const calls: Array<{ method: string; url: string }> = [];
+		let rerunCallCount = 0;
+		const fetcher = async (url: string, init?: RequestInit) => {
+			const method = init?.method ?? "GET";
+			calls.push({ method, url });
+			if (url.endsWith("/actions/runs/999")) {
+				return jsonResponse({
+					head_sha: "deadbeef",
+					run_attempt: runAttempt,
+					event,
+					head_branch: headBranch,
+					conclusion: "cancelled",
+					pull_requests: [],
+				});
+			}
+			if (url.endsWith("/actions/runs/999/jobs")) return jsonResponse({ jobs });
+			if (url.endsWith("/actions/runs/999/rerun-failed-jobs")) {
+				rerunCallCount += 1;
+				return jsonResponse({}, 201);
+			}
+			throw new Error(`unmocked URL in test: ${method} ${url}`);
+		};
+		return {
+			fetcher,
+			calls,
+			get rerunCallCount() {
+				return rerunCallCount;
+			},
+		};
+	}
+
+	it("classifies the cancelled master push as infra-kill and reruns it once", async () => {
+		const api = makeCancelledApi();
+		const result = await runClassifier({
+			fetcher: api.fetcher,
+			owner: "acme",
+			repo: "repo",
+			runId: 999,
+			skipMissingJob: true,
+			allowMissingPr: true,
+		});
+		expect("skipped" in result).toBe(false);
+		if ("skipped" in result) return;
+		expect(result.classification.kind).toBe("infra-kill");
+		expect(result.rerunTriggeredThisPass).toBe(true);
+		expect(result.commentBody).toContain("ci-classifier: infra-kill");
+		expect(result.commentBody).toContain("teardown race");
+		// No job logs: there is no failed job whose log could explain anything.
+		expect(api.calls.filter((call) => call.url.includes("/logs"))).toEqual([]);
+	});
+
+	it("stops at the two-rerun bound: attempt 3 is a human's call", async () => {
+		const api = makeCancelledApi({ runAttempt: MAX_AUTO_RERUN_ATTEMPT + 1 });
+		const result = await runClassifier({
+			fetcher: api.fetcher,
+			owner: "acme",
+			repo: "repo",
+			runId: 999,
+			skipMissingJob: true,
+			allowMissingPr: true,
+		});
+		expect("skipped" in result).toBe(false);
+		if ("skipped" in result) return;
+		expect(result.rerunTriggeredThisPass).toBe(false);
+		expect(api.rerunCallCount).toBe(0);
+	});
+
+	it("skips a cancelled pull_request run with its reason and reruns nothing", async () => {
+		const api = makeCancelledApi({
+			event: "pull_request",
+			headBranch: "feature",
+		});
+		const result = await runClassifier({
+			fetcher: api.fetcher,
+			owner: "acme",
+			repo: "repo",
+			runId: 999,
+			skipMissingJob: true,
+			prNumber: 7,
+		});
+		expect("skipped" in result).toBe(true);
+		if (!("skipped" in result)) throw new Error("expected a skip");
+		expect(result.reason).toContain("only a push to master");
+		expect(api.rerunCallCount).toBe(0);
+		expect(api.calls.filter((call) => call.url.includes("/comments"))).toEqual(
+			[],
+		);
+	});
+
+	it("skips a cancelled master run whose shard was killed mid-work", async () => {
+		const jobs = JSON.parse(JSON.stringify(realJobs)) as Array<{
+			name: string;
+			steps: Array<{ name: string; conclusion: string }>;
+		}>;
+		const shard = jobs.find((job) => job.name === "TLA+ models (shard 4/4)");
+		shard!.steps = shard!.steps.map((step) =>
+			step.name.startsWith("Model-check formal/")
+				? { ...step, conclusion: "cancelled" }
+				: step,
+		);
+		const api = makeCancelledApi({ jobs });
+		const result = await runClassifier({
+			fetcher: api.fetcher,
+			owner: "acme",
+			repo: "repo",
+			runId: 999,
+			skipMissingJob: true,
+			allowMissingPr: true,
+		});
+		expect("skipped" in result).toBe(true);
+		if (!("skipped" in result)) throw new Error("expected a skip");
+		expect(result.reason).toContain("cancelled mid-work, not in teardown");
+		expect(api.rerunCallCount).toBe(0);
 	});
 });
 

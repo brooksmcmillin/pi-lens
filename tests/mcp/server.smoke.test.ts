@@ -27,6 +27,9 @@ import {
 import { setupTestEnvironment } from "../clients/test-utils.js";
 import { McpHarness, repoRoot } from "./harness.js";
 import { isProcessAlive } from "../support/process-tree.js";
+import { projectScan } from "../../clients/lens-engine.js";
+import { _resetStateCacheForTests } from "../../clients/diagnostic-dispositions.js";
+import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { stripSource } from "../support/sweep-kit.js";
 
 // Spawns the MCP server as a real stdio subprocess; like analyze-cli, it can lose
@@ -349,6 +352,29 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 		expect(typeof result.content[0].text).toBe("string");
 	}, 25_000);
 
+	it("discloses unverified session evidence on the real MCP wire", async () => {
+		// MCP strips details before delivery. The shared tool's TEXT must keep
+		// the state and a callable MCP recipe, even when no cached row exists.
+		const res = await harness.request(600, "tools/call", {
+			name: "pilens_diagnostics",
+			arguments: {
+				source: "session",
+				scope: "paths",
+				paths: [path.join(workspace.tmpDir, "unseen-session-evidence.txt")],
+			},
+		});
+		const result = res.result as {
+			content: { text: string }[];
+			details?: unknown;
+		};
+		expect(result.content[0]?.text).toContain("Session cache unverified");
+		expect(result.content[0]?.text).toContain(
+			"pilens_diagnostics source=lsp scope=paths",
+		);
+		expect(result.content[0]?.text).not.toContain("✓");
+		expect(result.details).toBeUndefined();
+	}, 25_000);
+
 	it("keeps diagnostics visible for an out-of-enum severity through MCP", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-mcp-severity-"));
 		fs.writeFileSync(
@@ -456,6 +482,71 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 			expect(text).not.toMatch(/(?<![A-Za-z0-9_])lens_diagnostics/);
 		} finally {
 			isolated.dispose();
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("pilens_project_scan drops a marked finding and states the count (#1634)", async () => {
+		// #1634 recurrence: this tool rendered the raw cheap scan, so a finding
+		// marked false-positive through lens_diagnostic_mark came back here
+		// while every other surface dropped it. The mark is written in-process
+		// into the data directory the spawned server then reads.
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-mcp-1634-"));
+		const dataDir = path.join(cwd, ".data");
+		const filePath = path.join(cwd, "a.ts");
+		fs.writeFileSync(
+			filePath,
+			"export function f(x: unknown) {\n\tconsole.log(x);\n\treturn x;\n}\n",
+		);
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = dataDir;
+		_resetStateCacheForTests();
+		let isolated: McpHarness | undefined;
+		try {
+			const target = (await projectScan(cwd)).diagnostics.find(
+				(d) => d.filePath === filePath,
+			);
+			expect(target).toBeDefined();
+			if (!target) return;
+			const marked = await createLensDiagnosticMarkTool(() => cwd).execute(
+				"mark-1634-mcp",
+				{
+					filePath,
+					line: target.line,
+					message: target.message,
+					rule: target.rule,
+					tool: target.tool,
+					disposition: "false-positive",
+				},
+				undefined,
+				() => {},
+				{ cwd },
+			);
+			expect(marked.isError).toBeFalsy();
+			isolated = new McpHarness({ cwd, env: { PILENS_DATA_DIR: dataDir } });
+			await isolated.request(52, "initialize", {
+				protocolVersion: "2025-06-18",
+				capabilities: {},
+				clientInfo: { name: "scan-1634-test", version: "0" },
+			});
+			const response = await isolated.request(53, "tools/call", {
+				name: "pilens_project_scan",
+				arguments: { cwd },
+			});
+			const result = response.result as {
+				isError?: boolean;
+				content: { text: string }[];
+			};
+			expect(result.isError).toBeFalsy();
+			const text = result.content.map((part) => part.text).join("\n");
+			expect(text).toContain("suppressed by disposition: 1 finding(s)");
+			expect(text).not.toContain(target.message);
+			expect(text).toContain('"dispositionSuppressed": 1');
+		} finally {
+			isolated?.dispose();
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			_resetStateCacheForTests();
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	}, 60_000);
@@ -1467,6 +1558,136 @@ describe("McpHarness.dispose tears down the server's process tree", () => {
 		},
 		60_000,
 	);
+});
+
+/**
+ * #3405: a save-triggered server answers an MCP host. The fake server here
+ * declares `textDocumentSync.save` and publishes ONLY from its didSave branch,
+ * Expert's measured shape (it compiles on didSave and on nothing else), so the
+ * finding reaches the MCP result exactly when a save reached the server.
+ * Recurrences, each measured on the real MCP server with clangd 22.1.0:
+ * `pilens_analyze` (the route the PostToolUse hooks share) never declared its
+ * touch a save, and a cold `pilens_diagnostics` query lost its save to the
+ * debounce after its own unsaved sweep warm-up pushed the same bytes.
+ */
+describe("a save-triggered server through MCP (#3405)", { retry: 2 }, () => {
+	const SAVE_ONLY_MESSAGE = "diagnostic published only after didSave";
+
+	/** `cleanOnOpen`: the server also answers each didOpen/didChange with an
+	 *  empty publish, so a sweep warm-up sees a ready server; without it the
+	 *  server is silent until a save, Expert's measured shape. */
+	function saveOnlyWorkspace(prefix: string, cleanOnOpen = false) {
+		const env = setupTestEnvironment(prefix);
+		const trace = path.join(env.tmpDir, "save-server.trace");
+		const shim = path.join(env.tmpDir, "save-server.mjs");
+		fs.writeFileSync(
+			shim,
+			[
+				'process.env.FAKE_LSP_SAVE = "true";',
+				'process.env.FAKE_LSP_PUBLISH_ON_SAVE = "1";',
+				'process.env.FAKE_LSP_NO_DIAGNOSTIC_PROVIDER = "1";',
+				...(cleanOnOpen
+					? ['process.env.FAKE_LSP_PUBLISH_SEQUENCE = "empty";']
+					: []),
+				`process.env.FAKE_LSP_TRACE_FILE = ${JSON.stringify(trace)};`,
+				`await import(${JSON.stringify(new URL("../fixtures/fake-lsp-server.mjs", import.meta.url).href)});`,
+				"",
+			].join("\n"),
+		);
+		fs.writeFileSync(path.join(env.tmpDir, ".luarc.json"), "{}\n");
+		fs.mkdirSync(path.join(env.tmpDir, ".pi-lens"), { recursive: true });
+		fs.writeFileSync(
+			path.join(env.tmpDir, ".pi-lens", "lsp.json"),
+			JSON.stringify({
+				servers: {
+					emmylua: {
+						name: "save-only server",
+						extensions: [".lua"],
+						command: process.execPath,
+						args: [shim],
+						rootMarkers: [".luarc.json"],
+					},
+				},
+				disabledServers: ["lua", "ast-grep", "typos", "opengrep"],
+			}),
+		);
+		const file = path.join(env.tmpDir, "probe.lua");
+		fs.writeFileSync(file, "local value = 1\n");
+		/** Every document notification the server received, by method. */
+		const wire = () =>
+			fs.existsSync(trace)
+				? fs
+						.readFileSync(trace, "utf8")
+						.split("\n")
+						.flatMap(
+							(line) =>
+								/^recv textDocument\/(did\w+) /.exec(line)?.slice(1, 2) ?? [],
+						)
+				: [];
+		const saves = () => wire().filter((method) => method === "didSave");
+		return { env, file, saves, wire };
+	}
+
+	it("pilens_analyze returns the finding a save-only server publishes", async () => {
+		const { env, file, wire } = saveOnlyWorkspace("pi-lens-mcp-save-analyze-");
+		const child = new McpHarness({ cwd: env.tmpDir });
+		try {
+			// Default flags, so the auxiliary profiles stay on and the dispatch
+			// runner touches with scope "with-auxiliary" after the analysis's
+			// "primary" push. #3405 r2: the debounce key carried the scope, so the
+			// runner re-pushed the same bytes after the save and cleared the
+			// finding this server (silent on a change) had published.
+			const res = await child.request(3405, "tools/call", {
+				name: "pilens_analyze",
+				arguments: { file, mode: "warm" },
+			});
+			const text = (res.result as { content: { text: string }[] }).content[0]
+				.text;
+			expect(wire(), "one push, one save, no re-push").toEqual([
+				"didOpen",
+				"didSave",
+			]);
+			expect(text).toContain(SAVE_ONLY_MESSAGE);
+		} finally {
+			child.dispose();
+			env.cleanup();
+		}
+	}, 60_000);
+
+	it("a cold pilens_diagnostics query saves after its own warm-up pushed the same bytes", async () => {
+		const { env, file, saves } = saveOnlyWorkspace(
+			"pi-lens-mcp-save-query-",
+			true,
+		);
+		const child = new McpHarness({ cwd: env.tmpDir });
+		try {
+			const query = () =>
+				child.request(3406, "tools/call", {
+					name: "pilens_diagnostics",
+					arguments: {
+						source: "lsp",
+						scope: "paths",
+						paths: [file],
+						serverScope: "primary",
+						waitMs: 3000,
+						severity: "all",
+					},
+				});
+			await query();
+			expect(saves(), "the server heard a save").toHaveLength(1);
+			// The empty publish for the re-push and the save's finding race inside
+			// the first answer; a repeat query of the same bytes sends nothing
+			// (debounced) and reads what the save produced.
+			const res = await query();
+			const text = (res.result as { content: { text: string }[] }).content[0]
+				.text;
+			expect(saves(), "one save per bytes").toHaveLength(1);
+			expect(text).toContain(SAVE_ONLY_MESSAGE);
+		} finally {
+			child.dispose();
+			env.cleanup();
+		}
+	}, 60_000);
 });
 
 // #4300: the real MCP child must not inherit pi's absent-host trust policy.

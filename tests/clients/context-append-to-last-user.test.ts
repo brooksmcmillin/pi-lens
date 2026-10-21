@@ -1,6 +1,19 @@
 /**
  * Tests for #3693: Appending context injection to active user prompt to preserve KV cache
  * for local models (llama.cpp / Qwen) and prefix-caching providers.
+ *
+ * TWO TIERS (#4632). The first and the fourth case run through a REAL pi
+ * session (`tests/support/pi-session.ts`, tier 2): the extension is the built
+ * `index.js` loaded by pi's own loader, and the observable is the message the
+ * SCRIPTED MODEL received, after pi's own request processing. Every other case
+ * here asserts pi-lens's own return-value shaping for transcripts a scripted
+ * provider cannot produce — an image block list, an empty array, a custom
+ * `{ weird: true }` content object, an empty transcript — so those stay on the
+ * pi double, which is the cheaper and only possible driver for them. Each of
+ * those direct-handler cells now carries the host's real system head
+ * (`makeContextWithSystemEvent`), so its index positions are the shape pi
+ * actually sends (#4631 round 6, R6-1); the empty-transcript cell is the one
+ * exception, because the branch it reaches is unreachable from a host.
  */
 
 import * as fs from "node:fs";
@@ -9,9 +22,29 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { _resetProcessSingletonsForTests } from "../../clients/process-singletons.js";
+import {
+	makeContextWithSystemEvent,
+	makeSystemHead,
+} from "../support/host-event-factory.js";
 import { createPiMock, makeCtx } from "../support/pi-mock.js";
+import {
+	fauxAssistantMessage,
+	fauxText,
+	fauxToolCall,
+	piSessionFixture,
+	startPiSession,
+} from "../support/pi-session.js";
 
 const TIMEOUT_MS = 30_000;
+
+/** The delimiter every injected block is prefixed with. */
+const INJECTION_DELIMITER = "[pi-lens automated context — not a user request]";
+
+const fixture = piSessionFixture();
+// No per-case handle list: the helper registers every session it creates and
+// disposes the live ones in its own `afterEach`, so a case that fails before
+// `dispose()` cannot leak one (#4664 M2).
+const sessionCwd = (name: string) => path.join(fixture.root, name, "proj");
 
 let tmpDir: string;
 
@@ -29,49 +62,46 @@ async function loadContextHandler() {
 	const { default: registerExtension } = await import("../../index.js");
 	const mock = createPiMock();
 	registerExtension(mock.asExtensionAPI() as any);
-	const context = mock.handlers.get("context")?.[0];
+	// #4631: pi 0.87+ delivers the full transcript to `context_with_system` and
+	// strips system messages from `context`, so the injector is that hook. Its
+	// event carries the transcript the placement rule reads.
+	const context = mock.handlers.get("context_with_system")?.[0];
 	expect(context).toBeTypeOf("function");
 	return { context: context!, mock };
 }
 
 describe("context injection appends to last user message (#3693)", () => {
 	it(
-		"appends findings to a string user prompt with delimiter and preserves original message immutability",
+		"appends the injected block to the prompt the model actually receives, on a real pi turn",
 		async () => {
-			const { context } = await loadContextHandler();
-
-			new CacheManager(false).writeCache(
-				"session-start-guidance",
-				{ content: "Always verify tests." },
-				tmpDir,
-			);
-
-			const originalUser = { role: "user", content: "Optimize performance" };
-			const originalUserSnapshot = JSON.stringify(originalUser);
-			const existing = [{ role: "assistant", content: "Ready." }, originalUser];
-
-			const result = (await context(
-				{ messages: existing },
-				makeCtx({ cwd: tmpDir, sessionId: "sess-1" }),
-			)) as { messages: Array<{ role: string; content: unknown }> };
-
-			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(2);
-			expect(result.messages[0]).toEqual({
-				role: "assistant",
-				content: "Ready.",
+			const handle = await startPiSession({
+				root: fixture.root,
+				cwd: sessionCwd("string-prompt"),
+				responses: [fauxAssistantMessage(fauxText("ready"))],
 			});
 
-			const updatedUser = result.messages[1];
-			expect(updatedUser.role).toBe("user");
-			expect(updatedUser.content).toBe(
-				"Optimize performance\n\n[pi-lens automated context — not a user request]\n\nAlways verify tests.",
-			);
+			await handle.prompt("Optimize performance");
 
-			// Constraint 1: Never mutate original message object in place
-			expect(updatedUser).not.toBe(originalUser);
-			expect(JSON.stringify(originalUser)).toBe(originalUserSnapshot);
-			expect(originalUser.content).toBe("Optimize performance");
+			// What the model received on the turn, as pi built it: the host's
+			// own system head, then ONE user message carrying the prompt and the
+			// injected block — appended, not added as its own message.
+			const transcript = handle.requests[0];
+			expect(transcript[0]).toMatchObject({ role: "system" });
+			expect(transcript).toHaveLength(2);
+			const blocks = transcript[1].content as Array<{
+				type: string;
+				text: string;
+			}>;
+			expect(blocks[0]).toEqual({
+				type: "text",
+				text: "Optimize performance",
+			});
+			expect(blocks[1].type).toBe("text");
+			// The delimiter opens the block, exactly as the unit-level cases
+			// above require; the body is pi-lens's own session-start guidance.
+			expect(blocks[1].text.startsWith(INJECTION_DELIMITER)).toBe(true);
+			expect(blocks[1].text).toContain("pi-lens active");
+			expect(handle.errors).toEqual([]);
 		},
 		TIMEOUT_MS,
 	);
@@ -89,15 +119,23 @@ describe("context injection appends to last user message (#3693)", () => {
 
 			const emptyPrompt = { role: "user", content: "" };
 			const existing = [emptyPrompt];
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: existing },
+				makeContextWithSystemEvent(existing, head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-2" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(1);
-			const last = result.messages[0];
+			expect(result.messages).toHaveLength(2);
+			// #4631 round 6 (R6-1): the host's request leads with the system head,
+			// which the handler must hand back untouched — the user prompt and the
+			// injected block follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			const last = result.messages[1];
 			expect(last.role).toBe("user");
 			expect(typeof last.content).toBe("string");
 			expect((last.content as string).startsWith("\n")).toBe(false);
@@ -130,15 +168,23 @@ describe("context injection appends to last user message (#3693)", () => {
 			const originalArray = [imagePart, textPart];
 			const originalUser = { role: "user", content: originalArray };
 			const originalUserSnapshot = JSON.stringify(originalUser);
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: [originalUser] },
+				makeContextWithSystemEvent([originalUser], head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-3" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(1);
-			const last = result.messages[0];
+			expect(result.messages).toHaveLength(2);
+			// #4631 round 6 (R6-1): the host's request leads with the system head,
+			// which the handler must hand back untouched — the user prompt and the
+			// injected block follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			const last = result.messages[1];
 			expect(last.role).toBe("user");
 			expect(Array.isArray(last.content)).toBe(true);
 
@@ -176,15 +222,23 @@ describe("context injection appends to last user message (#3693)", () => {
 
 			const emptyArray: unknown[] = [];
 			const originalUser = { role: "user", content: emptyArray };
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: [originalUser] },
+				makeContextWithSystemEvent([originalUser], head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-4" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(1);
-			const last = result.messages[0];
+			expect(result.messages).toHaveLength(2);
+			// #4631 round 6 (R6-1): the host's request leads with the system head,
+			// which the handler must hand back untouched — the user prompt and the
+			// injected block follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			const last = result.messages[1];
 			expect(Array.isArray(last.content)).toBe(true);
 			const contentBlocks = last.content as Array<{
 				type: string;
@@ -202,40 +256,53 @@ describe("context injection appends to last user message (#3693)", () => {
 	);
 
 	it(
-		"preserves trailing tool_result adjacency by appending after transcript instead of into tool_result",
+		"appends after a trailing tool result on a real pi turn instead of into it",
 		async () => {
-			const { context } = await loadContextHandler();
-
-			new CacheManager(false).writeCache(
-				"session-start-guidance",
-				{ content: "Tool findings." },
-				tmpDir,
-			);
-
-			const toolUse = {
-				role: "assistant",
-				content: [{ type: "tool_use", id: "call_1", name: "read", input: {} }],
-			};
-			const toolResult = {
-				role: "user",
-				content: [
-					{ type: "tool_result", tool_use_id: "call_1", content: "ok" },
+			// The cache the request hook consumes is staged while pi assembles
+			// the FIRST request, so it is present for the request that follows
+			// the tool call — the transcript that ends in a tool result.
+			const MID_RUN = "MIDRUN-GUIDANCE";
+			const handle = await startPiSession({
+				root: fixture.root,
+				cwd: sessionCwd("tool-result-adjacency"),
+				responses: [
+					() => {
+						new CacheManager(false).writeCache(
+							"session-start-guidance",
+							{ content: MID_RUN },
+							sessionCwd("tool-result-adjacency"),
+						);
+						return fauxAssistantMessage([
+							fauxText("checking"),
+							fauxToolCall("lens_diagnostics", { paths: [] }),
+						]);
+					},
+					fauxAssistantMessage(fauxText("done")),
 				],
-			};
-			const existing = [toolUse, toolResult];
+			});
 
-			const result = (await context(
-				{ messages: existing },
-				makeCtx({ cwd: tmpDir, sessionId: "sess-5" }),
-			)) as { messages: Array<{ role: string; content: unknown }> };
+			await handle.prompt("keep working");
 
-			expect(result).toBeDefined();
-			// Injected message must be appended AFTER the tool_result message
-			expect(result.messages).toHaveLength(3);
-			expect(result.messages[0]).toBe(toolUse);
-			expect(result.messages[1]).toBe(toolResult);
-			expect(result.messages[2].role).toBe("user");
-			expect(result.messages[2].content).toContain("Tool findings.");
+			// pi's own transcript: system head, the prompt, the assistant's call,
+			// the tool result — then the injection as a NEW user message.
+			const second = handle.requests[1];
+			expect(second.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+				"assistant",
+				"toolResult",
+				"user",
+			]);
+
+			// Nothing was appended inside the tool result: it still carries the
+			// tool's own answer only.
+			const toolResultText = JSON.stringify(second[3]);
+			expect(toolResultText).not.toContain(MID_RUN);
+			expect(toolResultText).toContain("No issues in the current turn delta.");
+
+			// The injection is the trailing message, prefixed with the delimiter.
+			expect(second[4].content).toBe(`${INJECTION_DELIMITER}\n\n${MID_RUN}`);
+			expect(handle.errors).toEqual([]);
 		},
 		TIMEOUT_MS,
 	);
@@ -251,6 +318,10 @@ describe("context injection appends to last user message (#3693)", () => {
 				tmpDir,
 			);
 
+			// #4631 round 6 (R6-1): this cell stays HEADLESS on purpose. The branch
+			// it reaches (`existingMessages.length === 0`) is unreachable from a
+			// host, which always leads the transcript with the system head; giving
+			// it a head would delete the branch's only coverage.
 			const result = (await context(
 				{ messages: [] },
 				makeCtx({ cwd: tmpDir, sessionId: "sess-6" }),
@@ -278,23 +349,30 @@ describe("context injection appends to last user message (#3693)", () => {
 			const customContent = { weird: true };
 			const customUser = { role: "user", content: customContent };
 			const existing = [{ role: "assistant", content: "Ready." }, customUser];
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: existing },
+				makeContextWithSystemEvent(existing, head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-7" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
 			// Appends AFTER the transcript as a new message, leaving customContent untouched
-			expect(result.messages).toHaveLength(3);
-			expect(result.messages[0]).toEqual({
+			expect(result.messages).toHaveLength(4);
+			// #4631 round 6 (R6-1): the host's head leads the transcript; the
+			// prior turns and the appended message follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			expect(result.messages[1]).toEqual({
 				role: "assistant",
 				content: "Ready.",
 			});
-			expect(result.messages[1]).toBe(customUser);
-			expect(result.messages[1].content).toBe(customContent);
-			expect(result.messages[2].role).toBe("user");
-			expect(result.messages[2].content).toContain("Uncoerced test guidance.");
+			expect(result.messages[2]).toBe(customUser);
+			expect(result.messages[2].content).toBe(customContent);
+			expect(result.messages[3].role).toBe("user");
+			expect(result.messages[3].content).toContain("Uncoerced test guidance.");
 		},
 		TIMEOUT_MS,
 	);

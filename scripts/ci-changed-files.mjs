@@ -5,19 +5,26 @@
  *   node scripts/ci-changed-files.mjs --event <github event name> \
  *     [--repo <owner/repo> --pr <number>]
  *
- * The `changes` job of ci.yml. Writes two step outputs:
+ * The `changes` job of ci.yml and the `scope` job of install-smoke.yml. Writes
+ * three step outputs:
  *
  *   code=true|false    false ONLY for a pull_request whose every changed path
- *                      is on the strict docs allowlist below: the heavy jobs
- *                      (Unit shards, Install tests, Windows advisory, mutation,
- *                      ...) then skip.
+ *                      is on the strict docs allowlist below: the heavy advisory
+ *                      job (CodeQL) then skips. Every test job, the Windows
+ *                      unit leg included, still runs (#4518).
  *   formal=true|false  true when the diff touches the TLA+ models or what runs
  *                      them; `TLA+ models` model-checks only then.
+ *   smoke=true|false   true when the diff touches PR_SMOKE_PATHS (RPC, install,
+ *                      LSP launch, trust; #4291). install-smoke.yml reads it:
+ *                      true runs every pi-load cell and the LSP handshake on
+ *                      the pull request, false keeps the one pnpm-global cell.
+ *                      ci.yml ignores it.
  *
  * Direction of every doubt is FULL SUITE (AGENTS.md shape 48): a non-PR event
  * (push to master, merge_group), an unreadable file list,
  * an empty list, a list at GitHub's 3000-file cap, or any path this file does
- * not recognise as docs all give code=true. The script exits 0 in each of
+ * not recognise as docs all give code=true, and the same doubts give
+ * smoke=true. The script exits 0 in each of
  * those cases; only bad arguments exit 2.
  */
 
@@ -38,6 +45,57 @@ const DOCS_ALLOWLIST = [
 	(path) => path.startsWith(".changelog/"),
 ];
 
+/**
+ * The paths that decide the deep install smoke (#4291). One list drives both
+ * the all-cells pi-load matrix and the LSP handshake job of install-smoke.yml,
+ * through `smoke` below. An entry is a file or a `dir/**` prefix, nothing else;
+ * every entry must also sit verbatim in install-smoke.yml's pull_request
+ * `paths:`, or a PR touching only that path never starts the workflow
+ * (tests/config/pr-smoke-paths.test.ts pins both).
+ */
+export const PR_SMOKE_PATHS = [
+	// RPC driver and its fake host.
+	"scripts/rpc-load-check.mjs",
+	"scripts/lib/latency-log-phases.mjs",
+	"tests/fixtures/rpc-load-check/**",
+	// Host-crash seams the RPC smoke exists to catch (#4401).
+	"scripts/bundle-dist.mjs",
+	"clients/project-snapshot.ts",
+	"clients/project-snapshot-persist-worker.ts",
+	"clients/gzip-stage-write.ts",
+	"clients/review-graph/builder.ts",
+	"clients/review-graph/persist-worker.ts",
+	// Install: manifests, selftest, installer registry, bootstrap.
+	"package.json",
+	"package-lock.json",
+	"scripts/install-selftest.mjs",
+	"scripts/download-grammars.js",
+	"clients/installer/**",
+	"clients/bootstrap.ts",
+	// LSP launch, and the handshake harness itself (#4291 asks for it).
+	"scripts/smoke-tools.mjs",
+	"scripts/lib/git-fixture-env.mjs",
+	"scripts/lib/lsp-fixture-session-guard.mjs",
+	"scripts/lib/lsp-fixture-workspace.mjs",
+	"scripts/lib/safe-rm.mjs",
+	"scripts/lib/scratch-dir.mjs",
+	"scripts/lib/touch-result.mjs",
+	"clients/lsp-lazy.ts",
+	// The only `.spawn(` call site and the trust backstop (#4374), and the JVM
+	// launch runtime.
+	"clients/lsp/client-registry.ts",
+	"clients/lsp/jvm-runtime.ts",
+	"clients/lsp/launch.ts",
+	"clients/lsp/server.ts",
+	"clients/lsp/config.ts",
+	"clients/lsp/resolved-config.ts",
+	"clients/safe-spawn.ts",
+	// Trust.
+	"clients/project-trust.ts",
+	// The workflow itself: its edited lines must run all of the above.
+	".github/workflows/install-smoke.yml",
+];
+
 /** Paths that run or define the TLA+ models. */
 const FORMAL_TRIGGERS = [
 	(path) => path.startsWith("formal/"),
@@ -54,20 +112,37 @@ function isDocsPath(path) {
 	return DOCS_ALLOWLIST.some((matches) => matches(path));
 }
 
+/** A `dir/**` entry matches by prefix, any other entry exactly. */
+function matchesSmokePath(path) {
+	if (path.split("/").includes("..")) return false;
+	return PR_SMOKE_PATHS.some((entry) =>
+		entry.endsWith("/**")
+			? path.startsWith(entry.slice(0, -2))
+			: path === entry,
+	);
+}
+
 /**
  * @param {string[]} paths every path the diff touches (a rename contributes
  *   both its old and new path)
- * @returns {{ code: boolean, formal: boolean, reason: string }}
+ * @returns {{ code: boolean, formal: boolean, smoke: boolean, reason: string }}
  */
 export function classifyChangedFiles(paths) {
 	if (!Array.isArray(paths) || paths.length === 0)
-		return { code: true, formal: true, reason: "no changed files listed" };
+		return {
+			code: true,
+			formal: true,
+			smoke: true,
+			reason: "no changed files listed",
+		};
 	if (paths.length >= PR_FILES_API_CAP)
 		return {
 			code: true,
 			formal: true,
+			smoke: true,
 			reason: `${paths.length} files reaches the API listing cap`,
 		};
+	const smoke = paths.some(matchesSmokePath);
 	const nonDocs = paths.filter((path) => !isDocsPath(path));
 	const formal = paths.some((path) =>
 		FORMAL_TRIGGERS.some((matches) => matches(path)),
@@ -76,11 +151,13 @@ export function classifyChangedFiles(paths) {
 		return {
 			code: true,
 			formal,
+			smoke,
 			reason: `code paths in the diff: ${nonDocs.slice(0, 3).join(", ")}${nonDocs.length > 3 ? `, +${nonDocs.length - 3} more` : ""}`,
 		};
 	return {
 		code: false,
 		formal,
+		smoke,
 		reason: `docs-only diff (${paths.length} files)`,
 	};
 }
@@ -184,6 +261,7 @@ export function run(argv, io = {}) {
 		result = {
 			code: true,
 			formal: true,
+			smoke: true,
 			reason: `${options.event} runs the full suite`,
 		};
 	} else {
@@ -194,16 +272,17 @@ export function run(argv, io = {}) {
 			result = {
 				code: true,
 				formal: true,
+				smoke: true,
 				reason: `changed files unreadable (${message.split("\n")[0]})`,
 			};
 		}
 	}
-	const line = `changes: code=${result.code} formal=${result.formal} -- ${result.reason}`;
+	const line = `changes: code=${result.code} formal=${result.formal} smoke=${result.smoke} -- ${result.reason}`;
 	log(line);
 	if (env.GITHUB_OUTPUT)
 		fs.appendFileSync(
 			env.GITHUB_OUTPUT,
-			`code=${result.code}\nformal=${result.formal}\n`,
+			`code=${result.code}\nformal=${result.formal}\nsmoke=${result.smoke}\n`,
 		);
 	if (env.GITHUB_STEP_SUMMARY)
 		fs.appendFileSync(env.GITHUB_STEP_SUMMARY, `${line}\n`);

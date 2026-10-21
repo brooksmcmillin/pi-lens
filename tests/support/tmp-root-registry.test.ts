@@ -27,9 +27,10 @@ import {
 	installTmpRootInterposer,
 	recordedTmpRootCreators,
 	registerTmpRoot,
+	registerTmpSibling,
 	sampleTmpRoots,
 	sweepTmpRoots,
-	type MkdtempTarget,
+	type TmpRootFsTarget,
 } from "./tmp-root-registry.js";
 
 /** An in-memory filesystem: which paths exist, and what a remove does. */
@@ -100,6 +101,28 @@ describe("tmp-root registry decisions (#2912)", () => {
 		expect(registry.dropped).toBe(3);
 	});
 
+	// #4560 N2: sibling admissions share the roots budget; repeat observations
+	// upgrade an unknown creator without replacing the first known creator.
+	it("bounds siblings alongside roots and upgrades existing creators (#4560)", () => {
+		const registry = createTmpRootRegistry();
+		registerTmpRoot(registry, "/tmp/pi-lens-budget", "observed");
+		registerTmpSibling(registry, "/tmp/repeated");
+		registerTmpSibling(registry, "/tmp/repeated", "first.test.ts");
+		registerTmpSibling(registry, "/tmp/repeated", "second.test.ts");
+		expect(recordedTmpRootCreators(registry).get("repeated")).toBe(
+			"first.test.ts",
+		);
+		for (let i = 0; i < MAX_TMP_ROOTS; i++)
+			registerTmpSibling(registry, `/tmp/sibling-${i}`, "cap.test.ts");
+		expect(registry.siblings.size).toBe(MAX_TMP_ROOTS - 1);
+		expect(registry.dropped).toBe(2);
+		registerTmpSibling(registry, "/tmp/repeated", "third.test.ts");
+		expect(registry.dropped).toBe(2);
+		expect(recordedTmpRootCreators(registry).get("repeated")).toBe(
+			"first.test.ts",
+		);
+	});
+
 	it("reports a removal that throws or leaves the root behind, and keeps sweeping", () => {
 		const registry = createTmpRootRegistry();
 		registerTmpRoot(registry, "/tmp/pi-lens-throws", "registered");
@@ -166,9 +189,12 @@ describe("tmp-root interposer (#2912)", () => {
 			},
 			promises: {
 				mkdtemp: async (prefix: string) => `${prefix}CCCCCC`,
+				mkdir: async (dir: string) => dir,
 			},
+			mkdirSync: (dir: string) => dir,
+			mkdir: (_dir: string, done: (error: Error | null) => void) => done(null),
 		};
-		return { target: target as unknown as MkdtempTarget, made };
+		return { target: target as unknown as TmpRootFsTarget, made };
 	}
 
 	it("records pi-lens roots directly under the tmpdir, from all three mkdtemp shapes", async () => {
@@ -210,6 +236,64 @@ describe("tmp-root interposer (#2912)", () => {
 		expect(registry.roots.size).toBe(0);
 	});
 
+	it("records a fixture sibling of ANY name created by mkdir, and only a direct tmp child (#4560)", () => {
+		const registry = createTmpRootRegistry();
+		const { target } = fakeTarget();
+		installTmpRootInterposer(
+			registry,
+			target,
+			"/var/tmp",
+			() => "leaking.test.ts",
+		);
+		const mkdir = target.mkdirSync as (dir: string) => string;
+		mkdir("/var/tmp/capture");
+		mkdir("/var/tmp/capture/nested");
+		mkdir("/home/user/elsewhere");
+		expect(recordedTmpRootCreators(registry)).toEqual(
+			new Map([["capture", "leaking.test.ts"]]),
+		);
+	});
+
+	// #4560 N1: Node's created path may vary drive casing and separators.
+	it("judges Windows created paths through the same parent comparison (#4560)", () => {
+		const registry = createTmpRootRegistry();
+		const { target } = fakeTarget();
+		target.mkdirSync = (() => path.win32.join("c:/TEMP", "made")) as never;
+		installTmpRootInterposer(
+			registry,
+			target,
+			"C:\\Temp",
+			() => "windows.test.ts",
+		);
+		(target.mkdirSync as (p: string, o: { recursive: boolean }) => unknown)(
+			"C:/Temp/made/src",
+			{ recursive: true },
+		);
+		expect([...registry.siblings.values()]).toEqual([
+			{ createdBy: "windows.test.ts" },
+		]);
+	});
+
+	it("judges canonical parent aliases through setup-owned fs (#3703)", () => {
+		// V1: retain realpath alias equivalence without preloading clients/path-utils.
+		const env = setupTestEnvironment("pi-lens-4560-alias-");
+		try {
+			const real = path.join(env.tmpDir, "real");
+			const alias = path.join(env.tmpDir, "alias");
+			fs.mkdirSync(real);
+			fs.symlinkSync(real, alias, "junction");
+			const registry = createTmpRootRegistry();
+			const { target } = fakeTarget();
+			installTmpRootInterposer(registry, target, alias, () => "alias.test.ts");
+			(target.mkdirSync as (p: string) => unknown)(path.join(real, "made"));
+			expect([...registry.siblings.values()]).toEqual([
+				{ createdBy: "alias.test.ts" },
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("returns exactly what the wrapped function returned", () => {
 		const registry = createTmpRootRegistry();
 		const { target } = fakeTarget();
@@ -217,6 +301,75 @@ describe("tmp-root interposer (#2912)", () => {
 		expect(
 			(target.mkdtempSync as (p: string) => string)("/var/tmp/pi-lens-r-"),
 		).toBe("/var/tmp/pi-lens-r-AAAAAA");
+	});
+
+	// #4560 F3, both directions over REAL filesystem calls: the census used to
+	// judge the REQUESTED path, so the ancestor a recursive `mkdir` created at
+	// the tmp root was observed and never judged, and a recursive re-mkdir of a
+	// directory another process made was blamed on this test. `fs.mkdirSync`
+	// returns the FIRST directory it created, and nothing when it created none.
+	it("judges the ancestor a recursive mkdir created, and records nothing when it created none (#4560)", async () => {
+		const root = fs.realpathSync(
+			mkdtempSync(path.join(os.tmpdir(), "pi-lens-4560-rec-")),
+		);
+		const registry = createTmpRootRegistry();
+		const target = {
+			mkdtempSync: fs.mkdtempSync,
+			mkdtemp: fs.mkdtemp,
+			mkdirSync: fs.mkdirSync,
+			mkdir: fs.mkdir,
+			promises: { mkdtemp: fsp.mkdtemp, mkdir: fsp.mkdir },
+		} as unknown as TmpRootFsTarget;
+		installTmpRootInterposer(registry, target, root, () => "recursive.test.ts");
+		const mkdirSync = target.mkdirSync as (
+			dir: string,
+			options?: { recursive?: boolean },
+		) => string | undefined;
+		try {
+			// The requested path is `<root>/rec/src`; what the call CREATED at the
+			// tmp root is `rec`, and that is the entry the census must judge.
+			expect(
+				mkdirSync(path.join(root, "rec", "src"), { recursive: true }),
+			).toBe(path.join(root, "rec"));
+			expect(recordedTmpRootCreators(registry)).toEqual(
+				new Map([["rec", "recursive.test.ts"]]),
+			);
+			// A recursive re-mkdir of an existing child creates nothing, so it is a
+			// no-op. A directory that was already there and this call did not make —
+			// another writer's, or one the run's baseline already held — is never
+			// attributed to this file (#4560 F3, second direction).
+			fs.mkdirSync(path.join(root, "foreign"));
+			mkdirSync(path.join(root, "rec"), { recursive: true });
+			mkdirSync(path.join(root, "foreign"), { recursive: true });
+			expect(recordedTmpRootCreators(registry).has("foreign")).toBe(false);
+			// #4560 N4: callback recursive mkdir also reports its first-created path.
+			await new Promise<void>((resolve, reject) => {
+				(target.mkdir as typeof fs.mkdir)(
+					path.join(root, "callback", "nested"),
+					{ recursive: true },
+					(error) => (error ? reject(error) : resolve()),
+				);
+			});
+			expect(recordedTmpRootCreators(registry).get("callback")).toBe(
+				"recursive.test.ts",
+			);
+			// The promise form reports the same first-created path.
+			await (
+				target.promises.mkdir as (
+					dir: string,
+					options?: { recursive?: boolean },
+				) => Promise<string | undefined>
+			)(path.join(root, "promised", "nested"), { recursive: true });
+			expect(recordedTmpRootCreators(registry)).toEqual(
+				new Map([
+					["rec", "recursive.test.ts"],
+					["callback", "recursive.test.ts"],
+					["promised", "recursive.test.ts"],
+				]),
+			);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("records the test file running when each entry appeared, one record per entry", () => {

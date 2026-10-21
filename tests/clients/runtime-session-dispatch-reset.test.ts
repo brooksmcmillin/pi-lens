@@ -14,6 +14,7 @@
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
+import { safeSpawnAsync } from "../../clients/safe-spawn.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
@@ -50,7 +51,7 @@ function makeDefaultRuntime() {
 		isCurrentSession: () => true,
 		markStartupScanInFlight: () => {},
 		clearStartupScanInFlight: () => {},
-		complexityBaselines: new Map(),
+		complexityBaselines: new Set(),
 		resetForSession: () => {},
 		projectRoot: "",
 		projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -114,11 +115,19 @@ describe("dispatch availability suppression is reset at session start (#1266)", 
 
 	beforeEach(() => {
 		vi.clearAllMocks();
+		// Recurrence (#4561, shuffle seed 424): `clearAllMocks()` clears calls,
+		// not implementations, so a case's stubbed probe answers (and its send
+		// owner) were still installed for every later case. `mockReset()` puts
+		// back the factory's original implementation.
+		vi.mocked(safeSpawnAsync).mockReset();
 		tmpDir = setupTestEnvironment("pi-lens-dispatch-reset-").tmpDir;
 	});
 
 	afterEach(() => {
 		removeTempDirSync(tmpDir);
+		// #4560: the formatter-reprobe cell creates `${tmpDir}-next` at the tmp
+		// root; a sibling the file made is the file's to remove.
+		removeTempDirSync(`${tmpDir}-next`);
 	});
 
 	it("retries a suppressed tool's install after handleSessionStart, not just after calling the reset helper directly", async () => {
@@ -278,27 +287,51 @@ describe("dispatch availability suppression is reset at session start (#1266)", 
 	it("re-probes PowerShell after handleSessionStart", async () => {
 		const spawnMod = await import("../../clients/safe-spawn.js");
 		const spawnMock = vi.mocked(spawnMod.safeSpawnAsync);
-		const runner = (
-			await import("../../clients/dispatch/runners/psscriptanalyzer.js")
-		).default;
+		const psMod =
+			await import("../../clients/dispatch/runners/psscriptanalyzer.js");
+		// Arrange only, and this cell owns both inputs an earlier case can leave
+		// behind (#4574 seed 424: the package-manager case before it left a
+		// permissive `safeSpawnAsync` implementation, so the interpreter answered,
+		// the `-File` run never latched a blocked verdict, and every same-session
+		// `run` re-spawned it -- 4 probes where the latch should hold 3). The
+		// latches are module-local and shared by every case in this file, so start
+		// from no verdict, restore the spawn double afterwards, and answer as a
+		// genuinely absent interpreter: the shape #1490 was filed about.
+		psMod.resetPsScriptAnalyzerAvailability();
+		const restoreSpawn = spawnMock.getMockImplementation();
+		spawnMock.mockImplementation((async () => ({
+			stdout: "",
+			stderr: "",
+			status: null,
+			error: Object.assign(new Error("spawn pwsh ENOENT"), {
+				code: "ENOENT",
+			}),
+			failure: "spawn",
+			spawnFailure: { kind: "tool-not-found" },
+		})) as never);
+		const runner = psMod.default;
 		const psProbes = () =>
 			spawnMock.mock.calls.filter((call) =>
 				(call[1] as string[] | undefined)?.includes("-NoProfile"),
 			).length;
 
 		const ctx = { cwd: tmpDir, filePath: `${tmpDir}/script.ps1` } as never;
-		expect((await runner.run(ctx)).status).toBe("skipped");
-		const afterFirst = psProbes();
-		expect(afterFirst).toBeGreaterThan(0);
+		try {
+			expect((await runner.run(ctx)).status).toBe("skipped");
+			const afterFirst = psProbes();
+			expect(afterFirst).toBeGreaterThan(0);
 
-		// Same session: the verdict is latched, so nothing is re-probed.
-		expect((await runner.run(ctx)).status).toBe("skipped");
-		expect(psProbes()).toBe(afterFirst);
+			// Same session: the verdict is latched, so nothing is re-probed.
+			expect((await runner.run(ctx)).status).toBe("skipped");
+			expect(psProbes()).toBe(afterFirst);
 
-		await handleSessionStart(makeDeps(tmpDir));
+			await handleSessionStart(makeDeps(tmpDir));
 
-		expect((await runner.run(ctx)).status).toBe("skipped");
-		expect(psProbes()).toBeGreaterThan(afterFirst);
+			expect((await runner.run(ctx)).status).toBe("skipped");
+			expect(psProbes()).toBeGreaterThan(afterFirst);
+		} finally {
+			if (restoreSpawn) spawnMock.mockImplementation(restoreSpawn);
+		}
 	});
 
 	// #1497: govulncheck's install-class retry ceiling is terminal for a

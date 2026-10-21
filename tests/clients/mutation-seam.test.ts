@@ -14,6 +14,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
+import {
+	releaseGeneration,
+	tryAcquireGeneration,
+} from "../../clients/generation-lock.js";
 import { getProjectChangeLogPath } from "../../clients/project-changes.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 
@@ -25,6 +33,187 @@ function makeRuntime(): RuntimeCoordinator {
 	runtime.projectRoot = "/proj";
 	return runtime;
 }
+
+describe("recordProjectMutations — the bulk form of the same seam (#4535)", () => {
+	function makeCwd(): string {
+		return fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-bulk-seam-"));
+	}
+
+	function readLines(cwd: string): Array<{
+		seq: number;
+		source: string;
+		filePath: string;
+		fileSeq: number;
+		unlocked?: true;
+	}> {
+		const logPath = getProjectChangeLogPath(cwd);
+		if (!fs.existsSync(logPath)) return [];
+		return fs
+			.readFileSync(logPath, "utf8")
+			.split("\n")
+			.filter((line) => line.trim())
+			.map((line) => JSON.parse(line));
+	}
+
+	it("allocates one seq per path, in one append, on the existing sequence", () => {
+		const cwd = makeCwd();
+		try {
+			const runtime = makeRuntime();
+			const paths = ["src/a.ts", "src/b.ts", "src/c.ts"].map((rel) =>
+				path.join(cwd, rel),
+			);
+			const { projectSeq, fileSeqs } = runtime.recordProjectMutations({
+				paths,
+				source: "external",
+				cwd,
+			});
+			// The same sequence the single writer allocates: no second space.
+			expect(projectSeq).toBe(3);
+			expect(runtime.getFilesChangedSince(0)).toEqual(
+				expect.arrayContaining(paths.map(keyOf)),
+			);
+			for (const filePath of paths) {
+				expect(fileSeqs.get(keyOf(filePath))).toBe(1);
+				expect(runtime.getFileSeq(filePath)).toBe(1);
+			}
+			const lines = readLines(cwd);
+			expect(lines.map((line) => line.seq)).toEqual([1, 2, 3]);
+			expect(lines.map((line) => line.source)).toEqual([
+				"external",
+				"external",
+				"external",
+			]);
+			expect(lines.every((line) => line.unlocked === undefined)).toBe(true);
+			// One receipt per path, attributed to the bulk source, and the ring
+			// reads them in allocation order.
+			const receipts = runtime.getMutationsSince(0);
+			expect(receipts.map((receipt) => receipt.seq)).toEqual([1, 2, 3]);
+			expect(receipts.map((receipt) => receipt.source)).toEqual([
+				"external",
+				"external",
+				"external",
+			]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("continues the single writer's sequence and does not restart the fileSeq", () => {
+		const cwd = makeCwd();
+		try {
+			const runtime = makeRuntime();
+			const a = path.join(cwd, "a.ts");
+			const b = path.join(cwd, "b.ts");
+			runtime.recordProjectMutation({
+				filePath: a,
+				source: "agent-write",
+				cwd,
+			});
+			const bulk = runtime.recordProjectMutations({
+				paths: [a, b],
+				source: "external",
+				cwd,
+			});
+			runtime.recordProjectMutation({ filePath: b, source: "agent-edit", cwd });
+			expect(bulk.projectSeq).toBe(3);
+			// Same bump store: a's second bump is fileSeq 2, b's first is 1 and
+			// its agent edit is 2.
+			expect(bulk.fileSeqs.get(keyOf(a))).toBe(2);
+			expect(bulk.fileSeqs.get(keyOf(b))).toBe(1);
+			expect(runtime.getFileSeq(b)).toBe(2);
+			expect(readLines(cwd).map((line) => line.seq)).toEqual([1, 2, 3, 4]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("an unavailable lock tags every line unlocked and records ONE degradation for the batch", () => {
+		const cwd = makeCwd();
+		try {
+			const logPath = getProjectChangeLogPath(cwd);
+			// Real filesystem fault, no mocks (same shape as the single writer's
+			// case): the project data dir is a regular file, so the append's
+			// recursive mkdir throws EEXIST for the whole batch.
+			const projectDataDir = path.dirname(logPath);
+			fs.mkdirSync(path.dirname(projectDataDir), { recursive: true });
+			fs.writeFileSync(projectDataDir, "not a directory", "utf8");
+			const runtime = makeRuntime();
+			const onAppendError = vi.fn();
+			const paths = [path.join(cwd, "x.ts"), path.join(cwd, "y.ts")];
+			const result = runtime.recordProjectMutations({
+				paths,
+				source: "external",
+				cwd,
+				onAppendError,
+			});
+			// The failure is isolated exactly as the single writer's: receipts
+			// survive, the batch still allocates, and the error routes once.
+			expect(onAppendError).toHaveBeenCalledTimes(1);
+			expect(onAppendError.mock.calls[0][0]).toBeInstanceOf(Error);
+			expect(result.projectSeq).toBe(2);
+			expect(runtime.getMutationsSince(0)).toHaveLength(2);
+			expect(readLines(cwd)).toEqual([]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("the lock-unavailable path tags every appended line unlocked, once, not per line", () => {
+		const cwd = makeCwd();
+		try {
+			const runtime = makeRuntime();
+			const paths = [path.join(cwd, "a.ts"), path.join(cwd, "b.ts")];
+			const logPath = getProjectChangeLogPath(cwd);
+			fs.mkdirSync(path.dirname(logPath), { recursive: true });
+			resetDegradationLedger();
+			// A real hold on the real lock seam: the batch's lease wait runs out,
+			// so the production fallback appends the whole batch unlocked.
+			const hold = tryAcquireGeneration(`${logPath}.locks`, 5_000);
+			expect(hold).toBeDefined();
+			try {
+				runtime.recordProjectMutations({ paths, source: "external", cwd });
+			} finally {
+				if (hold) releaseGeneration(hold);
+			}
+			const lines = readLines(cwd);
+			expect(lines.map((line) => line.unlocked)).toEqual([true, true]);
+			// ONE record for the batch: the single writer's semantics, not one
+			// record per path.
+			const failures = getDegradationSummary().filter(
+				(group) => group.kind === "change-log-lock-unavailable",
+			);
+			expect(failures).toHaveLength(1);
+			expect(failures[0].count).toBe(1);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds the ring and counts drops for a bulk larger than the cap", () => {
+		const runtime = makeRuntime();
+		const paths = Array.from({ length: 600 }, (_, index) => `/p/f${index}.ts`);
+		runtime.recordProjectMutations({ paths, source: "external" });
+		expect(runtime.getMutationsSince(0).length).toBe(512);
+		expect(runtime.droppedMutationReceiptCount).toBe(88);
+	});
+
+	it("an empty path list touches neither the log nor the sequence", () => {
+		const cwd = makeCwd();
+		try {
+			const runtime = makeRuntime();
+			const { projectSeq, fileSeqs } = runtime.recordProjectMutations({
+				paths: [],
+				source: "external",
+				cwd,
+			});
+			expect(projectSeq).toBe(0);
+			expect(fileSeqs.size).toBe(0);
+			expect(fs.existsSync(getProjectChangeLogPath(cwd))).toBe(false);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("recordProjectMutation — the one mutation seam", () => {
 	it("bumps seq and records an attributed receipt", () => {

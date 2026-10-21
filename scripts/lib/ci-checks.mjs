@@ -93,6 +93,10 @@ export const ADVISORY_CHECKS = new Set([
 // makes one gate. tests/config/heavy-advisory-gate-workflow.test.ts derives the
 // same set from ci.yml, so a job added behind the gate cannot be missing here.
 //
+// `Unit tests Windows (advisory)` left this list when #4518 promoted it to a
+// gating check: it starts on every event now, so a deferred row for it would
+// be a PENDING claim about a job an older head simply does not carry.
+//
 // Their state is read off the gate's own check-run (`HEAVY_GATE_CHECK`): absent
 // or running means PENDING, concluded success means the jobs are about to be
 // queued, and skipped or red means NOT RUN with the reason. A head is of the
@@ -101,7 +105,6 @@ export const HEAVY_GATE_CHECK = "Heavy advisory gate (advisory)";
 export const CHANGES_CHECK = "Changed files (advisory)";
 export const DEFERRED_ADVISORY_CHECKS = Object.freeze([
 	"mutation (advisory)",
-	"Unit tests Windows (advisory)",
 	// #3801: ci.yml's PR-time CodeQL matrix (one check-run per language).
 	"CodeQL (actions) (advisory)",
 	"CodeQL (javascript-typescript) (advisory)",
@@ -187,6 +190,68 @@ function isConcludedSuccess(run) {
 	const status = String(run?.status ?? "").toUpperCase();
 	const conclusion = String(run?.conclusion ?? "").toUpperCase();
 	return status === "COMPLETED" && conclusion === "SUCCESS";
+}
+
+/**
+ * The aggregate check a SHARDED job row belongs to, or `null` for any other
+ * name: `"Unit tests (shard 3/5)"` -> `"Unit tests"`. The aggregate is the ONE
+ * required context (#3753, #4672), and it is the job that reads every shard's
+ * row and decides whether a cancellation was a teardown race.
+ *
+ * @param {unknown} name
+ * @returns {string | null}
+ */
+export function shardAggregateName(name) {
+	const match = /^(.+?) \(shard [0-9]+\/[0-9]+\)$/.exec(String(name ?? ""));
+	return match ? match[1] : null;
+}
+
+/**
+ * The names every one of whose runs came from a schedule/dispatch/
+ * workflow_run workflow (#4090). Those runs are not part of a commit's PR/push
+ * CI, so the name is advisory for this head. One run of the name from any other
+ * (or an unknown) event keeps it out of the set.
+ *
+ * @param {CheckRunRecord[]} checkRuns
+ * @returns {Set<string>}
+ */
+export function resolveTriggerAdvisoryNames(checkRuns) {
+	const events = new Map();
+	for (const run of checkRuns ?? []) {
+		const seen = events.get(run.name) ?? [];
+		seen.push(run.workflow_event);
+		events.set(run.name, seen);
+	}
+	return new Set(
+		[...events]
+			.filter(([, seen]) => seen.every((event) => isNonPrCiEvent(event)))
+			.map(([name]) => name),
+	);
+}
+
+/**
+ * Whether a check NAME gates this head: branch protection requires it, or it
+ * is not on the advisory allowlist and not a schedule-only lane.
+ *
+ * ONE owner for the rule, because two readers of the same payload answer it --
+ * `computeVerdict`'s rows and `runtimeCapLines`' printed `(gating)` marker --
+ * and they disagreed: the marker labelled seven schedule-only nightly jobs
+ * `(gating)` while the verdict scored them `gating: false` (V5a). The shape-38
+ * override still wins: a name branch protection requires always gates.
+ *
+ * @param {string} name
+ * @param {{ required?: Iterable<string>, triggerAdvisoryNames?: Set<string> }} [context]
+ * @returns {boolean}
+ */
+export function isGatingCheckName(
+	name,
+	{ required = REQUIRED_CHECKS, triggerAdvisoryNames = new Set() } = {},
+) {
+	const requiredSet = required instanceof Set ? required : new Set(required);
+	return (
+		requiredSet.has(name) ||
+		(!isAdvisoryCheck(name) && !triggerAdvisoryNames.has(name))
+	);
 }
 
 /**

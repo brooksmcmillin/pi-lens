@@ -12,10 +12,39 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/toml",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.toml",
 	"exitCode": 1,
 	"stdout": "",
-	"stderr": " INFO taplo:lint_files:collect_files: found files total=1 excluded=0 files=[\"__WORKSPACE__/bad.toml\"] cwd=\"__WORKSPACE__\"\nerror: invalid TOML\n  ┌─ __WORKSPACE__/bad.toml:2:9\n  │  \n2 │   [package\n  │ ╭────────^\n3 │ │ name = \"demo\"\n  │ ╰^ expected \"]\"\n\nERROR taplo:lint_files: invalid file error=syntax errors found path=\"__WORKSPACE__/bad.toml\"\n"
+	"stderr": " INFO taplo:lint_files:collect_files: found files total=1 excluded=0 files=[\"__WORKSPACE__/bad.toml\"] cwd=\"__WORKSPACE__\"\nerror: invalid TOML\n  ┌─ __WORKSPACE__/bad.toml:2:9\n  │  \n2 │   [package\n  │ ╭────────^\n3 │ │ name = \"demo\"\n  │ ╰^ expected \"]\"\n\nERROR taplo:lint_files: invalid file error=syntax errors found path=\"__WORKSPACE__/bad.toml\"\n",
+	"availability": [
+		{
+			"command": "taplo",
+			"argv": [
+				"--version"
+			],
+			"version": "0.10.0",
+			"exitCode": 0,
+			"stdout": "taplo 0.10.0\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/taplo",
+		"file": "bad.toml",
+		"argv": [
+			"check",
+			"--colors",
+			"never",
+			"bad.toml"
+		],
+		"version": "0.10.0",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": " INFO taplo:lint_files:collect_files: found files total=1 excluded=0 files=[\"__WORKSPACE__/bad.toml\"] cwd=\"__WORKSPACE__\"\n"
+	}
 }

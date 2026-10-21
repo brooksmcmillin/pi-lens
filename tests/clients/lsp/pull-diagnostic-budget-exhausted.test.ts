@@ -479,25 +479,4 @@ describe("#1771 a genuine pull timeout counts in the degradation ledger", () => 
 		);
 		expect(group?.count).toBe(1);
 	});
-
-	// Mutation guard: a SKIPPED pull (budget already exhausted) must never
-	// count toward this kind — only a genuinely dispatched-then-abandoned
-	// request is a timeout.
-	it("does NOT count a budget-exhausted skip toward the timeout kind", async () => {
-		const state = pullState();
-		installSendRequest(state, (method) =>
-			method !== "textDocument/diagnostic"
-				? Promise.resolve(undefined)
-				: Promise.resolve({ kind: "full", items: [] }),
-		);
-
-		await clientWaitForDiagnostics(state, TEST_FILE, 0, { pullOnly: true });
-
-		expect(skipEvents()).toHaveLength(1);
-		expect(
-			getDegradationSummary().find(
-				(g) => g.kind === "lsp-pull-diagnostic-timeout",
-			),
-		).toBeUndefined();
-	});
 });

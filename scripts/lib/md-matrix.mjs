@@ -22,6 +22,22 @@ export const GENERATED_LSP_DOCS = [
 ];
 
 /**
+ * The matrix `clean-behavior` values that are a measurement of anything.
+ * `unknown` is evidence in neither direction (the #240 doctrine), so it never
+ * enters a comparison. Shared by `scripts/probe-clean-signal.mjs` (through
+ * `buildMatrixObservations` and its row filter), `scripts/lib/assert-evaluated.mjs`
+ * (the evaluated count) and `tests/config/lsp-clean-behavior-census.test.ts`
+ * (the marker census), which previously kept independent spellings of the same
+ * set (#3401). Lives here because this file imports nothing: the refresh-PR job
+ * runs the floor script on a checkout with no `dist/` (#4518).
+ */
+export const MEASURED_CLEAN_BEHAVIORS = new Set([
+	"publishes-versioned",
+	"publishes-unversioned",
+	"silent",
+]);
+
+/**
  * Parse a GitHub-flavoured Markdown table into { header, aligns, rows } where
  * rows is an array of cell-string arrays. Only the FIRST table after `afterLine`
  * (a line whose text includes the marker) is parsed. Returns null if not found.
@@ -515,7 +531,13 @@ export function mergeServerCapabilitiesDoc(priorText, freshText) {
 //    degrades to `unknown` once `FIRST_PUBLISH_EXPIRY_DAYS` have elapsed. Only
 //    `direct` is in the population: `empty-first` backs live
 //    `emptyFirstPublish` markers, so expiring it would erase the measurement
-//    behind a marker while the first-publish census stays green.
+//    behind a marker while the first-publish census stays green. #4615 closes
+//    the other half of that exception: an `empty-first` cell the probe no
+//    longer observes is stamped with the same `firstMissed` clock (never
+//    expired, never slid), so the census can require the cell's evidence to be
+//    current instead of letting the marker/cell pair outlive the instrument
+//    that produced it — the #3310 blindness in the direction that never
+//    expires.
 //  - HYSTERESIS (clean-behavior/tier, run-based): a change is written only after
 //    `TIER_CHANGE_AGREE_RUNS` consecutive runs observe the same new value, so a
 //    single flapping run (ast-grep 2 -> 2* -> 3 -> 2* across four nightlies)
@@ -591,7 +613,7 @@ function isUtcDay(value) {
 }
 
 /** Whole UTC days from `from` to `to` (both `YYYY-MM-DD`); `null` if `from` is not a real date. */
-function elapsedDays(from, to) {
+export function elapsedDays(from, to) {
 	if (!isUtcDay(from)) return null;
 	return Math.round(
 		(Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) /
@@ -876,6 +898,21 @@ export function refreshCapabilityMatrix(text, observations, opts = {}) {
 				} else {
 					nextState["first-publish"][lang] = priorFp[lang];
 				}
+			} else {
+				nextState["first-publish"][lang] = { firstMissed: today };
+			}
+		} else if (currentFp === "empty-first") {
+			// #4615: an `empty-first` cell is never expired — it backs a live
+			// `emptyFirstPublish` marker — but the same rule made the pair immortal:
+			// a probe that stopped observing this axis left the cell standing with
+			// nothing behind it, which is the #3310 dead-instrument failure again in
+			// the direction that never expires. Stamp the FIRST unobserved night once
+			// (never slid) exactly as a `direct` miss does; the census reds when a
+			// marker-backed `empty-first` cell's stamp is `FIRST_PUBLISH_EXPIRY_DAYS`
+			// old, so the cell outlives nothing it cannot re-measure.
+			const elapsed = elapsedDays(priorFp[lang]?.firstMissed, today);
+			if (elapsed !== null && elapsed >= 0) {
+				nextState["first-publish"][lang] = priorFp[lang];
 			} else {
 				nextState["first-publish"][lang] = { firstMissed: today };
 			}

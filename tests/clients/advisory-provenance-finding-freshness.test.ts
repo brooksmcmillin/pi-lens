@@ -309,6 +309,45 @@ describe("gateFindingsByPathFreshness records (#1622 criterion 5)", () => {
 
 // ── Review round L1: the staleness boundary ──────────────────────────────────
 
+// #4495 review F1: the cascade's pending neighbour record observes each
+// neighbour at its own time, so one source carries a scan time per finding.
+// Recurrence: a store-wide scan time either keeps a claim on a file changed
+// after its own check (the time is too late) or drops a claim checked after
+// the change (too early).
+describe("gateFindingsByPathFreshness per-finding scan time (#4495)", () => {
+	afterEach(() => logLatency.mockReset());
+
+	it("decides each finding against its own scan time, even on one path", () => {
+		const mtimeMs = GATE_SCANNED_AT_MS;
+		const { pending: gate } = gateFindingsByPathFreshness({
+			cwd: "/repo",
+			sources: {
+				pending: {
+					findings: [
+						{ file: "/repo/n.ts", rule: "checked-before", line: 1 },
+						{ file: "/repo/n.ts", rule: "checked-after", line: 2 },
+					] as Finding[],
+					citedPath,
+					scannedAtOf: (finding: Finding) =>
+						finding.rule === "checked-before"
+							? mtimeMs - 60_000
+							: mtimeMs + 60_000,
+				},
+			},
+			probePath: () => ({ state: "present", mtimeMs }),
+		});
+		expect(gate.stale.map((f) => f.rule)).toEqual(["checked-before"]);
+		expect(gate.live.map((f) => f.rule)).toEqual(["checked-after"]);
+		const demote = logLatency.mock.calls
+			.map((call) => call[0] as { phase: string; metadata: unknown })
+			.find((entry) => entry.phase === "finding_stale_line_demote");
+		expect(demote?.metadata).toMatchObject({
+			store: "pending",
+			scannedAt: "per-finding",
+		});
+	});
+});
+
 describe("freshness boundary (#1622 review L1)", () => {
 	const cleanups: Array<() => void> = [];
 	afterEach(() => {

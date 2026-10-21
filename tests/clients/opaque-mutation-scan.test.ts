@@ -1,8 +1,7 @@
 /**
  * Opaque-mutation recovery (#2000 phase 2) — real-filesystem tests: actual
  * stat walks over temp trees and real diffs. This file pins the SEAM contract
- * only; handler wiring coverage (real node -e / python -c child writes through
- * handleToolCall/handleToolResult) is PR-B scope and NOT covered here.
+ * only; handler wiring coverage uses the same real child-process path.
  */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -72,6 +71,12 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import { FAKE_LSP_SERVER_PATH } from "../support/fake-lsp-server.js";
+import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
+import {
+	setProjectTrustState,
+	resetProjectTrust,
+} from "../../clients/project-trust.js";
 
 let tmpDir = "";
 
@@ -565,6 +570,113 @@ describe("recoverOpaqueChangesViaGit (real git repo)", () => {
 			}
 		},
 	);
+
+	it(
+		"keeps opaque recovery dispatch and LSP resync with read guard disabled (#4534)",
+		{ timeout: 15_000 },
+		async () => {
+			const previousDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = path.join(repoDir, "data");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = repoDir;
+			runtime.setTelemetryIdentity({ sessionId: "opaque-no-read-guard" });
+			const target = path.join(repoDir, "src", "no-read-guard.ts");
+			const command = "opaque-codemod --rewrite-source";
+			const noReadGuard = () => true;
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			vi.mocked(runPipeline).mockClear();
+			const { initLSPConfig } = await import("../../clients/lsp/config.js");
+			const lsp = await import("../../clients/lsp/index.js");
+			setProjectTrustState("trusted");
+			fs.mkdirSync(path.join(repoDir, ".pi-lens"), { recursive: true });
+			fs.writeFileSync(path.join(repoDir, "package.json"), "{}\n", "utf8");
+			fs.writeFileSync(
+				path.join(repoDir, ".pi-lens", "lsp.json"),
+				JSON.stringify({
+					servers: {
+						fake: {
+							name: "fake",
+							extensions: [".ts"],
+							command: process.execPath,
+							args: [FAKE_LSP_SERVER_PATH],
+							rootMarkers: ["package.json"],
+						},
+					},
+					disabledServers: ["typescript", "deno", "ast-grep", "typos"],
+				}),
+				"utf8",
+			);
+			await initLSPConfig(repoDir);
+			const service = lsp.getLSPService();
+			try {
+				fs.writeFileSync(target, "before recovery\n", "utf8");
+				await service.touchFile(target, fs.readFileSync(target, "utf8"), {
+					diagnostics: "none",
+					clientScope: "primary",
+					source: "lsp_sync",
+				});
+				await runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						event: {
+							toolName: "bash",
+							input: { command },
+							toolCallId: "4534-no-read-guard",
+						},
+						ctx: { cwd: repoDir },
+						lensEnabled: true,
+						getFlag: noReadGuard,
+						dbg: () => {},
+						runtime,
+						cacheManager: new CacheManager(false),
+						ensureLSPConfigInitialized: async () => {},
+						updateLspStatus: () => {},
+						resetLSPService: () => {},
+					} as Parameters<typeof handleToolCall>[0]),
+				);
+				fs.writeFileSync(target, "recovered\n", "utf8");
+				await handleToolResult({
+					event: {
+						toolName: "bash",
+						input: { command },
+						toolCallId: "4534-no-read-guard",
+						content: [{ type: "text", text: "done" }],
+					},
+					getFlag: noReadGuard,
+					dbg: () => {},
+					runtime,
+					readGuard: runtime.readGuard,
+					cacheManager: new CacheManager(false),
+					biomeClient: {},
+					ruffClient: {},
+					testRunnerClient: {},
+					metricsClient: {},
+					resetLSPService: () => {},
+					agentBehaviorRecord: () => [],
+					formatBehaviorWarnings: () => "",
+				} as unknown as Parameters<typeof handleToolResult>[0]);
+
+				expect(
+					vi
+						.mocked(runPipeline)
+						.mock.calls.some(([ctx]) =>
+							String(ctx?.filePath).endsWith("no-read-guard.ts"),
+						),
+				).toBe(true);
+				await service.documentSymbol(target);
+				expect(service.getTrackedContent(target, repoDir)?.hash).toBe(
+					hashDiagnosticContent("recovered\n"),
+				);
+				expect(runtime.readGuard.exportAuthorship().written).not.toContain(
+					normalizeFilePath(target),
+				);
+			} finally {
+				await service.shutdown();
+				resetProjectTrust();
+				if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+				else process.env.PILENS_DATA_DIR = previousDataDir;
+			}
+		},
+	);
 });
 
 describe("partial-recognition recovery (#2000 PR-B)", () => {
@@ -689,6 +801,9 @@ describe("partial-recognition recovery (#2000 PR-B)", () => {
 			// Delta assertion: latency.log is append-only and shared, so assert
 			// on the LINES THIS RUN ADDED - a plain toContain would stay green
 			// forever after the first ever emission (review round-2 P2).
+			// Drain before the baseline (#4381): a row this test already queued would
+			// land after it and read as one this run added.
+			await flushLatencyLog();
 			const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 			const beforeLines = new Set(
 				fs.existsSync(latencyPath)
@@ -732,6 +847,9 @@ describe("partial-recognition recovery (#2000 PR-B)", () => {
 				// Break the probe AFTER the baseline: git status now exits nonzero.
 				fs.writeFileSync(path.join(repoDir, ".git", "index"), "corrupt");
 
+				// Drain before the baseline (#4381): a row this test already queued would
+				// land after it and read as one this run added.
+				await flushLatencyLog();
 				const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 				const beforeLines = new Set(
 					fs.existsSync(latencyPath)
@@ -1020,6 +1138,9 @@ describe("failed Git integration recovery dispatch", () => {
 
 				const runtime = integrationRuntime("failed-integration-telemetry");
 				const command = "git merge incoming";
+				// Drain before the baseline (#4381): a row this test already queued would
+				// land after it and read as one this run added.
+				await flushLatencyLog();
 				const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 				const beforeLines = new Set(
 					fs.existsSync(latencyPath)
@@ -1074,6 +1195,9 @@ describe("failed Git integration recovery dispatch", () => {
 
 				const runtime = integrationRuntime("failed-integration-unknown-pair");
 				const command = "git merge incoming";
+				// Drain before the baseline (#4381): a row this test already queued would
+				// land after it and read as one this run added.
+				await flushLatencyLog();
 				const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 				const beforeLines = new Set(
 					fs.existsSync(latencyPath)
@@ -1730,6 +1854,46 @@ describe("parallel bash calls (#4137)", () => {
 		]);
 		expect(blockerFiles(runtime)).toEqual([]);
 		expect(runtime.hasResolvedBlockerFiles()).toBe(true);
+	});
+
+	// #4484: the same changed bytes, but the opaque run's own observation
+	// still holds the blocker (its channel is withheld, #3226, so it reports
+	// the count, not the blocker). Before #4484 the record was cleared and
+	// turn end said "Resolved" for a blocker still on the file.
+	it("keeps an authored blocker when an opaque run of changed bytes still observes it (#4484)", async () => {
+		(await pipelineMock()).mockImplementation(async (ctx) => {
+			const inlineBlockerFileContent = analysedBytes(String(ctx.filePath));
+			return ctx.allowAutonomousWriters === false
+				? { ...NO_BLOCKERS, inlineBlockerFileContent, currentBlockerCount: 1 }
+				: { ...BLOCKED, inlineBlockerFileContent };
+		});
+		const runtime = newRuntime("changed-bytes-still-blocked");
+		const recognized = "echo 'debugger;' >> par-a.ts";
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, recognized, "recognized")),
+		);
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, opaqueCommand(), "opaque")),
+		);
+		append("par-a.ts", "debugger;\n");
+		await handleToolResult(resultDeps(runtime, recognized, "recognized"));
+		append("par-a.ts", "export const y = 2;\n");
+		await handleToolResult(resultDeps(runtime, opaqueCommand(), "opaque"));
+		expect(await dispatchLog()).toEqual([
+			["par-a.ts", true],
+			["par-a.ts", false],
+		]);
+		expect(blockerFiles(runtime)).toEqual(["par-a.ts"]);
+		expect(resolvedFiles(runtime)).toEqual([]);
+		expect(
+			getDegradationSummary().find((g) => g.kind === "blocker-clear-refused")
+				?.latestReasons,
+		).toEqual([
+			{
+				subject: keyOf("par-a.ts"),
+				reason: expect.stringContaining("still observed a blocker"),
+			},
+		]);
 	});
 
 	// VERIFY_4159 N2: the other half of the in-flight rank. An opaque claim

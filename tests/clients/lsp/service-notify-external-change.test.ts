@@ -58,6 +58,7 @@ function makeClient() {
 		diagnosticsVersion: 0,
 		getDiagnostics: vi.fn(() => []),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			watchedFileChange: vi.fn(),

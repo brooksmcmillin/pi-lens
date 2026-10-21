@@ -226,6 +226,8 @@ function repoWorkflowFiles(): WorkflowFile[] {
  * preferred answer when the lane's steps can run pre-merge at all.
  */
 const EXEMPTIONS: Readonly<Record<string, string>> = {
+	".github/workflows/cache-prune.yml::prune":
+		"the deleting job of the cache cleanup (#4358): it removes shared repository state, so it runs on the nightly schedule or a push to master only. The pull_request run executes the same script and the same listing in the `plan` job, as a dry run with a read-only token, so the edited lines still run pre-merge",
 	".github/workflows/ci-infra-kill-rerun.yml::classify":
 		"workflow_run-triggered classifier: it reads a COMPLETED CI run's log, which by definition does not exist while that run is still going. Its own if: truth table is evaluated pre-merge, row by row, in tests/config/ci-infra-kill-rerun-gate.test.ts",
 	".github/workflows/ci-infra-kill-rerun.yml::finalize-rerun":

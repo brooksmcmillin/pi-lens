@@ -5,12 +5,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
 import {
+	MODEL_COSTS_FILE,
 	TLA_TOOLS,
 	buildJavaArgs,
 	classifyTlcOutput,
 	computeConcurrency,
 	formatSummary,
 	listModelConfigs,
+	loadModelCosts,
 	parseCliArgs,
 	parseConcurrencyArg,
 	parseModelHeader,
@@ -325,10 +327,112 @@ describe("parseShardArg (#3918)", () => {
 describe("selectShard (#3918)", () => {
 	const items = ["a", "b", "c", "d", "e", "f", "g"];
 
-	it("steps through the list round-robin, so a directory's configs spread across shards", () => {
+	it("steps through the list round-robin when no cost table is given, so a directory's configs spread across shards", () => {
 		expect(selectShard(items, { index: 1, total: 3 })).toEqual(["a", "d", "g"]);
 		expect(selectShard(items, { index: 2, total: 3 })).toEqual(["b", "e"]);
 		expect(selectShard(items, { index: 3, total: 3 })).toEqual(["c", "f"]);
+	});
+
+	// #4672: with the measured table the split is by COST, which is the whole
+	// point -- round-robin by count gave four shards of 733/1255/1617/2148 s.
+	it("packs the measured cost, so equal counts do not mean equal work", () => {
+		// The measured shape of the corpus (#4672): a handful of very heavy
+		// configs and a long cheap tail. A count-based split gives every shard
+		// the same number of configs and wildly different work; the LPT pack
+		// puts each heavy config in the lightest shard at the time it is placed,
+		// so the cheap tail fills around them.
+		// Keys are REPO-RELATIVE (the table's own form): `costOf` resolves each
+		// config against the root before the lookup.
+		const files: Record<string, number> = {
+			"formal/heavy/heavy1.cfg": 400,
+			"formal/heavy/heavy2.cfg": 300,
+		};
+		for (let index = 0; index < 16; index += 1) {
+			files[`formal/cheap/cheap${String(index).padStart(2, "0")}.cfg`] = 10;
+		}
+		const costs = { root: "/repo", files, max: 400 };
+		const configs = Object.keys(files)
+			.sort()
+			.map((relative) => `/repo/${relative}`);
+		const shards = [1, 2, 3, 4].map((index) =>
+			selectShard(configs, { index, total: 4 }, costs),
+		);
+		// Exactly once, everywhere: the partition property does not soften.
+		expect(shards.flat().sort()).toEqual(configs);
+		const loads = shards.map((picked) =>
+			picked.reduce(
+				(sum, config) => sum + files[config.slice("/repo/".length)],
+				0,
+			),
+		);
+		// Total 860 s over four shards. 400 s is indivisible, so the best any
+		// partition can do is the heavy shard at 400 s: greedy LPT reaches it, and
+		// the cheap tail spreads evenly around it instead of piling onto one
+		// shard (the old count-based split's failure mode).
+		// The exact pack: one shard carries the 400 s config alone, one the 300 s
+		// config alone, and the 16 cheap configs split 8/8 across the other two.
+		expect([...loads].sort((a, b) => a - b)).toEqual([80, 80, 300, 400]);
+		// The two heavy configs never share a shard: their wall clocks add.
+		expect(
+			shards.filter((picked) =>
+				picked.includes("/repo/formal/heavy/heavy1.cfg"),
+			).length,
+		).toBe(1);
+		expect(
+			shards.find((picked) => picked.includes("/repo/formal/heavy/heavy1.cfg")),
+		).not.toContain("/repo/formal/heavy/heavy2.cfg");
+	});
+
+	// A config the table does not know costs the table's MAX, never zero and
+	// never the median: a new model is usually a heavy one, and under-pricing it
+	// is how the next tail shard appears (#4672).
+	it("prices an unmeasured config at the table's maximum, not as free", () => {
+		// Two 1 s configs, one unmeasured, max 10 s, two shards. Priced at max the
+		// unknown takes a shard of its own; priced at 0 (or at the median, 1) it
+		// would share with a known config and the placement changes.
+		const costs = {
+			root: "/repo",
+			files: { "formal/a/a.cfg": 1, "formal/b/b.cfg": 1 },
+			max: 10,
+		};
+		const configs = [
+			"/repo/formal/a/a.cfg",
+			"/repo/formal/b/b.cfg",
+			"/repo/formal/new/new.cfg",
+		];
+		const shards = [1, 2].map((index) =>
+			selectShard(configs, { index, total: 2 }, costs),
+		);
+		const withNew = shards.find((picked) =>
+			picked.includes("/repo/formal/new/new.cfg"),
+		);
+		expect(withNew).toEqual(["/repo/formal/new/new.cfg"]);
+	});
+
+	// The table is the shard's only cost input, so a malformed one must be loud:
+	// a silent fallback to equal costs would quietly restore the old tail.
+	it("refuses a malformed cost table", () => {
+		// The fixture root is removed on EVERY path, green or red: a straggler
+		// under the shared tmp root is what the tmp-fixture-hygiene owner reds on,
+		// and a throwing assertion would otherwise skip the cleanup below.
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-check-tla-models-costs-"),
+		);
+		try {
+			fs.mkdirSync(path.join(dir, "scripts"));
+			const file = path.join(dir, MODEL_COSTS_FILE);
+			fs.writeFileSync(
+				file,
+				JSON.stringify({ files: { "formal/x/a.cfg": -1 } }),
+			);
+			expect(() => loadModelCosts(dir)).toThrow(/non-negative/);
+			fs.writeFileSync(file, JSON.stringify({ nope: true }));
+			expect(() => loadModelCosts(dir)).toThrow(/no "files" object/);
+			fs.rmSync(file);
+			expect(() => loadModelCosts(dir)).toThrow(/unreadable/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -400,19 +504,34 @@ describe("selectConfigs (#3918)", () => {
 		).toThrow(/no formal\/\*\/\*\.cfg found/);
 	});
 
+	// #4672: the split is by measured cost, so it is no longer "every other
+	// config". What this pins is the property the old assertion carried -- a
+	// shard is a strict, non-empty SUBSET and the pair covers the tree exactly
+	// once.
 	it("narrows to the shard's configs with --shard", () => {
-		const all = listModelConfigs(REPO_ROOT);
-		expect(selectConfigs(["--shard", "1/2"], REPO_ROOT)).toEqual(
-			all.filter((_, position) => position % 2 === 0),
+		const all = listModelConfigs(REPO_ROOT).map((config) =>
+			path.resolve(config),
 		);
+		const first = selectConfigs(["--shard", "1/2"], REPO_ROOT).map((config) =>
+			path.resolve(config),
+		);
+		const second = selectConfigs(["--shard", "2/2"], REPO_ROOT).map((config) =>
+			path.resolve(config),
+		);
+		assertNonEmptyScan("first shard", first.length, 100);
+		expect(first.length).toBeLessThan(all.length);
+		expect([...first, ...second].sort()).toEqual([...all].sort());
+		expect(first.filter((config) => second.includes(config))).toEqual([]);
 	});
 
 	// Recurrence: `indexOf("--shard")` missed both the equals form and a
 	// misspelled flag, so the run silently selected the whole population.
 	it("narrows to the shard with the --shard= equals form", () => {
-		const all = listModelConfigs(REPO_ROOT);
 		expect(selectConfigs(["--shard=1/2"], REPO_ROOT)).toEqual(
-			all.filter((_, position) => position % 2 === 0),
+			selectConfigs(["--shard", "1/2"], REPO_ROOT),
+		);
+		expect(selectConfigs(["--shard=1/2"], REPO_ROOT)).not.toEqual(
+			listModelConfigs(REPO_ROOT),
 		);
 	});
 

@@ -147,12 +147,28 @@ export type DegradationKind =
 	| "bash-view-clipped"
 	| "biome-explain-unavailable"
 	/**
+	 * #4484 round 2: a write's dispatch did not observe a recorded inline
+	 * blocker, and the blocker's runner or language server reached no verdict
+	 * on that write (failed, timed out, unanswered, still in flight). The
+	 * blocker stays pending. One subject per file key, counted across the
+	 * session.
+	 */
+	| "blocker-carried-unobserved"
+	/**
 	 * #4137 round 3: `clearInlineBlockers` refused a clean result from a run
 	 * without authorship (an opaque recovery, #3226) over the very bytes an
 	 * authored verdict recorded; the inline blocker record stays. One subject per
 	 * file key, counted across the session.
 	 */
 	| "blocker-clear-refused"
+	/**
+	 * #4484 round 3: a write could not align its bytes to the bytes the file's
+	 * recorded blockers were read from (no stored line hashes, a file over the
+	 * alignment caps, or a rewrite past `MAX_ALIGNMENT_EDITS`). Each recorded
+	 * line and owed line is taken at its recorded number instead. Once per file
+	 * per session.
+	 */
+	| "blocker-position-unaligned"
 	/**
 	 * #3594: `acquireBoundedPidFileLock`'s wait (the durable-store sync
 	 * waiter) was skipped because the same top-generation holder an earlier
@@ -166,6 +182,8 @@ export type DegradationKind =
 	| "cascade-budget-override-disarmed"
 	/** Deferred cascade admission reached its bounded in-memory queue. */
 	| "cascade-pending-cap"
+	/** #4487: the pending neighbour-error record reached its cap. */
+	| "cascade-pending-neighbors-evicted"
 	| "cascade-tier3-backlog-evicted"
 	/**
 	 * #3511: the change-log lock stayed held past its bounded wait (or its
@@ -261,6 +279,29 @@ export type DegradationKind =
 	| "deferred-format-unsettled"
 	| "demoted-finding-retired"
 	| "diagnostic-retained-unreconciled"
+	/**
+	 * #4535: the change-log append a publish allocated its sequence through
+	 * failed, so the subscribers hold a `seq` the durable log does not
+	 * (clients/disk-changes.ts). Before this record the publish swallowed the
+	 * failure and the whole fan-out proceeded on a sequence nothing could
+	 * replay. Subject: the normalized project root; one row per root per
+	 * session, the count carrying the repeat.
+	 */
+	| "disk-change-append-failed"
+	/**
+	 * #4535: one publish carried more paths than
+	 * `DISK_CHANGE_MAX_RECORDED_PATHS`, so the tail got no sequence and the
+	 * record is reported as unenumerable (clients/disk-changes.ts). Once per
+	 * root per session; the conservative direction for every subscriber.
+	 */
+	| "disk-change-paths-truncated"
+	/**
+	 * #4535: one disk-change subscriber threw while a publish delivered to it
+	 * (clients/disk-changes.ts). The publish continues to the next subscriber;
+	 * the record names the consumer and the root, once per consumer per session,
+	 * so a broken consumer cannot spam the agent-facing summary.
+	 */
+	| "disk-change-subscriber-failed"
 	| "dispatch-non-absolute-baseline-path"
 	/**
 	 * A server-initiated `workspace/applyEdit` fell back to the mutation
@@ -281,6 +322,14 @@ export type DegradationKind =
 	| "fact-store-capacity-eviction"
 	/** #2007: `git status` could not answer for that same decision. */
 	| "fact-store-pinned-over-budget"
+	/**
+	 * #4454: the fish runner could not find `fish` next to `fish_indent`, so it
+	 * checked formatting but not syntax (`fish_indent --check` reports no syntax
+	 * error). Subject is the tool; recorded once per session via
+	 * `recordDegradationOnce`, since the binary's absence does not change per
+	 * file.
+	 */
+	| "fish-syntax-check-unavailable"
 	/**
 	 * The blind review-graph read (`getCachedReviewGraph`) either DROPPED a
 	 * persisted snapshot because its git stamp names a different worktree, or
@@ -396,6 +445,14 @@ export type DegradationKind =
 	| "gradle-ktlint-scan-budget-exceeded"
 	| "grammar-blocked"
 	/**
+	 * #3096: `holdOwnChildPid` found the held-pid set full of still-live
+	 * groups and `BoundedSet.add` dropped the oldest, usually the longest-lived
+	 * LSP leader, so a group kill after that leader dies is refused. Counted;
+	 * subject is the call site (`lsp-spawn`), a fixed tiny set; the dropped
+	 * pids are in the reason and the per-call drop count in the metadata.
+	 */
+	| "held-own-pid-evicted"
+	/**
 	 * A selected formatter's executable was proven absent (#2413): its
 	 * `resolveCommand` probed every install location and PATH and found nothing,
 	 * or the static fallback spawn returned a typed `tool-not-found`. Distinct
@@ -482,6 +539,15 @@ export type DegradationKind =
 	 * lock on its tail slot (#3618). Subject is this process's pid.
 	 */
 	| "instance-registry-deregister-queued"
+	/**
+	 * #4596 (#4563): a concurrent secondary's own root deregistration, queued at
+	 * its shutdown, rejected. Before this row the call ended in
+	 * `.catch(() => {})` (`index.ts`), so a root could stay registered in the
+	 * process-wide registry with nothing to explain it: the next session that
+	 * walks the registry reads a root no live session owns. Subject is the root
+	 * the holder tried to release; counted, since each root is a separate leak.
+	 */
+	| "instance-registry-deregister-root-failed"
 	/**
 	 * #3071: a registration-record write fell back to the process cwd because
 	 * the session's identity carried no `projectRoot` — `instance-registry.ts`
@@ -635,6 +701,32 @@ export type DegradationKind =
 	 */
 	| "lsp-covers-unvalidated"
 	/**
+	 * #4346: a diagnostics call resolved the imports of only the first
+	 * `CREATED_IMPORT_SCAN_MAX_FILES` finding-bearing files, so a module the
+	 * rest import, created outside pi-lens, may not reach a server that caches
+	 * a failed lookup. Subject is `capped`. Once per session.
+	 */
+	| "lsp-created-import-scan-incomplete"
+	/**
+	 * #4476: the walk of a root's declaration files passed its directory or
+	 * file cap, so a declaration file created, edited or deleted outside
+	 * pi-lens under that root reaches no language server and refuses no
+	 * diagnostics-cache entry (clients/out-of-band-changes.ts). Once per root.
+	 */
+	| "lsp-declaration-look-capped"
+	/**
+	 * #4596: the walk of a root's declaration files could not LIST a directory
+	 * under it, so the walk's map is incomplete. Before this record the walk
+	 * skipped the failed directory silently (`catch { continue; }`), the diff
+	 * read every declaration file under it as deleted, and
+	 * `lsp_out_of_band_change` published `deleted: 1` for a file that still
+	 * existed (clients/out-of-band-changes.ts). Subject is the root; counted,
+	 * because each unreadable subtree is a different blind spot. Metadata names
+	 * the directory count, the first directory, and how many previous
+	 * fingerprints were kept so no consumer is told the file went away.
+	 */
+	| "lsp-declaration-walk-unreadable"
+	/**
 	 * `loadWebTreeSitter()` (clients/deps/web-tree-sitter.js) rejected during
 	 * MODULE EVALUATION, not resolution (#1592). Node's ESM loader permanently
 	 * memoizes a module record that threw while evaluating, so re-importing
@@ -655,6 +747,28 @@ export type DegradationKind =
 	| "lsp-diagnostics-paths-cap"
 	| "lsp-diagnostics-timeout"
 	| "lsp-diagnostics-unsupported"
+	/**
+	 * #4532 gap 9 round 6 F4 (shape 31): the bounded recovery of a standalone
+	 * `didSave` is spent — the save a debounced saved touch owed, the failure,
+	 * and its ONE retry all resolved without a save leaving the process. The
+	 * next saved touch of those bytes owes one again (the mark is withdrawn),
+	 * but nothing else would tell the server before then, so a reader chasing a
+	 * save-triggered server's silence needs this row. Subject is the server id
+	 * (one row per server per session, like `lsp-did-save-text-omitted`), with
+	 * the file in `metadata`; the failed ATTEMPT is
+	 * `lsp-did-save-send-failed` in `clients/lsp/client.ts`.
+	 */
+	| "lsp-did-save-recovery-exhausted"
+	/**
+	 * #4532 gap 9 round 6 F4: one `textDocument/didSave` notification did not
+	 * leave the process (a stream error, or a write that resolved false).
+	 * `lsp_touch_file` is written before the save finishes, so without this row
+	 * "the save was queued" and "the save never landed" read the same. Subject
+	 * is the server id and the file rides `metadata`, one row per server per
+	 * session: a save-triggered project can fail one save per edit, and a
+	 * per-save row would be one row per edit.
+	 */
+	| "lsp-did-save-send-failed"
 	/**
 	 * #3405: a `textDocument/didSave` was sent WITHOUT its `text` to a server
 	 * that negotiated `includeText: true`, because the document exceeded the
@@ -683,11 +797,42 @@ export type DegradationKind =
 	 */
 	| "lsp-edit-stale-content"
 	/**
+	 * #4320: this process cannot tell when a path was born (the filesystem
+	 * reports no birth time, or Node reports ctime as it without statx), so a
+	 * file created while a language server runs is announced as Changed.
+	 * Subject is the cause: `no-birth-time` or `ctime-alias`. Once per cause.
+	 */
+	| "lsp-file-birth-unknown"
+	/**
 	 * An idle LSP client was released by the shared idle-eviction timer (a
 	 * server whose registry `idleEviction` is `transparent`); it respawns on the
 	 * next request. Subject is the client key.
 	 */
 	| "lsp-idle-eviction"
+	/**
+	 * #3952: `scheduleIdleEviction` was asked to arm a client and DECLINED,
+	 * because the server object the service holds does not declare
+	 * `idleEviction: "transparent"` and the client is not an adopted-root one.
+	 * The pair this row separates is `resident-by-declaration` (a policy answer:
+	 * `unmeasured`/`resident` servers are meant to stay) from
+	 * `not-evicted` (a measurement whose arm never reached the policy), and
+	 * before it both read as "the timer did not fire". Subject is the server id,
+	 * recorded ONCE per server per session: the declaration is the same every
+	 * time, so one row answers for every touch of that server.
+	 */
+	| "lsp-idle-eviction-declined"
+	/**
+	 * #4596: an implicit-scope question could not be answered — a JS/TS file
+	 * that cannot be read or parsed, a Go package directory that cannot be
+	 * listed, a Go package's mtime, or a Go peer's header
+	 * (clients/lsp/implicit-scope.ts). The verdict is still conservative
+	 * (`"unknown"` feeds the global scope, so the diagnostics cache refuses
+	 * rather than serves); before this row the decision left no trace at all,
+	 * so a wrong refusal could not be explained. Subject is the cause, so the
+	 * retained population stays bounded, and the reason and metadata name the
+	 * file. Counted: each unresolved file is a separate decision.
+	 */
+	| "lsp-implicit-scope-unknown"
 	| "lsp-liveness-probe-unsupported"
 	/**
 	 * A pi-lens `tool_call` handler threw. pi's `emitToolCall` has no
@@ -993,6 +1138,14 @@ export type DegradationKind =
 	 */
 	| "path-variant-unresolved"
 	/**
+	 * #4402: a persist host's worker `message` listener contained a message.
+	 * Subject is `<host> persist worker: rejected` (no routable `id` and
+	 * `generation`; dropped) or `<host> persist worker: threw` (handling it
+	 * threw; caught so the host survives). Reason carries the shape verdict or
+	 * the error message.
+	 */
+	| "persist-worker-message-contained"
+	/**
 	 * #3311: a registry entry declares `pipConstraints`, but the constraints file
 	 * the pip ladder hands to `PIP_CONSTRAINT` could not be written. The install
 	 * then proceeds UNCONSTRAINED — the pre-#3311 resolution — so this row is the
@@ -1017,6 +1170,8 @@ export type DegradationKind =
 	 * itself already landed; only the hash is missing. Subject is the file path.
 	 */
 	| "pipeline-post-write-hash-unavailable"
+	/** #4543: first-write capture exceeded its deadline or capacity (once/session). */
+	| "pre-edit-capture-incomplete"
 	/** A mounted process bridge refused calls during a primary-session gap. */
 	| "process-bridge-unavailable"
 	/**
@@ -1051,6 +1206,14 @@ export type DegradationKind =
 	 * Subject is the gz body path; reason carries the error message.
 	 */
 	| "project-snapshot-serialize-failed"
+	/**
+	 * #4400: the host could not remove a project-snapshot stage file from inside
+	 * the persist worker's `message` listener (a directory in its place, or a
+	 * Windows handle held by antivirus). The reap is contained so the host
+	 * survives and the persist continues. Subject is the gz body path (the stage
+	 * path for a late result); reason carries the error message.
+	 */
+	| "project-snapshot-stage-reap-failed"
 	/**
 	 * The orphan backstop's OWN process-table scanner blew the scan timeout and
 	 * had to be tree-killed (#1864 review F3). Reason carries the kill verdict,
@@ -1114,6 +1277,13 @@ export type DegradationKind =
 	 * mismatch) is diagnosable from the ledger alone.
 	 */
 	| "read-guard-record-cap-trim"
+	/**
+	 * #1649: a file the read-accounting scan (`scanFileLines`) would not read,
+	 * because its size is over the byte gate (V8's string limit, past which
+	 * the released whole-file read threw). Its reads count one line and keep no
+	 * line hashes, as they did before. Subject is the file; once per file.
+	 */
+	| "read-guard-scan-byte-gate"
 	/**
 	 * #3521: a deferred writer (the agent_settled sweep or the format, autofix
 	 * or LSP quick-fix drain) captured the read guard's branch epoch before a
@@ -2202,6 +2372,17 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// the cap and its re-offer working together; the agent's message carries
 	// the "N held" note, and the ledger needs only the tally.
 	"turn-end-sections-held",
+	// #3952: both are the idle-eviction POLICY answering, not a timer that
+	// failed. `lsp-idle-eviction` is the memory bound releasing a client that
+	// respawns on the next request; `lsp-idle-eviction-declined` is the
+	// declaration `unmeasured`/`resident` doing its job, once per server, so a
+	// nominal session writes up to one row per non-`transparent` server (32 of
+	// the 49 built-ins today). A `⚠` per server on every healthy session is
+	// the cry-wolf shape #2505 rejected; the sibling that DOES stand out is a
+	// measurement whose arm never reached the policy, and that one reads as a
+	// missing row, not as a warning here.
+	"lsp-idle-eviction",
+	"lsp-idle-eviction-declined",
 ]);
 
 export function renderDegradationLines(

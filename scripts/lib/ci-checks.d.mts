@@ -19,6 +19,26 @@ export declare function isBlockingConclusion(
 export declare function isUncertainConclusion(
 	conclusion: string | null | undefined,
 ): boolean;
+/**
+ * The aggregate a sharded job row belongs to (`"X (shard 3/5)"` -> `"X"`), or
+ * null. The aggregate is the required context that judges its shards.
+ */
+export declare function shardAggregateName(name: unknown): string | null;
+/** Names every one of whose runs came from a non-PR-CI event (#4090). */
+export declare function resolveTriggerAdvisoryNames(
+	checkRuns: CheckRunRecord[] | null | undefined,
+): Set<string>;
+/**
+ * Whether a check name gates this head: required by branch protection, or not
+ * advisory and not a schedule-only lane. One owner for both readers.
+ */
+export declare function isGatingCheckName(
+	name: string,
+	context?: {
+		required?: Iterable<string>;
+		triggerAdvisoryNames?: Set<string>;
+	},
+): boolean;
 
 export interface CheckRunRecord {
 	name: string;

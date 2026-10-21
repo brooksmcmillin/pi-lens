@@ -575,39 +575,43 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 		);
 	});
 
-	it("includes the failed Vitest count for a red Windows advisory", async () => {
-		const windows = job(
+	it("includes the failed Vitest count for a red advisory row", async () => {
+		// #4592 review F7: the sample row names a live advisory job that runs
+		// Vitest. It used to say `Unit tests Windows (advisory)`, a name #4518
+		// retired, so the rendering case spoke about a row CI no longer emits; the
+		// job fixture itself is the generic Vitest-log capture, renamed here.
+		const advisory = job(
 			"unit-tests-fail-101554674114",
 			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
 		);
-		windows.json.name = "Unit tests Windows (advisory)";
+		advisory.json.name = "Targeted tests (advisory)";
 		const w = world({
 			prs: [
 				{
 					number: 5,
-					checkRuns: [...GREEN, jobRow(windows)],
+					checkRuns: [...GREEN, jobRow(advisory)],
 				},
 			],
-			jobs: [windows],
+			jobs: [advisory],
 		});
 		const { exitCode, lines } = await cli(["5"], w);
 		expect(exitCode).toBe(EXIT_SUCCESS);
 		expect(lines).toContain(
-			"Advisory (never gates): 1 checks, 1 red: Unit tests Windows (advisory) (failure, 56 failed)",
+			"Advisory (never gates): 1 checks, 1 red: Targeted tests (advisory) (failure, 56 failed)",
 		);
 	});
 
 	// Recurrence: #4042 review F2 — a persistent advisory red must not reread
 	// the same Actions job metadata and log on every watch poll for one head.
 	it("reads advisory failure details once per watched head", async () => {
-		const windows = job(
+		const advisory = job(
 			"unit-tests-fail-101554674114",
 			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
 		);
-		windows.json.name = "Unit tests Windows (advisory)";
+		advisory.json.name = "Targeted tests (advisory)";
 		const w = world({
-			prs: [{ number: 5, login: "apmantza", checkRuns: [jobRow(windows)] }],
-			jobs: [windows],
+			prs: [{ number: 5, login: "apmantza", checkRuns: [jobRow(advisory)] }],
+			jobs: [advisory],
 		});
 		const result = await cli(["--watch-open", "--stream", "--wait", "180"], w);
 		expect(result.exitCode).toBe(EXIT_PENDING);
@@ -637,6 +641,32 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 		expect(lines).toContain(
 			"Advisory (never gates): 1 checks, 1 red: jscpd (advisory) (failure)",
 		);
+	});
+});
+
+// #3920 item 3, the integration the unit test could not reach (review thread on
+// ci-verdict-runtime-cap.test.ts:271/#272): the report is a separate read of
+// the payload the verdict already has, so its lines appear in the command's own
+// output and the exit code is untouched. Driven through `run()` on a real
+// over-cap row rather than through `runtimeCapLines` alone.
+describe("run — the runtime-vs-cap report prints and never gates (#3920 item 3)", () => {
+	it("prints an over-cap gating row and still exits 0", async () => {
+		// `TLA+ models` is the aggregate job, `timeout-minutes: 10` in ci.yml.
+		const overCap = {
+			...row("TLA+ models", "success", 31),
+			completed_at: "2026-09-30T11:10:40Z", // 640 s of its 600 s cap = 107%
+		};
+		const w = world({ prs: [{ number: 5, checkRuns: [...GREEN, overCap] }] });
+		const { exitCode, lines } = await cli(["5"], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		const report = lines.filter((line) => line.startsWith("Runtime vs cap:"));
+		expect(report).toHaveLength(1);
+		expect(report[0]).toContain("TLA+ models 640s of 600s (107%)");
+		expect(report[0]).toContain("at or over its cap");
+		expect(report[0]).toContain("(gating)");
+		// And the verdict line the merger reads still says green, so the report
+		// cannot be mistaken for a gate.
+		expect(lines).toContain("Gating: 3 checks, 0 failing");
 	});
 });
 

@@ -1,0 +1,15 @@
+# The fixture Git policy (#4552), read as the global config of every fixture Git
+# process by `scripts/lib/git-fixture-env.mjs` and
+# `tests/support/git-fixture-env.ts` (both pin GIT_CONFIG_GLOBAL here).
+#
+# `git commit` calls `run_auto_maintenance`, which forks a DETACHED
+# `git maintenance run --auto --quiet --detach` child. The child outlives the
+# command that spawned it and writes inside the fixture `.git`
+# (maintenance.lock, packed-refs.lock, repack temp files), so a test's teardown
+# raced it and the gating Unit shard failed in `afterEach` with ENOTEMPTY on the
+# fixture `.git` instead of in an assertion. A fixture never needs background
+# maintenance, so the forward-looking tasks are off:
+[maintenance]
+	auto = false
+[gc]
+	auto = 0

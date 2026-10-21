@@ -1,7 +1,10 @@
 // Minimal JSON-RPC 2.0 LSP fake server over stdio
 // Used for integration tests — speaks real LSP protocol without actual language smarts
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // #2436: parent-death watchdog. A test that spawns this fixture and then
 // dies without running its own cleanup (a SIGKILLed vitest worker fork, a
@@ -182,7 +185,10 @@ const DELAY_AFTER_FIRST_PULL_MS = Number.parseInt(
 	process.env.FAKE_LSP_DELAY_AFTER_FIRST_PULL_MS ?? "0",
 	10,
 );
-let pullCount = 0;
+// `FAKE_LSP_DELAY_FIRST_PULL=1` counts the first pull as already served, so
+// `FAKE_LSP_DELAY_AFTER_FIRST_PULL_MS` delays it too (#4322: a server that is
+// slow from its very first answer, with no earlier case priming it).
+let pullCount = process.env.FAKE_LSP_DELAY_FIRST_PULL === "1" ? 1 : 0;
 
 function sendPullPush(uri) {
 	send({
@@ -234,6 +240,171 @@ const PUBLISH_SEQUENCE_GAP_MS = Number(
 const PUBLISH_SEQUENCE_FIRST_MS = Number(
 	process.env.FAKE_LSP_PUBLISH_SEQUENCE_FIRST_MS ?? "0",
 );
+
+// #4320: a server that caches a failed module lookup, as Pyrefly 1.3.2 does
+// (measured: `import new_module` keeps its missing-import after the module is
+// created, until the server hears a `Created` watched-files event; `Changed`
+// does not clear it). `FAKE_LSP_STALE_MODULE_LOOKUP=1` makes every open
+// document's `import "./name"` (or `"../dir/name"`) line resolve to
+// `<dir>/name.lua` relative to the document, remember a
+// lookup that failed, and re-evaluate every open document when a `Created`
+// event for the missing file arrives. Push diagnostics, version-matched.
+// Off by default. #4346: `FAKE_LSP_STALE_MODULE_EXT` (default `.lua`) names
+// the module's extension, so a TypeScript side-effect import
+// (`import "./name"`), which the review graph extracts, can model it too.
+const STALE_MODULE_LOOKUP = process.env.FAKE_LSP_STALE_MODULE_LOOKUP === "1";
+const STALE_MODULE_EXT = process.env.FAKE_LSP_STALE_MODULE_EXT ?? ".lua";
+const failedModuleLookups = new Set();
+
+function publishModuleLookups(uri) {
+	const text = openDocuments.get(uri) ?? "";
+	const dir = path.dirname(fileURLToPath(uri));
+	const diagnostics = [];
+	for (const match of text.matchAll(/import\s+"(\.\.?\/[\w/-]+)"/g)) {
+		const target = path.join(dir, `${match[1]}${STALE_MODULE_EXT}`);
+		if (!failedModuleLookups.has(target) && !fs.existsSync(target)) {
+			failedModuleLookups.add(target);
+		}
+		if (failedModuleLookups.has(target)) {
+			diagnostics.push({
+				severity: 1,
+				source: "fake-stale-lookup",
+				code: "missing-import",
+				message: `Cannot find module ${path.basename(match[1])}`,
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
+			});
+		}
+	}
+	send({
+		jsonrpc: "2.0",
+		method: "textDocument/publishDiagnostics",
+		params: { uri, diagnostics },
+	});
+}
+
+// #4476/#4507: a checker whose view of a CLOSED file is what it read first, as
+// TypeScript 7's native server behaves (measured with a raw JSON-RPC probe of
+// `tsc --lsp --stdio`, TS 7.0.2): it registers `<root>/**/*` and
+// `<root>/node_modules/**/*` as client watchers and re-reads a closed file
+// only when a watched-files event names that exact file (a directory or
+// manifest event changes nothing), or when it restarts. An open document's
+// view is the bytes it was sent. With `FAKE_LSP_NO_DIAGNOSTIC_PROVIDER=1`
+// every change to a view republishes every open document (push, version-less),
+// as the real server republishes dependents; otherwise each pull is answered
+// from the views held then. Opt in with `FAKE_LSP_CLOSED_FILE_CACHE=1`; off by
+// default.
+//
+// The checks, on each open document:
+// - `import { A, B } from "./m"` (`m.ts`, then `m.d.ts`) or `from "pkg"`
+//   (`<root>/node_modules/pkg/index.d.ts`): a name the module's view does not
+//   export is `Module '"m"' has no exported member 'A'.` (2305); a module with
+//   no view is `Cannot find module 'm'.` (2307);
+// - a `G_NAME` token no ambient declaration declares (`declare const G_NAME`
+//   in a `.d.ts` outside node_modules, seen at initialize or announced by a
+//   Created event since) is `Cannot find name 'G_NAME'.` (2304).
+const CLOSED_FILE_CACHE = process.env.FAKE_LSP_CLOSED_FILE_CACHE === "1";
+const closedViews = new Map();
+const ambientFiles = new Set();
+let checkerRoot;
+
+function viewOf(filePath) {
+	const open = openDocuments.get(pathToFileURL(filePath).href);
+	if (open !== undefined) return open;
+	if (!closedViews.has(filePath)) {
+		let text;
+		try {
+			text = fs.readFileSync(filePath, "utf8");
+		} catch {
+			text = undefined;
+		}
+		closedViews.set(filePath, text);
+	}
+	return closedViews.get(filePath);
+}
+
+function walkAmbient(dir) {
+	let entries;
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (entry.name !== "node_modules" && entry.name !== ".git")
+				walkAmbient(full);
+		} else if (entry.name.endsWith(".d.ts")) {
+			ambientFiles.add(full);
+		}
+	}
+}
+
+function checkerDiagnostics(uri) {
+	const text = openDocuments.get(uri) ?? "";
+	const dir = path.dirname(fileURLToPath(uri));
+	const diagnostics = [];
+	const range = {
+		start: { line: 0, character: 0 },
+		end: { line: 0, character: 1 },
+	};
+	const report = (code, message) =>
+		diagnostics.push({ severity: 1, source: "fake-checker", code, message, range });
+	for (const match of text.matchAll(
+		/import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*"([^"]+)"/g,
+	)) {
+		const spec = match[2];
+		const candidates = spec.startsWith(".")
+			? [path.join(dir, `${spec}.ts`), path.join(dir, `${spec}.d.ts`)]
+			: [path.join(checkerRoot ?? dir, "node_modules", spec, "index.d.ts")];
+		const view = candidates
+			.map((candidate) => viewOf(candidate))
+			.find((candidate) => candidate !== undefined);
+		if (view === undefined) {
+			report(2307, `Cannot find module '${spec}'.`);
+			continue;
+		}
+		const exported = new Set(
+			[
+				...view.matchAll(
+					/export\s+(?:declare\s+)?(?:function|const|let|type|interface|class)\s+(\w+)/g,
+				),
+			].map((m) => m[1]),
+		);
+		for (const name of match[1]
+			.split(",")
+			.map((part) => part.trim())
+			.filter(Boolean)) {
+			if (!exported.has(name))
+				report(2305, `Module '"${spec}"' has no exported member '${name}'.`);
+		}
+	}
+	const declared = new Set();
+	for (const file of ambientFiles) {
+		for (const m of (viewOf(file) ?? "").matchAll(/declare\s+const\s+(G_\w+)/g))
+			declared.add(m[1]);
+	}
+	for (const name of new Set([...text.matchAll(/\bG_\w+\b/g)].map((m) => m[0]))) {
+		if (!declared.has(name)) report(2304, `Cannot find name '${name}'.`);
+	}
+	return diagnostics;
+}
+
+// Push mode republishes every open document on each change to a view; pull
+// mode (`FAKE_LSP_NO_DIAGNOSTIC_PROVIDER` unset) answers each pull from the
+// views it holds at that moment.
+function checkEveryOpenDocument() {
+	if (process.env.FAKE_LSP_NO_DIAGNOSTIC_PROVIDER !== "1") return;
+	for (const uri of openDocuments.keys())
+		send({
+			jsonrpc: "2.0",
+			method: "textDocument/publishDiagnostics",
+			params: { uri, diagnostics: checkerDiagnostics(uri) },
+		});
+}
 
 function publishSequenceFor(uri) {
 	if (PUBLISH_SEQUENCE.length === 0) return false;
@@ -343,6 +514,12 @@ process.stdin.on("data", (chunk) => {
 		return;
 	}
 	for (const m of messages) {
+        // #4528 r3: a separate request task can reply before queued notifications.
+        if (process.env.FAKE_LSP_PING_OVERTAKES === "1" &&
+            JSON.parse(m).method === "textDocument/documentSymbol") {
+            handle(m);
+            continue;
+        }
 		if (workQueue.length >= NOTIFY_BACKLOG_WEDGE) {
 			// More work outstanding than this server can hold. It stops reading and
 			// never comes back.
@@ -375,6 +552,38 @@ function handle(raw) {
 		trace(
 			`recv ${data.method ?? "<response>"} ${data.params?.textDocument?.uri ?? ""}`.trim(),
 		);
+		// #4493: which bytes each didOpen/didChange carried, as a short sha256,
+		// so a test reads what the server holds from the wire. Off by default.
+		if (process.env.FAKE_LSP_TRACE_TEXT === "1") {
+			const text =
+				data.method === "textDocument/didOpen"
+					? data.params?.textDocument?.text
+					: data.method === "textDocument/didChange"
+						? data.params?.contentChanges?.at(-1)?.text
+						: undefined;
+			if (typeof text === "string")
+				trace(
+					`text ${data.params?.textDocument?.uri} ${createHash("sha256").update(text).digest("hex").slice(0, 12)}`,
+				);
+		}
+		// #4636: the `languageId` each `didOpen` announced, so a test reads the
+		// classifier's answer off the wire instead of from the helper behind it.
+		// Off by default: the line would join every existing trace assertion.
+		if (
+			process.env.FAKE_LSP_TRACE_LANGUAGE_ID === "1" &&
+			data.method === "textDocument/didOpen" &&
+			typeof data.params?.textDocument?.languageId === "string"
+		) {
+			trace(
+				`language ${data.params.textDocument.uri} ${data.params.textDocument.languageId}`,
+			);
+		}
+		// #4320 r3: which watched-files changes reached this server.
+		if (data.method === "workspace/didChangeWatchedFiles") {
+			for (const change of data.params?.changes ?? []) {
+				trace(`watched ${change.uri} ${change.type}`);
+			}
+		}
 		if (
 			process.env.FAKE_LSP_ECHO_NOTIFY_METHODS === "1" &&
 			data.id === undefined
@@ -389,6 +598,10 @@ function handle(raw) {
 	// timeout kill + 2s SIGKILL-backstop path (#1114).
 	if (data.method === "initialize") {
 		if (process.env.FAKE_LSP_IGNORE_INITIALIZE === "1") return;
+		if (CLOSED_FILE_CACHE && typeof data.params?.rootUri === "string") {
+			checkerRoot = fileURLToPath(data.params.rootUri);
+			walkAmbient(checkerRoot);
+		}
 		const clientCapabilities = data.params?.capabilities;
 		const clientCodeAction = clientCapabilities?.textDocument?.codeAction;
 		const clientSupportsCodeActionResolve =
@@ -636,6 +849,8 @@ function handle(raw) {
 			data.params?.textDocument?.text ?? "",
 		);
 		publishSequenceFor(data.params?.textDocument?.uri);
+		if (STALE_MODULE_LOOKUP) publishModuleLookups(data.params?.textDocument?.uri);
+		if (CLOSED_FILE_CACHE) checkEveryOpenDocument();
 		if (process.env.FAKE_LSP_PUSH_DIAGNOSTIC === "1") {
 			send({
 				jsonrpc: "2.0",
@@ -673,10 +888,22 @@ function handle(raw) {
 	}
 	if (data.method === "textDocument/didChange") {
 		const text = data.params?.contentChanges?.at(-1)?.text;
+		// #4528 r1 F1: a server that dies on reading one change (after the
+		// trace line), so a request queued behind it can never be answered.
+		const exitMarker = process.env.FAKE_LSP_EXIT_ON_CHANGE_TEXT;
+		if (exitMarker && typeof text === "string" && text.includes(exitMarker))
+			process.exit(0);
 		if (typeof text === "string") {
 			openDocuments.set(data.params?.textDocument?.uri, text);
 		}
 		publishSequenceFor(data.params?.textDocument?.uri);
+		if (STALE_MODULE_LOOKUP) publishModuleLookups(data.params?.textDocument?.uri);
+		if (CLOSED_FILE_CACHE) checkEveryOpenDocument();
+		// #4493 r2: a scanner that re-parses on every change (ast-grep's live
+		// shape). Synchronous, so a request queued behind the changes is answered
+		// only after all of them: what the #1714 aux pacing barrier waits on.
+		const changeCostMs = Number(process.env.FAKE_LSP_CHANGE_COST_MS ?? "");
+		if (Number.isFinite(changeCostMs) && changeCostMs > 0) burnCpu(changeCostMs);
 		// #1669 review F5: echo the received contentChanges back so a real-init
 		// integration test can assert the ON-THE-WIRE shape (ranged vs
 		// whole-document) that the client actually sent, proving
@@ -740,6 +967,28 @@ function handle(raw) {
 		// #271 smoke: echo each received batch back so an integration test can
 		// assert the client coalesced N file opens into ONE wire frame. Off by
 		// default (the bulk of tests neither send nor care about watched-files).
+		if (STALE_MODULE_LOOKUP) {
+			let created = false;
+			for (const change of data.params?.changes ?? []) {
+				if (change.type !== 1) continue;
+				created = failedModuleLookups.delete(fileURLToPath(change.uri)) || created;
+			}
+			if (created) for (const uri of openDocuments.keys()) publishModuleLookups(uri);
+		}
+		if (CLOSED_FILE_CACHE) {
+			for (const change of data.params?.changes ?? []) {
+				const changed = fileURLToPath(change.uri);
+				closedViews.delete(changed);
+				if (
+					!changed.endsWith(".d.ts") ||
+					changed.includes(`${path.sep}node_modules${path.sep}`)
+				)
+					continue;
+				if (change.type === 3) ambientFiles.delete(changed);
+				else ambientFiles.add(changed);
+			}
+			checkEveryOpenDocument();
+		}
 		if (process.env.FAKE_LSP_ECHO_WATCHED_FILES) {
 			send({
 				jsonrpc: "2.0",
@@ -887,8 +1136,9 @@ function handle(raw) {
 				});
 				return;
 			}
-			const items =
-				PULL_RESPONSE === "empty" ||
+			const items = CLOSED_FILE_CACHE
+				? checkerDiagnostics(uri)
+				: PULL_RESPONSE === "empty" ||
 				(text.includes("fake-lsp-clean") && PULL_RESPONSE !== "items")
 					? []
 					: [
@@ -933,13 +1183,18 @@ function handle(raw) {
 				return;
 			}
 			const uri = process.env.FAKE_LSP_WORKSPACE_DIAGNOSTIC_URI;
-			send({
-				jsonrpc: "2.0",
-				id: data.id,
-				result: {
-					items: uri ? [{ uri, kind: "full", items: [] }] : [],
-				},
-			});
+			// #4528 r1 F3: the closed-file-cache profile answers a project-wide
+			// pull from the views it holds, one full report per open document.
+			const items = CLOSED_FILE_CACHE
+				? [...openDocuments.keys()].map((open) => ({
+						uri: open,
+						kind: "full",
+						items: checkerDiagnostics(open),
+					}))
+				: uri
+					? [{ uri, kind: "full", items: [] }]
+					: [];
+			send({ jsonrpc: "2.0", id: data.id, result: { items } });
 		};
 		const delay = Number.parseInt(
 			process.env.FAKE_LSP_WORKSPACE_DIAGNOSTIC_DELAY_MS ?? "0",

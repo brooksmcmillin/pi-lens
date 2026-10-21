@@ -268,49 +268,58 @@ describe("spawnWedgedChild", () => {
 // would race the very backstop under test and could mask a broken backstop
 // by killing the leaked process before test B looks at it. The only cleanup
 // is `afterAll`, which runs strictly after test B's assertion.
-describe("spawnWedgedChild — onTestFinished backstop (#2436)", () => {
-	let leakedPid: number | undefined;
+// Shuffle exemption (#4561 D1, registered in scripts/shuffle-census-ratchet.json):
+// the ORDER of these two cases is the mechanism under test, so the suite opts
+// out per `describe` rather than the file opting out. Reordering them — the
+// shuffle census's seed 202 did — makes case B look for a `leakedPid` that a
+// case which has not run yet never set, and the backstop proof evaporates.
+describe(
+	"spawnWedgedChild — onTestFinished backstop (#2436)",
+	{ shuffle: false },
+	() => {
+		let leakedPid: number | undefined;
 
-	function isAlive(pid: number): boolean {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch {
-			return false;
-		}
-	}
-
-	afterAll(() => {
-		if (leakedPid !== undefined && isAlive(leakedPid)) {
+		function isAlive(pid: number): boolean {
 			try {
-				process.kill(leakedPid, "SIGKILL");
+				process.kill(pid, 0);
+				return true;
 			} catch {
-				/* already gone */
+				return false;
 			}
 		}
-	});
 
-	it("spawns the wedged child and deliberately does not kill it", async () => {
-		const wedged = await spawnWedgedChild();
-		expect(wedged.pid).toBeDefined();
-		expect(isAlive(wedged.pid as number)).toBe(true);
-		leakedPid = wedged.pid;
-		// No wedged.kill() here on purpose — the onTestFinished backstop
-		// registered inside spawnWedgedChild is the only thing that should
-		// reap this.
-	});
-
-	it(
-		"the backstop reaped the previous test's process once it finished",
-		{ timeout: 15_000 },
-		async () => {
-			expect(leakedPid).toBeDefined();
-			const deadline = Date.now() + 10_000;
-			while (Date.now() < deadline && isAlive(leakedPid as number)) {
-				await new Promise((resolve) => setTimeout(resolve, 50));
+		afterAll(() => {
+			if (leakedPid !== undefined && isAlive(leakedPid)) {
+				try {
+					process.kill(leakedPid, "SIGKILL");
+				} catch {
+					/* already gone */
+				}
 			}
-			expect(isAlive(leakedPid as number)).toBe(false);
-		},
-	);
-});
+		});
+
+		it("spawns the wedged child and deliberately does not kill it", async () => {
+			const wedged = await spawnWedgedChild();
+			expect(wedged.pid).toBeDefined();
+			expect(isAlive(wedged.pid as number)).toBe(true);
+			leakedPid = wedged.pid;
+			// No wedged.kill() here on purpose — the onTestFinished backstop
+			// registered inside spawnWedgedChild is the only thing that should
+			// reap this.
+		});
+
+		it(
+			"the backstop reaped the previous test's process once it finished",
+			{ timeout: 15_000 },
+			async () => {
+				expect(leakedPid).toBeDefined();
+				const deadline = Date.now() + 10_000;
+				while (Date.now() < deadline && isAlive(leakedPid as number)) {
+					await new Promise((resolve) => setTimeout(resolve, 50));
+				}
+				expect(isAlive(leakedPid as number)).toBe(false);
+			},
+		);
+	},
+);
 // flake-shape: real-process-spawn — a genuinely wedged child proves pipe and kill behavior that a resolved promise cannot model

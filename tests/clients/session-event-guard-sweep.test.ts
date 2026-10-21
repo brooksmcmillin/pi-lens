@@ -15,14 +15,20 @@
  * event name. A copy-pasted wrapper naming a different event would mislabel
  * the ledger subject, so it fails too.
  *
- * The declared floor of 12 is the second half of the emptiness guard. index.ts
- * registers 12 handlers today. A regex that stops matching one of them, the
- * way the first draft missed the `on?.()` form, drops the count and reds here
- * instead of quietly excusing the handler it can no longer see.
+ * The declared floor is the count the scan actually sees. index.ts registers 14
+ * handlers today, and the floor is that number: it sat at 12 while the tree
+ * carried 13 and then 14, which let a regex that stopped matching one or two of
+ * them pass on the remaining twelve. A regex that loses a registration now reds
+ * here instead of quietly excusing the handler it can no longer see — the way
+ * the first draft missed the `on?.()` form.
  *
  * #1929 moved `session_start` and `context` out of the exemption table and into
- * the wrapper, so seven registrations are wrapped and five carry a reason. The
- * registration count is unchanged: neither handler was added or removed.
+ * the wrapper. The roster is 14 registrations: nine wrapped and five carrying a
+ * reason. #4631 added `context_with_system` to the wrapper, so both request
+ * hooks are wrapped alike; that is the registration the count gained. (An
+ * earlier revision of this paragraph said "12" and "seven" and called the count
+ * unchanged while correcting a floor that was already stale — the whole roster
+ * is stated here instead, so the next delta is checkable.)
  */
 
 import * as fs from "node:fs";
@@ -128,7 +134,7 @@ describe("session-event stale-ctx guard sweep (#1925)", () => {
 		assertNonEmptyScan(
 			"session-event registration scan",
 			registrations.length,
-			12,
+			14,
 		);
 		expect(registrations.map((entry) => entry.event)).toContain("turn_end");
 	});
@@ -144,7 +150,7 @@ describe("session-event stale-ctx guard sweep (#1925)", () => {
 				.map((entry) => entry.event),
 			exemptions: UNWRAPPED_HANDLER_REASONS,
 			scannedCount: registrations.length,
-			minScanned: 12,
+			minScanned: 14,
 			remediation:
 				"Wrap it with wrapSessionEventHandler(<event>, handler, { dbg }) from clients/session-event-guard.ts — or wrapSessionEventHandlerWithResult(<event>, handler, { dbg, onStaleResult }) when the host consumes the handler's return value — or add the event to UNWRAPPED_HANDLER_REASONS with the mechanism that makes a stale ctx unreachable for it.",
 		});

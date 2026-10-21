@@ -1,0 +1,2 @@
+function greet
+    echo hello

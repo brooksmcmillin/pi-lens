@@ -223,6 +223,9 @@ describe("lsp launch", () => {
 				startupFailureWindowMs: 1,
 			});
 
+			// No drain needed (#4381 sweep): launch.ts keeps its own
+			// `logSessionStart`, which writes with `fs.appendFileSync`, so the
+			// line is on disk before `launchLSP` returns.
 			const log = fs.readFileSync(
 				path.join(tempDir, "sessionstart.log"),
 				"utf8",

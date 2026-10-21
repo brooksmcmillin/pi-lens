@@ -1,0 +1,100 @@
+{
+	"about": "Test files the shuffle census (scripts/ci-shuffle-census.mjs, #4405) found order-dependent and nobody has fixed at the cause yet. One entry per FILE: a file stays listed until the census finds it clean under every seed, because which cases of a file fail under a seed moves with its case count. `seam` names the group the fix belongs to (first-error evidence, not a root-cause analysis); `seed` and `test` are one example failing case, for the fixer, and the last segment of `test` must still appear in the file. The list only shrinks: delete an entry in the PR that fixes the file, and lower PINNED_FILES in tests/scripts/ci-shuffle-census.test.ts. Reproduce with `npx vitest run <file> --sequence.shuffle --sequence.seed=<seed>`. `byDesign` is the other direction (#4561 D1): a `describe` whose subject IS the order its cases run in opts out with `{ shuffle: false }` (never the whole file) and is registered here with the reason, so the exemption is visible and checked both ways instead of hiding in a test file.",
+	"members": [
+		{
+			"file": "tests/clients/debug-handles.test.ts",
+			"seam": "once-per-session-sink",
+			"seed": 202,
+			"test": "debug-handles: PI_LENS_DEBUG_HANDLES=1 unset (default) > dumpActiveHandles is a no-op — writes nothing to disk"
+		},
+		{
+			"file": "tests/clients/dispatch/runners/lsp-real-runner.test.ts",
+			"seam": "lsp-real-server-timing",
+			"seed": 202,
+			"test": "LSP dispatch runner — real server (#873) > maps a genuine server error to a 1-indexed blocking diagnostic"
+		},
+		{
+			"file": "tests/clients/installer/archive-install.integration.test.ts",
+			"seam": "lsp-real-server-timing",
+			"seed": 202,
+			"test": "archive installer fixture path (#3020) > installs clangd ZIP through ensureTool and strips its wrapper"
+		},
+		{
+			"file": "tests/clients/lsp/integration.test.ts",
+			"seam": "lsp-real-server-timing",
+			"seed": 202,
+			"test": "LSP Client Integration — mutation-bridge fallback for server-initiated edits (#2450) > records turn-state and a change-log receipt for a server-initiated applyEdit with no mutationContext threaded through executeCommand"
+		},
+		{
+			"file": "tests/clients/lsp/service-aux-grace.test.ts",
+			"seam": "lsp-real-server-timing",
+			"seed": 202,
+			"test": "R8 — aux grace: touchFile with-auxiliary path > partitions real lens_diagnostics results by delivering server id (#2776)"
+		},
+		{
+			"file": "tests/clients/ndjson-logger.test.ts",
+			"seam": "once-per-session-sink",
+			"seed": 202,
+			"test": "createNdjsonLogger > bounds a wedged shutdown drain and records one degradation"
+		},
+		{
+			"file": "tests/clients/review-graph/wasm-trap-containment.test.ts",
+			"seam": "tree-sitter-wasm-state",
+			"seed": 202,
+			"test": "review graph after a contained trap (#3605 F2, F3) > re-extracts a file a one-off trap cost on the next build"
+		},
+		{
+			"file": "tests/clients/review-graph/wasm-trap-decay.test.ts",
+			"seam": "tree-sitter-wasm-state",
+			"seed": 202,
+			"test": "a one-off trap's entry decays after a healthy parse (#3678 F-A) > decays when the SAME consumer parses the same unchanged content"
+		},
+		{
+			"file": "tests/index-3248-git-guard-latch-witness.test.ts",
+			"seam": "index-activation-state",
+			"seed": 202,
+			"test": "#3248 witness: the commit gate and the banner agree through pi > matches the committed golden for a fully marked file"
+		},
+		{
+			"file": "tests/index-3873-session-decision-records.test.ts",
+			"seam": "index-activation-state",
+			"seed": 202,
+			"test": "#3873 O5: the fence rollup > counts guarded and dropped writes per declared source, once, then starts over"
+		},
+		{
+			"file": "tests/mcp/analyze-graph.smoke.test.ts",
+			"seam": "persisted-graph-store",
+			"seed": 202,
+			"test": "pilens_analyze (warm) maintains the review graph over MCP > has no who-uses-this data for a.ts before any analyze call (cold graph)"
+		},
+		{
+			"file": "tests/mcp/build-graph-cli.test.ts",
+			"seam": "persisted-graph-store",
+			"seed": 202,
+			"test": "pi-lens build-graph CLI > builds and persists a small project with a stats line"
+		},
+		{
+			"file": "tests/support/vitest-setup-console-channel.test.ts",
+			"seam": "once-per-session-sink",
+			"seed": 202,
+			"test": "(file)"
+		}
+	],
+	"byDesign": [
+		{
+			"file": "tests/support/fake-lsp-server.test.ts",
+			"describe": "spawnFakeLspServer — onTestFinished backstop (#2436)",
+			"reason": "case B reads the pid case A deliberately left unkilled: the reaping this suite proves IS the boundary between the two cases."
+		},
+		{
+			"file": "tests/support/fault-injection.test.ts",
+			"describe": "spawnWedgedChild — onTestFinished backstop (#2436)",
+			"reason": "case B reads the pid case A deliberately left unkilled: the reaping this suite proves IS the boundary between the two cases."
+		},
+		{
+			"file": "tests/clients/test-utils-fake-timers.test.ts",
+			"describe": "useTrackedTempDirs under a fake clock (#4019)",
+			"reason": "case 2 asserts what the harness drain did after case 1 left fake timers installed, so the case boundary is the mechanism under test."
+		}
+	]
+}

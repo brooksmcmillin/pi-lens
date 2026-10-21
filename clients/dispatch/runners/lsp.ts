@@ -15,8 +15,12 @@
 import { logExtension } from "../../extension-log.js";
 import { getLspCapableKinds } from "../../language-policy.js";
 import { exceedsLspSyncLimits } from "../../lsp/content-limits.js";
-import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
+import {
+	primaryUnavailableCause,
+	touchCoverageGap,
+} from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/capabilities.js";
+import { disabledPrimaries } from "../../lsp/session-roots.js";
 import { LSP_SERVERS } from "../../lsp/server.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
 import { PRIORITY } from "../priorities.js";
@@ -27,7 +31,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult } from "../types.js";
+import { findingsResult, spanOverlapsModifiedRanges } from "../types.js";
 import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
 import { demoteInferredProjectDiagnostics } from "../../lsp/inferred-project.js";
 import {
@@ -138,7 +142,20 @@ const lspRunner: RunnerDefinition = {
 		// Fast capability check only — actual client creation happens when we
 		// open the file below.
 		if (!lspService.supportsLSP(ctx.filePath)) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			// #4403: no server is selected, but a primary the operator disabled
+			// would have served the file. Say so; it is not "no LSP here".
+			const { disabledServerIds: disabledPrimaryServerIds } = disabledPrimaries(
+				ctx.filePath,
+			);
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				...(disabledPrimaryServerIds.length > 0 && {
+					primaryUnavailableCause: "disabled" as const,
+					disabledPrimaryServerIds,
+				}),
+			};
 		}
 
 		// Always sync current file content before reading diagnostics so dispatch
@@ -155,6 +172,13 @@ const lspRunner: RunnerDefinition = {
 		// confirmed clean result and must not be reported as one (#570).
 		let diagnosticsInconclusive = false;
 		let inconclusiveServerIds: readonly string[] = [];
+		// #4403: set when the touch says no primary answered (`primary-unavailable`).
+		let primaryUnavailable:
+			| Pick<
+					RunnerResult,
+					"primaryUnavailableCause" | "disabledPrimaryServerIds"
+			  >
+			| undefined;
 		// #1470/#1493: server ids the touch carries no evidence for — an auxiliary
 		// whose push wait our aux grace timer cut off (#1470), or one that stayed
 		// silent with no stored publication for this content (#1493). The touch is
@@ -230,6 +254,21 @@ const lspRunner: RunnerDefinition = {
 				lspDiags = touched.diags;
 				diagnosticsInconclusive = touched.inconclusive === true;
 				inconclusiveServerIds = touched.inconclusiveServerIds ?? [];
+				if (touched.inconclusiveReason === "primary-unavailable") {
+					const disabledPrimaryServerIds =
+						touched.disabledPrimaryServerIds ?? [];
+					primaryUnavailable = {
+						primaryUnavailableCause:
+							touched.primaryUnavailableCause ??
+							primaryUnavailableCause(
+								inconclusiveServerIds,
+								disabledPrimaryServerIds,
+							),
+						...(disabledPrimaryServerIds.length > 0 && {
+							disabledPrimaryServerIds,
+						}),
+					};
+				}
 				unconfirmedServerIds = [
 					...new Set([
 						...touchCoverageGap(touched),
@@ -304,7 +343,14 @@ const lspRunner: RunnerDefinition = {
 			// reply. Report "skipped" so the coverage notice can flag the gap and
 			// the next edit re-checks once the server has warmed; any diagnostics
 			// published late still land in the client cache and surface then.
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			// #4403: no client was ready, and a disabled primary would have made
+			// the touch say so, so the language server could not start in time.
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				primaryUnavailableCause: "unstarted",
+			};
 		}
 
 		if (diagnosticsInconclusive && lspDiags.length === 0) {
@@ -312,7 +358,16 @@ const lspRunner: RunnerDefinition = {
 			// diagnostics wait hit their deadline without any collected findings.
 			// With no answered diagnostics, report "skipped" so the coverage notice
 			// flags the gap instead of reading this as a confirmed clean result (#570).
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			// #4403: when no primary answered at all, the result says why.
+			// #4484: a skip without a stated reason reaches no verdict
+			// (`reachedNoVerdict`), so this empty result never retires a recorded
+			// blocker.
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				...primaryUnavailable,
+			};
 		}
 
 		if (lspDiags.length === 0) {
@@ -447,12 +502,42 @@ const lspRunner: RunnerDefinition = {
 		// #692: shared with the scan/sweep reconcile paths (`retagAuxiliaryDiagnostics`
 		// in `../auxiliary-lsp.js`) so a scan-reconciled aux finding gets identical
 		// tool/semantic/defectClass tagging instead of keeping tool "lsp".
-		const keptDiagnostics = retagAuxiliaryDiagnostics(
+		// #4481 r2: each converted diagnostic's raw LSP range (1:1, as above),
+		// captured before the re-tag drops suppressed entries, so the edit-scope
+		// filter below reads the match's full span, not only its start line.
+		const rawRangeByDiagnostic = new Map(
+			diagnostics.map((d, i) => [d, validLspDiags[i]?.range]),
+		);
+		const retaggedDiagnostics = retagAuxiliaryDiagnostics(
 			diagnostics,
 			validLspDiags,
 			content,
 			{ cwd: ctx.cwd, fileRole: ctx.fileRole },
 		);
+		// #4481: the ast-grep LSP runs the same rule catalog as the
+		// ast-grep-napi runner, so on the per-edit pass its blocker whose span
+		// does not overlap the edited lines is dropped, as napi and tree-sitter
+		// drop theirs. Language-server diagnostics (tool "lsp") and every other
+		// auxiliary stay unscoped by design: an edit can cause a type error or a
+		// finding at a line it never touched.
+		// #4484 r2: the gate decides delivery only; what it withholds rides out
+		// as `outOfEditScope`, still observed, for the recorded-blocker carry.
+		const keptDiagnostics: Diagnostic[] = [];
+		const outOfEditScope: Diagnostic[] = [];
+		for (const d of retaggedDiagnostics) {
+			const range =
+				ctx.blockingOnly && d.tool === "ast-grep" && d.semantic === "blocking"
+					? rawRangeByDiagnostic.get(d)
+					: undefined;
+			const inScope =
+				range === undefined ||
+				spanOverlapsModifiedRanges(
+					range.start.line + 1,
+					(range.end?.line ?? range.start.line) + 1,
+					ctx.modifiedRanges,
+				);
+			(inScope ? keptDiagnostics : outOfEditScope).push(d);
+		}
 
 		const hasErrors = keptDiagnostics.some((d) => d.semantic === "blocking");
 		const resultSemantic = hasErrors
@@ -478,6 +563,7 @@ const lspRunner: RunnerDefinition = {
 			...(deferredServerIds.length > 0 && {
 				deferredServerIds: [...deferredServerIds],
 			}),
+			...(outOfEditScope.length > 0 && { outOfEditScope }),
 		};
 	},
 };

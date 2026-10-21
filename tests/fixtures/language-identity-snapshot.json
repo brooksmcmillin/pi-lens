@@ -1383,7 +1383,7 @@
 		"Makefile": {
 			"kind": "shell",
 			"kindLanguageId": "shell",
-			"lspId": "shell",
+			"lspId": "shellscript",
 			"treeSitterGrammar": null,
 			"scannerGrammar": null,
 			"readExpansionLang": null,
@@ -1393,7 +1393,7 @@
 		"root.hcl": {
 			"kind": "terragrunt",
 			"kindLanguageId": "terragrunt",
-			"lspId": null,
+			"lspId": "terragrunt",
 			"treeSitterGrammar": null,
 			"scannerGrammar": null,
 			"readExpansionLang": null,
@@ -1403,7 +1403,17 @@
 		"terragrunt.hcl": {
 			"kind": "terragrunt",
 			"kindLanguageId": "terragrunt",
-			"lspId": null,
+			"lspId": "terragrunt",
+			"treeSitterGrammar": null,
+			"scannerGrammar": null,
+			"readExpansionLang": null,
+			"reviewGraphGrammar": null,
+			"moduleReportGrammar": null
+		},
+		"tsconfig.app.json": {
+			"kind": "json",
+			"kindLanguageId": "json",
+			"lspId": "jsonc",
 			"treeSitterGrammar": null,
 			"scannerGrammar": null,
 			"readExpansionLang": null,

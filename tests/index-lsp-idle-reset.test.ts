@@ -70,7 +70,7 @@ async function setupLspStatusRepaint(
 	return { turnEnd, ui, lspStatuses, resetLSPService };
 }
 
-vi.mock("../clients/read-guard.js", () => {
+const MockReadGuard = vi.hoisted(() => {
 	class MockReadGuard {
 		isNewFile() {
 			return false;
@@ -102,11 +102,14 @@ vi.mock("../clients/read-guard.js", () => {
 		}
 	}
 
-	return {
-		ReadGuard: MockReadGuard,
-		createReadGuard: () => new MockReadGuard(),
-	};
+	return MockReadGuard;
 });
+
+vi.mock("../clients/read-guard.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../clients/read-guard.js")>()),
+	ReadGuard: MockReadGuard,
+	createReadGuard: () => new MockReadGuard(),
+}));
 
 describe("index.ts LSP idle reset", () => {
 	let tmpDir: string;

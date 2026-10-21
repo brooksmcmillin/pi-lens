@@ -1,4 +1,3 @@
-import * as nodeCrypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import {
@@ -10,10 +9,22 @@ import {
 	type CaptureOptions,
 	diffFileContent,
 	getOpaqueBaselineStore,
+	headRecordKey,
+	isGitWorktree,
+	listGitHeadDelta,
+	observeGitHead,
 	opaqueBaselineSlot,
+	opaquePrescanRoot,
+	readGitHead,
 	recoverOpaqueChangesViaGit,
+	serializeHeadLook,
+	shouldRunOpaqueRecovery,
 } from "./opaque-mutation-scan.js";
-import { normalizeMapKey } from "./path-utils.js";
+import {
+	isUnderDir,
+	normalizeMapKey,
+	resolveToolCallFilePath,
+} from "./path-utils.js";
 import { detectFileKind } from "./file-kinds.js";
 import {
 	extractReadPathsFromCommand,
@@ -33,10 +44,15 @@ import {
 	invalidateProjectIgnoreMatcherForPath,
 	isPiLensInternalPath,
 	isPathIgnoredByProject,
+	isRecordableProjectPath,
 } from "./file-utils.js";
 import { invalidateFormatterCacheForPath } from "./formatters.js";
 import { judgeConfirmedDelete } from "./confirmed-delete.js";
-import { deliveredLineEvidence, type ReadGuard } from "./read-guard.js";
+import {
+	deliveredLineEvidence,
+	type ReadGuard,
+	scanFileLines,
+} from "./read-guard.js";
 import {
 	expectationFromToolInput,
 	noteAgentCallEnd,
@@ -55,6 +71,7 @@ import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	classifyMutatingTool,
+	isBashDerivedReplay,
 	readToolResultPathField,
 	PI_LENS_SYNTHETIC_MUTATION_FIELD,
 	type MutatingToolClassification,
@@ -80,12 +97,12 @@ import {
 	getReadGuardCorrelationId,
 	logReadGuardEvent,
 } from "./read-guard-logger.js";
-import { countFileLines } from "./read-guard-tool-lines.js";
 import type { PiLensFlagSource } from "./lens-config.js";
 import type { EditToolDetails } from "@earendil-works/pi-coding-agent";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import {
 	notifyExternalFileChange,
+	peekLSPService,
 	resyncGitChangedFiles,
 } from "./lsp/capabilities.js";
 import type { MetricsClient } from "./metrics-client.js";
@@ -105,6 +122,7 @@ import type {
 } from "./runtime-coordinator.js";
 import { EXPANSION_LIMIT_LINES } from "./read-expansion.js";
 import { syncGitGuardRecord } from "./git-guard.js";
+import { hashContentBytes, hashFileBytes } from "./content-stamp.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import { getActiveSessionId } from "./session-lifecycle.js";
@@ -115,6 +133,8 @@ import {
 } from "./session-scope.js";
 import { requestBootstrapClients } from "./bootstrap.js";
 import { bounded } from "./deadline-utils.js";
+import type { DiskChangeRuntime } from "./disk-changes.js";
+import { lookForOutOfBandChanges } from "./out-of-band-changes.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import {
 	incrementDegradationCount,
@@ -199,6 +219,202 @@ export function isFailedGitIntegrationCommand(
 }
 
 /**
+ * #4493: forced drift passes a HEAD move's resync may run before it reports
+ * the rest deferred: 16 passes of `DRIFT_RESYNC_BATCH` (4) cover 64 held
+ * documents. The primary phase sends to the same cap.
+ */
+const HEAD_MOVE_RESYNC_MAX_PASSES = 16;
+const HEAD_MOVE_PRIMARY_CAP = 64;
+
+/**
+ * #4493, #4507: send the disk bytes of `candidates` to the PRIMARY servers
+ * that hold them, awaited, and to no auxiliary: that is the view the next
+ * read or edit's dispatch reads, and primaries are not paced. The caller runs
+ * the full resync (every holding server, held importers, drift records)
+ * detached after it.
+ *
+ * A queued target is resent unconditionally, and most HEAD moves (every
+ * `git commit`, an amend) leave the held bytes current: only a document
+ * whose last-sent bytes differ from the disk is a target. An unreadable one
+ * is one too, so the resync reports it vanished. A candidate no server holds
+ * is skipped: opening it is its dispatch's job. Never spawns, and creates no
+ * service.
+ */
+async function sendToHeldPrimaries(
+	root: string,
+	candidates: readonly string[],
+	drainMs: number,
+): Promise<{
+	targets: string[];
+	primary: number;
+	failed: boolean;
+	drained: boolean;
+}> {
+	const service = peekLSPService();
+	if (!service || candidates.length === 0)
+		return { targets: [], primary: 0, failed: false, drained: true };
+	const held = new Set(service.getOpenDocumentPaths(root));
+	const targets = (
+		await Promise.all(
+			candidates.map(async (filePath) => {
+				if (!held.has(filePath)) return undefined;
+				const sent = service.getTrackedContent(filePath, root)?.hash;
+				try {
+					const disk = await nodeFs.promises.readFile(filePath, "utf8");
+					return sent === hashContentBytes(Buffer.from(disk, "utf8"))
+						? undefined
+						: filePath;
+				} catch {
+					return filePath;
+				}
+			}),
+		)
+	).filter((filePath): filePath is string => filePath !== undefined);
+	if (targets.length === 0)
+		return { targets, primary: 0, failed: false, drained: true };
+	try {
+		const { sent, drained } = await service.resyncHeldPrimaries(
+			targets.slice(0, HEAD_MOVE_PRIMARY_CAP),
+			drainMs,
+		);
+		return { targets, primary: sent, failed: false, drained };
+	} catch {
+		return { targets, primary: 0, failed: true, drained: false };
+	}
+}
+
+/**
+ * #4493: when HEAD moved since this session last looked, resync the held
+ * documents in `git diff <old> <new>`.
+ *
+ * A clean-tree move (checkout, reset --hard, a completed rebase or
+ * cherry-pick, or the same outside pi) leaves `git status` empty, so opaque
+ * recovery finds nothing and the server kept the pre-move bytes. The delta is
+ * incoming content, not the agent's: it reaches the LSP resync only, never
+ * mutation bookkeeping, authorship or dispatch. One `opaque_mutation_head_moved`
+ * row per move, none when HEAD did not move.
+ *
+ * The returned promise settles once the PRIMARY servers hold the new bytes;
+ * the auxiliaries catch up after it (see {@link lookAtHead}).
+ *
+ * #4476: the same look first checks the root for a dependency install or a
+ * declaration file changed outside pi-lens (`out-of-band-changes.ts`), in a
+ * git checkout or not, so a restart lands before the resync and both before
+ * the next check.
+ */
+export function resyncHeadMove(args: HeadLook): Promise<void> {
+	return serializeHeadLook(args.key, async () => {
+		try {
+			await lookForOutOfBandChanges(args.root, args.trigger, args.runtime);
+		} finally {
+			await lookAtHead(args);
+		}
+	});
+}
+
+interface HeadLook {
+	root: string;
+	key: string;
+	trigger: "tool_call" | "tool_result";
+	label: string;
+	/**
+	 * The bulk mutation seam the out-of-band look's publish allocates the
+	 * existing project sequence through (#4535). Optional: a look driven
+	 * without a runtime still publishes, it just allocates no sequence.
+	 */
+	runtime?: DiskChangeRuntime;
+}
+
+/**
+ * One look, the only one of its key in flight. A look that joined a flight is
+ * answered by the flight's trailing look, which carries the first caller's
+ * `trigger` and `label` in its row.
+ *
+ * Two phases (review r1 F1). Inside the look, the changed held documents go to
+ * the primary servers only: that is the view the next read or edit's dispatch
+ * reads, and primaries are not paced. After the look, detached, the drift
+ * resync sends them to every holding server (the paced auxiliaries), adds held
+ * importers and stamps the drift records; its end writes the row. The hooks and
+ * every joined look wait for the first phase only, so an auxiliary's pacing
+ * barrier no longer holds back the primary or the next tool call.
+ */
+async function lookAtHead(args: HeadLook): Promise<void> {
+	if (!(await isGitWorktree(args.root))) return;
+	const head = await readGitHead(args.root);
+	if (!head) return;
+	const from = observeGitHead(args.key, head);
+	if (!from) return;
+	const started = Date.now();
+	const delta = await listGitHeadDelta(args.root, from, head);
+	const service = peekLSPService();
+	const heldPaths = service?.getOpenDocumentPaths(args.root) ?? [];
+	const held = new Set(heldPaths);
+	// Only a held document can be stale, and the reverse-import lookup inside
+	// the resync costs one index build per path, so a large delta is cut here.
+	// An unknown delta (git failed, or the listing was cut) leaves the held set
+	// as the candidates: the stale views are the harm (shape 48, review r1 F6).
+	const inDelta =
+		delta === undefined
+			? heldPaths
+			: delta.filter((filePath) => held.has(filePath));
+	const {
+		targets,
+		primary,
+		failed: resyncFailed,
+		drained,
+	} = await sendToHeldPrimaries(
+		args.root,
+		inDelta,
+		// The tool_call bound around the look; past it the wait is cut anyway.
+		HOOK_WALL_BUDGET_MS.tool_result_read_only,
+	);
+	const primaryMs = Date.now() - started;
+	const report = (
+		dispositions: ReadonlyMap<string, string> | undefined,
+		failed: boolean,
+	): void => {
+		const outcomes = [...(dispositions?.values() ?? [])];
+		const count = (kind: string) =>
+			outcomes.filter((outcome) => outcome === kind).length;
+		logLatency({
+			type: "phase",
+			phase: "opaque_mutation_head_moved",
+			filePath: args.label.slice(0, 80),
+			durationMs: Date.now() - started,
+			result: failed
+				? "resync-failed"
+				: delta === undefined
+					? "delta-unknown"
+					: `changed:${delta.length}`,
+			metadata: {
+				trigger: args.trigger,
+				from: from.slice(0, 12),
+				to: head.slice(0, 12),
+				changed: delta?.length ?? -1,
+				held: inDelta.length,
+				current: inDelta.length - targets.length,
+				primary,
+				primaryMs,
+				drained,
+				resynced: count("resynced"),
+				deferred: count("deferred"),
+				failed: count("failed"),
+			},
+		});
+	};
+	if (targets.length === 0 || resyncFailed) {
+		report(undefined, resyncFailed);
+		return;
+	}
+	void resyncGitChangedFiles(targets, {
+		maxPasses: HEAD_MOVE_RESYNC_MAX_PASSES,
+	}).then(
+		(dispositions) => report(dispositions, false),
+		() => report(undefined, true),
+	);
+}
+
+/**
  * The `tool_result` payload pi-lens actually receives.
  *
  * Kept aligned with what pi BUILDS, not with what a payload might plausibly
@@ -230,6 +446,8 @@ interface ToolResultEvent {
 	details?: unknown;
 	content: Array<{ type: string; text?: string }>;
 	structuredContent?: unknown;
+	/** Internal bash-replay marker, set below rather than by the host. */
+	[PI_LENS_SYNTHETIC_MUTATION_FIELD]?: unknown;
 }
 
 interface ToolResultDeps {
@@ -259,6 +477,16 @@ interface ToolResultDeps {
 	sessionId?: string;
 	/** Role of the activation that owns this write. */
 	sessionRole?: "primary" | "secondary";
+	/**
+	 * The host ctx's `cwd` for THIS tool_result — the same per-session field the
+	 * `tool_call` hook reads. The opaque prescan resolves its root through
+	 * `opaquePrescanRoot(deps.cwd, …)` (#4504): a session whose cwd is not the
+	 * coordinator's `projectRoot` (a concurrent secondary in a linked worktree,
+	 * #473/#2129) otherwise wrote its baseline under one root and looked it up
+	 * under another. Absent means the host offered none, and the prescan falls
+	 * back to the same `projectRoot` the `tool_call` side falls back to.
+	 */
+	cwd?: string;
 	/**
 	 * Internal: set when the debounce timer fires to skip re-scheduling.
 	 * Do not pass from external callers.
@@ -292,6 +520,17 @@ interface ToolResultDeps {
 	_sessionGeneration?: LineageHandle;
 	/** Internal (#3525): the debounce re-entry keeps its call's stamp decision. */
 	_ownWriteStamp?: OwnWriteStamp;
+	/**
+	 * Internal (#4577): this event's path is ALREADY the file's identity — a
+	 * bash-derived or opaque-recovered absolute path read back from disk — so
+	 * it must not go through the host-tool resolver again. The resolver applies
+	 * host-argument rules (unicode-space fold, `@` strip, the variant ladder) to
+	 * a spelling the model typed; re-running a name that came FROM the
+	 * filesystem rewrites its bytes (`a\u202Fb.ts` folded to `a b.ts`) and
+	 * dispatches a path that does not exist. The recovery caller knows the
+	 * provenance, so it states it here instead of the handler re-detecting it.
+	 */
+	_pathAlreadyResolved?: boolean;
 }
 
 /** How the agent's own write/edit moves the read guard (#3524, #3525). */
@@ -696,10 +935,26 @@ function scheduleDebounced(
 	return promise;
 }
 
+/**
+ * #1649: whether the file's last byte is `\n`, read alone (not the whole file),
+ * so a clipped bash view of a large file pays one byte for it. A file that
+ * cannot be read throws, as the whole-file read it replaced did.
+ */
+function lastByteIsNewline(filePath: string): boolean {
+	const fd = nodeFs.openSync(filePath, "r");
+	try {
+		const size = nodeFs.fstatSync(fd).size;
+		// An empty file reads at position -1, the current one, and gets 0 bytes.
+		const last = Buffer.alloc(1);
+		return nodeFs.readSync(fd, last, 0, 1, size - 1) === 1 && last[0] === 0x0a;
+	} finally {
+		nodeFs.closeSync(fd);
+	}
+}
+
 function getFileStateHash(filePath: string): string {
 	try {
-		const content = nodeFs.readFileSync(filePath);
-		return nodeCrypto.createHash("sha256").update(content).digest("hex");
+		return hashFileBytes(filePath);
 	} catch (err) {
 		const code = (err as { code?: string }).code ?? "unknown";
 		return `unreadable:${code}`;
@@ -1024,6 +1279,11 @@ async function dispatchPipelineAnalysis(args: {
 			autofixMode,
 			allowAutonomousWriters,
 			modifiedRanges,
+			// #4484 r2: read when the dispatch returns, so a collect-later answer
+			// absorbed meanwhile is part of what the run carries forward.
+			priorInlineBlockers: () => runtime.getInlineBlockerDiagnostics(filePath),
+			// #4484 round 3: what those blockers' lines refer to.
+			priorAnalysisAnchor: () => runtime.getAnalysisAnchor(filePath),
 			telemetry: {
 				model: runtime.telemetryModel,
 				sessionId: runtime.telemetrySessionId,
@@ -1267,9 +1527,11 @@ async function dispatchPipelineAnalysis(args: {
 			),
 		]);
 		for (const changedFile of changedForReadGuard) {
-			// A native positional edit already credited its own produced lines above.
-			// The pipeline may re-credit ownPath only when it actually rewrote those
-			// bytes; otherwise a whole-file stamp would erase the native scope.
+			// A native edit already credited its own bytes above (a positional
+			// edit with its produced lines, any other with UNKNOWN ones). The
+			// pipeline may re-credit ownPath only when it actually rewrote those
+			// bytes; otherwise a whole-file stamp would erase the native scope or
+			// make a first authorship the edit's credit refused (#4387).
 			if (
 				changedFile === ownPath &&
 				pipelineOwnedWriteHash === undefined &&
@@ -1576,11 +1838,19 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// not a regression introduced by it.
 		resolutionBasis = workspaceRoot;
 	}
-	const filePath = rawFilePath
-		? path.isAbsolute(rawFilePath)
+	// #4576: one host-path resolver for both sides of a call. The `tool_call`
+	// seam already expanded `~`, `file://`, an `@` prefix and the variant
+	// ladder through this exact function; resolving the result's authoritative
+	// path with a bare `path.resolve` turned `~/x` into `<root>/~/x`, a path
+	// that cannot exist, and dispatched runners and analyzers against it.
+	// #4577: a path recovered from disk is already an identity, not a spelling
+	// the model typed — `_pathAlreadyResolved` carries that provenance from the
+	// recovery caller instead of this handler guessing it from the string.
+	const filePath =
+		rawFilePath && deps._pathAlreadyResolved
 			? rawFilePath
-			: path.resolve(resolutionBasis, rawFilePath)
-		: rawFilePath;
+			: resolveToolCallFilePath(rawFilePath, resolutionBasis, workspaceRoot)
+					?.path;
 	const analysisRootMode = resolveAnalysisRoot(filePath ?? "", workspaceRoot);
 	if (filePath) {
 		invalidateProjectIgnoreMatcherForPath(filePath);
@@ -1614,7 +1884,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			},
 		});
 	}
-	const behaviorWarnings = agentBehaviorRecord(event.toolName, filePath);
+	// The parent bash call is already recorded. Its per-file diagnostic replays
+	// must not push that real call out of the BLIND WRITE knowledge window.
+	const behaviorWarnings = isBashDerivedReplay(event)
+		? []
+		: agentBehaviorRecord(event.toolName, filePath);
 	const syntheticWriteContent: Array<{ type: string; text?: string }> = [];
 	// #1590: one shared authoritative-content budget for every path this bash
 	// command wrote. It is handed DOWN to each synthetic call so the single
@@ -1644,11 +1918,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// excluded here, attributed nowhere.
 		let recognizedWritten =
 			event.isError !== true
-				? recognized.filter(
-						(wp) =>
-							!isExternalOrVendorFile(wp, workspaceRoot) &&
-							!isPathIgnoredByProject(wp, workspaceRoot, false),
-					)
+				? recognized.filter((wp) => isRecordableProjectPath(wp, workspaceRoot))
 				: [];
 		// #2000 phase 2: when the extractor recognizes NOTHING, the command is
 		// opaque-candidate — recover its actual changed set by diffing the pre
@@ -1666,8 +1936,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// with zero telemetry; git-first recovery is cheap enough (~60ms) to
 		// close that gap, subtracting already-recognized paths so nothing
 		// double-dispatches.
-		if (workspaceRoot && !getFlag("no-read-guard")) {
-			const scanRoot = workspaceRoot;
+		// #4504: one root for the record and the take. The coordinator's
+		// `projectRoot` is the LIVE PRIMARY's for a concurrent secondary (#473),
+		// so this side has to ask the host's own cwd, exactly as the `tool_call`
+		// side does — never the root it happens to be dispatching against.
+		const scanRoot = opaquePrescanRoot(deps.cwd, workspaceRoot);
+		if (shouldRunOpaqueRecovery(event.toolName, workspaceRoot)) {
 			const started = Date.now();
 			const pending = getOpaqueBaselineStore().take(
 				opaqueBaselineSlot(scanRoot, runtime.sessionGeneration),
@@ -1693,10 +1967,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					},
 				);
 				if (recovery.verdict === "recovered") {
-					opaquePaths = recovery.paths.filter(
-						(p) =>
-							!isExternalOrVendorFile(p, scanRoot) &&
-							!isPathIgnoredByProject(p, scanRoot, false),
+					opaquePaths = recovery.paths.filter((p) =>
+						isRecordableProjectPath(p, scanRoot),
 					);
 					observedChangedKeys = new Set(opaquePaths);
 				} else if (recovery.verdict === "unknown") {
@@ -1757,10 +2029,23 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			}
 			hadOpaqueRecovery = opaquePaths.length > 0;
 			if (observedChangedKeys) {
-				recognizedAuthored = recognizedWritten.filter((file) =>
+				// The scan speaks only for the checkout it ran in (#4504 r1). A
+				// recognized write OUTSIDE `scanRoot` — a secondary session naming a
+				// path in the primary's checkout — is neither observed nor disproven
+				// by it, so it stays a dispatched write (shape 54: a scan may not drop
+				// the only fresh answer it cannot see) and earns no authorship it
+				// cannot confirm (shape 65).
+				const scanned: string[] = [];
+				const unscanned: string[] = [];
+				for (const file of recognizedWritten)
+					(isUnderDir(path.resolve(file), scanRoot) ? scanned : unscanned).push(
+						file,
+					);
+				recognizedAuthored = scanned.filter((file) =>
 					observedChangedKeys!.has(normalizeMapKey(path.resolve(file))),
 				);
-				if (recognizedAuthored.length === 0) recognizedWritten = [];
+				if (recognizedAuthored.length === 0 && unscanned.length === 0)
+					recognizedWritten = [];
 			} else if (unknownReason) {
 				recognizedAuthored = [];
 				// The bounded opaque_mutation_coverage_unknown record below remains
@@ -1783,26 +2068,145 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					durationMs: Date.now() - started,
 					result: `changed:${opaquePaths.length}`,
 				});
-				void resyncGitChangedFiles(opaquePaths).catch((err) => {
-					dbg(`git-change LSP resync failed: ${err}`);
-				});
 			}
+		}
+		// #4493: a command that moved HEAD resyncs the held documents it
+		// rewrote before this result returns, ahead of the synthetic dispatches
+		// below, so their diagnostics read the new dependencies. It has the edit
+		// budget, as the bash-write primary phase does: a move is a write, and
+		// the 500 ms read-only bound cut a slow primary mid-send (#4528 r4).
+		// #4504 r1: the head-move record and take resolve their root through the
+		// same owner as the baseline slot, so a concurrent secondary (#473) joins
+		// the look its own `tool_call` recorded, not the live primary's.
+		const headScanRoot = opaquePrescanRoot(deps.cwd, workspaceRoot);
+		if (headScanRoot) {
+			const headMoveSignal = deps.signal ?? undefined;
+			await bounded(
+				resyncHeadMove({
+					root: headScanRoot,
+					key: headRecordKey(
+						opaqueBaselineSlot(headScanRoot, runtime.sessionGeneration),
+						deps.sessionId,
+					),
+					trigger: "tool_result",
+					label: command,
+					runtime,
+				}),
+				{
+					ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+					signal: headMoveSignal,
+					hook: "tool_result_edit",
+					label: "head-move-resync",
+				},
+			);
 		}
 		// wp iterates opaquePaths VERBATIM (already normalizeMapKey keys), so the
 		// set must hold those exact strings - no re-resolution.
 		const opaqueSet = new Set(opaquePaths);
 		const written = [...recognizedWritten, ...opaquePaths];
+		// #4507: every file the command wrote reaches the primary servers that
+		// hold it before the synthetic dispatches below. They run one file at a
+		// time, so without this a dependent dispatched ahead of its dependency
+		// was checked against the dependency's old bytes (a phantom STOP). The
+		// full resync of the opaque paths (auxiliaries, held importers, drift
+		// records) follows the primary phase, detached.
+		//
+		// #4528 r1 F1: the dispatch loop waits for the phase itself, under the
+		// edit budget its dispatches already run under, not the 500 ms read-only
+		// bound: under load the phase outlasted 500 ms, the cut let a.ts be
+		// checked while z.ts was still unsent, and the phantom STOP came back.
+		// A live primary takes the capped sends far inside the budget; one that
+		// does not answers the dispatches after it no better (no verdict).
+		if (workspaceRoot && written.length > 0) {
+			const primaryStarted = Date.now();
+			// The servers must also have READ the sends before a dispatch reads a
+			// check (#4528 r1 F1): resyncHeldPrimaries' drain barrier.
+			//
+			// #4504 r1: a server answers for the checkout that roots it, so the
+			// phase runs one send per root `written` spans. A concurrent
+			// secondary's recovered files belong to its own checkout; looking them
+			// up under the coordinator's root found no holder, so the awaited send
+			// skipped every document and a dispatch could read the stale bytes.
+			const sendsByRoot = new Map<string, string[]>();
+			for (const file of written) {
+				const owner = isUnderDir(path.resolve(file), scanRoot)
+					? scanRoot
+					: workspaceRoot;
+				const bucket = sendsByRoot.get(owner);
+				if (bucket) bucket.push(file);
+				else sendsByRoot.set(owner, [file]);
+			}
+			const primaryPhase = Promise.all(
+				[...sendsByRoot].map(([root, files]) =>
+					sendToHeldPrimaries(
+						root,
+						files,
+						HOOK_WALL_BUDGET_MS.tool_result_edit,
+					),
+				),
+			).then((outcomes) => ({
+				targets: outcomes.flatMap((outcome) => outcome.targets),
+				primary: outcomes.reduce(
+					(count, outcome) => count + outcome.primary,
+					0,
+				),
+				failed: outcomes.some((outcome) => outcome.failed),
+				drained: outcomes.every((outcome) => outcome.drained),
+			}));
+			if (opaquePaths.length > 0)
+				void primaryPhase
+					.then(() => resyncGitChangedFiles(opaquePaths))
+					.catch((err) => {
+						dbg(`git-change LSP resync failed: ${err}`);
+					});
+			// A name of its own: the HEAD look above bounds with the same signal.
+			const primarySignal = deps.signal ?? undefined;
+			const sent = await bounded(primaryPhase, {
+				ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+				signal: primarySignal,
+				hook: "tool_result_edit",
+				label: "bash-write-primary-resync",
+			});
+			// One row per bash result that had held documents to resend, or whose
+			// phase failed or was cut ("cut": the bound ended the wait, and its
+			// hook-await-exceeded row names it; "undrained": a server did not
+			// answer the drain barrier in time, so a check may predate the sends).
+			if (sent === undefined || sent.failed || sent.targets.length > 0)
+				logLatency({
+					type: "phase",
+					phase: "bash_write_primary_resync",
+					filePath: written.slice(0, 5).join(","),
+					durationMs: Date.now() - primaryStarted,
+					result:
+						sent === undefined
+							? "cut"
+							: sent.failed
+								? "failed"
+								: sent.drained
+									? "sent"
+									: "undrained",
+					metadata: {
+						written: written.length,
+						opaque: opaquePaths.length,
+						targets: sent?.targets.length ?? -1,
+						primary: sent?.primary ?? 0,
+					},
+				});
+		}
 		const recognizedAuthoredSet = new Set(recognizedAuthored);
 		bashAuthorshipConfirmed = recognizedAuthored.length > 0;
 		for (const wp of written) {
 			// #3525: a parser-recognized bash write is whole-file authorship only
 			// after the tool_call preflight proved no foreign writer intervened.
 			// Opaque recovery is observed bridge evidence, not bytes the parser
-			// accounted for, so it remains UNKNOWN for F-4210-2.
+			// accounted for, so it remains UNKNOWN for F-4210-2. No pre-write
+			// check covered those bytes, so it may only end an existing
+			// authorship, never advance it (#4387).
+			const opaqueEvidence = hadOpaqueRecovery || opaqueSet.has(wp);
 			if (!getFlag("no-read-guard") && recognizedAuthoredSet.has(wp))
 				deps.readGuard?.recordWritten(wp, {
-					authorship:
-						hadOpaqueRecovery || opaqueSet.has(wp) ? "unknown" : "whole-file",
+					authorship: opaqueEvidence ? "unknown" : "whole-file",
+					...(opaqueEvidence && { advanceAuthorship: false }),
 					stampFileTime: false,
 					...(toolCallId !== undefined && { toolCallId }),
 				});
@@ -1842,6 +2246,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				_attachmentBudget: syntheticAttachmentBudget,
 				_mutationSourceOverride: isOpaque ? "opaque-script" : undefined,
 				_readGuardAuthorship: recognizedAuthoredSet.has(wp),
+				_pathAlreadyResolved: true,
 				_ownWriteStamp: {
 					stampFileTime: false,
 					...(toolCallId !== undefined && { toolCallId }),
@@ -1872,12 +2277,25 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					};
 				}
 			)?.truncation;
-			const parsedSpans = extractReadPathsFromCommand(command, workspaceRoot);
-			let spans = parsedSpans;
-			if (
+			const clippedLines =
 				truncation?.truncated === true &&
 				typeof truncation.outputLines === "number"
-			) {
+					? truncation.outputLines
+					: undefined;
+			const clipped = clippedLines !== undefined;
+			// #1649: an unclipped view drops vendor and ignored files before their
+			// lines are counted. A clipped one keeps every span: the multi-span
+			// check below must still see a file the loop then skips, or
+			// `cat a.ts vendor.js` would credit lines of a.ts pi never showed.
+			const parsedSpans = extractReadPathsFromCommand(
+				command,
+				workspaceRoot,
+				clipped
+					? undefined
+					: (candidate) => isRecordableProjectPath(candidate, workspaceRoot),
+			);
+			let spans = parsedSpans;
+			if (clipped) {
 				if (parsedSpans.length === 1) {
 					const span = parsedSpans[0];
 					if (span) {
@@ -1885,13 +2303,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						// convention, where a trailing newline contributes an empty final
 						// element. The host's output line count does not include that
 						// element, so remove it from the span basis before taking the tail.
-						const hasTrailingNewline = nodeFs
-							.readFileSync(span.filePath, "utf8")
-							.endsWith("\n");
+						const hasTrailingNewline = lastByteIsNewline(span.filePath);
 						const spanLineCount = hasTrailingNewline
 							? Math.max(1, span.limit - 1)
 							: span.limit;
-						const shown = Math.min(truncation.outputLines, spanLineCount);
+						const shown = Math.min(clippedLines, spanLineCount);
 						spans =
 							shown > 0
 								? [
@@ -1925,9 +2341,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				}
 			}
 			for (const span of spans) {
-				if (isExternalOrVendorFile(span.filePath, workspaceRoot)) continue;
-				if (isPathIgnoredByProject(span.filePath, workspaceRoot, false))
-					continue;
+				if (!isRecordableProjectPath(span.filePath, workspaceRoot)) continue;
 				deps.readGuard?.recordRead({
 					filePath: span.filePath,
 					requestedOffset: span.offset,
@@ -2047,10 +2461,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					  }
 					| undefined
 			)?.truncation;
-			const available = Math.max(
-				0,
-				countFileLines(deliveredFilePath) - requestedOffset + 1,
+			// #1649: one bounded pass gives the count and the delivered range's
+			// line hashes, read at the same moment the capture always was. The
+			// delivered limit waits on the count, so the range is open-ended: the
+			// scan keeps at most READ_HASH_MAX_LINES lines from the offset.
+			const deliveredScan = scanFileLines(
+				deliveredFilePath,
+				[{ offset: requestedOffset, limit: Number.POSITIVE_INFINITY }],
+				{ count: true },
 			);
+			// An unreadable file counts one line, as countFileLines always answered.
+			const totalLines = deliveredScan?.totalLines ?? 1;
+			const available = Math.max(0, totalLines - requestedOffset + 1);
 			const deliveredLimit = Math.min(
 				available,
 				truncation?.outputLines ?? requestedLimit ?? available,
@@ -2072,7 +2494,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					effectiveOffset: requestedOffset,
 					effectiveLimit: deliveredLimit,
 					metadata: {
-						totalLines: countFileLines(deliveredFilePath),
+						totalLines,
 						isPartial: deliveredLimit < available,
 						fileKind: detectFileKind(deliveredFilePath) ?? "unknown",
 						fractionRead:
@@ -2167,7 +2589,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						: {
 								effectiveOffset: requestedOffset,
 								effectiveLimit: delivered?.lineCount ?? deliveredLimit,
-								lineHashes: delivered?.lineHashes,
+								// Unraced, the disk is what pi delivered: the scan above is
+								// the capture recordRead would otherwise take again.
+								lineHashes: raced
+									? delivered?.lineHashes
+									: deliveredScan?.hashes(requestedOffset, deliveredLimit),
 							};
 				if (evidence) {
 					const deliveredRecord = {
@@ -2266,8 +2692,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			getStoredLineHashes: (candidate) =>
 				storedLineHashesFor(deps.readGuard, candidate),
 			isRecordable: (candidate) =>
-				!isExternalOrVendorFile(candidate, workspaceRoot) &&
-				!isPathIgnoredByProject(candidate, workspaceRoot, false),
+				isRecordableProjectPath(candidate, workspaceRoot),
 			dbg,
 		});
 		observedReplayed = observed.replayed;
@@ -3029,7 +3454,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			participantTotal,
 			toolResultStart,
 			nativeAppliedPairs,
-			preserveNativeAuthorship: nativeAuthoredRanges !== undefined,
+			preserveNativeAuthorship: mutation.kind !== "write",
 			allowAutonomousWriters: bashAuthorshipConfirmed,
 			// #3512: one capture for the whole dispatch, the same one the
 			// inline verdict below writes through.
@@ -3281,13 +3706,20 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					// #4137 round 3: a run without authorship does not retire a
 					// record about the very bytes it read. The already-analysed latch
 					// is a cost rule, not the record's guard.
+					// #4484: and no run retires a record while its own observation
+					// still holds a blocker.
 					{
 						authored: bashAuthorshipConfirmed,
 						sha256: result.inlineBlockerFileContent?.sha256,
+						blocking: result.currentBlockerCount ?? 0,
 					},
 				),
 			) ?? false;
 	}
+	// #4484 round 3: the anchor follows the record, so it moves only with a
+	// verdict that applied.
+	if (inlineVerdictApplied)
+		runtime.setAnalysisAnchor(filePath, result.analysisAnchor);
 
 	// A superseded verdict must not latch the commit gate either (#3507).
 	if (resultLive) {

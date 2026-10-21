@@ -455,6 +455,31 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 			]).toContain(tool.reason);
 		}
 	});
+
+	// #4636, the reporter's live evidence: `effective_config` printed
+	// `"language": "json"` for a `tsconfig.json`, which is the registry's answer
+	// read back through the query an agent actually asks. The FILE KIND stays
+	// `json`: the coarse classifier is not what changed.
+	it("reports a JSONC-by-convention config file as language jsonc, kind json", async () => {
+		const { view } = await viewFor(
+			{
+				files: {
+					"proj/tsconfig.app.json": { compilerOptions: {} },
+					"proj/data.json": { compilerOptions: {} },
+				},
+				startDir: "proj",
+			},
+			{ file: "tsconfig.app.json" },
+		);
+		expect(resolvedFile(view)?.language).toBe("jsonc");
+		expect(resolvedFile(view)?.kind).toBe("json");
+
+		const plain = await viewFor(
+			{ files: { "proj/data.json": {} }, startDir: "proj" },
+			{ file: "data.json" },
+		);
+		expect(resolvedFile(plain.view)?.language).toBe("json");
+	});
 });
 
 describe("effectiveConfig — redaction is unconditional", () => {

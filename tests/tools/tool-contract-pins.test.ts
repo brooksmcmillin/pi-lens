@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import extension from "../../index.js";
 import { McpHarness } from "../mcp/harness.js";
-import { createPiMock } from "../support/pi-mock.js";
+import { startPiRunner } from "../support/pi-runner.js";
 
 type ListedTool = {
 	name: string;
@@ -34,11 +33,10 @@ describe("model-facing tool contract pins (#2808)", () => {
 	let mcpTools: ListedTool[];
 
 	beforeAll(async () => {
-		// Reuse the roster-budget registration seam: real extension wiring for pi
-		// and the real stdio tools/list roster for MCP, not hand-built metadata.
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-		piTools = [...pi.tools.values()] as ListedTool[];
+		// Real host registrations for pi and the real stdio tools/list roster for
+		// MCP, not hand-built metadata.
+		const pi = await startPiRunner();
+		piTools = pi.getAllRegisteredTools().map((tool) => tool.definition);
 
 		mcp = new McpHarness();
 		const listed = await mcp.request(1, "tools/list");

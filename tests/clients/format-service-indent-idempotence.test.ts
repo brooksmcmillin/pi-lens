@@ -358,6 +358,8 @@ describe("formatter indentation inference through FormatService (#3038)", () => 
 			expect(safeSpawnAsync.mock.calls[0]?.[1]).toEqual(
 				expect.arrayContaining(["--indent-style", "tab"]),
 			);
+			// #4321: the style is pinned, the width is the formatter's own.
+			expect(safeSpawnAsync.mock.calls[0]?.[1]).not.toContain("--indent-width");
 			expect(fs.readFileSync(filePath, "utf8")).toBe(tabDocCommented);
 		} finally {
 			env.cleanup();

@@ -55,6 +55,14 @@ event per session, never one per occurrence in a loop; repeated degradations go
 through a once-only or counted record. A discriminator nothing can observe is a
 vacuous guard and does not ship.
 
+**Gates fail closed on what they do not recognize.** When code decides a
+verdict (a trust check, a lint, a census, a body check), it admits a short list
+of known-good forms and refuses everything else. It never enumerates known-bad
+spellings. Each review of an enumerated gate finds the next spelling it missed;
+one gate took sixteen rounds that way. Once a second round finds a new
+spelling, stop patching and redesign. Screen: can an input nobody planned for
+pass the gate?
+
 **Blast radius as a call-tree diff.** For any change to a shared seam, list the
 changed symbol, its callers above, its callees below, with plus and minus on the
 lines that moved. Prose keeps missing callers; a tree the reviewer can grep does
@@ -118,6 +126,12 @@ thing is required, a registry entry, a baseline row and lane membership. A
 mocked seam is not a real spawn and gets an exemption with its reason, never an
 admission.
 
+**A new ratchet sweeps the open changes before it lands.** A governance test
+that rejects a new pattern fails every open change that already adds one, and
+none of them conflict textually, so nothing warns. Before merging a ratchet,
+run it against each open change merged with the base, and fix or notify each
+one it fails. Screen: which open change would fail this test after the merge?
+
 **Run targeted files while iterating; the full suite runs once.** Build before
 testing when tests execute compiled output, and rebuild between mutations. A red
 is environmental only when the same test is red on the base branch in the same
@@ -156,6 +170,13 @@ literal, a changelog line) are applied by the orchestrator as trailing commits
 and never re-verified; anything that changes what code means goes through a
 round, however small it looks.
 
+**A round does what its brief prescribes, and flags anything more.** A worker
+that changes something outside its brief lists that change as scope growth at
+the top of its hand-off; one round widened a shared detector while asked to add
+a single admission. Routing then re-classifies the round, because a silent extra
+mechanism turns a merge-on-green round into one that needs a verify. Screen:
+does the hand-off name every change the brief did not ask for?
+
 **Merge gate.** Merge only when the verdict is merge-ready, every gating check
 genuinely executed and passed on the exact head, and every failing check was
 read and judged. Absent is not green. Read exit codes directly, never after a
@@ -170,10 +191,21 @@ at the worktree root; the orchestrator commits. Implementation and review are
 never mixed in one delegation. Scope changes are mirrored on the tracking issue
 before they are sent, so the worker can verify them.
 
+**Work in progress survives a cut.** A worker with Git authority commits at
+each green step; one without it leaves its tree and names it in the hand-off.
+A backend outage, a quota stop or a crash then costs one step, not the round,
+and the next round ports the tree instead of redoing it. Screen: how much is
+lost if this process dies now?
+
 **No manufactured work.** An idle worker is cheaper than fake work. Delegate
 when a real producer, consumer, probe or diagnosis is unresolved, never to keep
 a pool busy. The same applies to status artifacts: they exist for coordination
 someone consumes.
+
+**A step done by hand twice becomes a script with a test.** That includes
+cleanup, triage and status upkeep. The script surfaces unfinished work and
+never hides it: stalled work is restarted, not unassigned, archived or deleted.
+Screen: is this the second time this step was done by hand?
 
 ## 4. Honesty and records
 

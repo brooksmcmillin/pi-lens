@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 // #1639: capture `lsp_typescript_diagnostic_sequence` phase records so the
@@ -59,6 +60,8 @@ import {
 } from "../../../clients/lsp/client.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
+import { exceedsLspSyncLimits } from "../../../clients/lsp/content-limits.js";
+import { RUNTIME_CONFIG } from "../../../clients/runtime-config.js";
 import { applyWorkspaceEdit } from "../../../clients/lsp/edits.js";
 import type { LspMutationContext } from "../../../clients/lsp-mutation.js";
 // #1667: the LSPClientState fixture moved to a shared module so the
@@ -830,6 +833,102 @@ describe("handleNotifyOpen", () => {
 		});
 	});
 
+	// #2066 round 2: `scanSentContent` has a native `indexOf` fast path for
+	// documents with no `\r` and a per-character loop for the rest. Recurrence
+	// this guards: the fast path drifting from the loop's conventions (a `\r`
+	// slipping into the LF-only branch, an off-by-one on where the last line
+	// starts) — the wrong `contentLineCount` and the wrong didChange range end
+	// that follow are silent. The reference below is independent of the
+	// implementation: a regex split, which is exactly what the pre-#2066 code
+	// ran. Edits splice at random offsets, so a CR and an LF are routinely
+	// separated and rejoined into a CRLF across a step.
+	it("#2066: the sent line count and last-line position equal an independent split over random edit sequences", async () => {
+		let seed = 0x2066;
+		const random = (): number => {
+			// mulberry32: deterministic, so a red names a reproducible document.
+			seed = (seed + 0x6d2b79f5) | 0;
+			let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+			t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+			return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+		};
+		const pick = <T>(items: readonly T[]): T =>
+			items[Math.floor(random() * items.length)];
+		const POOLS: readonly (readonly string[])[] = [
+			["ab", "é", "x y", "\n"], // LF-only
+			["ab", "🙂", "\r\n"], // CRLF-only
+			["ab", "\r", "c"], // lone CR
+			["a", "\n", "\r", "\r\n", "🙂", ""], // mixed
+		];
+		const randomText = (pool: readonly string[]): string => {
+			const pieces = Math.floor(random() * 12);
+			let text = "";
+			for (let i = 0; i < pieces; i++) text += pick(pool);
+			return text;
+		};
+
+		let documentsChecked = 0;
+		let fastPathDocuments = 0;
+		let loopDocuments = 0;
+		for (let sequence = 0; sequence < 60; sequence++) {
+			const pool = POOLS[sequence % POOLS.length];
+			const state = createMockState({ syncKind: 2 });
+			let doc = sequence % 5 === 0 ? "" : randomText(pool);
+			for (let step = 0; step < 25; step++) {
+				logLatencyMock.mockClear();
+				await handleNotifyChange(state, TEST_FILE, doc);
+
+				const lines = doc.split(/\r\n|\r|\n/);
+				const lastLineLength = lines[lines.length - 1].length;
+				const lfCount = doc.split("\n").length - 1;
+				const sendCall = logLatencyMock.mock.calls.find(
+					(c) => c[0]?.phase === "lsp_document_send",
+				);
+				const label = JSON.stringify(doc);
+				expect(sendCall?.[0].metadata.contentLineCount, label).toBe(
+					lfCount + 1,
+				);
+				expect(
+					state.documentContentHashes.get(TEST_KEY)?.lastLine,
+					label,
+				).toEqual({
+					index: lines.length - 1,
+					start: doc.length - lastLineLength,
+				});
+				// #2066: the #1095 content binding is unchanged by the shared walk.
+				// The hash is the sha256 of THIS document's own UTF-8 bytes,
+				// recomputed here independently, so a future fold that hashed
+				// anything else (a normalized text, a byte copy built for the scan)
+				// reds on a corpus that carries CRLF, lone CR, and astral glyphs.
+				expect(state.documentContentHashes.get(TEST_KEY)?.hash, label).toBe(
+					createHash("sha256").update(doc).digest("hex"),
+				);
+				// And the sync bound's line count is still the split it replaced.
+				expect(exceedsLspSyncLimits(doc).tooLarge, label).toBe(
+					Buffer.byteLength(doc, "utf-8") >
+						RUNTIME_CONFIG.pipeline.lspMaxFileBytes ||
+						lfCount + 1 > RUNTIME_CONFIG.pipeline.lspMaxFileLines,
+				);
+				documentsChecked++;
+				if (doc.includes("\r")) loopDocuments++;
+				else fastPathDocuments++;
+
+				// The next document: splice a random span out and random text in
+				// (deletes, inserts, and replacements across line boundaries).
+				const from = Math.floor(random() * (doc.length + 1));
+				const to = Math.min(
+					doc.length,
+					from + (random() < 0.5 ? 0 : Math.floor(random() * 6)),
+				);
+				doc = `${doc.slice(0, from)}${randomText(random() < 0.15 ? pick(POOLS) : pool)}${doc.slice(to)}`;
+			}
+		}
+		// Positive control: both branches were driven, so a scan that always took
+		// one of them could not satisfy this test by construction.
+		expect(documentsChecked).toBe(60 * 25);
+		expect(fastPathDocuments).toBeGreaterThan(150);
+		expect(loopDocuments).toBeGreaterThan(150);
+	});
+
 	it("detaches the classic TypeScript projectInfo probe after didOpen", async () => {
 		const state = createMockState({
 			serverId: "typescript",
@@ -1488,21 +1587,35 @@ describe("handleNotifyChange", () => {
 
 describe("clientWaitForDiagnostics", () => {
 	it("resolves immediately if diagnostics already cached", async () => {
-		const state = createMockState();
-		state.diagnosticsVersion = 1;
-		state.pushDiagnostics.set(TEST_KEY, [
-			{
-				severity: 1,
-				message: "error",
-				range: {
-					start: { line: 0, character: 0 },
-					end: { line: 0, character: 0 },
+		vi.useFakeTimers();
+		try {
+			const state = createMockState();
+			state.diagnosticsVersion = 1;
+			state.pushDiagnostics.set(TEST_KEY, [
+				{
+					severity: 1,
+					message: "error",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 0 },
+					},
 				},
-			},
-		]);
+			]);
 
-		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
-		// Should resolve immediately without waiting
+			let settled = false;
+			const waitPromise = (async () => {
+				await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+				settled = true;
+			})();
+			// No fake time passes: the early return settles it, and no deadline
+			// timer was armed.
+			await vi.advanceTimersByTimeAsync(0);
+			expect(settled).toBe(true);
+			expect(vi.getTimerCount()).toBe(0);
+			await waitPromise;
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("does not accept cached diagnostics at or below minVersion", async () => {
@@ -1634,21 +1747,36 @@ describe("clientWaitForDiagnostics", () => {
 	});
 
 	it("ignores diagnostics for other files", async () => {
-		const state = createMockState();
+		vi.useFakeTimers();
+		try {
+			const state = createMockState();
 
-		const waitPromise = clientWaitForDiagnostics(state, TEST_FILE, 5000);
+			let settled = false;
+			const waitPromise = (async () => {
+				await clientWaitForDiagnostics(state, TEST_FILE, 5000);
+				settled = true;
+			})();
 
-		// Emit diagnostics for a different file
-		setTimeout(() => {
-			state.diagnosticEmitter.emit("diagnostics", "/project/other.ts");
-		}, 50);
+			// Emit diagnostics for a different file
+			setTimeout(() => {
+				state.diagnosticEmitter.emit("diagnostics", "/project/other.ts");
+			}, 50);
 
-		// Emit for the right file after a bit longer
-		setTimeout(() => {
-			state.diagnosticEmitter.emit("diagnostics", TEST_FILE);
-		}, 100);
+			// Emit for the right file after a bit longer
+			setTimeout(() => {
+				state.diagnosticEmitter.emit("diagnostics", TEST_FILE);
+			}, 100);
 
-		await waitPromise;
+			// The other file's emit at 50ms must not end this file's wait.
+			await vi.advanceTimersByTimeAsync(99);
+			expect(settled).toBe(false);
+
+			await vi.advanceTimersByTimeAsync(51);
+			expect(settled).toBe(true);
+			await waitPromise;
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
@@ -2183,6 +2311,14 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 
 		it("marks a settle with no server-reported version as push-unversioned, never null", async () => {
 			const { state, emitPublishDiagnostics } = createCapturingState();
+			// Recurrence this guards: shuffled order (seeds 202 and 424, advisory job
+			// 116856635842). A publish for a typescript server arms a real debounce
+			// timer (50-150 ms). These two tests end at once, so it fired into the
+			// module-level `pullSequenceEvents` during whichever test ran next, and
+			// the quiet-window test found THEIR settled record (elapsed 0, no
+			// documentOpenedAt) instead of its own. Fake timers plus the clear at
+			// the end keep the timer inside the test that armed it.
+			vi.useFakeTimers();
 			Object.defineProperty(state, "serverId", { value: "typescript" });
 
 			pullSequenceEvents.length = 0;
@@ -2198,10 +2334,13 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 				unknown
 			>;
 			expect(metadata.version).toBe("push-unversioned");
+			vi.clearAllTimers();
+			vi.useRealTimers();
 		});
 
 		it("keeps the real server-reported version when present", async () => {
 			const { state, emitPublishDiagnostics } = createCapturingState();
+			vi.useFakeTimers();
 			Object.defineProperty(state, "serverId", { value: "typescript" });
 
 			pullSequenceEvents.length = 0;
@@ -2217,6 +2356,8 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 				unknown
 			>;
 			expect(metadata.version).toBe(7);
+			vi.clearAllTimers();
+			vi.useRealTimers();
 		});
 	});
 });

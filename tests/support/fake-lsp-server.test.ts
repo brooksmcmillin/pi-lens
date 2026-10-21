@@ -43,42 +43,51 @@ async function waitUntil(
 	return predicate();
 }
 
-describe("spawnFakeLspServer — onTestFinished backstop (#2436)", () => {
-	let leakedPid: number | undefined;
+// Shuffle exemption (#4561 D1, registered in scripts/shuffle-census-ratchet.json):
+// the ORDER of these two cases is the mechanism under test, so the suite opts
+// out per `describe` rather than the file opting out. Reordering them — the
+// shuffle census's seed 202 did — makes case B look for a `leakedPid` that a
+// case which has not run yet never set, and the backstop proof evaporates.
+describe(
+	"spawnFakeLspServer — onTestFinished backstop (#2436)",
+	{ shuffle: false },
+	() => {
+		let leakedPid: number | undefined;
 
-	afterAll(() => {
-		// Sweep only if the backstop under test actually failed (mutation
-		// runs, or a genuine regression) — the passing case has already
-		// reaped this before we get here, making this a no-op.
-		if (leakedPid !== undefined && isAlive(leakedPid)) {
-			try {
-				process.kill(leakedPid, "SIGKILL");
-			} catch {
-				/* already gone */
+		afterAll(() => {
+			// Sweep only if the backstop under test actually failed (mutation
+			// runs, or a genuine regression) — the passing case has already
+			// reaped this before we get here, making this a no-op.
+			if (leakedPid !== undefined && isAlive(leakedPid)) {
+				try {
+					process.kill(leakedPid, "SIGKILL");
+				} catch {
+					/* already gone */
+				}
 			}
-		}
-	});
+		});
 
-	it("spawns the fixture and deliberately does not kill it", async () => {
-		const proc = await spawnFakeLspServer();
-		const pid = proc.process.pid;
-		expect(pid).toBeDefined();
-		expect(isAlive(pid as number)).toBe(true);
-		leakedPid = pid;
-		// No kill() here on purpose — the onTestFinished backstop registered
-		// inside spawnFakeLspServer is the only thing that should reap this.
-	});
+		it("spawns the fixture and deliberately does not kill it", async () => {
+			const proc = await spawnFakeLspServer();
+			const pid = proc.process.pid;
+			expect(pid).toBeDefined();
+			expect(isAlive(pid as number)).toBe(true);
+			leakedPid = pid;
+			// No kill() here on purpose — the onTestFinished backstop registered
+			// inside spawnFakeLspServer is the only thing that should reap this.
+		});
 
-	it("the backstop reaped the previous test's process once it finished", async () => {
-		expect(leakedPid).toBeDefined();
-		const died = await waitUntil(
-			() => !isAlive(leakedPid as number),
-			2_000,
-			50,
-		);
-		expect(died).toBe(true);
-	});
-});
+		it("the backstop reaped the previous test's process once it finished", async () => {
+			expect(leakedPid).toBeDefined();
+			const died = await waitUntil(
+				() => !isAlive(leakedPid as number),
+				2_000,
+				50,
+			);
+			expect(died).toBe(true);
+		});
+	},
+);
 
 type OrderingFrame = {
 	id?: number;

@@ -24,10 +24,15 @@
  *      first-message stability with an unbounded hash and never truncates.
  *
  *   3. Request-side prefix stability (`cache_prefix_break`) — a content hash of
- *      `messages[0]` observed on every `context` call. After #1016 the first
- *      message must stay byte-stable across a whole session; a logged CHANGE
- *      flags that something (pi-lens or otherwise) broke the cache prefix. This
- *      remains a local observation, never a provider cache-miss claim.
+ *      `messages[0]` observed on every request hook that sees the list the
+ *      provider receives first (`context_with_system` on pi 0.87+, `context`
+ *      before it). After #1016 the first message must stay byte-stable across a
+ *      whole session; a logged CHANGE flags that something (pi-lens or
+ *      otherwise) broke the cache prefix. This remains a local observation,
+ *      never a provider cache-miss claim. #4631: the observer must move with
+ *      the injector, because 0.87+'s `context` event never carries the system
+ *      head, and hashing the conversation instead made a rewritten head look
+ *      stable.
  *
  * #1071 adds miss ATTRIBUTION on top of those three. Each `cache_usage` record
  * carries the inter-turn gap and a `cacheMissCause` verdict, and each
@@ -86,6 +91,15 @@ export type CachePrefixObservation =
 	| "unchanged"
 	| "changed"
 	| "empty";
+
+/**
+ * The request hook that carried pi-lens's injection (#4631). pi 0.87+ runs
+ * `context` handlers over the conversation WITHOUT its system messages and then
+ * `context_with_system` handlers over the full transcript; pi-lens injects from
+ * exactly one of them, so a record naming the hook is also the record of which
+ * generation's request shape was observed.
+ */
+export type CacheContextInjectionHook = "context" | "context_with_system";
 
 /**
  * Why a turn read less from the provider prompt cache than the turn before it
@@ -1035,6 +1049,8 @@ export function observeCacheContext(args: {
 	 */
 	injectionSlices?: ReadonlyArray<CacheContextInjectionSlice>;
 	placement?: CacheContextPlacement;
+	/** The request hook that carried this observation (#4631). */
+	injectionHook?: CacheContextInjectionHook;
 	dbg?: (msg: string) => void;
 }): void {
 	try {
@@ -1121,6 +1137,10 @@ export function observeCacheContext(args: {
 			metadata: {
 				version: 1,
 				observedStage: "pi-lens-context-handler",
+				// #4631: `context` on a pre-0.87 host, `context_with_system` on
+				// 0.87+. The two see different message lists, so a reader needs
+				// this to compare an observation against a host generation.
+				injectionHook: args.injectionHook ?? null,
 				observationId: `ctx-${(++contextObservationCounter).toString(36)}`,
 				sessionId: sessionKey(args.sessionId),
 				sessionRole: args.sessionRole,
@@ -1430,9 +1450,27 @@ export function logCacheUsage(
 }
 
 /**
- * Content hash of the first transcript message. Stable for identical content
- * (role + content are serialized in a fixed order), so a changing hash means
- * `messages[0]` actually changed byte-for-byte.
+ * Hash of the first transcript message, over EVERY field the message carries.
+ *
+ * #4631 round 5 (F1): it must be the whole message, not a projection. The
+ * signal answers "did what the provider caches first change", and on pi 0.87+
+ * `messages[0]` is the SYSTEM head: the prompt lives in `sections`, the tool
+ * table in `toolsAdded`, and `content` is an empty string. A `{ role, content }`
+ * projection therefore hashed the constant `{"role":"system","content":""}` on
+ * the exact generation #4631 is about, so a rebuilt head read as a stable
+ * prefix: `prefixStableSinceLastUsage` stayed true and the miss verdict stayed
+ * `unknown`. Measured on the built twin: a head whose `sections`, `toolsAdded`
+ * and `timestamp` had all moved answered `unchanged`, while a `content` change
+ * was visible.
+ *
+ * Enumerating the fields at fault would re-create the same shape for the next
+ * host field, so the serialization covers whatever the message carries. The
+ * parameter's DECLARED shape stays the two fields its callers are guaranteed to
+ * have; the runtime object is the host's whole message, and `JSON.stringify`
+ * reads every own field of it, not the declared two. A stable head stays stable
+ * — pi hands the transcript's own object across turns, and the tier-2 cells pin
+ * that byte-for-byte — and a rebuilt one is visible whatever recency field the
+ * host re-stamps.
  */
 function hashFirstMessage(first: {
 	role?: unknown;
@@ -1441,10 +1479,7 @@ function hashFirstMessage(first: {
 	// Keep the original full local hash semantics for the existing
 	// `cache_prefix_break` signal. The new `cache_context` hashes above are the
 	// bounded hashes; this signal must not silently miss a suffix-only change.
-	const serialized = JSON.stringify({
-		role: first.role,
-		content: first.content,
-	});
+	const serialized = JSON.stringify(first);
 	return createHash("sha256").update(serialized).digest("hex");
 }
 
@@ -1516,6 +1551,15 @@ function recordSessionHash(key: string, hash: string): void {
  * fails closed with `request-correlation-unavailable`.
  *
  * Does nothing on an empty transcript (nothing to anchor a prefix to yet).
+ *
+ * #4631: the caller must pass the message list the PROVIDER receives first, so
+ * this runs in whichever request hook sees it — `context_with_system` on pi
+ * 0.87+, whose `context` event filters system messages out — and never in the
+ * hook that sees only the conversation. Observing the conversation there hashed
+ * a message the provider does not send first, so a rewritten SYSTEM head read as
+ * a stable prefix and every affected turn ended in `cacheMissCause: unknown`.
+ * `firstMessageRole` names which message the prefix is anchored to, so a head
+ * rewrite is readable as one.
  */
 export function observeCachePrefix(
 	messages: ReadonlyArray<{ role?: unknown; content?: unknown }> | undefined,
@@ -1528,6 +1572,8 @@ export function observeCachePrefix(
 		if (!messages || messages.length === 0) return "empty";
 		const first = messages[0];
 		if (!first || typeof first !== "object") return "empty";
+		const firstMessageRole =
+			typeof first.role === "string" ? first.role : "unknown";
 		const key = attributionKey(sessionId, sessionRole);
 		const reportedSessionId = sessionKey(sessionId);
 		const currentHash = hashFirstMessage(first);
@@ -1550,6 +1596,7 @@ export function observeCachePrefix(
 					previousHash: null,
 					currentHash,
 					baseline: true,
+					firstMessageRole,
 					sessionId: reportedSessionId,
 					sessionRole,
 				},
@@ -1572,6 +1619,7 @@ export function observeCachePrefix(
 						: { turnIndex, turnScope: PROCESS_TURN_SCOPE }),
 					previousHash,
 					currentHash,
+					firstMessageRole,
 					sessionId: reportedSessionId,
 					sessionRole,
 				},

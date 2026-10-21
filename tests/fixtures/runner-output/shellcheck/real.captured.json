@@ -13,10 +13,40 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/shell",
 		"platform": "darwin-arm64",
-		"capturedAt": "2026-10-04"
+		"capturedAt": "2026-10-04",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.sh",
 	"exitCode": 1,
 	"stdout": "[{\"file\":\"bad.sh\",\"line\":6,\"endLine\":6,\"column\":6,\"endColumn\":8,\"level\":\"info\",\"code\":2086,\"message\":\"Double quote to prevent globbing and word splitting.\",\"fix\":{\"replacements\":[{\"column\":6,\"endColumn\":6,\"endLine\":6,\"insertionPoint\":\"afterEnd\",\"line\":6,\"precedence\":10,\"replacement\":\"\\\"\"},{\"column\":8,\"endColumn\":8,\"endLine\":6,\"insertionPoint\":\"beforeStart\",\"line\":6,\"precedence\":10,\"replacement\":\"\\\"\"}]}}]\n",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "shellcheck",
+			"argv": [
+				"--version"
+			],
+			"version": "0.11.0",
+			"exitCode": 0,
+			"stdout": "ShellCheck - shell script analysis tool\nversion: 0.11.0\nlicense: GNU General Public License, version 3\nwebsite: https://www.shellcheck.net\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/shellcheck",
+		"file": "bad.sh",
+		"argv": [
+			"--format",
+			"json",
+			"--severity",
+			"info",
+			"bad.sh"
+		],
+		"version": "0.11.0",
+		"exitCode": 0,
+		"stdout": "[]\n",
+		"stderr": ""
+	}
 }

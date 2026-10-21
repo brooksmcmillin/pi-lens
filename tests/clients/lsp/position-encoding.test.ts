@@ -8,7 +8,6 @@ import { describe, expect, it } from "vitest";
 import {
 	ADVERTISED_POSITION_ENCODINGS,
 	convertCharacterOffset,
-	lineTextAt,
 	negotiatePositionEncoding,
 } from "../../../clients/lsp/position-encoding.js";
 
@@ -68,19 +67,5 @@ describe("convertCharacterOffset (#269)", () => {
 		expect(convertCharacterOffset("utf-8", "café", 99)).toBe(5); // whole line
 		expect(convertCharacterOffset("utf-8", "café", 0)).toBe(0);
 		expect(convertCharacterOffset("utf-8", "café", -3)).toBe(0);
-	});
-});
-
-describe("lineTextAt (#269)", () => {
-	it("returns the 0-based line text", () => {
-		const content = "first\nsecond\nthird";
-		expect(lineTextAt(content, 0)).toBe("first");
-		expect(lineTextAt(content, 1)).toBe("second");
-		expect(lineTextAt(content, 2)).toBe("third");
-	});
-
-	it("returns empty string for out-of-range lines", () => {
-		expect(lineTextAt("only", 5)).toBe("");
-		expect(lineTextAt("only", -1)).toBe("");
 	});
 });

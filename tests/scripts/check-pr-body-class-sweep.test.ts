@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -59,18 +60,25 @@ describe("Class sweep shape and search (#4273)", () => {
 		expect(lintClassSweep(section(sweep))).toHaveLength(1);
 	});
 
+	// Recurrence: #4385. The test ran against the real repository root, and
+	// `lintPrBody` hands `testCorpus` no git stub, so the 4248 body's `tests/`
+	// citations made it run a real `git ls-files tests` and lex every test file:
+	// 2024 of 2072 ms in one profiled call, over the 5000 ms default under shard
+	// load. An empty root keeps the composition (Class sweep reached through
+	// `lintLocalPrBody`) and drops the whole-tree scan.
 	it("reaches the local preflight composition", () => {
-		const gitStub = () => "";
-		expect(
-			lintLocalPrBody(pr4248Body, process.cwd(), gitStub as never).errors.join(
-				" ",
-			),
-		).toContain('"## Class sweep"');
-		expect(
-			lintLocalPrBody(pr4245Body, process.cwd(), gitStub as never).errors.join(
-				" ",
-			),
-		).not.toContain('"## Class sweep"');
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-class-sweep-"));
+		try {
+			const gitStub = () => "";
+			expect(
+				lintLocalPrBody(pr4248Body, root, gitStub as never).errors.join(" "),
+			).toContain('"## Class sweep"');
+			expect(
+				lintLocalPrBody(pr4245Body, root, gitStub as never).errors.join(" "),
+			).not.toContain('"## Class sweep"');
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	// F1: the template sanctions "a per-member line (an arrow or a coverage

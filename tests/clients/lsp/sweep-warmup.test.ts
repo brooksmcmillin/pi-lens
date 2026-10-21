@@ -72,7 +72,10 @@ function makeFakeClient(root: string, serverId = "typescript") {
 			getRawCapabilityKeys: () => [],
 			serverId,
 			root,
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (filePath: string, ms: number) => {
 				waitCalls.push({ filePath, ms });
 				return undefined;
@@ -327,7 +330,10 @@ function makeControlledClient(
 			getOperationSupport: () => ({}),
 			serverId,
 			root,
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (filePath: string, ms: number) => {
 				const outcome = plan[Math.min(call, plan.length - 1)] ?? "warm";
 				call += 1;

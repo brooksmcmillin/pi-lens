@@ -10,6 +10,7 @@ import {
 	parseArgs,
 	pathsFromPrFiles,
 	PR_FILES_API_CAP,
+	PR_SMOKE_PATHS,
 	ghPrFiles,
 	run,
 } from "../../scripts/ci-changed-files.mjs";
@@ -104,6 +105,64 @@ describe("classifyChangedFiles: the strict docs allowlist", () => {
 		[["README.md"], false],
 	])("formal for %j is %s", (paths, formal) => {
 		expect(classifyChangedFiles(paths as string[]).formal).toBe(formal);
+	});
+});
+
+// #4291: `smoke` decides install-smoke.yml's deep run (every pi-load cell and
+// the LSP handshake) on a pull request. Recurrence: #4409 passed its PR run on
+// one pnpm-global cell and broke the npm-global, bun-global and curl legs on
+// master. Doubt resolves to the deep run, like `code`.
+describe("classifyChangedFiles: the deep install smoke (#4291)", () => {
+	const smoke = (paths: string[]) => classifyChangedFiles(paths).smoke;
+
+	// Recurrence: a list entry the matcher cannot read, so the path it names
+	// never turns the deep smoke on. A `dir/**` entry is probed with a file
+	// under it.
+	it.each(PR_SMOKE_PATHS)("turns on for the listed path %s", (entry) => {
+		const file = entry.endsWith("/**") ? `${entry.slice(0, -2)}x/y.ts` : entry;
+		expect(smoke([file])).toBe(true);
+		expect(smoke(["docs/a.md", file])).toBe(true);
+	});
+
+	// Recurrence: an over-wide filter (index.ts alone is 37 of 690 merges in 30
+	// days) that makes the deep run the default instead of the exception.
+	it.each([
+		["index.ts"],
+		["clients/lsp/index.ts"],
+		["clients/lsp/client.ts"],
+		["clients/dispatch/runners/lsp.ts"],
+		["clients/installer-notes.ts"],
+		["tests/clients/foo.test.ts"],
+		["docs/a.md"],
+		["scripts/rpc-load-check.d.mts"],
+		["clients/installer/../index.ts"],
+		["clients/installer"],
+	])("stays off for %s", (file) => {
+		expect(smoke([file])).toBe(false);
+	});
+
+	// Recurrence: a rename that moves a listed file away reads as its new path
+	// only; `pathsFromPrFiles` carries the old path and the matcher reads it.
+	it("counts the old path of a rename out of a listed file", () => {
+		const paths = pathsFromPrFiles([
+			{
+				filename: "clients/project-trust-moved.ts",
+				previous_filename: "clients/project-trust.ts",
+			},
+		]);
+		expect(smoke(paths)).toBe(true);
+	});
+
+	// Recurrence: doubt must run the deep smoke (AGENTS.md shape 48), exactly as
+	// it runs the full suite for `code`.
+	it("turns on for an empty list and for a list at the API cap", () => {
+		expect(smoke([])).toBe(true);
+		const capped = Array.from(
+			{ length: PR_FILES_API_CAP },
+			(_, i) => `docs/f${i}.md`,
+		);
+		expect(smoke(capped)).toBe(true);
+		expect(smoke(capped.slice(0, PR_FILES_API_CAP - 1))).toBe(false);
 	});
 });
 
@@ -205,9 +264,13 @@ describe("run (the CLI the changes job calls)", () => {
 			});
 			expect(code).toBe(0);
 			expect(seen).toEqual([["apmantza/pi-lens", "3807"]]);
-			expect(outputs(files.output)).toEqual({ code: "false", formal: "false" });
+			expect(outputs(files.output)).toEqual({
+				code: "false",
+				formal: "false",
+				smoke: "false",
+			});
 			expect(fs.readFileSync(files.summary, "utf8")).toMatch(
-				/^changes: code=false formal=false -- docs-only diff/,
+				/^changes: code=false formal=false smoke=false -- docs-only diff/,
 			);
 		});
 	});
@@ -227,7 +290,11 @@ describe("run (the CLI the changes job calls)", () => {
 					log: () => {},
 				});
 				expect(code).toBe(0);
-				expect(outputs(files.output)).toEqual({ code: "true", formal: "true" });
+				expect(outputs(files.output)).toEqual({
+					code: "true",
+					formal: "true",
+					smoke: "true",
+				});
 			});
 		},
 	);
@@ -244,7 +311,11 @@ describe("run (the CLI the changes job calls)", () => {
 				log: () => {},
 			});
 			expect(code).toBe(0);
-			expect(outputs(files.output)).toEqual({ code: "true", formal: "true" });
+			expect(outputs(files.output)).toEqual({
+				code: "true",
+				formal: "true",
+				smoke: "true",
+			});
 		});
 	});
 

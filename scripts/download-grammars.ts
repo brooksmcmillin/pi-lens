@@ -247,13 +247,46 @@ function grammarUrl(version: string, filename: string): string {
 	return SOURCE_OVERRIDES[filename]?.url ?? `${baseUrl(version)}/${filename}`;
 }
 
+/**
+ * Abort a fetch that receives no bytes for this long, headers included; each
+ * chunk restarts the count, so a slow link that keeps delivering completes.
+ * Mirrors `GRAMMAR_STALL_MS` in clients/grammar-source.ts, which this script
+ * cannot import before the TS build; `tests/clients/grammar-source.test.ts`
+ * pins the two together (#4425).
+ */
+export const GRAMMAR_STALL_MS = 15_000;
+
 async function fetchGrammar(
 	version: string,
 	filename: string,
+	stallMs = GRAMMAR_STALL_MS,
 ): Promise<Buffer> {
-	const res = await fetch(grammarUrl(version, filename));
-	if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${filename}`);
-	return Buffer.from(await res.arrayBuffer());
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), stallMs);
+	try {
+		const res = await fetch(grammarUrl(version, filename), {
+			signal: controller.signal,
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${filename}`);
+		const reader = res.body?.getReader();
+		if (!reader) return Buffer.from(await res.arrayBuffer());
+		const chunks: Uint8Array[] = [];
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) return Buffer.concat(chunks);
+			timer.refresh();
+			chunks.push(value);
+		}
+	} catch (err) {
+		if (controller.signal.aborted) {
+			throw new Error(
+				`no bytes arrived for ${stallMs} ms fetching ${filename}`,
+			);
+		}
+		throw err;
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 /**
@@ -262,16 +295,17 @@ async function fetchGrammar(
  * integrity mismatch — a grammar whose bytes don't match the pinned manifest is
  * never written (guards CDN corruption / tampering / ABI drift).
  */
-async function downloadGrammar(
+export async function downloadGrammar(
 	destDir: string,
 	filename: string,
 	manifest: GrammarManifest,
+	stallMs = GRAMMAR_STALL_MS,
 ): Promise<void> {
 	if (!needsDownload(destDir, filename, manifest)) {
 		console.error(`  skip  ${filename} (verified)`);
 		return;
 	}
-	const buf = await fetchGrammar(manifest.version, filename);
+	const buf = await fetchGrammar(manifest.version, filename, stallMs);
 	const actual = sha256(buf);
 	const expected = manifest.grammars[filename];
 	if (expected && actual !== expected) {

@@ -50,15 +50,44 @@ function isWindowsOnlyGate(match: string, rawSpan: string): boolean {
 	);
 }
 
-function detectedWin32GateFiles(): string[] {
-	const files = listSourceFiles(TESTS_ROOT, {
-		extensions: [".ts"],
-		exclude: (file) => file.includes("/fixtures/"),
-	});
-	const detected = new Set<string>();
+// One walk and read of tests/ for every case in this file. Each tests/-tree
+// walk measured 22.8 s under Stryker's dry run (#3104 review F4), so the
+// cases below share the walk, the library's lane population and its gates.
+let walkedTests: Array<{ file: string; source: string }> | undefined;
+let laneFiles: string[] | undefined;
+let gateFiles: string[] | undefined;
+let gates: Array<{ file: string; line: number }> | undefined;
+
+function walkedTestSources(): Array<{ file: string; source: string }> {
 	// readWalkedFiles: a path that vanished between the walk and the read is
 	// out of the population, not a finding (#3082).
-	for (const { file: absolute, source: raw } of readWalkedFiles(files)) {
+	walkedTests ??= readWalkedFiles(
+		listSourceFiles(TESTS_ROOT, {
+			extensions: [".ts"],
+			exclude: (file) => file.includes("/fixtures/"),
+		}),
+	);
+	return walkedTests;
+}
+
+function libraryLaneFiles(): string[] {
+	laneFiles ??= getWin32LaneFiles(ROOT);
+	return laneFiles;
+}
+
+function libraryGateFiles(): string[] {
+	gateFiles ??= getWin32GateFiles(ROOT);
+	return gateFiles;
+}
+
+function libraryGates(): Array<{ file: string; line: number }> {
+	gates ??= findWin32Gates(ROOT);
+	return gates;
+}
+
+function detectedWin32GateFiles(): string[] {
+	const detected = new Set<string>();
+	for (const { file: absolute, source: raw } of walkedTestSources()) {
 		const stripped = stripSource(raw);
 		for (const match of stripped.matchAll(windowsGatePattern())) {
 			const offset = match.index ?? 0;
@@ -73,14 +102,10 @@ function detectedWin32GateFiles(): string[] {
 
 describe("win32 gate lane governance (#2536)", () => {
 	it("names the lane for every Windows-only declarative gate", () => {
-		const files = listSourceFiles(TESTS_ROOT, {
-			extensions: [".ts"],
-			exclude: (file) => file.includes("/fixtures/"),
-		});
 		const missing: string[] = [];
-		let gates = 0;
+		let gateCount = 0;
 
-		for (const { file: absolute, source: raw } of readWalkedFiles(files)) {
+		for (const { file: absolute, source: raw } of walkedTestSources()) {
 			const stripped = stripSource(raw);
 			for (const match of stripped.matchAll(windowsGatePattern())) {
 				const offset = match.index ?? 0;
@@ -91,7 +116,7 @@ describe("win32 gate lane governance (#2536)", () => {
 					)
 				)
 					continue;
-				gates++;
+				gateCount++;
 				const line = raw.slice(0, offset).split("\n").length;
 				const previousLine = raw.split("\n")[line - 2] ?? "";
 				if (!previousLine.trim().startsWith(LANE_HEADER)) {
@@ -100,7 +125,7 @@ describe("win32 gate lane governance (#2536)", () => {
 			}
 		}
 
-		assertNonEmptyScan("win32 gate detection", gates, 1);
+		assertNonEmptyScan("win32 gate detection", gateCount, 1);
 		expect(missing, "every Windows-only gate must name windows-vitest").toEqual(
 			[],
 		);
@@ -108,45 +133,31 @@ describe("win32 gate lane governance (#2536)", () => {
 
 	it("keeps the workflow population and execution filter wired", () => {
 		const steps = windowsJobSteps();
-		const enumeration = steps.find(
-			(step) => step.name === "Enumerate Windows Vitest subset",
-		);
 		const runner = steps.find(
 			(step) => step.name === "Run Windows Vitest subset",
 		);
-		const enumerationRun = enumeration?.run ?? "";
 		const runnerRun = runner?.run ?? "";
 
 		// Recurrence: #2536's gates can be documented yet omitted from the only
-		// Windows job, leaving the platform-specific assertions unexecuted.
-		expect(enumerationRun).toContain(
-			"node scripts/lib/win32-gate-population.mjs --files",
-		);
-		expect(enumerationRun).not.toMatch(/git grep/);
+		// Windows job, leaving the platform-specific assertions unexecuted. The
+		// enumeration step's command is pinned by windows-vitest-workflow.test.ts.
 		const detectedFiles = detectedWin32GateFiles();
-		const population = getWin32LaneFiles(ROOT);
+		const population = libraryLaneFiles();
 		expect(population).toContain(
 			"tests/clients/dispatch/runners/go-vet.test.ts",
 		);
-		expect(findWin32Gates(ROOT).length).toBeGreaterThan(0);
-		expect(getWin32GateFiles(ROOT)).toEqual(
-			expect.arrayContaining(detectedFiles),
-		);
+		expect(libraryGates().length).toBeGreaterThan(0);
+		expect(libraryGateFiles()).toEqual(expect.arrayContaining(detectedFiles));
 		expect(population).toEqual(expect.arrayContaining(detectedFiles));
 		expect(runnerRun).toContain('vitest run "${FILES[@]}"');
 		expect(runner?.shell).toBe("bash");
-		// #3104 review F4: two full tests/-tree walks (`detectedWin32GateFiles`
-		// and `getWin32LaneFiles`) measured 22.8 s under Stryker's dry run,
-		// past vitest's 5 s default. Walk time, not wall-clock waiting.
 	}, 60_000);
 
-	// One tests/-tree walk for the whole table, not one per admission: the walk
-	// is the expensive part (the sibling above measured 22.8 s under Stryker's
-	// dry run), and #3278 made this the SECOND admission — two walks blew
-	// vitest's 5 s default in the nightly Stryker job. Same 60 s budget and
-	// the same reason as the sibling: walk time, not wall-clock waiting.
+	// #3278 made this the SECOND admission: two tests/-tree walks blew vitest's
+	// 5 s default in the nightly Stryker job. Same 60 s budget and the same
+	// reason as the sibling: walk time, not wall-clock waiting.
 	it("keeps every explicit Windows admission live and reasoned (#3277)", () => {
-		const population = getWin32LaneFiles(ROOT);
+		const population = libraryLaneFiles();
 		for (const admission of WINDOWS_LANE_ADMISSIONS) {
 			const source = readFileSync(resolve(ROOT, admission.file), "utf8");
 			expect(source).toContain(LANE_HEADER);

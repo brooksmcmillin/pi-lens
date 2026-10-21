@@ -11,10 +11,38 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/vale",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.md",
 	"exitCode": 1,
 	"stdout": "{\n  \"bad.md\": [\n    {\n      \"Action\": {\n        \"Name\": \"\",\n        \"Params\": null\n      },\n      \"Span\": [\n        1,\n        6\n      ],\n      \"Check\": \"pi-lens.NoPlease\",\n      \"Description\": \"\",\n      \"Link\": \"\",\n      \"Message\": \"Drop 'please' — state the instruction directly.\",\n      \"Severity\": \"error\",\n      \"Match\": \"Please\",\n      \"Line\": 3\n    },\n    {\n      \"Action\": {\n        \"Name\": \"\",\n        \"Params\": null\n      },\n      \"Span\": [\n        29,\n        34\n      ],\n      \"Check\": \"pi-lens.NoPlease\",\n      \"Description\": \"\",\n      \"Link\": \"\",\n      \"Message\": \"Drop 'please' — state the instruction directly.\",\n      \"Severity\": \"error\",\n      \"Match\": \"please\",\n      \"Line\": 3\n    }\n  ]\n}\n",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "vale",
+			"argv": [
+				"--version"
+			],
+			"version": "3.24.0",
+			"exitCode": 0,
+			"stdout": "vale version 3.24.0\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/vale",
+		"file": "bad.md",
+		"argv": [
+			"--output",
+			"JSON",
+			"bad.md"
+		],
+		"version": "3.24.0",
+		"exitCode": 0,
+		"stdout": "{}\n",
+		"stderr": ""
+	}
 }

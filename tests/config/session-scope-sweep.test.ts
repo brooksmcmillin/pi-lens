@@ -130,6 +130,8 @@ const ACTIVATION_STATE: Readonly<Record<string, string>> = {
 	ownedSessionRole: "this activation's primary or secondary role (#1996)",
 	renderInvalidator: "this activation's widget repaint callback",
 	scope: "this activation's session scope (#3611)",
+	sharedInfraOwner:
+		"the admitted primary context; shared teardown requires it still owns the current process registration (#4554 r5)",
 	startInFlight:
 		"this activation's primary session_start until it returns, so a shutdown that lands before the start adopted hands on the slot left for it (#3881)",
 	turnStartScope:
@@ -174,6 +176,8 @@ const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
 	_mutationReceipts: "reset",
 	_nextCascadeSettleToken:
 		"kept: a monotonic token source; restarting it would let an old settle's token match a new one",
+	_owedAnchors: "reset",
+	_owedRunners: "reset",
 	_pendingCascadeRuns: "reset",
 	_pendingDeferredMutations: "reset",
 	_pendingInlineBlockers: "reset",

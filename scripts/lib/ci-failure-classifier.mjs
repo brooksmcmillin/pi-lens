@@ -723,9 +723,30 @@ async function fetchText(fetcher, url) {
 }
 
 /**
+ * The pull request of THIS repository a run belongs to, or null (#4382).
+ * `run.pull_requests` is not trustworthy on its own: GitHub fills it by head
+ * branch and sha, so a master push run listed other repositories' fork PRs
+ * whose head branch was also `master` (brooksmcmillin/pi-lens#23,
+ * floatGray/pi-lens#2), and the comment write to issue 23 of this repository
+ * then 403ed. A push run has no PR; any other run takes only an entry whose
+ * API url is under this repository and whose head sha is the run's own head.
+ */
+function ownPullRequestNumber(run, owner, repo) {
+	if (run.event === "push") return null;
+	const prefix = `https://api.github.com/repos/${owner}/${repo}/pulls/`;
+	const own = (run.pull_requests ?? []).find(
+		(pr) =>
+			typeof pr?.url === "string" &&
+			pr.url.startsWith(prefix) &&
+			pr.head?.sha === run.head_sha,
+	);
+	return own?.number ?? null;
+}
+
+/**
  * Resolve a run's head SHA, its associated PR number (when GitHub reports
- * one -- same-repo pushes and PRs both do; a fork PR or a bare workflow_run
- * event may not, so callers can pass an explicit PR number instead), and the
+ * one for this repository -- see ownPullRequestNumber; a fork PR or a push
+ * run has none, so callers can pass an explicit PR number instead), and the
  * id of the job to classify.
  *
  * @param {{ fetcher: typeof fetch, owner: string, repo: string, runId: number | string, jobName?: string }} args
@@ -739,14 +760,31 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		`${base}/actions/runs/${runId}/jobs`,
 	);
 	const jobs = jobsResponse.jobs ?? [];
+	// #4672: a CANCELLED run has no failed job to read, so it used to fall
+	// through to the "has no failed job" throw below and the lane never judged
+	// it. Hand the run and its job rows back instead and let `runClassifier`
+	// ask `classifyCancelledRun` whether this is the teardown race.
+	if (String(run.conclusion ?? "") === "cancelled") {
+		return {
+			cancelledRun: { run, jobs },
+			sha: run.head_sha,
+			prNumber: ownPullRequestNumber(run, owner, repo),
+			runAttempt: Number(run.run_attempt) || 1,
+			jobId: null,
+			jobName: jobName ?? "",
+			jobIds: [],
+		};
+	}
 	const failedJobs = jobName
 		? failedJobsNamed(jobs, jobName)
 		: jobs.filter((job) => job.conclusion === "failure").slice(0, 1);
 	const failedJob = failedJobs[0];
 	if (!failedJob) {
 		// #3801 (verify r2 V3): a CI run that failed ONLY on advisory jobs (a
-		// not-ready `Heavy advisory gate`, the Windows run) is not a `real`
+		// not-ready `Heavy advisory gate`, a CodeQL language leg) is not a `real`
 		// failure of the change; the caller must not label the PR `ci:real`.
+		// #4518: `Unit tests Windows` is not on that list any more -- it gates, so
+		// a red Windows row is a blocking failure like any other.
 		// Every job with a BLOCKING conclusion (failure, timed_out, cancelled, ...)
 		// must be advisory: a required job that timed out beside a red gate is
 		// not "only advisory" (verify r3 V6).
@@ -759,10 +797,9 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		error.advisoryOnly = advisoryOnly;
 		throw error;
 	}
-	const prNumber = run.pull_requests?.[0]?.number ?? null;
 	return {
 		sha: run.head_sha,
-		prNumber,
+		prNumber: ownPullRequestNumber(run, owner, repo),
 		// GitHub's own per-head attempt counter (#2042): the rerun guard is
 		// keyed on it, so it is read from the run the classifier was pointed
 		// at rather than passed in by the caller. An API shape without it
@@ -771,6 +808,118 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		jobId: failedJob.id,
 		jobName: failedJobs.map((job) => job.name).join(", "),
 		jobIds: failedJobs.map((job) => job.id),
+	};
+}
+
+/** Step conclusions that mean "this step ran to its end". A `skipped` step ran
+ * nothing, which is not a failure of the work it skipped. */
+const STEP_DONE_CONCLUSIONS = new Set(["success", "skipped"]);
+
+/**
+ * #4672: judge a CANCELLED `CI` run as the teardown race it is, or refuse it.
+ *
+ * The defect (master push run 39380875926, head e3767bd78): `TLA+ models
+ * (shard 4/4)` started 06:36:59Z, was `cancelled` at 06:49:14Z -- 735 s
+ * against a `timeout-minutes: 12` cap -- with EVERY step concluded `success`,
+ * the model check itself 06:37:06Z -> 06:49:12Z. The aggregate job then read
+ * `needs.tla-shards.result == cancelled` and failed the required
+ * `TLA+ models` check on master's tip with no model violation, and this lane
+ * could not recover it: `classify` required
+ * `workflow_run.conclusion == 'failure'`, so the run got no verdict, no
+ * classification and no rerun.
+ *
+ * The gate is deliberately narrow, in three directions:
+ *   - MASTER PUSHES ONLY. A pull_request run cancelled by
+ *     `concurrency.cancel-in-progress` is superseded by design; rerunning it
+ *     would spend quota re-testing a head nothing waits on, and the newer run
+ *     owns the verdict. Only `event == 'push'` on `master` ("nothing reruns a
+ *     cancelled run") is eligible, and this function decides that itself so a
+ *     bare CLI invocation cannot route around the workflow's own `if:`.
+ *   - EVERY CANCELLED job's steps must have concluded `success` (or been
+ *     skipped). A job with a `cancelled`/`failure`/absent step was killed
+ *     mid-work, so its tests or models did not finish: rerunning it would be
+ *     papering over a real red, and the classifier must say no.
+ *   - Unreadable is not eligible. A job row with no `steps` array is not
+ *     evidence of completion, so it refuses rather than assumes.
+ *
+ * FAILED jobs are deliberately NOT part of the gate, and the witness shows
+ * why: run 39380875926's `TLA+ models` aggregate job concluded `failure`
+ * BECAUSE shard 4/4 concluded `cancelled` -- that is the defect #4672 fixes
+ * (the aggregate now keeps it as a pass-with-warning). Gating on failed jobs
+ * would therefore refuse to judge the very shape this branch exists for. A
+ * genuinely failed job is not hidden by this: a rerun replays it, the replayed
+ * attempt concludes `failure`, and the ordinary failure path above classifies
+ * and labels THAT run -- so a real red still reads `real` on the attempt the
+ * truth appears. On the master lane there is no label write at all.
+ *
+ * The kind is `infra-kill` on purpose: that is the classification the label
+ * step (`ci:infra`) and `shouldTriggerRerun`'s attempt bound already handle,
+ * and the detail says plainly what happened, so a human reading the sticky
+ * comment knows this was a teardown race and not an assertion failure.
+ *
+ * @param {{ run: object, jobs: object[] }} args
+ * @returns {{ eligible: true, kind: "infra-kill", detail: string } | { eligible: false, reason: string }}
+ */
+export function classifyCancelledRun({ run, jobs }) {
+	const event = String(run?.event ?? "");
+	const branch = String(run?.head_branch ?? "");
+	if (event !== "push" || branch !== "master") {
+		return {
+			eligible: false,
+			reason: `run ${run?.id ?? "?"} was cancelled on a ${event || "unknown"} event (branch ${branch || "unknown"}); only a push to master is a teardown race, every other cancelled run is superseded by design`,
+		};
+	}
+	const cancelled = (Array.isArray(jobs) ? jobs : []).filter(
+		(job) => String(job?.conclusion ?? "") === "cancelled",
+	);
+	if (cancelled.length === 0) {
+		return {
+			eligible: false,
+			reason: `run ${run?.id ?? "?"} concluded cancelled but reports no cancelled job to judge`,
+		};
+	}
+	const offenders = [];
+	for (const job of cancelled) {
+		const steps = Array.isArray(job?.steps) ? job.steps : null;
+		if (steps === null || steps.length === 0) {
+			offenders.push(`${job?.name ?? "(unnamed job)"} has no readable steps`);
+			continue;
+		}
+		const unfinished = steps.filter(
+			(step) => !STEP_DONE_CONCLUSIONS.has(String(step?.conclusion ?? "")),
+		);
+		if (unfinished.length > 0) {
+			offenders.push(
+				`${job?.name ?? "(unnamed job)"}: ${unfinished
+					.map(
+						(step) =>
+							`${step?.name ?? "?"} concluded ${step?.conclusion ?? "no conclusion"}`,
+					)
+					.join(", ")}`,
+			);
+		}
+	}
+	if (offenders.length > 0) {
+		return {
+			eligible: false,
+			reason: `run ${run?.id ?? "?"} was cancelled mid-work, not in teardown: ${offenders.join("; ")}`,
+		};
+	}
+	const failed = (Array.isArray(jobs) ? jobs : []).filter((job) =>
+		isBlockingConclusion(job?.conclusion),
+	);
+	const otherRed =
+		failed.length > cancelled.length
+			? "; the run's other red job(s) are re-read by the rerun, which classifies and labels them on its own attempt"
+			: "";
+	return {
+		eligible: true,
+		kind: "infra-kill",
+		detail: `no failing assertion; ${cancelled.length} job(s) cancelled with every step concluded success (${cancelled
+			.map((job) => job.name)
+			.join(
+				", ",
+			)}) -- a job lost its teardown race with its own timeout-minutes after its work finished${otherRed}`,
 	};
 }
 
@@ -1001,14 +1150,43 @@ export async function runClassifier({
 		jobId,
 		jobIds,
 		jobName: resolvedJobName,
+		cancelledRun,
 	} = runAndJob;
 	const prNumber = prNumberOverride ?? resolvedPrNumber;
+	// #4382: the sticky comment is bookkeeping; a refused write (403 on a
+	// token without the scope, a deleted thread) must never stop the
+	// classification or the rerun. The first failure is recorded once and
+	// every later comment step is skipped: the same token fails the same way.
+	let commentWarning = null;
+	const bestEffortComment = async (step, fallback) => {
+		if (commentWarning !== null) return fallback;
+		try {
+			return await step();
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			commentWarning = `ci-classifier: PR #${prNumber} comment not written, classification and rerun continue: ${detail.replace(/\s+/g, " ").slice(0, 300)}`;
+			return fallback;
+		}
+	};
 	if (!prNumber && !allowMissingPr) {
 		throw new Error(
 			`run ${runId} has no associated pull request; pass an explicit PR number`,
 		);
 	}
 
+	// #4672: a cancelled master run is judged from its job rows, never from a
+	// log -- there is no failed job, and "every step concluded success" is the
+	// whole evidence. An ineligible cancelled run (a PR run superseded by
+	// concurrency, or a job killed mid-work) is SKIPPED with its reason, so the
+	// lane never reruns a red or a superseded head.
+	let cancelledClassification = null;
+	if (cancelledRun) {
+		const judged = classifyCancelledRun(cancelledRun);
+		if (!judged.eligible) {
+			return { skipped: true, reason: judged.reason };
+		}
+		cancelledClassification = { kind: judged.kind, detail: judged.detail };
+	}
 	let rawLogs;
 	try {
 		rawLogs = [];
@@ -1030,19 +1208,29 @@ export async function runClassifier({
 	// there is never a prior marker to recover, so this pass is always the
 	// first look at this SHA.
 	const existingComment = prNumber
-		? await findExistingClassifierComment({
-				fetcher,
-				owner,
-				repo,
-				prNumber,
-			})
+		? await bestEffortComment(
+				() =>
+					findExistingClassifierComment({
+						fetcher,
+						owner,
+						repo,
+						prNumber,
+					}),
+				null,
+			)
 		: null;
 	let classification;
 	try {
 		// One log per failed job (several failed shards, #3753). A real failure
 		// in ANY of them wins: a rerun that would only replay the infra-killed
 		// shard cannot fix a shard that is genuinely red.
-		const classified = rawLogs.map((rawLog) => classifyFailureLog(rawLog));
+		//
+		// #4672: a cancelled run carries no log to read -- `classifyCancelledRun`
+		// already decided, from the job rows, that every step of every cancelled
+		// job finished.
+		const classified = cancelledClassification
+			? [cancelledClassification]
+			: rawLogs.map((rawLog) => classifyFailureLog(rawLog));
 		classification =
 			classified.find((entry) => entry.kind === "real") ?? classified[0];
 	} catch (error) {
@@ -1111,14 +1299,18 @@ export async function runClassifier({
 	// classify job's own log (this function's caller prints commentBody) is
 	// the only trace for that run, by design (#2668).
 	const postedComment = prNumber
-		? await upsertComment({
-				fetcher,
-				owner,
-				repo,
-				prNumber,
-				existingComment,
-				body: commentBody,
-			})
+		? await bestEffortComment(
+				() =>
+					upsertComment({
+						fetcher,
+						owner,
+						repo,
+						prNumber,
+						existingComment,
+						body: commentBody,
+					}),
+				null,
+			)
 		: null;
 
 	let result = {
@@ -1135,14 +1327,18 @@ export async function runClassifier({
 	// -new comment into a duplicate -- a PATCH to an existing single comment
 	// cannot itself create one. No PR means no comment thread to reconcile.
 	if (prNumber && !existingComment) {
-		const reconciled = await reconcileDuplicateClassifierComments({
-			fetcher,
-			owner,
-			repo,
-			prNumber,
-			sha,
-			postedCommentId: postedComment?.id,
-		});
+		const reconciled = await bestEffortComment(
+			() =>
+				reconcileDuplicateClassifierComments({
+					fetcher,
+					owner,
+					repo,
+					prNumber,
+					sha,
+					postedCommentId: postedComment?.id,
+				}),
+			{ isWinner: true },
+		);
 		if (!reconciled.isWinner) {
 			// A concurrent invocation's earlier comment owns this SHA now; this
 			// call's own rerun attempt (if any) already fired and can't be
@@ -1156,7 +1352,7 @@ export async function runClassifier({
 		}
 	}
 
-	return result;
+	return commentWarning === null ? result : { ...result, commentWarning };
 }
 
 /**
@@ -1184,19 +1380,25 @@ async function commentClassificationFailure({
 	const body =
 		`ci-classifier: classification failed; no rerun was triggered: ${detail} ` +
 		buildMarker(sha, "false");
-	const existingComment = await findExistingClassifierComment({
-		fetcher,
-		owner,
-		repo,
-		prNumber,
-	});
-	await upsertComment({
-		fetcher,
-		owner,
-		repo,
-		prNumber,
-		existingComment,
-		body,
-	});
-	return true;
+	// #4382: callers rethrow the ORIGINAL classification error right after this
+	// returns; a refused comment write must not replace it with a 403.
+	try {
+		const existingComment = await findExistingClassifierComment({
+			fetcher,
+			owner,
+			repo,
+			prNumber,
+		});
+		await upsertComment({
+			fetcher,
+			owner,
+			repo,
+			prNumber,
+			existingComment,
+			body,
+		});
+		return true;
+	} catch {
+		return false;
+	}
 }

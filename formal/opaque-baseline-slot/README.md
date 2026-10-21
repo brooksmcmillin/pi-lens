@@ -58,6 +58,11 @@ Issue: #4137. Lane M5 of #3803.
 - **Knobs.**
   - `Keying = "cwd"` is the pre-fix store (one key per `cwd:generation`).
     `"call"` is one key per tool-call id.
+  - `Root = "one"` is both hooks resolving the session's own root through
+    `opaquePrescanRoot` (`clients/opaque-mutation-scan.ts`, #4504). `"split"`
+    is the pre-fix code: the `tool_call` key was the host's `ctx.cwd` and the
+    `tool_result` key was the coordinator's `projectRoot`, which differ for a
+    concurrent secondary session (#473) in a linked worktree.
   - `Subtract` is round 1's sibling subtraction: a recovery leaves out the names
     of every pending entry and of every call that took after this one recorded.
   - `Observe = "counted"` is the degradation ledger's `opaque-baseline-lost`
@@ -74,6 +79,10 @@ Issue: #4137. Lane M5 of #3803.
 
 - `EveryWriteAttributed`: a finished, successful call has an authored analysis
   of every path it named and wrote.
+- `EveryCallFindsItsBaseline` (shape 19): a call that ran and was not blocked
+  finds the baseline its own `tool_call` recorded. A hook pair that resolves
+  two roots misses it and reports `no-pending-snapshot` for a command that did
+  write (#4504).
 - `BlockerKept`: if no other call writes the path, its blocker record is
   still the authored one.
 - `NoDrop` (shape 54, the no-drop side): once no call is in flight, the latest
@@ -112,12 +121,14 @@ States are as TLC reported them with `-workers 1` (generated / distinct).
 | `PerCallOverCap` | pass | 11644 / 6094 | More parallel calls than the cap. The oldest baseline is dropped and counted, and no write goes unanalysed without a counted loss. |
 | `PerCallOverCapUncounted` | violated `SlotLossObservable` | 19 / 19 | A cap eviction without its ledger record is a silent loss. |
 | `SequentialSingle` | pass | 121 / 108 | Today's rows. Calls that never overlap share the one cwd slot without loss, under the pre-fix keying and dedupe. `PerCallKeyed`'s state space includes every sequential order. |
+| `SplitRootSlot` | violated `EveryCallFindsItsBaseline` | not measured here (no JVM on the authoring host; the `TLA+ models` CI job reports it) | The pre-fix root split with the per-call keying already in place. Each call records under its own key in one root and takes under the other, so every take misses and reports `no-pending-snapshot` for a command that did write. Nothing is overwritten or evicted, so the loss is uncounted: the evidence is the miss itself. |
 
 ## Counter-checks
 
 Each knob has a config that flips when it is turned:
 
 - `Keying`: `PerCallKeyed` to `CwdKeyedSlot`.
+- `Root`: `PerCallKeyed` to `SplitRootSlot`.
 - `Dedupe`: `PerCallKeyed` to `PerCallContentDedupe`.
 - `ClearRule`: `PerCallSecondaryTurn` to `Round2SecondaryTurn`.
 - `LatchClear`: `PerCallSecondaryTurn` to `PerCallKeyed` (the same fix, without the

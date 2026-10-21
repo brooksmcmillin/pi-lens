@@ -32,6 +32,12 @@ import {
 } from "../clients/instance-registry.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx, STALE_CTX_MESSAGE } from "./support/pi-mock.js";
+import {
+	fauxAssistantMessage,
+	fauxText,
+	piSessionFixture,
+	startPiSession,
+} from "./support/pi-session.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
 
 /** Make an already-emitted ctx read as invalidated, the way the SDK does after
@@ -56,6 +62,18 @@ async function settleRegistryWrites(): Promise<void> {
 	await _settleRegistryMutationsForTests();
 }
 
+/**
+ * The active primary root, resolved through the filesystem so a lane whose tmp
+ * root is a symlink (macOS `/var`, a Windows short name) still compares equal to
+ * the path the case passed. Throws rather than comparing `undefined`, so a
+ * missing registration can never read as a passing identity.
+ */
+function realPathOfActivePrimaryRoot(): string {
+	const root = getActivePrimaryRoot();
+	if (root === undefined) throw new Error("no active primary root");
+	return fs.realpathSync(root);
+}
+
 /** The roots this process's registry entry currently holds. */
 async function rootsForThisPid(): Promise<string[]> {
 	const entry = (await readInstanceRegistry()).find(
@@ -70,6 +88,9 @@ const testRegistryHome = path.join(
 	"index-multi-root-session-start",
 );
 const workerHome = process.env.PI_LENS_HOME;
+
+/** The tier-2 fixture two of the cases below run real sessions under. */
+const fixture = piSessionFixture();
 
 describe("session_start keys on the project root (#2129 wiring)", () => {
 	let hostRoot: string;
@@ -380,25 +401,44 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 		// stale activeRoot decisive: without an explicit release at the primary's
 		// shutdown, every later start in a different root would classify
 		// secondary-root FOREVER — never primary, never a full start.
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
+		//
+		// Tier 2 (#4632): two REAL pi sessions, each at its own project root
+		// under this file's fixture. The session identity the assertions read is
+		// the id pi's own session manager minted, and the release below is pi's
+		// own `session_shutdown` reaching the loaded copy.
+		//
+		// The two roots' LAST segments differ (`root-primary` / `root-next`) and
+		// each assertion names its own root: the directory names the pre-tier-2
+		// case used both ended in `/proj`, which made a `toContain(basename)`
+		// hold for either session (#4664 F5).
+		const firstCwd = path.join(fixture.root, "root-primary", "proj");
+		const first = await startPiSession({
+			root: fixture.root,
+			cwd: firstCwd,
+			responses: [fauxAssistantMessage(fauxText("ready"))],
+		});
+		expect(getActiveSessionId()).toBe(
+			first.session.sessionManager.getSessionId(),
+		);
+		expect(getSecondarySessionCount()).toBe(0);
+		expect(realPathOfActivePrimaryRoot()).toBe(fs.realpathSync(firstCwd));
 
-		const hostCtx = makeCtx({ cwd: hostRoot, sessionId: "host-session" });
-		await pi.emit("session_start", makeSessionStartEvent(), hostCtx);
-		await pi.emit("session_shutdown", {}, hostCtx);
+		await first.dispose();
 		expect(getActivePrimaryRoot()).toBeUndefined();
 
 		// A brand new session in a DIFFERENT root must take over as primary.
-		const next = createPiMock();
-		extension(next.asExtensionAPI());
-		await next.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: tempWorktree, sessionId: "next-session" }),
-		);
-
+		const nextCwd = path.join(fixture.root, "root-next", "proj");
+		const next = await startPiSession({
+			root: fixture.root,
+			cwd: nextCwd,
+			responses: [fauxAssistantMessage(fauxText("ready"))],
+		});
 		expect(getSecondarySessionCount()).toBe(0);
-		expect(getActivePrimaryRoot()).toContain(path.basename(tempWorktree));
+		expect(realPathOfActivePrimaryRoot()).toBe(fs.realpathSync(nextCwd));
+		expect(getActiveSessionId()).toBe(
+			next.session.sessionManager.getSessionId(),
+		);
+		await next.dispose();
 	}, 30_000);
 
 	for (const gapRoot of ["host", "temp"] as const) {

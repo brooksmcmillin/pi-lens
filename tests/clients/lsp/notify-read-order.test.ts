@@ -105,6 +105,7 @@ async function setup() {
 		getAllDiagnostics: vi.fn(() => new Map()),
 		getDiagnosticBinding: vi.fn(() => undefined),
 		notify: {
+			announceCreated: () => undefined,
 			open: (
 				filePath: string,
 				content: string,

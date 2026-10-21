@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, vi } from "vitest";
+import { PROJECT_ROOT_MARKERS } from "../../clients/project-root-markers.js";
 import {
 	getTmpRootRegistry,
 	registerTmpRoot,
@@ -61,11 +63,44 @@ export function removeTempDirSync(dir: string): void {
 	}
 }
 
-export function setupTestEnvironment(prefix = "pi-lens-test-"): {
+/** The project-root marker every `setupTestEnvironment` root carries unless a
+ *  cell opts out (#4560). `.git` is honoured by `findNearestProjectRoot` and is
+ *  the marker this suite's own project fixtures already plant
+ *  (`makeProject`, `makeWarmableProject`, `writeSourceFiles`), so the shared
+ *  default replaces those copies instead of adding a second vocabulary.
+ *  An EMPTY directory is not a real Git marker (`isRealGitMarker` requires a
+ *  `HEAD`), so the callers of that predicate (`resolveToolCwd`'s formatter cwd,
+ *  `ephemeral-root`'s checkout classification) keep answering "not a repo",
+ *  while `findNearestProjectRoot` (existence only) sees the fixture as its own
+ *  root. `gitleaks-client`'s `hasGitRepo` is a bare existence check, so a
+ *  `mode=full` scan now finds a repo in a fixture; the cells that pin that gate
+ *  are part of this change.
+ *  The directory is also invisible to the tree walks (`.git` is in
+ *  `EXCLUDED_DIRS`), so no fixture file count moves.
+ *
+ *  Recurrence (#4546 / #4559): a bare fixture under `os.tmpdir()` resolved its
+ *  project root by walking UP past the fixture. A stray empty `/tmp/.git` on
+ *  the dev host made `findNearestProjectRoot` return `/tmp`, so a cell that
+ *  saved and read a project snapshot under its fixture saw an empty one and
+ *  redded with `expected undefined`. Planting the marker here makes every
+ *  fixture its own root. A cell that asserts marker-less resolution passes
+ *  `{ rootMarker: false }` and says why. */
+export const TEST_FIXTURE_ROOT_MARKER =
+	".git" satisfies (typeof PROJECT_ROOT_MARKERS)[number];
+
+export function setupTestEnvironment(
+	prefix = "pi-lens-test-",
+	options: { rootMarker?: boolean } = {},
+): {
 	tmpDir: string;
 	cleanup: () => void;
 } {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	if (options.rootMarker !== false) {
+		fs.mkdirSync(path.join(tmpDir, TEST_FIXTURE_ROOT_MARKER), {
+			recursive: true,
+		});
+	}
 	activeTestEnvironments.add(tmpDir);
 	// #2912: the shared setup removes this root at file teardown and on SIGTERM,
 	// so a timeout or a failed assertion before `cleanup()` cannot leak it.
@@ -81,6 +116,45 @@ export function setupTestEnvironment(prefix = "pi-lens-test-"): {
 }
 
 const activeTestEnvironments = new Set<string>();
+
+/**
+ * Run `load` with the process's tmp env aimed inside the fixture root. pi's
+ * extension loader builds jiti's transform cache as
+ * `path.join(os.tmpdir(), "jiti")` for every extension it loads, so an
+ * in-process load otherwise leaves a `jiti` directory at the shared tmp root,
+ * where the fixture-sibling census judges it (#4641 F1). Inside the fixture it
+ * is removed with the fixture. jiti only creates the directory: the built entry
+ * imports natively, so the cache stays empty and the redirect costs nothing.
+ *
+ * Both real-host tiers load through that loader (`tests/support/pi-runner.ts`,
+ * `tests/support/pi-session.ts`); this is the one copy they share, so the
+ * redirect cannot drift between them (#4664 F6).
+ */
+export async function withFixtureTmpdir<T>(
+	root: string,
+	load: () => Promise<T>,
+): Promise<T> {
+	const isolate = path.join(root, "tmp");
+	fs.mkdirSync(isolate, { recursive: true });
+	const previous = {
+		TMPDIR: process.env.TMPDIR,
+		TEMP: process.env.TEMP,
+		TMP: process.env.TMP,
+	};
+	process.env.TMPDIR = isolate;
+	process.env.TEMP = isolate;
+	process.env.TMP = isolate;
+	try {
+		return await load();
+	} finally {
+		if (previous.TMPDIR === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = previous.TMPDIR;
+		if (previous.TEMP === undefined) delete process.env.TEMP;
+		else process.env.TEMP = previous.TEMP;
+		if (previous.TMP === undefined) delete process.env.TMP;
+		else process.env.TMP = previous.TMP;
+	}
+}
 
 export function cleanupTestEnvironments(
 	prefix: string,
@@ -136,7 +210,8 @@ async function drainWriter(
 /**
  * Wait for every known background writer that can recreate a fixture root
  * after its test removed it: review-graph persists, project-snapshot body
- * persists, and extension-log appends. Each costs nothing when idle.
+ * persists, extension-log appends, and the resident jscpd scan (#4505). Each
+ * costs nothing when idle.
  *
  * The modules are loaded here, at call time, never at the top of this file,
  * so a file that never touched a writer pays only the import. Skipped under
@@ -164,6 +239,10 @@ export async function drainBackgroundWritesForTests(): Promise<void> {
 		() => import("../../clients/extension-log.js"),
 		["flushExtensionLog"],
 	);
+	// #4505: a session_start jscpd scan is fire-and-forget, so a file that ends
+	// right after its last turn strands the report directory (the 4403 cascade
+	// file, in the pre-push batch). Every drained cleanup waits for it.
+	await drainResidentJscpdScans();
 }
 
 /**
@@ -305,4 +384,183 @@ export function createTempFile(
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(filePath, content);
 	return filePath;
+}
+
+/**
+ * The worker-owned parent of every pinned fixture HOME (#4591): outside every
+ * root the harness deletes, outside the OS tmp root the census watches, and
+ * beside the worker's own home rather than inside it.
+ *
+ * `vitest-setup.ts` publishes the resolved path on
+ * `PI_LENS_TMP_HYGIENE_FIXTURE_HOME` before any test module loads and removes
+ * this directory at its teardown; the name carries the worker-home prefix so
+ * the run's dead-worker sweep reclaims a killed run's copy too. It is a SIBLING
+ * of the worker home on purpose: production classifies a path under
+ * `PI_LENS_HOME` as pi-lens's own housekeeping (`isPiLensInternalPath`) and
+ * refuses to adopt it as a project, so a fixture HOME there would silently
+ * change what the write path does with the files under it.
+ *
+ * The published value is the identity the teardown removes (#4591). Deriving
+ * it again from `PI_LENS_TMP_HYGIENE_RUN_ID` at teardown time would answer with
+ * a different directory after any in-process mutation of that variable (the
+ * census suite mutates it on purpose), and the directories a case created would
+ * then be reclaimed only by the run's six-hour sweep arm. The fallback below
+ * exists for a harness that publishes the run-shared home only; with neither
+ * variable set there is no place to put a fixture home, and the caller hears it.
+ */
+export function fixtureHomeRoot(): string {
+	const published = process.env.PI_LENS_TMP_HYGIENE_FIXTURE_HOME?.trim();
+	if (published) return path.resolve(published);
+	const sharedHome = process.env.PI_LENS_TMP_HYGIENE_HOME?.trim();
+	if (!sharedHome) {
+		throw new Error(
+			"fixtureHomeRoot() needs PI_LENS_TMP_HYGIENE_FIXTURE_HOME (or the run-shared PI_LENS_TMP_HYGIENE_HOME the vitest setup publishes) — a fixture home has no place to live outside the harness's own scratch root",
+		);
+	}
+	return fixtureHomeRootIn(
+		sharedHome,
+		process.env.PI_LENS_TMP_HYGIENE_RUN_ID ?? "local",
+		process.pid,
+	);
+}
+
+/**
+ * The ONE spelling of a worker's fixture-home root: `worker-home-<run>-<pid>-`
+ * then `-fixtures`, under the run-shared home. The run's dead-worker sweep
+ * matches the `worker-home-<run>-` family, so a killed worker's copy is
+ * reclaimed with its own worker home.
+ *
+ * `vitest-setup.ts` publishes the value it derives from THIS worker's own
+ * identity, never whatever the environment already holds (#4591 V1): a nested
+ * Vitest child inherits the parent's whole environment, and a child that
+ * published its parent's root removed that root — and every HOME pinned inside
+ * it — at its own teardown. `fixtureHomeRoot()`'s fallback derives the same
+ * name, so a worker with no inherited value still gets its own root.
+ */
+export function fixtureHomeRootIn(
+	sharedHome: string,
+	runId: string,
+	pid: number,
+): string {
+	return path.join(
+		path.resolve(sharedHome),
+		`worker-home-${runId}-${pid}-fixtures`,
+	);
+}
+
+/**
+ * Point `os.homedir()` at a fresh fixture HOME and return it with its undo.
+ *
+ * `homedir()` reads `HOME` (Windows: `USERPROFILE`) on every call, so pinning
+ * both is what makes a `~` path expand into this directory instead of the
+ * maintainer's real home. Every call site restores in its own `finally`, and
+ * the harness restores whatever is left at the end of the case
+ * ({@link restorePinnedFixtureHomes}, called by `vitest-setup.ts`'s
+ * `afterEach`): a setup step that throws between the pin and that `finally`
+ * would otherwise leave the next case reading a fixture directory (#4591).
+ *
+ * The home deliberately does NOT live inside the fixture root (#4591). A child
+ * the test never awaits inherits HOME and `cwd`, and a write it lands after the
+ * file's teardown sweep re-creates a root the harness already removed: on
+ * Windows `pi-lens-4577-resolver-cqF0yk` was still there three minutes later,
+ * `registered=0 stragglers=0 failed=0` at its own sweep, for the census to red.
+ * No sweep can remove a root a foreign process re-creates, so the home is
+ * placed where nothing deletes it out from under a straggler and where the
+ * tmp-root census never looks. Create the files the test needs under the
+ * returned `home`.
+ *
+ * `slug` only names the directory, so a leftover is attributable to its file.
+ */
+export function pinFixtureHome(slug: string): {
+	home: string;
+	restore: () => void;
+} {
+	const base = fixtureHomeRoot();
+	fs.mkdirSync(base, { recursive: true });
+	// A counted name, not `mkdtempSync`: the census sweep over `mkdtemp` parents
+	// (`tests/config/tmp-fixture-hygiene.test.ts`) admits tmpdir-, repo- and
+	// scratch-rooted parents only, and this one is the worker's own scratch,
+	// removed by the setup's teardown. The run id and pid in `base` already
+	// separate workers, so a per-process count is all the uniqueness needed.
+	fixtureHomeSeq += 1;
+	const home = path.join(base, `${slug}-${process.pid}-${fixtureHomeSeq}`);
+	fs.mkdirSync(home, { recursive: true });
+	const undo = pinHome(home);
+	let restored = false;
+	const restore = () => {
+		if (restored) return;
+		restored = true;
+		const index = pendingFixtureHomeRestores.indexOf(restore);
+		if (index >= 0) pendingFixtureHomeRestores.splice(index, 1);
+		undo();
+	};
+	pendingFixtureHomeRestores.push(restore);
+	return { home, restore };
+}
+
+/** One counter per worker process; `fixtureHomeRoot()` separates runs. */
+let fixtureHomeSeq = 0;
+
+/** Pins this case has not undone yet, oldest first. */
+const pendingFixtureHomeRestores: Array<() => void> = [];
+
+/**
+ * Undo every {@link pinFixtureHome} pin still in effect, newest first. The
+ * harness calls this from its per-test `afterEach` (`vitest-setup.ts`), so a
+ * case that throws between the pin and its own fixture work cannot leave HOME
+ * pointed at a fixture directory for the next case: the call-site `finally`
+ * never ran, and the home outlives it. A pin a call site already restored has
+ * deregistered itself, so this is a no-op for the ordinary path.
+ */
+export function restorePinnedFixtureHomes(): void {
+	while (pendingFixtureHomeRestores.length > 0) {
+		const restore = pendingFixtureHomeRestores.pop();
+		restore?.();
+	}
+}
+
+/** The raw environment pin `pinFixtureHome` returns; not exported, so no call
+ *  site can pin a home inside a root its own teardown deletes (#4591). */
+function pinHome(home: string): () => void {
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	return () => {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+	};
+}
+
+/** How a connect to a Unix socket path ends: `connected` when a server
+ *  listens there, otherwise the errno code (a stale socket or a regular file
+ *  refuses with `ECONNREFUSED`). */
+export function connectOutcome(endpoint: string): Promise<string> {
+	return new Promise((resolve) => {
+		const probe = net.createConnection(endpoint);
+		probe.once("connect", () => {
+			probe.destroy();
+			resolve("connected");
+		});
+		probe.once("error", (error) =>
+			resolve((error as NodeJS.ErrnoException).code ?? String(error)),
+		);
+	});
+}
+
+/** Leave a stale Unix socket file at `file`, as a killed host does, without a
+ *  child process: bind, move the file aside so the close-time unlink finds
+ *  nothing, close the listener, move the file back. */
+export async function plantStaleUnixSocket(file: string): Promise<void> {
+	const parked = `${file}.parked`;
+	const server = net.createServer();
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(file, resolve);
+	});
+	fs.renameSync(file, parked);
+	await new Promise<void>((resolve) => server.close(() => resolve()));
+	fs.renameSync(parked, file);
 }

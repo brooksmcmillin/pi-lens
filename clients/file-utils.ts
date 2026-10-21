@@ -1280,25 +1280,6 @@ export function getProjectIgnoreGlobs(rootDir: string): string[] {
 	return globs;
 }
 
-/**
- * Read simple directory-name entries from a root .gitignore.
- *
- * Prefer createProjectIgnoreMatcher() for path-aware gitignore matching. This
- * helper is kept for callers/tests that only need simple directory names.
- */
-export function readGitignoreDirs(rootDir: string): string[] {
-	return readGitignorePatterns(rootDir)
-		.filter(
-			(entry) =>
-				!entry.negated &&
-				!entry.pattern.includes("*") &&
-				!entry.pattern.includes("?") &&
-				!entry.pattern.includes("[") &&
-				!entry.pattern.includes("/"),
-		)
-		.map((entry) => entry.pattern);
-}
-
 function globToRegExp(glob: string): RegExp {
 	// Directory names use the same `*`-only dialect as read-guard exemptions.
 	// Collapse adjacent stars before compiling to avoid nullable-group

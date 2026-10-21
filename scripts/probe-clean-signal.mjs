@@ -44,18 +44,21 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeEvaluatedRecord } from "./lib/assert-evaluated.mjs";
 import {
-	COMPARABLE_FIRST_PUBLISH,
 	DRIFT_SUMMARY_PATH,
-	MEASURED_CLEAN_BEHAVIORS,
 	buildMatrixObservations,
 	createPublishTraceDrainer,
+	describeFirstPublishAuthors,
 	findCleanSignalDrift,
+	resolveTargetLangRows,
 	strategyKeyForLang,
 	targetLangForFixture,
 } from "./lib/clean-signal.mjs";
 import {
+	adoptFixtureProjectTrust,
 	bootstrapFixtureWorkspace,
+	fixtureTrustRefusal,
 	withScratchHome,
 } from "./lib/lsp-fixture-workspace.mjs";
 import { createProbeFixture } from "./lib/probe-fixture.mjs";
@@ -90,9 +93,17 @@ const { getLSPService, resetLSPService } = await imp(
 const { getServersForFileWithConfig, initLSPConfig } = await imp(
 	"dist/clients/lsp/config.js",
 );
+// #4615: the client stamps its normalized document key into each `[lsp-pub]`
+// row; the drainer must key the probe's fixture file the same way, or one
+// live fixture's row would attribute to another fixture of the same server.
+const { normalizeMapKey } = await imp("dist/clients/path-utils.js");
 const { SERVER_DIAGNOSTIC_STRATEGIES } = await imp(
 	"dist/clients/lsp/wait-policy/strategies.js",
 );
+// #4514: this script is a standalone host, not pi. Adopt project trust before
+// the first touch, or the launch gate refuses every project-local and
+// project-code server and the rows read as unavailable.
+await adoptFixtureProjectTrust({ repoRoot });
 let ensureTool;
 if (install) {
 	({ ensureTool } = await imp("dist/clients/installer/index.js"));
@@ -162,6 +173,7 @@ function pubLogSize() {
 
 const drainPublishTrace = createPublishTraceDrainer({
 	echoTrace: ECHO_TRACE,
+	documentPathKey: normalizeMapKey,
 	readLog(offset) {
 		const size = pubLogSize();
 		if (size === offset) return { size, read: () => null };
@@ -197,6 +209,7 @@ const probeFixture = createProbeFixture({
 	initLSPConfig,
 	getServersForFileWithConfig,
 	bootstrapFixtureWorkspace,
+	trustRefusal: () => fixtureTrustRefusal(repoRoot),
 	drainPublishTrace,
 	pubLogSize,
 	sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -284,12 +297,13 @@ const unk = rows.filter((r) => r.behavior === "unknown").length;
 // matrix footnote so a human decides whether to flip the marker. `unknown`
 // rows are never fed in (findCleanSignalDrift's per-row check guards this).
 //
-// Resolved to the same `targetLang` the matrix merge uses (clean fixture wins
-// over its dirty sibling for the same base lang — resolveTargetLangRows is
-// shared with updateMatrix below) so the console report and the footnote never
-// disagree, and so typescript's clean-fixture verdict (the authoritative
+// Resolved to the same `targetLang` the matrix merge uses (resolveTargetLangRows
+// is shared with updateMatrix below) so the console report and the footnote
+// never disagree, and so typescript's clean-fixture verdict (the authoritative
 // clean→clean observation) is what's compared, not the dirty fixture's
-// diagnostic-neutral-edit approximation.
+// diagnostic-neutral-edit approximation. #4615: that per-axis author is now
+// explicit — the clean fixture owns clean-behavior, a DIRTY sibling owns
+// first-publish (a clean file has no finding to publish).
 //
 // #558: the native-ts7 rows (typescript7/typescript7-clean) stay IN this
 // comparison (not re-excluded), but `lookupSilentOnClean` now gives them an
@@ -352,6 +366,9 @@ console.log(
 	`  unknown (slow/absent/ambiguous — conservative, not guessed):          ${unk}`,
 );
 console.log("  n/a (pull) rows are Tier 1 by protocol (#240), not probed.\n");
+// #4514: the step exits 0 by design, so the nightly's floor step reads this.
+// A pull row is answered by protocol; a push row is answered when classified.
+writeEvaluatedRecord({ producer: "probe-clean-signal", input: rows });
 // #3310 first-publish census: which push servers answer didOpen with an EMPTY
 // set before their real one. `emptyFirstPublish: "indexing"` in
 // wait-policy/strategies.ts is derived from THIS measurement, and
@@ -368,6 +385,14 @@ console.log(
 );
 console.log(
 	`  first-publish empty-only/unknown (not classifiable on this axis):      ${emptyOnly.length + rows.filter((r) => r.firstPublish === "unknown" && r.mode !== "pull").length}\n`,
+);
+// #4615: name the fixture that AUTHORED each matrix row's class, in the nightly
+// step log. `firstPublishFrom` used to reach only the tests, so a class a clean
+// fixture supplied would have been committed with nothing in the log naming it.
+// A clean fixture can no longer author the axis (producer refusal + the seam's
+// normalisation), and this line is the record that would name it if one did.
+console.log(
+	`  first-publish author: ${describeFirstPublishAuthors(resolveTargetLangRows(rows))}`,
 );
 
 // Merge classifications into docs/lsp-capability-matrix.md — MERGE, don't
@@ -387,26 +412,6 @@ try {
 } catch {}
 process.exit(0);
 
-// Resolve a `clean: true` fixture onto its base lang's row (clean fixture wins)
-// and keep only rows with at least one comparable axis. Shared by the console
-// drift report and the matrix refresh, so they never disagree (#3310). The
-// matrix writer itself stays dependency-free; this classification lives here.
-function resolveTargetLangRows(measuredRows) {
-	const measurable = measuredRows.filter(
-		(r) =>
-			MEASURED_CLEAN_BEHAVIORS.has(r.behavior) ||
-			COMPARABLE_FIRST_PUBLISH.has(r.firstPublish),
-	);
-	const byTargetLang = new Map();
-	for (const r of measurable) {
-		const targetLang = targetLangForFixture(r.lang, r.cleanFixture);
-		const prev = byTargetLang.get(targetLang);
-		if (prev && prev.cleanFixture && !r.cleanFixture) continue; // clean fixture wins
-		byTargetLang.set(targetLang, { ...r, lang: targetLang, targetLang });
-	}
-	return [...byTargetLang.values()];
-}
-
 function nameList(langs) {
 	return langs.length ? langs.join(", ") : "none";
 }
@@ -421,7 +426,7 @@ function updateMatrix(measuredRows) {
 	}
 	const text = fs.readFileSync(docPath, "utf8");
 	// #529/#541/#558 drift footnote: same targetLangRows the table merge below
-	// uses (clean fixture wins), so the footnote and the row it's about agree.
+	// uses (per-axis authors, #4615), so the footnote and the row it's about agree.
 	// NEVER a CI gate — this only rewrites a footnote section in the doc. #558:
 	// native-ts7 rows are compared too, against an explicit `false` expectation
 	// (see the drift-check comment above), not classic's marker.

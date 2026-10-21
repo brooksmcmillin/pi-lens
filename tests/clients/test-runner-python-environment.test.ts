@@ -468,11 +468,11 @@ describe("pytest project environment", () => {
 		process.env.PI_LENS_TEST_MODE = "0";
 		clearLatencyLog();
 		await flushLatencyLog();
-		const makeWorkspace = (partCount: number) => {
+		const makeWorkspace = (patternLength: number) => {
 			const workspace = createProject(false);
-			const parts = Array.from({ length: partCount }, () => "a");
-			const relative = parts.join("/");
-			const member = path.join(workspace.root, ...parts);
+			// Put the cap-sized input in the manifest, not an overlong disk path.
+			const relative = "a".repeat(patternLength);
+			const member = path.join(workspace.root, "a".repeat(100));
 			fs.mkdirSync(member, { recursive: true });
 			fs.writeFileSync(
 				path.join(member, "pyproject.toml"),
@@ -485,8 +485,8 @@ describe("pytest project environment", () => {
 			createEnvironment(path.join(workspace.root, ".venv"));
 			return { member, relative };
 		};
-		const first = makeWorkspace(708);
-		const second = makeWorkspace(709);
+		const first = makeWorkspace(20_000);
+		const second = makeWorkspace(20_001);
 
 		try {
 			await detectPythonEnvironment(first.member, os.tmpdir());

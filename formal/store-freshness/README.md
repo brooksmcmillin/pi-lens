@@ -8,7 +8,11 @@ imports (dependency axis). The `TLA+ models` CI job
 (`node scripts/check-tla-models.mjs`) checks every config here against its
 `\* expect:` line.
 
-Issues: #3503, #3504, #3505, #3573, #3574.
+Issues: #3503, #3504, #3505, #3573, #3574, #4620, #4625.
+
+`StoreRetire.tla` extends the model with what the widget store keeps once
+the gate has demoted a result (see Retirement below). The base module and its
+configs are unchanged.
 
 ## What the model covers
 
@@ -56,6 +60,7 @@ The clock is explicit, one tick is about 25 ms, and events can share a tick.
 | Store | Reference | Taken relative to the read | Gate | Config |
 |---|---|---|---|---|
 | widget-state own file, per entry (`reconcileStaleWidgetFiles`) | `observedAt` = the pipeline's `analysisReadAtMs`, passed to `recordDiagnostics` (#3503); `lsp_diagnostics`' fresh row: its `scannedAt` (#3505); `lens_diagnostics mode=full`'s fresh sweep row: the sweep's per-file read stamp, kept through the correlated commit (#3573); `pilens_analyze`: a stamp before its LSP warm-up (#3573); a confirmed active cascade touch: a stamp before the neighbor's read (#3573) | before | mtime | `WidgetOwnLateStamp`: pass. Mutant `MutWidgetOwnLateStamp` (record-time stamp): violated |
+| widget-state own file, after a stale verdict (`reconcileStaleWidgetFiles`: what the record becomes) | not a stamp: the record the verdict leaves (#4625) | | | `WidgetOwnRetain`: pass (`Retire = "retain"`). Mutants `MutWidgetOwnDropOnce` (586dd00fd) and `MutWidgetOwnDrop` (the code before #4625): violated `NoCleanAfterDemotion` |
 | widget-state dependency axis (`reconcileStaleWidgetDependencyBlockers`, and the turn-end sweep's widget rows via `getWidgetBlockingFilesForSweep`) | same `observedAt` | before | mtime | same shape as `BlockerDepLateStamp` |
 | inline blocker, import axis (`detectDrift`) | `recordedAtMs` = the pipeline's `analysisReadAtMs`, threaded through `recordInlineBlockers` (#3503) | before | mtime, latched | `BlockerDepLateStamp`: pass. Mutant `MutBlockerDepLateStamp`: violated |
 | inline blocker, own file, all-LSP | size+sha256 of the raw bytes the pipeline analysed (#3574: not of a decoded-then-re-encoded string) | at the read | content | `BlockerLspOwn`: pass, mtime regress included |
@@ -143,6 +148,12 @@ it varies with worker scheduling.
 | `MutWorkspaceOwnPullPostHocHash` (disk hash after the answer) | violated NoStaleServe | 863 | 2.5 |
 | `WorkspaceOwnPullStatBeforeLag` (fix mutant: stat before the request, no binding) | violated NoStaleServe | 2,813 | 2.6 |
 | `WorkspaceOwnCoarseSameSize` | violated NoStaleServe (admitted, #2300) | 688 | 1.6 |
+| `WidgetOwnRetain` (`StoreRetire`, #4625) | pass | 68,215 | 2.9 |
+| `MutWidgetOwnDropOnce` (`StoreRetire`: deleted, the sweeping call told once) | violated NoCleanAfterDemotion | 6,011 | 2.3 |
+| `MutWidgetOwnDrop` (`StoreRetire`: deleted, nobody told) | violated NoCleanAfterDemotion | 2,892 | 2.5 |
+
+The three `StoreRetire` rows ran with `-workers 1`, as
+`scripts/check-tla-models.mjs` runs every config (#3517).
 
 Times are from a shared 4-core host at load average 11 (review round 1); the three pull-path rows were re-run for #3505 b at load average 6.
 
@@ -168,7 +179,76 @@ excuse it.
 3. Record stats v2's mtime and size.
 4. The gate finds the stat equal to disk and serves v1.
 
+## Retirement (`StoreRetire`, #4625)
+
+`lens_diagnostics` reads the widget store, and the store's stale gate
+(`reconcileStaleWidgetFiles`) used to delete a record whose file changed
+after it was read. The model adds the record (`live`, `unfinished` or
+`gone`), two actors that run the gate over it, and a reader.
+
+- The tool's sweep runs inside a read. An observer hands that one call the
+  files the sweep just invalidated.
+- The footer's sweep (`scheduleStaleReconcile`) runs the same gate with no
+  observer, at any time between reads.
+- The reader reports only what the record says: `served` for a live
+  record, `inconclusive` for an unfinished one. A record that is gone has
+  nothing to flag, so the file reads `clean`. The `unverified` rule covers
+  a file the request names; a directory scope, or a sibling's final
+  snapshot, still prints the check mark.
+
+`Retire` is what a stale verdict leaves behind:
+
+| `Retire` | The code | Config |
+|---|---|---|
+| `"drop"` | deleted, nobody told: the code before #4625 | `MutWidgetOwnDrop` |
+| `"dropOnce"` | deleted, the sweeping call told through its observer: #4625 at 586dd00fd | `MutWidgetOwnDropOnce` |
+| `"retain"` | kept as unfinished evidence: `hasFinalDiagnosticsSnapshot = false`, only the findings still current stay, `touchedAt` moved to the sweep and never before the file's mtime | `WidgetOwnRetain` |
+
+`NoCleanAfterDemotion`: once the gate has demoted the result, no read says
+`clean`. `WidgetOwnRetain` also checks `NoStaleServeBeyondTol`, so the
+extension keeps the base module's promise. The two mutants are the
+non-vacuity witnesses: the same gate constants reach a demotion, and only the
+retained record keeps it from reading clean.
+
+**One read only** (`MutWidgetOwnDropOnce`, the shortest trace TLC finds):
+
+1. Start, a write lands after the reference, Read, Record.
+2. The tool's sweep demotes the result and deletes the record. Its observer
+   makes this one read answer `inconclusive`.
+3. A second read finds no record and answers `clean`.
+
+**Footer first** (`MutWidgetOwnDropOnce`, the same depth): the footer's sweep
+takes step 2, with no observer, so the first read never hears of the change
+and answers `clean`. TLC reaches `rec = "gone"` with no report through
+`FooterSweep` alone.
+
+Replays: `tests/tools/lens-diagnostics-session-evidence.test.ts` ("stays
+inconclusive on a second read that rescans nothing" and "stays inconclusive
+when the footer's observer-less sweep ran first") drive both traces through
+the built tool and the real widget store; `tests/clients/widget-state.test.ts`
+("keeps the record unfinished, reports it once, ...") drives the record.
+`formal/switch-pins.json` pins `Retire = "retain"` to those tests.
+
 ## Scope and limits
+
+- `StoreRetire`: a run has one computation, so the two ends of an
+  unfinished record are not modelled. A fresh snapshot (`commitDiagnostics`
+  sets the final flag again) is pinned by the vitest case "stays inconclusive
+  until a fresh final snapshot replaces the evidence". The store's idle
+  eviction (a record idle for 30 minutes, once the store holds more than
+  1,024 file records) retires the mark too: that is the store's existing rule, no timer was
+  added for it, and the vitest case "is retired by idle eviction counted
+  from the sweep" pins that the idle window starts at the sweep. A retained
+  record that still holds errors or warnings is the exception: like a final
+  snapshot's findings it stays, and the footer draws it, so the findings the
+  header counts stay visible ("keeps a retained record that holds findings
+  through idle eviction", "draws the findings a partial prune kept, ...").
+- `StoreRetire`: a file that is gone from disk still drops its record,
+  which the model does not reach (X is only written). `dropStaleFiles`
+  (resume) deletes a persisted record whose file changed between sessions;
+  that file reads `unverified` when the request names it, and a directory
+  scope reads it like any file the session never diagnosed (an accepted
+  residual of #4625).
 
 - One input file per config. A result with many dependencies is the union
   of per-dependency configs, because the gates check each file
@@ -205,3 +285,19 @@ excuse it.
   (`WorkspaceOwnCoarseSameSize`, #2300).
 - `BlockerLspOwn` runs with two writes in six ticks (three in eight in the
   investigation, 957k states) to fit the CI budget.
+
+## #4541 mtime-only drift
+
+`WorkspaceOwnTouchBound.cfg` models the current pull binding with `Gate =
+"eqTouch"`: size still gates, and mtime drift is waived only by a matching
+hash bound to the diagnosed text. `WorkspaceOwnTouchUnbound.cfg` models the
+per-file path with no binding: mtime drift still refuses it.
+`MutWorkspaceOwnTouchPostHocHash.cfg` replaces the sent-text binding with a
+post-answer disk hash and must violate `NoStaleServe`. These three configs
+have not been run in the round-3 sandbox (Java is absent); their expected
+results are obligations for the host, not measured results.
+
+The writer is `recordSentContent` in `clients/lsp/client.ts`; the full pull
+answer accepts its hash only when the reported version matches. The sweep
+threads that hash into `record`, never a post-answer disk hash. Existing
+`eq` configs remain as the historical strict-stat gate and its counterexamples.

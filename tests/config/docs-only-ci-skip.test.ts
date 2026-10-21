@@ -40,7 +40,7 @@ const asList = (needs: Job["needs"]) =>
 
 type Ctx = {
 	event: string;
-	changes: { code: string; formal: string };
+	changes: { code: string; formal: string; smoke?: string };
 	results: Record<string, string>;
 	outputs: Record<string, Record<string, string>>;
 	matrixOs?: string;
@@ -149,7 +149,7 @@ function simulate(
 							.split("\n")
 							.map((l) => l.split("=")),
 					)
-		) as { code: string; formal: string };
+		) as { code: string; formal: string; smoke?: string };
 		const results: Record<string, string> = changesFails
 			? { changes: "failure" }
 			: {};
@@ -230,13 +230,16 @@ const DOCS_ONLY = [
 	"README.md",
 	".changelog/3801-x.md",
 ];
-// The jobs behind `heavy-gate`: advisory, and the only jobs a docs-only diff skips.
-const HEAVY_ADVISORY = ["heavy-gate", "unit-tests-windows", "codeql"];
+// The jobs behind `heavy-gate`: advisory, and the only jobs a docs-only diff
+// skips. #4518 promoted the Windows Vitest subset to a gating check, so it left
+// this list: a required row that a docs-only diff skips is absent, not passing.
+const HEAVY_ADVISORY = ["heavy-gate", "codeql"];
 // Every test-running job: a docs edit can red these (review r1 F2), so a
 // docs-only diff runs ALL of them.
 const TEST_JOBS = [
 	"test",
 	"unit-tests",
+	"unit-tests-windows",
 	"install-test",
 	"prod-install-build",
 	"targeted-tests-advisory",
@@ -248,7 +251,7 @@ const TEST_JOBS = [
 describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () => {
 	it("skips the heavy advisory jobs for a docs-only diff and runs every test job", () => {
 		const { changes, results } = simulate("pull_request", DOCS_ONLY);
-		expect(changes).toEqual({ code: "false", formal: "false" });
+		expect(changes).toEqual({ code: "false", formal: "false", smoke: "false" });
 		for (const id of HEAVY_ADVISORY) expect(results[id], id).toBe("skipped");
 		for (const id of [
 			"changes",
@@ -301,7 +304,7 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 			docs.changes,
 			docs.results,
 		);
-		expect(docsSteps["ubuntu-latest"]).toHaveLength(total - 1); // the macOS-only APFS step
+		expect(docsSteps["ubuntu-latest"]).toHaveLength(total - 2); // the macOS-only APFS step and its evaluated floor (#4518)
 		expect(docsSteps["macos-latest"]).toHaveLength(total);
 	});
 
@@ -327,11 +330,10 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 		"runs the full suite for a %s event even for a docs-only file list",
 		(event) => {
 			const { changes, results } = simulate(event, DOCS_ONLY);
-			expect(changes).toEqual({ code: "true", formal: "true" });
+			expect(changes).toEqual({ code: "true", formal: "true", smoke: "true" });
 			for (const id of [
 				...TEST_JOBS.filter((id) => id !== "targeted-tests-advisory"),
 				"heavy-gate",
-				"unit-tests-windows",
 			]) {
 				expect(results[id], id).toBe("success");
 			}

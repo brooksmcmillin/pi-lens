@@ -1,7 +1,16 @@
+import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
+import {
+	blankMarkdown,
+	blankHtmlComments,
+	HEADING,
+	parseDefectShapes,
+	sourceWithoutFencedBlocks,
+} from "./lib/defect-shapes.mjs";
+import { githubGet } from "./lib/github-rest.mjs";
 import {
 	changedHookAnchors,
 	evaluateTlaCoverage,
@@ -11,7 +20,7 @@ import {
 } from "./lib/tla-coverage.mjs";
 import { evaluateWorkflowRunEvidence } from "./lib/workflow-run-evidence.mjs";
 import {
-	INVALID_CLOSE_KEYWORD_MESSAGE,
+	closeKeywordErrors,
 	closeKeywordPlacementMessage,
 	lintCloseKeywordPlacement,
 	lintCloseKeywords,
@@ -38,11 +47,16 @@ const REQUIRED_SECTIONS = [
 	"Class sweep",
 	"Observability",
 ];
-const HEADING = /^#{2,4}\s+(.+?)\s*$/;
+// The PR footer the template requires (.github/PULL_REQUEST_TEMPLATE.md).
+const GENERATED_FOOTER =
+	/^🤖 Generated with \[Claude Code\]\(https:\/\/claude\.com\/claude-code\)$/;
 const FLATTENED_BODY_MAX_NEWLINES = 2;
 // One post-image read bound, shared by the git and working-tree branches of
 // `headFileSource`: a file-count bound alone is not a byte bound.
 const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
+// The unclassifiable-post-image notice names at most this many files, then the
+// remainder as a count (#4585 row classification is an agent-facing surface).
+const UNCLASSIFIED_REPORT_LIMIT = 5;
 const REPAIR_HEADINGS = [
 	"Why",
 	"Notes for the reviewer",
@@ -90,6 +104,7 @@ const SECTION_SYNONYMS = new Map([
 	["verification", "tests"],
 	["blast radius", "blast radius"],
 	["class sweep", "class sweep"],
+	["behavior equivalence", "behavior equivalence"],
 	["observability", "observability"],
 	["test assessment", "test assessment"],
 	// #4288: required only when the PR closes a bug-labelled issue, so it stays
@@ -112,62 +127,6 @@ function hasSection(heading, section) {
 	return Array.isArray(heading?.section)
 		? heading.section.includes(section)
 		: heading?.section === section;
-}
-
-// Fenced (``` / ~~~) and 4-space indented code blocks are stripped, so a quoted
-// example cannot satisfy a body section (#4288 R3). An indented block cannot
-// interrupt a paragraph (CommonMark), so a 4-space line that follows body text
-// stays: list continuations and nested bullets are content, not code. The
-// closing fence must repeat the opener's character (>=3 of them).
-function sourceWithoutFencedBlocks(source) {
-	const lines = String(source ?? "").split(/\r?\n/);
-	const output = [];
-	let fenceChar = null;
-	let fenceLength = 0;
-	let inIndented = false;
-	// "start" | "blank" | "heading" | "text": whether the previous emitted
-	// line can precede an indented code block.
-	let previous = "start";
-	for (const line of lines) {
-		if (fenceChar) {
-			const close = new RegExp(`^\\s*\\${fenceChar}{${fenceLength},}\\s*$`);
-			if (close.test(line)) {
-				fenceChar = null;
-				fenceLength = 0;
-			}
-			output.push("");
-			continue;
-		}
-		const open = /^\s*(`{3,}|~{3,})/.exec(line);
-		if (open) {
-			fenceChar = open[1][0];
-			fenceLength = open[1].length;
-			inIndented = false;
-			output.push("");
-			previous = "blank";
-			continue;
-		}
-		if (/^(?: {4,}|\t)/.test(line)) {
-			if (
-				inIndented ||
-				previous === "start" ||
-				previous === "blank" ||
-				previous === "heading"
-			) {
-				inIndented = true;
-				output.push("");
-				continue;
-			}
-		} else {
-			inIndented = false;
-		}
-		output.push(line);
-		const trimmed = line.trim();
-		if (trimmed === "") previous = "blank";
-		else if (HEADING.test(line)) previous = "heading";
-		else previous = "text";
-	}
-	return output.join("\n");
 }
 
 function templatePlaceholderLines() {
@@ -483,6 +442,10 @@ export function parseRuntimeHunks(diff) {
 				added: new Map(),
 				deletedAfter: new Set(),
 				removed: [],
+				// The diff states a whole-file removal explicitly. It is the one
+				// post-image state that needs no read: there is nothing to classify
+				// (#4605 V2).
+				deletedFile: false,
 			};
 			files.push(current);
 			inHunk = false;
@@ -490,6 +453,8 @@ export function parseRuntimeHunks(diff) {
 		}
 		if (!current) continue;
 		if (!inHunk) {
+			if (line.startsWith("deleted file mode ") || line === "+++ /dev/null")
+				current.deletedFile = true;
 			const rename = /^rename to (.+)$/.exec(line);
 			if (rename) {
 				current.post = unquoteGitPath(rename[1]);
@@ -645,13 +610,17 @@ function lineAt(source, index) {
 
 // Index of the `)` closing the `(` at `open`, over comment- and
 // string-blanked text; -1 when the call runs past the end of the source.
-function closeParenIndex(blanked, open) {
+function closeBracketIndex(blanked, open, opener = "(", closer = ")") {
 	let depth = 0;
 	for (let index = open; index < blanked.length; index++) {
-		if (blanked[index] === "(") depth++;
-		else if (blanked[index] === ")" && --depth === 0) return index;
+		if (blanked[index] === opener) depth++;
+		else if (blanked[index] === closer && --depth === 0) return index;
 	}
 	return -1;
+}
+
+function closeParenIndex(blanked, open) {
+	return closeBracketIndex(blanked, open);
 }
 
 function recordLocationsFromRuntimeSource(source, blankedText) {
@@ -661,9 +630,10 @@ function recordLocationsFromRuntimeSource(source, blankedText) {
 	// source itself, so a record's span still maps back to the diff's added
 	// POST-image lines.
 	const blanked = blankedText ?? blankCommentsAndStrings(source).text;
-	const push = (value, valueIndex, start, end) =>
+	const push = (value, valueIndex, start, end, field) =>
 		records.push({
 			value,
+			field,
 			line: lineAt(source, valueIndex),
 			startLine: lineAt(source, start),
 			endLine: lineAt(source, end),
@@ -713,6 +683,7 @@ function recordLocationsFromRuntimeSource(source, blankedText) {
 						match.index + fieldMatch.index + fieldMatch[0].indexOf(value),
 						match.index,
 						match.index + match[0].length,
+						field,
 					);
 			}
 		}
@@ -733,6 +704,7 @@ function recordLocationsFromRuntimeSource(source, blankedText) {
 				open + 1 + phase.index + phase[0].indexOf(phase[2]),
 				match.index,
 				end,
+				"phase",
 			);
 		const ledgerKind = /\bledgerKind\s*:\s*["']([^"']+)["']/.exec(call);
 		if (ledgerKind)
@@ -741,6 +713,7 @@ function recordLocationsFromRuntimeSource(source, blankedText) {
 				open + 1 + ledgerKind.index + ledgerKind[0].indexOf(ledgerKind[1]),
 				match.index,
 				end,
+				"kind",
 			);
 	}
 	return records;
@@ -973,24 +946,34 @@ export function testCorpus(options = {}) {
 	return corpus;
 }
 
-function markdownBlocks(body) {
+// `tilde` reads CommonMark's `~~~` fences too. The citation and test-reference
+// lints keep the backtick-only view on purpose (master's behavior, pinned by
+// the "nested bullets and tilde fences" case), while the diff-keyed compliance
+// rows read every fence a reader sees (#4605 F5).
+function markdownBlocks(body, { tilde = false } = {}) {
 	const lines = String(body ?? "").split(/\r?\n/);
 	const blocks = [];
 	let current = null;
 	let fence = null;
+	const fenceMarker = tilde ? /^\s*(`{3,}|~{3,})/ : /^\s*(`{3,})/;
 	const flush = () => {
 		if (current?.lines.length) blocks.push(current);
 		current = null;
 	};
 	for (let index = 0; index < lines.length; index += 1) {
 		const line = lines[index];
-		const marker = line.match(/^\s*(```+)/)?.[1];
+		const marker = fenceMarker.exec(line)?.[1];
 		if (marker || fence) {
 			if (marker && !fence && current && current.lines.length) flush();
 			if (!current) current = { lines: [], start: index, fence: true };
 			current.lines.push(line);
 			if (marker && !fence) fence = marker;
-			else if (fence && marker && marker.length >= fence.length) {
+			else if (
+				fence &&
+				marker &&
+				marker[0] === fence[0] &&
+				marker.length >= fence.length
+			) {
 				fence = null;
 				flush();
 			}
@@ -1163,6 +1146,31 @@ function sourceQuoteAfter(lines, bodyLine) {
 	if (end === -1) return null;
 	const text = lines.slice(index + 1, end).filter((row) => row.trim());
 	return { end, info: opener[2].trim(), text };
+}
+
+// A transcript fence is tagged with one of the output info strings or left
+// bare: an author who pastes a red into an untagged fence has still quoted it,
+// and requiring a tag is an enumerated detector that misses the next spelling.
+// A named language (`typescript`, `json`) marks an example, not a run.
+const TRANSCRIPT_INFO = /^(?:(?:text|console|shell|sh|bash|output))?$/i;
+// #4585 row 1: what makes a fence a red. A Vitest failure list (`× title`, with
+// or without a run prefix) and a count (`2 failed`) are as much a quoted red as
+// `FAIL` or an assertion dump.
+const FAILURE_MARKER =
+	/\b(?:[1-9]\d* failed|AssertionError|failed test titles|error TS\d+)\b|^\s*FAIL\b|[×✗✕]\s+\S/m;
+// A red a body quotes inline, in a backticked span (a mutation table's cell).
+const BACKTICKED_RED =
+	/`[^`]*(?:[×✗✕]\s+\S|[1-9]\d* failed|AssertionError|failed test titles|error TS\d+)[^`]*`/;
+
+/** One visible fence that quotes a failing run of its own. */
+function isFailureQuote(quote) {
+	const text = quote.text.join("\n");
+	if (!TRANSCRIPT_INFO.test(quote.info)) return false;
+	// A declared exit code decides the verdict: a green mutation run quotes no
+	// red, whatever its titles still print.
+	const exit = /exit code: (\d+)/.exec(text);
+	if (exit?.[1] === "0") return false;
+	return FAILURE_MARKER.test(text);
 }
 
 function isTranscriptQuote(quote) {
@@ -1550,6 +1558,1076 @@ function hasNoRecordReason(content, files) {
 	);
 }
 
+// --- #4597: a named record must be read back by a test ---------------------
+//
+// `docs/pi-lens-fixer.md:117` requires every record the `## Observability`
+// section names to be asserted by a test, and nothing checked it: the audit of
+// the 53 `fix` PRs merged 2026-10-11..2026-10-18 found 3 of 29 record-naming
+// bodies whose record no test reads (`cascade_pending_rendered`,
+// `blocker-position-unaligned`, and #4527's `savedServerIds` claim). The rule
+// is its own function with one call site, beside `lintRuntimeObservability`
+// (which asks whether a record was named at all), so the diff-keyed rules of
+// #4585 land next to it without either change touching the other.
+//
+// What counts as naming a record: a token of the section with a record's shape
+// that the runtime actually emits as a record value, whatever its font — a
+// backticked span, a bare word, or the text of a link (F-4597-R2-2). A
+// camelCase symbol, a path, a command and a one-word value fail the shape. The
+// registry, not the body's formatting, decides: the harvest reads the call
+// sites `recordLocationsFromRuntimeSource` names (the
+// `logLatency`/`logCascade`/`logBusEvent`/`emitBounded` object forms, the
+// ledger's Once/Count/`recordDegradation` kinds, and `summary.push`), so a
+// record written through another wrapper — `logReviewGraph`, `logTreeSitter`,
+// the `logActionableWarningsEvent` NDJSON row — is outside this rule until that
+// wrapper joins the harvest (#3168's `logCascade` precedent). A one-word record
+// value (a bare `autofix`) fails the two-segment shape on purpose, so it stays
+// outside the rule even where a sink emits it.
+const RECORD_LITERAL_SPAN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/;
+// A bare mention is read against the fields that identify a record, because a
+// bare two-segment compound is also ordinary prose: `ast-grep`, `project-trust`
+// and `file-mutation-queue` are `subsystem`/`message` values, not record
+// identities. A backticked span is an explicit naming and is read against every
+// harvested field, as it was in round 2.
+const RECORD_IDENTITY_FIELDS = new Set([
+	"phase",
+	"kind",
+	"event",
+	"eventName",
+	"outcome",
+]);
+// The bare spelling's token: the same shape, as its own word of the section.
+const RECORD_TOKEN = /(?<![\w$])[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+(?![\w$])/g;
+// One lint sends at most this many needles to `git grep`. A section that
+// exceeds it is disclosed (`::warning::`) rather than silently half-checked.
+const MAX_RECORD_MENTIONS = 400;
+// Where a read-back may live (#4597 review round 1: F1, F2, F3; round 2:
+// F-4597-R2-1). The rule names the ONE form it admits and refuses everything
+// else, so it never enumerates the bypasses it rejects (shape 69):
+//
+//   an exact occurrence of the literal — as a string inside an assertion
+//   expression, an equality operand, a `case` label, a record-keyed object
+//   literal, or a containment predicate's argument, or as the identifier the
+//   test spells — in the body of a declaration vitest collects and runs.
+//
+// A test or suite title is not a body position, any other call argument is a
+// mention, and a declaration whose modifier the rule cannot prove runs
+// (`.skip`, `.todo`, `.skipIf`, a plugin's extension) contributes nothing. A
+// position no declaration encloses is not a read position either: "this file
+// holds a live test somewhere" was a guess that admitted a dead body.
+
+const COMPARISON_BEFORE = /(?:===|!==|==|!=)\s*$/;
+const COMPARISON_AFTER = /^\s*(?:===|!==|==|!=)/;
+const CASE_LABEL_BEFORE = /\bcase\s+$/;
+// The record key a caller writes: the discriminators the harvest reads at its
+// call sites (`phase`, `event`, `eventName`, `kind`, `outcome`).
+const RECORD_KEY_BEFORE = /\b(?:phase|event|eventName|kind|outcome)\s*:\s*$/;
+const CONTAINMENT_CALL_BEFORE =
+	/\.\s*(?:includes|contains|match|matchAll|startsWith|endsWith|indexOf|lastIndexOf|has|some|every|filter|find)\s*\(\s*$/;
+
+// The trees `recordLocationsFromRuntimeSource` harvests from (AGENTS.md's
+// runtime observability paths; `scripts/` records are CI annotations, not
+// ledger or NDJSON rows, so they carry no harvestable literal).
+const RUNTIME_OBSERVABILITY_ROOTS = ["clients", "tools", "mcp", "index.ts"];
+// A test source. `tests/fixtures/ci-pr-bodies/*.md` are bodies under test, not
+// evidence, and a non-source file cannot be lexed as one.
+const TEST_SOURCE_FILE = /\.(?:[cm]?[jt]sx?)$/;
+
+/**
+ * The span of the call chain that starts at the identifier at `index`:
+ * `expect(...)`, `expect.soft(...).toBe(...)`, `assert.equal(...)`,
+ * `it.each([...])("title", fn)`, `it["only"]("title", fn)`. Blanked text has
+ * no string or comment bracket, so every paren read here is code, and a `[...]`
+ * link resolves through the lexer's own string spans. `null` when the chain
+ * reaches no argument list (a bare identifier, `expect.only`, `it.todo`).
+ * `unproven` reports a link this reader cannot resolve (`it[modifier]`): the
+ * declaration rule refuses that form whole instead of guessing.
+ */
+function callChainAt(code, index, strings = []) {
+	if (!/[A-Za-z_$]/.test(code[index] ?? "")) return null;
+	let cursor = index;
+	while (/[$\w]/.test(code[cursor] ?? "")) cursor += 1;
+	const links = [];
+	let calls = 0;
+	let lastOpen = -1;
+	let lastClose = -1;
+	let unproven = false;
+	for (;;) {
+		const at = skipSpaces(code, cursor);
+		if (code[at] === ".") {
+			MEMBER_LINK.lastIndex = at;
+			const link = MEMBER_LINK.exec(code);
+			if (!link) break;
+			links.push(link[1]);
+			cursor = at + link[0].length;
+			continue;
+		}
+		if (code[at] === "[") {
+			const link = bracketLinkAt(code, at, strings);
+			if (link) {
+				links.push(link.name);
+				cursor = link.end;
+				continue;
+			}
+			// An index this reader cannot resolve (`it[modifier]`) is a declaration
+			// it cannot follow only when the chain goes on to a call; `test[key] !==`
+			// is a value, not a declaration form.
+			const close = closeBracketIndex(code, at, "[", "]");
+			if (
+				close !== -1 &&
+				/[.([<]/.test(code[skipSpaces(code, close + 1)] ?? "")
+			)
+				unproven = true;
+			break;
+		}
+		if (code[at] === "<") {
+			// A generic argument list (`it.each<NodeJS.Platform>([...])`) is part
+			// of the chain; one this reader cannot close is an unmodelled form.
+			const close = angleSpanEnd(code, at);
+			if (close === -1) {
+				unproven = true;
+				break;
+			}
+			cursor = close + 1;
+			continue;
+		}
+		if (code[at] !== "(") break;
+		const close = closeParenIndex(code, at);
+		// A call this reader cannot close (an unbalanced file) is not a
+		// declaration form it misread: the chain simply ends here.
+		if (close === -1) break;
+		lastOpen = at;
+		lastClose = close;
+		calls += 1;
+		cursor = close + 1;
+	}
+	if (!calls && !unproven) return null;
+	return {
+		start: index,
+		end: lastClose + 1,
+		links,
+		lastOpen,
+		lastClose,
+		calls,
+		unproven,
+	};
+}
+
+/**
+ * Whether the text after a declaration name begins a declaration this reader
+ * cannot parse at all: an optional call (`it?.(…)`, `it!.(…)`). Every other
+ * attempt (`it[...]`, `it <T>`, `it(…)`) is resolved by `callChainAt`, and a
+ * value (`test:`, `test,`, `test?.name`, `describe.skip`) holds no body.
+ */
+function declarationAttemptAt(code, from) {
+	const at = skipSpaces(code, from);
+	const char = code[at] ?? "";
+	if ((char === "?" || char === "!") && code[at + 1] === ".")
+		return code[skipSpaces(code, at + 2)] === "(";
+	return false;
+}
+
+/**
+ * The member link a `[...]` holds: `it["skip"]`, `it['each']`, `` it[`for`] ``.
+ * The blanker replaces every string with spaces, so the link's name comes from
+ * the lexer's own span and an index that is anything else (a variable, an
+ * expression, a template with a hole) resolves to nothing.
+ */
+function bracketLinkAt(code, open, strings) {
+	const close = closeBracketIndex(code, open, "[", "]");
+	if (close === -1) return null;
+	if (code.slice(open + 1, close).trim() !== "") return null;
+	const string = strings.find((one) => one.start > open && one.end <= close);
+	const name = string?.text.trim() ?? "";
+	if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+	return { name, end: close + 1 };
+}
+
+const MEMBER_LINK = /\.[ \t\r\n]*([A-Za-z_$][\w$]*)/y;
+
+/** The index of the `>` closing the `<` at `open`, or -1 when there is none. */
+function angleSpanEnd(code, open) {
+	let depth = 0;
+	for (let index = open; index < code.length; index += 1) {
+		const char = code[index];
+		// A function type's arrow is not a closing angle (`<(a) => void>`).
+		if (char === "=" && code[index + 1] === ">") {
+			index += 1;
+			continue;
+		}
+		if (char === "<") depth += 1;
+		else if (char === ">") {
+			if (--depth === 0) return index;
+		} else if (char === ";" || char === "{" || char === "}") return -1;
+	}
+	return -1;
+}
+
+function skipSpaces(code, index) {
+	let cursor = index;
+	while (cursor < code.length && /\s/.test(code[cursor])) cursor += 1;
+	return cursor;
+}
+
+/// The declarations whose body vitest runs, and the links that keep them live.
+// `LIVE_TEST_LINKS` is an allowlist: a link it does not name (`.skip`,
+// `.todo`, `.skipIf`, `.runIf`, a plugin extension) is a declaration the rule
+// cannot prove runs, so its assertions are refused. A hook takes no link.
+// A `[...]` link (`it["only"]`) is a member link like any other, and a name
+// bound to a declaration (`const t = it`, `const d = it.skipIf(cond)`) is an
+// alias that carries the links its chain already applied.
+const TEST_HOOKS = new Set([
+	"beforeEach",
+	"beforeAll",
+	"afterEach",
+	"afterAll",
+]);
+const DECLARATION_NAMES = new Set([
+	"describe",
+	"suite",
+	"it",
+	"test",
+	...TEST_HOOKS,
+]);
+const LIVE_TEST_LINKS = new Set([
+	"only",
+	"concurrent",
+	"sequential",
+	"each",
+	"for",
+	"fails",
+	"live",
+]);
+
+// The two vocabulary patterns below escape their own names inline: a named or
+// arrow-body helper here would be a second copy of `escapeRegExp`, which
+// `tests/config/escape-regexp-fold-sweep.test.ts` forbids outside
+// `clients/string-utils.ts` (and this script cannot import, because it runs
+// with no build). The sweep's header allows the inline expression.
+
+/**
+ * The ranges of `import` statements. An import specifier names the declaration
+ * without starting one (`import { it } from "vitest"`), so the declaration scan
+ * skips it; a dynamic `import(...)` is an expression and is left alone.
+ */
+function importStatementRanges(code) {
+	const ranges = [];
+	for (const match of code.matchAll(/\bimport\b/g)) {
+		const before = code[match.index - 1] ?? " ";
+		if (before === "." || /[$\w]/.test(before)) continue;
+		const at = skipSpaces(code, match.index + match[0].length);
+		if (code[at] === "(" || code[at] === ".") continue;
+		let depth = 0;
+		for (let index = at; index < code.length; index += 1) {
+			const char = code[index];
+			if (char === "(" || char === "[" || char === "{") depth += 1;
+			else if (char === ")" || char === "]" || char === "}") depth -= 1;
+			else if ((char === ";" || char === "\n") && depth <= 0) {
+				ranges.push([match.index, index]);
+				break;
+			}
+		}
+	}
+	return ranges;
+}
+
+// A binding of a declaration name to another name, and the name it binds.
+const BINDING_BEFORE = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*$/;
+// The alias's own declaration site (`const t = it`): a name being bound, not a
+// declaration used as a value.
+const BINDING_TARGET_BEFORE = /\b(?:const|let|var)\s+$/;
+// A declaration name destructured into other bindings (`const { skip } = it`)
+// hides a declaration behind a binding this reader cannot follow.
+const DESTRUCTURE_BEFORE = /\b(?:const|let|var)\s*\{[^{}]*\}\s*=\s*$/;
+
+/**
+ * The names that alias a test declaration, with the links the alias already
+ * carries (`const d = it.skipIf(cond)` binds `.skipIf`). A bare alias
+ * (`const t = it`) is resolved once its own target is known, so an alias of an
+ * alias lands too. A binding this reader cannot follow is reported `unproven`.
+ */
+function declarationAliases(code, strings) {
+	const aliases = new Map();
+	let unproven = false;
+	const bindings = [
+		...code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/g),
+	].map((match) => ({
+		name: match[1],
+		at: match.index + match[0].length,
+	}));
+	for (let changed = true; changed;) {
+		changed = false;
+		for (const { name, at } of bindings) {
+			if (DECLARATION_NAMES.has(name) || aliases.has(name)) continue;
+			const target = /^([A-Za-z_$][\w$]*)/.exec(code.slice(at))?.[1];
+			const carried = DECLARATION_NAMES.has(target ?? "")
+				? []
+				: aliases.get(target ?? "")?.links;
+			if (carried === undefined) continue;
+			const chain = callChainAt(code, at, strings);
+			if (chain?.unproven) {
+				unproven = true;
+				continue;
+			}
+			aliases.set(name, {
+				links: [...carried, ...(chain?.links ?? [])],
+			});
+			changed = true;
+		}
+	}
+	return { aliases, unproven };
+}
+
+/**
+ * Every test-family declaration in a lexed file, with the span its body lives
+ * in. The title and the callee chain sit before `bodyStart`, so nothing there
+ * can ever read as a read-back: `it("<record>", …)` is a name, not an
+ * assertion. `unproven` says the file writes a declaration in a form this
+ * reader cannot classify, which makes the whole file contribute nothing
+ * (F-4597-R2-1): the rule never falls back to guessing.
+ */
+function declarationScopes(code, strings = []) {
+	const { aliases, unproven: aliasUnproven } = declarationAliases(
+		code,
+		strings,
+	);
+	const alternatives = [];
+	for (const name of [...DECLARATION_NAMES, ...aliases.keys()])
+		alternatives.push(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+	const declarationName = new RegExp(
+		`\\b(?:${alternatives.join("|")})\\b`,
+		"g",
+	);
+	const imports = importStatementRanges(code);
+	const scopes = [];
+	let unproven = aliasUnproven;
+	for (const match of code.matchAll(declarationName)) {
+		const before = code[match.index - 1] ?? " ";
+		if (before === "." || /[$\w]/.test(before)) continue;
+		if (
+			imports.some(([start, end]) => match.index > start && match.index < end)
+		)
+			continue;
+		const name = match[0];
+		const chain = callChainAt(code, match.index, strings);
+		if (!chain) {
+			// A declaration name bound to another name is the alias pass's business
+			// and a bare value (`test:`, `test,`, `describe.skip` as a value) holds
+			// no declaration body, so neither can hide one. A name followed by a
+			// declaration bracket, a generic list or an optional call IS an attempt
+			// this reader cannot resolve: the file is unprovable (F-4597-R2-1).
+			const before = code.slice(Math.max(0, match.index - 96), match.index);
+			if (
+				BINDING_BEFORE.test(before) ||
+				BINDING_TARGET_BEFORE.test(before.slice(-32))
+			)
+				continue;
+			if (declarationAttemptAt(code, match.index + name.length))
+				unproven = true;
+			if (DESTRUCTURE_BEFORE.test(before)) unproven = true;
+			continue;
+		}
+		if (chain.unproven) {
+			unproven = true;
+			continue;
+		}
+		const links = [...(aliases.get(name)?.links ?? []), ...chain.links];
+		const hook = TEST_HOOKS.has(name);
+		const live = hook
+			? links.length === 0
+			: links.every((link) => LIVE_TEST_LINKS.has(link));
+		scopes.push({
+			start: chain.start,
+			end: chain.end,
+			kind: hook
+				? "hook"
+				: name === "describe" || name === "suite"
+					? "suite"
+					: "test",
+			live,
+			bodyStart: hook
+				? chain.lastOpen
+				: firstArgumentEnd(code, chain.lastOpen, chain.lastClose),
+			bodyEnd: chain.lastClose,
+		});
+	}
+	return { scopes, unproven };
+}
+
+/** Index of the first top-level `,` inside a call's arguments, or `null`. */
+function firstArgumentEnd(code, open, close) {
+	let depth = 0;
+	for (let index = open + 1; index < close; index++) {
+		const char = code[index];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") depth -= 1;
+		else if (char === "," && depth === 0) return index;
+	}
+	return null;
+}
+
+/**
+ * Whether a position is where this file's tests can read a record: in the body
+ * of a declaration vitest runs, never in the callee chain or the title of one
+ * (a title is a name, not an assertion), and never inside a declaration the
+ * rule cannot prove runs — a `describe.skip` refuses everything under it. A
+ * position no declaration encloses is not a read position: the rule reads
+ * positions, not dataflow, and "the file holds a live test" admitted a dead
+ * helper's body (F-4597-R2-1).
+ */
+function isReadPosition(scopes, position) {
+	let inBody = false;
+	let inDead = false;
+	for (const scope of scopes) {
+		if (position < scope.start || position >= scope.end) continue;
+		if (!scope.live) {
+			inDead = true;
+			continue;
+		}
+		if (
+			scope.bodyStart !== null &&
+			position > scope.bodyStart &&
+			position < scope.bodyEnd
+		)
+			inBody = true;
+	}
+	return inBody && !inDead;
+}
+
+/** The index of the `;` that ends the statement starting at `from`, or -1. */
+function statementEnd(code, from) {
+	let depth = 0;
+	for (let index = from; index < code.length; index += 1) {
+		const char = code[index];
+		if (char === "(" || char === "[" || char === "{") depth += 1;
+		else if (char === ")" || char === "]" || char === "}") {
+			if (depth === 0) return -1;
+			depth -= 1;
+		} else if (char === ";" && depth === 0) return index;
+	}
+	return -1;
+}
+
+/**
+ * The name of the module-scope function that encloses `position`, or null:
+ * `function NAME(…) { … }`, `const NAME = (…) => { … }`, `const NAME =
+ * function (…) { … }`, and a concise arrow (`const NAME = () => rows(…);`),
+ * whose statement is the body. A declaration whose brace comes after its own
+ * `;` is not a helper this reader can name.
+ */
+function enclosingHelperName(code, position) {
+	const candidates = [];
+	const add = (name, from) => {
+		const brace = code.indexOf("{", from);
+		if (
+			brace !== -1 &&
+			brace < position &&
+			!code.slice(from, brace).includes(";")
+		) {
+			const close = closeBracketIndex(code, brace, "{", "}");
+			if (close >= position) {
+				candidates.push({ name, at: from });
+				return;
+			}
+		}
+		const end = statementEnd(code, from);
+		if (end >= position) candidates.push({ name, at: from });
+	};
+	for (const match of code.matchAll(
+		/(?<![.$\w])function\s+([A-Za-z_$][\w$]*)\s*\(/g,
+	))
+		add(match[1], match.index);
+	for (const match of code.matchAll(
+		/(?<![.$\w])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^()]*\)\s*=>|function\b|[A-Za-z_$][\w$]*\s*=>)/g,
+	))
+		add(match[1], match.index);
+	if (!candidates.length) return null;
+	// The innermost helper is the one whose body holds the position.
+	candidates.sort((left, right) => right.at - left.at);
+	return candidates[0].name;
+}
+
+/**
+ * Whether a position no declaration encloses is still a read-back: it sits in a
+ * named module-scope helper that a live declaration calls. That is the shape
+ * most of this repository's read-backs use (`function availabilityRows() { …
+ * phase === "<record>" }`, called from a test body), and it is evidence, not
+ * the round-2 guess "this file holds a live test somewhere": the helper's own
+ * name has to appear as a call in a live body (F-4597-R2-1).
+ */
+function helperReadPosition(code, scopes, position) {
+	if (scopes.some((scope) => position >= scope.start && position < scope.end))
+		return false;
+	const name = enclosingHelperName(code, position);
+	if (!name) return false;
+	const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const call = new RegExp(`(?<![\\w$])${escaped}\\s*\\(`, "g");
+	for (const match of code.matchAll(call))
+		if (isReadPosition(scopes, match.index)) return true;
+	return false;
+}
+
+/** Whether a position is where this file's tests can read a record. */
+function readPosition(code, scopes, position) {
+	return (
+		isReadPosition(scopes, position) ||
+		helperReadPosition(code, scopes, position)
+	);
+}
+
+/** The spans of the file's assertion expressions (`expect(...)` chains, `assert*(...)`). */
+function assertionSpans(code, strings = []) {
+	const spans = [];
+	for (const match of code.matchAll(/\b(?:expect|assert)\b/g)) {
+		const before = code[match.index - 1] ?? " ";
+		if (before === "." || /[$\w]/.test(before)) continue;
+		const chain = callChainAt(code, match.index, strings);
+		if (chain) spans.push([chain.start, chain.end]);
+	}
+	return spans;
+}
+
+function withinSpans(spans, position) {
+	return spans.some(([start, end]) => position >= start && position < end);
+}
+
+/**
+ * The full name, not a prefix: `lsp_document_drift` never matches a test that
+ * reads `lsp_document_drift_cap` (the shape the sibling rule's file-name match
+ * already fixed, #3905 r2).
+ */
+function exactTokenPattern(value) {
+	const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`(?<![\\w.$-])${escaped}(?![\\w$-])`);
+}
+
+/** Whether the position is an operand of an equality comparison. */
+function comparisonAt(code, start, end) {
+	const before = code.slice(Math.max(0, start - 8), start);
+	const after = code.slice(end, end + 8);
+	return COMPARISON_BEFORE.test(before) || COMPARISON_AFTER.test(after);
+}
+
+/** Whether a string sits where a test asserts, compares or keys on a record. */
+function stringIsRead(code, assertions, string) {
+	if (withinSpans(assertions, string.start)) return true;
+	const before = code.slice(Math.max(0, string.start - 40), string.start);
+	return (
+		COMPARISON_BEFORE.test(before) ||
+		comparisonAt(code, string.start, string.end) ||
+		CASE_LABEL_BEFORE.test(before) ||
+		RECORD_KEY_BEFORE.test(before) ||
+		CONTAINMENT_CALL_BEFORE.test(before)
+	);
+}
+
+/** Whether an identifier the test spells is read where a record is decided. */
+function identifierIsRead(code, scopes, assertions, identifier) {
+	const pattern = new RegExp(
+		`(?<![\\w$])${identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w$])`,
+		"g",
+	);
+	for (const match of code.matchAll(pattern)) {
+		if (!readPosition(code, scopes, match.index)) continue;
+		if (withinSpans(assertions, match.index)) return true;
+		if (comparisonAt(code, match.index, match.index + match[0].length))
+			return true;
+	}
+	return false;
+}
+
+// Vitest's own default `include` (`configDefaults.include` in `vitest/config`),
+// which is what the projects that declare no `include` collect — the default
+// project here. The lint cannot import it (`lintPrBody` is synchronous, and the
+// script runs in lanes with no `npm install`), so the value is pinned against
+// the real `configDefaults.include` by the #4597 test file: a vitest upgrade
+// that moves the default reds there, and this constant moves with it.
+const VITEST_DEFAULT_INCLUDE = ["**/*.{test,spec}.?(c|m)[jt]s?(x)"];
+const VITEST_CONFIG = "vitest.config.ts";
+// A conditional list's own choice (`process.env.npm_lifecycle_event ===
+// "test:unit" ? A : B`), read the way the config module reads it when it
+// loads: the lint sees the lists the run sees. `undefined` is "this reader
+// cannot decide", and the caller unions both branches.
+const ENV_COMPARISON =
+	/process\.env(?:\.([A-Za-z_$][\w$]*)|\s*\[\s*["'`]([^"'`]+)["'`]\s*\])\s*(===|==|!==|!=)\s*["'`]([^"'`]*)["'`]/;
+
+function conditionalBranch(condition) {
+	const match = ENV_COMPARISON.exec(String(condition ?? ""));
+	if (!match) return undefined;
+	const actual = process.env[match[1] ?? match[2]] ?? "";
+	const equal = actual === match[4];
+	return match[3] === "===" || match[3] === "==" ? equal : !equal;
+}
+
+/**
+ * Whether a repo-relative POSIX path is a file vitest collects, read from the
+ * repository's own `vitest.config.ts`: each project's `include`/`exclude` lists
+ * (the root `test` block's merge into every project), resolved through the
+ * `const` arrays they name or spread. `null` when the config is absent,
+ * unreadable, or holds a list this reader cannot resolve, because a guessed
+ * answer would either refuse every body or admit every file.
+ */
+function vitestCollectedPaths(cwd = REPO_ROOT) {
+	let source;
+	try {
+		source = readFileSync(resolve(cwd, VITEST_CONFIG), "utf8");
+	} catch {
+		return null;
+	}
+	if (source.length > MAX_SOURCE_BYTES) return null;
+	const lexed = blankCommentsAndStrings(source);
+	const code = lexed.text;
+	// Every `const/let/var NAME = …` initializer, so a list can be named.
+	const declarations = new Map();
+	for (const match of code.matchAll(
+		/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/g,
+	))
+		declarations.set(match[1], match.index + match[0].length);
+	// The blanked text carries no string, so a list's patterns are read from the
+	// lexer's own string spans. A negation (`!pattern`) changes what the list
+	// means in a way this reader does not model, so it makes the config
+	// unreadable rather than silently absent.
+	const elementsOf = (open, close, depth) => {
+		if (open === -1 || close === -1 || depth > 12) return null;
+		const found = [];
+		for (const string of lexed.strings) {
+			if (string.start <= open || string.end > close) continue;
+			if (string.text.startsWith("!")) return null;
+			found.push(string.text);
+		}
+		const inner = code.slice(open + 1, close);
+		for (const match of inner.matchAll(
+			/\.\.\.\s*([A-Za-z_$][\w$]*)|([^\s,])/g,
+		)) {
+			if (match[1] !== undefined) {
+				const span = declarations.get(match[1]);
+				const spread = span === undefined ? null : resolveList(span, depth + 1);
+				if (spread === null) return null;
+				found.push(...spread);
+				continue;
+			}
+			// Blanked text holds no strings, so anything else inside the array is an
+			// element this reader does not model (an expression, a call, a number).
+			if (match[2] !== undefined) return null;
+		}
+		return found;
+	};
+	/** `\`?\`` or `\`:\`` at depth 0 before the statement's `;`, or `-1`. */
+	const separatorAt = (start, separator) => {
+		let depth = 0;
+		for (let index = start; index < code.length; index++) {
+			const char = code[index];
+			if (char === "(" || char === "[" || char === "{") depth += 1;
+			else if (char === ")" || char === "]" || char === "}") depth -= 1;
+			else if (char === ";" && depth === 0) return -1;
+			else if (char === separator && depth === 0) return index;
+		}
+		return -1;
+	};
+	// A list is an array literal, a name bound to one, or a conditional over two
+	// of them (`process.env.npm_lifecycle_event === "test:unit" ? A : []`). A
+	// conditional that compares an environment variable is decided the way the
+	// config module decides it when loaded, so the lint sees the lists the run
+	// sees; any other condition unions both branches, which errs toward refusing
+	// a file rather than admitting one the suite may not run.
+	const resolveList = (start, depth) => {
+		if (depth > 12) return null;
+		const at = skipSpaces(code, start);
+		if (code[at] === "[")
+			return elementsOf(at, closeBracketIndex(code, at, "[", "]"), depth);
+		const question = separatorAt(at, "?");
+		if (question !== -1) {
+			const colon = separatorAt(question + 1, ":");
+			if (colon === -1) return null;
+			const whenTrue = () => resolveList(question + 1, depth + 1);
+			const whenFalse = () => resolveList(colon + 1, depth + 1);
+			const branch = conditionalBranch(source.slice(at, question));
+			const first = branch === false ? whenFalse() : whenTrue();
+			if (branch !== undefined) return first;
+			const second = whenFalse();
+			if (first === null || second === null) return null;
+			return [...first, ...second];
+		}
+		const name = /^([A-Za-z_$][\w$]*)/.exec(code.slice(at))?.[1];
+		const init = name === undefined ? undefined : declarations.get(name);
+		if (init === undefined) return null;
+		return resolveList(init, depth + 1);
+	};
+	const patterns = (kind, open, close) => {
+		if (open === -1 || close === -1) return null;
+		const found = [];
+		const key = new RegExp(`\\b${kind}\\s*:\\s*`, "y");
+		let depth = 0;
+		for (let index = open + 1; index < close; index++) {
+			const char = code[index];
+			if (char === "(" || char === "[" || char === "{") depth += 1;
+			else if (char === ")" || char === "]" || char === "}") depth -= 1;
+			if (depth !== 0) continue;
+			key.lastIndex = index;
+			const match = key.exec(code);
+			if (!match) continue;
+			const resolved = resolveList(match.index + match[0].length, 0);
+			if (resolved === null) return null;
+			found.push(...resolved);
+			index = match.index + match[0].length - 1;
+		}
+		return found;
+	};
+	// A vitest config collects a file through ONE project: each project's
+	// `include` and `exclude` list, plus the root `test` block's, which apply to
+	// every project (`tests/support/vitest-collection.ts` reads the same merge).
+	// A project that declares neither `include` nor an inherited one collects
+	// vitest's default include. This is the twice-verified part of the config: a
+	// dedicated project's own files are excluded from the default project
+	// (`wallClockBudgetInclude` here), so a union over every exclude list would
+	// answer "not collected" for files the suite really runs.
+	const blocks = [];
+	for (const match of code.matchAll(/\btest\s*:\s*\{/g)) {
+		const open = match.index + match[0].length - 1;
+		const close = closeBracketIndex(code, open, "{", "}");
+		if (close === -1) return null;
+		blocks.push({ open, close });
+	}
+	const root = blocks.find((block) =>
+		/\bprojects\s*:/.test(code.slice(block.open, block.close)),
+	);
+	if (!root) return null;
+	const rootLists = {
+		include: patterns("include", root.open, root.close),
+		exclude: patterns("exclude", root.open, root.close),
+	};
+	if (rootLists.include === null || rootLists.exclude === null) return null;
+	const projects = blocks
+		.filter(
+			(block) =>
+				block !== root && block.open > root.open && block.close < root.close,
+		)
+		.map((block) => ({
+			include: patterns("include", block.open, block.close),
+			exclude: patterns("exclude", block.open, block.close),
+		}));
+	if (!projects.length) projects.push({ include: [], exclude: [] });
+	const compiled = [];
+	for (const project of projects) {
+		if (project.include === null || project.exclude === null) return null;
+		const include = [...rootLists.include, ...project.include];
+		const exclude = [...rootLists.exclude, ...project.exclude];
+		compiled.push({
+			include: (include.length ? include : VITEST_DEFAULT_INCLUDE).map(
+				(pattern) => globToRegExp(pattern, { directory: false }),
+			),
+			exclude: exclude.map((pattern) =>
+				globToRegExp(pattern, { directory: true }),
+			),
+		});
+	}
+	return (path) =>
+		compiled.some(
+			(project) =>
+				project.include.some((matcher) => matcher.test(path)) &&
+				!project.exclude.some((matcher) => matcher.test(path)),
+		);
+}
+
+/** A glob as vitest reads it: `**`, `*`, `?`, `{a,b}`, `?(a|b)`, `[abc]`. */
+function globToRegExp(pattern, { directory }) {
+	if (!/[*?[\]{}()]/.test(pattern)) {
+		const escaped = pattern
+			.replace(/\/+$/, "")
+			.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		return directory
+			? new RegExp(`^(?:${escaped}(?:/.*)?)$`)
+			: new RegExp(`^${escaped}$`);
+	}
+	let out = "^";
+	for (let index = 0; index < pattern.length; index++) {
+		const char = pattern[index];
+		if (char === "*") {
+			if (pattern[index + 1] === "*") {
+				index += 1;
+				if (pattern[index + 1] === "/") {
+					index += 1;
+					out += "(?:[^/]+/)*";
+				} else out += ".*";
+			} else out += "[^/]*";
+			continue;
+		}
+		if (char === "?") {
+			const group = /^\?\(([^)]*)\)/.exec(pattern.slice(index));
+			if (group) {
+				out += `(?:${group[1]})?`;
+				index += group[0].length - 1;
+			} else out += "[^/]";
+			continue;
+		}
+		if (char === "{") {
+			const end = pattern.indexOf("}", index);
+			if (end !== -1) {
+				// One-off call-site escapes, the shape this sweep's header allows for a
+				// `scripts/*.mjs` that runs with no `npm install`: no escaping helper.
+				const alternatives = [];
+				for (const one of pattern.slice(index + 1, end).split(","))
+					alternatives.push(one.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+				out += `(?:${alternatives.join("|")})`;
+				index = end;
+				continue;
+			}
+		}
+		if (char === "[") {
+			const end = pattern.indexOf("]", index);
+			if (end !== -1) {
+				out += pattern.slice(index, end + 1);
+				index = end;
+				continue;
+			}
+		}
+		out += char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+	return new RegExp(`${out}$`);
+}
+
+/** The record-shaped mentions of a section, in the order the body makes them. */
+function recordMentions(content) {
+	const source = String(content ?? "");
+	const mentioned = new Map();
+	for (const match of source.matchAll(/`([^`\n]+)`/g)) {
+		const span = match[1].trim();
+		if (RECORD_LITERAL_SPAN.test(span)) mentioned.set(span, true);
+	}
+	for (const match of source.matchAll(RECORD_TOKEN))
+		if (!mentioned.has(match[0])) mentioned.set(match[0], false);
+	const entries = [...mentioned];
+	if (entries.length <= MAX_RECORD_MENTIONS)
+		return { mentions: entries, truncated: false };
+	return {
+		mentions: entries.slice(0, MAX_RECORD_MENTIONS),
+		truncated: true,
+	};
+}
+
+/**
+ * `git grep -l` for several fixed strings at once: the file list, `[]` for no
+ * match (git exits 1, which is not a failure), or `null` when the probe could
+ * not run at all. A null is reported, never read as an empty tree.
+ */
+function grepLiteralFiles(patterns, pathspecs, options = {}) {
+	if (!patterns.length) return [];
+	let output;
+	try {
+		output = (options.git ?? gitExecFileSync)(
+			[
+				"grep",
+				"-l",
+				// The long form on purpose: the writer-script census reads a bare
+				// "-F" as a `gh` field flag (tests/config/workflow-writers-governance).
+				"--fixed-strings",
+				...patterns.flatMap((pattern) => ["-e", pattern]),
+				"--",
+				...pathspecs,
+			],
+			{
+				cwd: options.cwd ?? process.cwd(),
+				encoding: "utf8",
+				maxBuffer: MAX_SOURCE_BYTES,
+			},
+		);
+	} catch (error) {
+		if (error?.status === 1) return [];
+		return null;
+	}
+	return String(output ?? "")
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+}
+
+/**
+ * The record values the head tree's runtime code emits among the candidates,
+ * split by the field they were harvested from: `values` is every record value,
+ * `identity` only the ones read from a record-identity field. One grep for
+ * every candidate, then one lex per file that mentions any of them: reading the
+ * whole runtime tree to answer a handful of needles is the cost this avoids.
+ */
+function emittedRecordLiterals(candidates, options = {}) {
+	const files = grepLiteralFiles(
+		candidates,
+		RUNTIME_OBSERVABILITY_ROOTS,
+		options,
+	);
+	// `null` is "the probe could not run", never "the tree holds nothing":
+	// the caller reports it rather than reading the empty answer as proof.
+	if (files === null) return null;
+	const values = new Set();
+	const identity = new Set();
+	for (const file of files) {
+		if (!isRuntimeObservabilityPath(file)) continue;
+		const source = headFileSource(file, {
+			headFiles: options.headFiles,
+			workingTree: true,
+			cwd: options.cwd,
+			git: options.git,
+		});
+		if (typeof source !== "string") continue;
+		for (const record of recordLocationsFromRuntimeSource(source)) {
+			values.add(record.value);
+			if (RECORD_IDENTITY_FIELDS.has(record.field)) identity.add(record.value);
+		}
+	}
+	return { values, identity };
+}
+
+// A record literal can reach a test through a binding (`const PHASE = "x"`,
+// then `row.phase === PHASE`), which is still the test reading the record back:
+// the binding is one indirection, not a bare mention. The binding counts only
+// where an assertion compares it or hands it to a matcher; `notice(PHASE)` is a
+// mention, not a read-back.
+const LITERAL_BINDING_BEFORE =
+	/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*$/;
+
+/**
+ * The literals a test reads back, under the two rules above: a position inside a
+ * declaration vitest collects and runs, and a string or identifier the test
+ * asserts, compares or keys on. One lex per file, so a comment that quotes the
+ * literal never counts; one `vitest.config.ts` read per call, so a file the
+ * suite never runs never counts either. A probe that cannot run answers
+ * `{ skipped }`, never an empty set.
+ */
+function testedRecordLiterals(literals, options = {}) {
+	const files = grepLiteralFiles(literals, ["tests"], options);
+	if (files === null)
+		return { skipped: "the tests/ search", reason: "git grep failed" };
+	const collects = vitestCollectedPaths();
+	if (collects === null)
+		return {
+			skipped: "the vitest config read",
+			reason: `${VITEST_CONFIG} could not be read`,
+		};
+	const tested = new Set();
+	const unprovable = [];
+	for (const file of files) {
+		if (!TEST_SOURCE_FILE.test(file)) continue;
+		if (!collects(file)) continue;
+		const source = headFileSource(file, {
+			headFiles: options.headFiles,
+			workingTree: true,
+			cwd: options.cwd,
+			git: options.git,
+		});
+		if (typeof source !== "string") continue;
+		const lexed = blankCommentsAndStrings(source);
+		const code = lexed.text;
+		const { scopes, unproven: cannotProve } = declarationScopes(
+			code,
+			lexed.strings,
+		);
+		// A declaration this reader cannot classify makes the file unprovable: it
+		// contributes no read-back rather than admitting a position on the strength
+		// of some other live test (F-4597-R2-1).
+		if (cannotProve) {
+			unprovable.push(file);
+			continue;
+		}
+		const assertions = assertionSpans(code, lexed.strings);
+		const bindings = new Map();
+		for (const string of lexed.strings) {
+			const identifier = LITERAL_BINDING_BEFORE.exec(string.prefix)?.[1];
+			if (!identifier) continue;
+			const bound = bindings.get(string.text) ?? [];
+			bound.push(identifier);
+			bindings.set(string.text, bound);
+		}
+		for (const literal of literals) {
+			if (tested.has(literal)) continue;
+			const token = exactTokenPattern(literal);
+			const read =
+				lexed.strings.some(
+					(string) =>
+						token.test(string.text) &&
+						readPosition(code, scopes, string.start) &&
+						stringIsRead(code, assertions, string),
+				) ||
+				identifierIsRead(code, scopes, assertions, literal) ||
+				(bindings.get(literal) ?? []).some((identifier) =>
+					identifierIsRead(code, scopes, assertions, identifier),
+				);
+			if (read) tested.add(literal);
+		}
+	}
+	return { tested, unprovable };
+}
+
+/**
+ * #4597: every record literal the `## Observability` section names must appear
+ * in a test under `tests/` in the head tree, in a declaration vitest collects
+ * and runs. `none: <reason>` needs no special case: a body that names no record
+ * literal owes no read-back, and the record checks above already refuse an
+ * empty answer where the diff adds a failure path. A probe that cannot run is a
+ * skipped check and says so (`warnRecordReadBackSkipped`), never silence and
+ * never a refusal the author cannot act on. It runs only when a diff was
+ * resolved, like the record-naming rule beside it, so the local preflight
+ * without an upstream ref keeps structural lint alone.
+ */
+/**
+ * A probe that cannot run is a skipped check, and a skipped check says so: a
+ * caller that copied a body outside a checkout must not read the silence as a
+ * clean result (shape 10), and refusing would answer a body under test with an
+ * error the author cannot act on. The record is the CI annotation below.
+ */
+function warnRecordReadBackSkipped(step, names, reason = "git grep failed") {
+	console.warn(
+		`::warning::PR body Observability names ${names
+			.map((name) => `\`${name}\``)
+			.join(
+				", ",
+			)}, but ${step} could not run (${reason}), so the #4597 read-back check was skipped for them.`,
+	);
+}
+
+function lintObservabilityRecordsTested(lines, headings, options = {}) {
+	const content = observabilitySectionContent(lines, headings);
+	const { mentions, truncated } = recordMentions(content);
+	if (!mentions.length) return [];
+	if (truncated)
+		console.warn(
+			`::warning::PR body Observability names more than ${MAX_RECORD_MENTIONS} record-shaped tokens, so the #4597 read-back check read the first ${MAX_RECORD_MENTIONS} and did not check the rest.`,
+		);
+	const candidates = mentions.map(([name]) => name);
+	const emitted = emittedRecordLiterals(candidates, options);
+	if (emitted === null) {
+		warnRecordReadBackSkipped("the runtime record harvest", candidates);
+		return [];
+	}
+	// A backticked span is an explicit naming and is read against every
+	// harvested field; a bare token or link text must be a record identity,
+	// because a bare two-segment compound is also ordinary prose
+	// (F-4597-R2-2).
+	const named = mentions
+		.filter(
+			([name, quoted]) =>
+				emitted.values.has(name) && (quoted || emitted.identity.has(name)),
+		)
+		.map(([name]) => name);
+	if (!named.length) return [];
+	const result = testedRecordLiterals(named, options);
+	if (result.skipped) {
+		warnRecordReadBackSkipped(result.skipped, named, result.reason);
+		return [];
+	}
+	const missing = named.filter((name) => !result.tested.has(name));
+	if (!missing.length) return [];
+	const unprovable = result.unprovable ?? [];
+	const shown = unprovable.slice(0, 3);
+	const extra =
+		unprovable.length > shown.length
+			? ` (+${unprovable.length - shown.length} more)`
+			: "";
+	const unprovableNote = shown.length
+		? ` A tests/ file whose declarations this rule cannot prove runs contributes nothing, so name the record in a form it reads: ${shown.join(", ")}${extra}.`
+		: "";
+	return [
+		`PR body Observability names ${missing.map((name) => `\`${name}\``).join(", ")}, which no test under tests/ reads: admit one proven form — the record's full name in an assertion inside a test vitest collects and runs, or where that test compares the observed value with it — because docs/pi-lens-fixer.md:117 requires the record the section names to be asserted by a test (#4597).${unprovableNote}`,
+	];
+}
+
 /** Detect the high-confidence shape produced when a worker flattens a body. */
 export function detectFlattenedBody(body = "") {
 	const source = String(body ?? "");
@@ -1733,7 +2811,16 @@ export const DETECTION_LAYERS = Object.freeze([
 	"reviewer probe",
 	"CI unit",
 	"governance sweep",
+	// #4490: CodeQL code scanning caught a defect no other layer names.
+	"static analysis",
+	// #4519: the retro (2026-10-16) found 43 TLA+ catches and no word for them,
+	// nor for mutation, the pre-push hook or the type/lint gate.
+	"TLA+",
+	"mutation",
+	"pre-push",
+	"lint/type check",
 	"smoke",
+	// `nightly` may carry its workflow as `nightly:<workflow>` (#4519).
 	"nightly",
 	"dogfood",
 	"release gate",
@@ -1741,15 +2828,31 @@ export const DETECTION_LAYERS = Object.freeze([
 const DETECTION_LAYER_SET = new Set(
 	DETECTION_LAYERS.map((layer) => layer.toLowerCase()),
 );
+// `nightly:<workflow>` is a layer word too; the workflow is a file stem or name.
+const NIGHTLY_WORKFLOW_LAYER = /^nightly:\s*[a-z0-9][a-z0-9._-]*$/;
+const isDetectionLayer = (normalized) =>
+	DETECTION_LAYER_SET.has(normalized) ||
+	NIGHTLY_WORKFLOW_LAYER.test(normalized);
 // "This layer caught it in time" is a valid detection lesson (issue #4288,
 // "Valid verdicts"): the gate must not demand new tests for every bug.
-const DETECTION_SHOULD_SET = new Set([...DETECTION_LAYER_SET, "this layer"]);
+const isDetectionShouldLayer = (normalized) =>
+	normalized === "this layer" || isDetectionLayer(normalized);
+
+const DETECTION_LAYER_HINT = `Layers: ${DETECTION_LAYERS.join(", ")}; "nightly:<workflow>" names the workflow. See ${TEMPLATE_PATH}.`;
 
 export const DETECTION_MESSAGE =
-	'PR body "## Detection" must state the bug-detection lesson in three lines: ' +
+	'PR body "## Detection" must state the bug-detection lesson in five lines: ' +
 	'"Caught by: <layer>", "Should have been caught by: <layer|this layer>", ' +
-	'and "Gap: <issue ref> | exists: <test path> | none: <reason>". ' +
-	`Layers: ${DETECTION_LAYERS.join(", ")}. See ${TEMPLATE_PATH}.`;
+	'"Gap: <issue ref> | exists: <path of a test already on master> | none: <reason>", ' +
+	'"Shape: #N (an AGENTS.md Recurring defect shapes number) | new: <name>", ' +
+	'and "Enforcer: <tree-wide test path on master> | #N (an issue to build one) | none: judgment-only, <reason>". ' +
+	DETECTION_LAYER_HINT;
+
+// #4519: the retro read 139 of 363 closed bugs as "unknown". A bug-closing PR
+// owes a layer word and a reason; "unknown", "n/a", "tbd" and "?" are neither.
+export const DETECTION_UNKNOWN_MESSAGE =
+	'PR body "## Detection" answers "unknown", "n/a", "tbd" or "?" (or a reason that starts with "unknown"), which is not a detection lesson: a bug-closing PR names the layer that caught the bug (and the layer that should have), a real reason after "Gap: none:", the shape name, and the enforcer reason. ' +
+	DETECTION_LAYER_HINT;
 
 // A field value is found by its line prefix, never a sentence mention: a
 // prose line that merely contains "caught by" is not the field. Leading list
@@ -1777,37 +2880,301 @@ function normalizeDetectionLayer(value) {
 		.toLowerCase();
 }
 
+// A placeholder answer: "unknown" opening the text, or a bare "n/a", "tbd" or
+// "?". Only free-text answers of a bug-closing PR are screened (#4519).
+function isPlaceholderAnswer(value) {
+	const text = normalizeDetectionLayer(value);
+	return /^unknown\b/.test(text) || /^(?:n\/a|tbd|\?+)$/.test(text);
+}
+
+const BEHAVIOR_EQUIVALENCE_MESSAGE =
+	'PR body "## Behavior equivalence" must contain a markdown table with Site, Before, and After columns and at least one non-placeholder data row.';
+
+function isBehaviorEquivalencePlaceholder(value) {
+	const normalized = normalizeDetectionLayer(value);
+	return (
+		!normalized ||
+		isPlaceholderAnswer(normalized) ||
+		/^(?:-|—|–|empty)$/.test(normalized)
+	);
+}
+
+function behaviorTableCells(line) {
+	if (!/^\s*\|.*\|\s*$/.test(line)) return null;
+	return line
+		.trim()
+		.slice(1, -1)
+		.split("|")
+		.map((cell) => cell.trim());
+}
+
+function lintBehaviorEquivalence(body, headings, title) {
+	if (!/^\s*refactor(?:\([^)]*\))?!?:/i.test(String(title ?? ""))) return [];
+	const heading = headings.find((candidate) =>
+		hasSection(candidate, "behavior equivalence"),
+	);
+	if (!heading) return [BEHAVIOR_EQUIVALENCE_MESSAGE];
+	const lines = sourceWithoutFencedBlocks(body).split(/\r?\n/);
+	const nextHeading = headings.find(
+		(candidate) =>
+			candidate.index > heading.index && candidate.level <= heading.level,
+	);
+	const sectionLines = lines.slice(
+		heading.index + 1,
+		nextHeading?.index ?? lines.length,
+	);
+	for (let index = 0; index + 1 < sectionLines.length; index += 1) {
+		const headers = behaviorTableCells(sectionLines[index]);
+		if (!headers) continue;
+		const normalizedHeaders = headers.map((header) => header.toLowerCase());
+		const site = normalizedHeaders.indexOf("site");
+		const before = normalizedHeaders.indexOf("before");
+		const after = normalizedHeaders.indexOf("after");
+		if (
+			site < 0 ||
+			before < 0 ||
+			after < 0 ||
+			!/^\s*\|?(?:\s*:?-+:?\s*\|)+\s*$/.test(sectionLines[index + 1])
+		)
+			continue;
+		// The table ends at the first line that is not a table row: a blank line,
+		// prose, or the next section. Scanning past it would read a later,
+		// unrelated table's cells (even its header) as this table's data row.
+		for (
+			let rowIndex = index + 2;
+			rowIndex < sectionLines.length;
+			rowIndex += 1
+		) {
+			const row = behaviorTableCells(sectionLines[rowIndex]);
+			if (!row) break;
+			if (row.length < headers.length) continue;
+			if (
+				![site, before, after].some((column) =>
+					isBehaviorEquivalencePlaceholder(row[column]),
+				)
+			)
+				return [];
+		}
+	}
+	return [BEHAVIOR_EQUIVALENCE_MESSAGE];
+}
+
 // `Gap:` names a follow-up issue, an existing test that now covers the bug, or
 // a reasoned `none:`. `exists:` must name a test path (under tests/ or a test
-// extension), so "exists: TBD" is refused.
+// extension), so "exists: TBD" is refused. When the caller supplies
+// `existsOnBase` (#4404), the path must also be a file on the PR's base: a test
+// this PR adds is the fix, not a layer that already existed.
+const DETECTION_EXISTS_ALTERNATIVES =
+	'Give an issue ref (#NNN) or "none: <reason>" instead.';
+
+export const detectionExistsNotOnBaseMessage = (path) =>
+	`PR body "## Detection" says "Gap: exists: ${path}", but that file is not on the PR's base commit (git merge-base origin/master HEAD). A test this PR adds is not an existing layer. Name one repo-relative path with forward slashes and no line number. ${DETECTION_EXISTS_ALTERNATIVES}`;
+
+export const DETECTION_EXISTS_BASE_UNRESOLVED_MESSAGE =
+	'PR body "## Detection" says "Gap: exists: <path>", but the PR\'s base commit could not be resolved (git merge-base origin/master HEAD failed; run "git fetch origin master", plus "git fetch --unshallow" in a shallow clone), so the path cannot be verified. ' +
+	DETECTION_EXISTS_ALTERNATIVES;
+
+/**
+ * #4404: the PR's base commit, the merge base `localDiff` already diffs from.
+ * `null` when it cannot be resolved (no `origin/master`, a shallow checkout, a
+ * git stub that prints nothing).
+ */
+export function resolvePrBase(cwd = process.cwd(), git = gitExecFileSync) {
+	try {
+		const sha = String(
+			git(["merge-base", "origin/master", "HEAD"], { cwd, encoding: "utf8" }),
+		).trim();
+		return sha || null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The `existsOnBase` reader for `lintDetectionSection`: `true` when the path is
+ * a file on the PR's base, `false` when it is not, `null` when the base cannot
+ * be resolved. The base resolves once, on first use.
+ */
+export function baseFileReader(cwd = process.cwd(), git = gitExecFileSync) {
+	let base;
+	return (path) => {
+		base ??= resolvePrBase(cwd, git) ?? false;
+		if (!base) return null;
+		try {
+			return (
+				String(
+					git(["cat-file", "-t", `${base}:${path}`], {
+						cwd,
+						encoding: "utf8",
+						stdio: ["ignore", "pipe", "ignore"],
+					}),
+				).trim() === "blob"
+			);
+		} catch {
+			return false;
+		}
+	};
+}
+
+function existsGapPath(value) {
+	const exists = /^exists\s*:\s*(.+)$/i.exec(String(value ?? "").trim());
+	return exists ? exists[1].replace(/[*_`]/g, "").trim() : null;
+}
+
+function isDetectionTestPath(testPath) {
+	return (
+		testPath.startsWith("tests/") ||
+		/(?:^|\/)test_[^/]+$/.test(testPath) ||
+		/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(testPath) ||
+		/_test\.(?:py|go|rs)$/.test(testPath)
+	);
+}
+
+// The reason after `none:` in a `Gap:` value, or null when it is not a `none:`.
+function noneReason(value) {
+	const none = /^none\s*:\s*(.+)$/i.exec(String(value ?? "").trim());
+	return none ? none[1] : null;
+}
+
 function validDetectionGap(value) {
 	const text = String(value ?? "").trim();
 	if (/(?:^|\s|[(])#\d+\b/.test(text)) return true;
-	const exists = /^exists\s*:\s*(.+)$/i.exec(text);
-	if (exists) {
-		const testPath = exists[1].replace(/[*_`]/g, "").trim();
-		return (
-			testPath.startsWith("tests/") ||
-			/(?:^|\/)test_[^/]+$/.test(testPath) ||
-			/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(testPath) ||
-			/_test\.(?:py|go|rs)$/.test(testPath)
-		);
-	}
-	const none = /^none\s*:\s*(.+)$/i.exec(text);
+	const testPath = existsGapPath(text);
+	if (testPath !== null) return isDetectionTestPath(testPath);
+	const reason = noneReason(text);
 	// A one-word reason ("none: oversight") is legitimate; the shape only
 	// requires a reason to be present (#4288 R5).
-	if (none) return wordCount(none[1]) >= 1;
+	if (reason !== null) return wordCount(reason) >= 1;
 	return false;
+}
+
+// #4439: a bug fix names the defect SHAPE and the tree-wide enforcer of that
+// shape, not only a test for the instance. `Shape:` is a catalog number from
+// AGENTS.md "Recurring defect shapes" or `new: <name>`; `Enforcer:` is a test
+// path on the base, an issue to build one, or `none: judgment-only, <reason>`.
+// With `Shape: #N`, a path enforcer must be one the catalog entry for #N names.
+export const DETECTION_SHAPE_CATALOG_UNRESOLVED_MESSAGE =
+	'PR body "## Detection" says "Shape: #N" with a path "Enforcer:", but AGENTS.md "Recurring defect shapes" could not be read from the base commit of the PR (git show <merge-base>:AGENTS.md), so the catalog entry cannot be checked. Give an issue ref (#NNN) or "none: judgment-only, <reason>" as the enforcer instead.';
+
+export const detectionUnknownShapeMessage = (number) =>
+	`PR body "## Detection" says "Shape: #${number}", but AGENTS.md "Recurring defect shapes" has no shape ${number}. Use a catalog number, or "Shape: new: <name>" for a shape the catalog lacks.`;
+
+export const detectionEnforcerNotOnBaseMessage = (path) =>
+	`PR body "## Detection" says "Enforcer: ${path}", but that file is not on the PR's base commit (git merge-base origin/master HEAD). A test this PR adds is the regression test, not the enforcer of the shape. Name a tree-wide test already on the base, an issue (#NNN) to build one, or "none: judgment-only, <reason>".`;
+
+export const detectionEnforcerNotInCatalogMessage = (path, number) =>
+	`PR body "## Detection" says "Shape: #${number}" and "Enforcer: ${path}", but AGENTS.md shape ${number} does not name that path. Name a test the catalog entry lists, or give an issue (#NNN) to add it, or "none: judgment-only, <reason>".`;
+
+const stripEmphasis = (value) =>
+	String(value ?? "")
+		.replace(/[*_`]/g, "")
+		.trim();
+
+function detectionShape(value) {
+	const text = stripEmphasis(value);
+	const number = /^#(\d+)\b/.exec(text);
+	if (number) return { number: Number(number[1]) };
+	const created = /^new\s*:\s*(\S.*)$/i.exec(text);
+	return created ? { name: created[1] } : null;
+}
+
+function detectionEnforcer(value) {
+	const text = stripEmphasis(value);
+	if (/^#\d+\b/.test(text)) return { issue: true };
+	const none = /^none\s*:\s*(?:judgment|judgement)-only\s*,\s*(.+)$/i.exec(
+		text,
+	);
+	if (none)
+		return wordCount(none[1]) >= 3 ? { none: true, reason: none[1] } : null;
+	const path = /^\S+/.exec(text)?.[0].replace(/[.,;]+$/, "");
+	return path && isDetectionTestPath(path) ? { path } : null;
+}
+
+// A path is named when it stands as its own token in the entry: not a prefix
+// of a longer file name and not the middle of a longer path.
+function entryNamesPath(entry, path) {
+	const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`(?<![\\w./-])${escaped}(?![\\w/-])(?!\\.\\w)`).test(entry);
+}
+
+/**
+ * `shapeCatalog` reads the AGENTS.md catalog: a `Map<number, entry text>`, or
+ * `null` when AGENTS.md cannot be read. `existsOnBase` is the Gap reader.
+ */
+function lintShapeAndEnforcer(content, options) {
+	const shape = detectionShape(detectionFieldValue(content, "shape"));
+	const enforcer = detectionEnforcer(detectionFieldValue(content, "enforcer"));
+	if (!shape || !enforcer) return [DETECTION_MESSAGE];
+	// #4519: the free text of the record, on the bug-closing seam only.
+	if (
+		options.requireShape &&
+		[shape.name, enforcer.reason].some(isPlaceholderAnswer)
+	)
+		return [DETECTION_UNKNOWN_MESSAGE];
+	let catalog;
+	if (
+		shape.number !== undefined &&
+		typeof options.shapeCatalog === "function"
+	) {
+		catalog = options.shapeCatalog();
+		if (catalog && !catalog.has(shape.number))
+			return [detectionUnknownShapeMessage(shape.number)];
+	}
+	if (!enforcer.path) return [];
+	if (typeof options.existsOnBase === "function") {
+		const onBase = options.existsOnBase(enforcer.path);
+		if (onBase === null) return [DETECTION_EXISTS_BASE_UNRESOLVED_MESSAGE];
+		if (!onBase) return [detectionEnforcerNotOnBaseMessage(enforcer.path)];
+	}
+	if (catalog === null) return [DETECTION_SHAPE_CATALOG_UNRESOLVED_MESSAGE];
+	if (catalog && !entryNamesPath(catalog.get(shape.number), enforcer.path))
+		return [detectionEnforcerNotInCatalogMessage(enforcer.path, shape.number)];
+	return [];
+}
+
+/**
+ * The `shapeCatalog` reader for `lintDetectionSection`: AGENTS.md as the PR's
+ * base commit has it (the base `baseFileReader` reads the enforcer path from),
+ * parsed once on first use. `null` when the base or its AGENTS.md cannot be
+ * read. The base, never the checkout: a PR that edits entry N to name its own
+ * enforcer must not approve itself (#4439).
+ */
+export function shapeCatalogReader(cwd = process.cwd(), git = gitExecFileSync) {
+	let catalog;
+	return () => {
+		if (catalog !== undefined) return catalog;
+		catalog = null;
+		const base = resolvePrBase(cwd, git);
+		try {
+			catalog = parseDefectShapes(
+				String(
+					git(["show", `${base}:AGENTS.md`], {
+						cwd,
+						encoding: "utf8",
+						maxBuffer: 16 * 1024 * 1024,
+						stdio: ["ignore", "pipe", "ignore"],
+					}),
+				),
+			);
+		} catch {
+			// null: a path enforcer under `Shape: #N` fails closed.
+		}
+		return catalog;
+	};
 }
 
 /**
  * #4288: the `## Detection` contract. Returns [] when the section is absent
  * (the missing-section error stays owned by `lintPrBody`), otherwise one
- * message when any of the three lines is missing or invalid. Parsing runs over
+ * message when any of the three lines is missing or invalid, and (#4439) the
+ * `Shape:` / `Enforcer:` lines when `requireShape` is set or either is
+ * present. `ignoreUnfilled`
+ * (the local preflight, where the label does not require the section) also
+ * returns [] for a section holding only the template's own hint. Parsing runs over
  * the fenced-block-free body, so a quoted example inside a code fence never
  * satisfies the requirement (issue #4288, "Red first").
  */
-export function lintDetectionSection(body = "") {
+export function lintDetectionSection(body = "", options = {}) {
 	const lines = sourceWithoutFencedBlocks(body).split(/\r?\n/);
 	const headings = [];
 	for (let index = 0; index < lines.length; index += 1) {
@@ -1827,23 +3194,55 @@ export function lintDetectionSection(body = "") {
 		(candidate) =>
 			candidate.index > heading.index && candidate.level <= heading.level,
 	);
-	const content = lines
-		.slice(heading.index + 1, nextHeading?.index ?? lines.length)
-		.join("\n");
+	// An HTML comment is not an answer: lines quoted in one never count (#4439).
+	const content = blankMarkdown(
+		lines
+			.slice(heading.index + 1, nextHeading?.index ?? lines.length)
+			.join("\n"),
+	);
+	// A non-bug PR may leave the template's optional hint in place; that is an
+	// unanswered section, not a malformed answer.
+	// The mandatory footer is the last line of the body, so it lands inside
+	// this section when Detection is last; it is not the author's content.
+	if (
+		options.ignoreUnfilled &&
+		!hasRealContent(
+			content.split("\n").filter((line) => !GENERATED_FOOTER.test(line.trim())),
+			"detection",
+			templatePlaceholderLines(),
+		)
+	)
+		return [];
 	const caughtBy = detectionFieldValue(content, "caught by");
 	const shouldBy = detectionFieldValue(content, "should have been caught by");
 	const gap = detectionFieldValue(content, "gap");
+	// #4519: only the bug-closing seam (`requireShape`) names "unknown"; a
+	// non-bug section that says it stays on the generic refusal below.
 	if (
-		caughtBy === null ||
-		!DETECTION_LAYER_SET.has(normalizeDetectionLayer(caughtBy))
+		options.requireShape &&
+		[caughtBy, shouldBy, noneReason(gap)].some(isPlaceholderAnswer)
 	)
+		return [DETECTION_UNKNOWN_MESSAGE];
+	if (caughtBy === null || !isDetectionLayer(normalizeDetectionLayer(caughtBy)))
 		return [DETECTION_MESSAGE];
 	if (
 		shouldBy === null ||
-		!DETECTION_SHOULD_SET.has(normalizeDetectionLayer(shouldBy))
+		!isDetectionShouldLayer(normalizeDetectionLayer(shouldBy))
 	)
 		return [DETECTION_MESSAGE];
 	if (gap === null || !validDetectionGap(gap)) return [DETECTION_MESSAGE];
+	const claimed = existsGapPath(gap);
+	if (claimed !== null && typeof options.existsOnBase === "function") {
+		const onBase = options.existsOnBase(claimed);
+		if (onBase === null) return [DETECTION_EXISTS_BASE_UNRESOLVED_MESSAGE];
+		if (!onBase) return [detectionExistsNotOnBaseMessage(claimed)];
+	}
+	if (
+		options.requireShape ||
+		detectionFieldValue(content, "shape") !== null ||
+		detectionFieldValue(content, "enforcer") !== null
+	)
+		return lintShapeAndEnforcer(content, options);
 	return [];
 }
 
@@ -2021,7 +3420,499 @@ export function lintClassSweep(body = "", { diff } = {}) {
 	return [CLASS_SWEEP_MESSAGE];
 }
 
+// A failing-test line names its own title: a `FAIL`/`❯` line carries a runner
+// tag, a file and zero or more suite segments before the title, and a glyph
+// line carries the title alone. Vitest appends a duration, which is not part
+// of the title. #4585 row 1 matches this line's own title, never a substring of
+// another test's evidence (#4605 F3).
+const FAILING_ENTRY = /(?:^|\s)(FAIL|❯|[×✗✕])\s+/g;
+const RUNNER_TAG = /^\|[^|]*\|\s*/;
+const VITEST_DURATION = /\s+\d+(?:\.\d+)?\s*m?s\s*$/;
+const UNKNOWN_FILE = /^(?:\.{3}|…)$/;
+
+function failingEntries(quote) {
+	const entries = [];
+	for (const row of String(quote ?? "").split("\n")) {
+		const markers = [...row.matchAll(FAILING_ENTRY)];
+		for (const [index, marker] of markers.entries()) {
+			const start = (marker.index ?? 0) + marker[0].length;
+			const end = markers[index + 1]?.index ?? row.length;
+			const body = row.slice(start, end).replace(/[;\s]+$/, "");
+			entries.push(failingEntry(marker[1], body));
+		}
+	}
+	return entries;
+}
+
+function failingEntry(marker, body) {
+	const title = String(body).replace(VITEST_DURATION, "").trim();
+	if (marker !== "FAIL" && marker !== "❯")
+		return { file: null, titles: [title] };
+	const parts = title.replace(RUNNER_TAG, "").split(/\s+>\s+/);
+	if (parts.length < 2) return { file: null, titles: [title] };
+	// The line carries a file, zero or more suite segments and its own title,
+	// and the title itself may contain the ` > ` separator (`blocking > 0`).
+	// Offer every suffix of the chain, longest first, so a suite chain still
+	// resolves and a title that carries the separator matches at its full
+	// length against the declaration's exact title (#4605 F7).
+	const segments = parts.slice(1);
+	const titles = segments.map((_, start) => segments.slice(start).join(" > "));
+	const file = parts[0].trim().replace(/^\.\//, "");
+	return { file: file && !UNKNOWN_FILE.test(file) ? file : null, titles };
+}
+
+function samePath(left, right) {
+	return left.replace(/^\.\//, "") === right.replace(/^\.\//, "");
+}
+
+// Row 1 is file-level (#4585 as amended by issuecomment-6252599595): a changed
+// test file owes one red-first transcript that names it and shows a failure from
+// it, or a Controls row naming it with a reason. Titles, table rows and suite
+// chains are not read, so the per-title matcher does not exist.
+function transcriptNamesFile(fence, file) {
+	if (!fence.failure) return false;
+	if (!fence.lines.some((line) => namesFile(line, file))) return false;
+	return failingEntries(fence.lines.join("\n")).some(
+		(entry) => !entry.file || samePath(entry.file, file),
+	);
+}
+
+// A Controls row names the file it covers and gives a reason: a `Control: ...`
+// line, or a row of a Controls table. A row that names no file, or gives no
+// reason, proves nothing.
+function controlRows(visibleRows) {
+	let inSection = false;
+	let controlTable = false;
+	const rows = [];
+	for (const row of visibleRows) {
+		const heading = HEADING.exec(row);
+		if (heading) {
+			inSection = /\bcontrols?\b/i.test(heading[1]);
+			controlTable = false;
+			continue;
+		}
+		if (/^\s*(?:\*\*)?Controls?\b/i.test(row)) inSection = true;
+		if (!row.trim()) {
+			controlTable = false;
+			continue;
+		}
+		if (/^\s*\|/.test(row)) {
+			// A table whose own header names the column is a Controls table,
+			// wherever it sits.
+			if (/\bcontrols?\b/i.test(row)) controlTable = true;
+			if (inSection || controlTable) rows.push(row);
+			continue;
+		}
+		controlTable = false;
+		if (inSection || /\bcontrols?\b/i.test(row)) rows.push(row);
+	}
+	return rows;
+}
+
+function controlsNameFile(rows, file) {
+	return rows.some((row) => {
+		if (!namesFile(row, file)) return false;
+		if (/^\s*\|/.test(row)) {
+			const cells = row
+				.split("|")
+				.slice(1, -1)
+				.map((cell) => cell.trim())
+				.filter(Boolean);
+			return cells.length >= 2 && wordCount(cells.join(" ")) >= 2;
+		}
+		return /(?:—|:|because)\s+[A-Za-z0-9].+/.test(row);
+	});
+}
+
+// A path token, or a bare filename for a root-level changed file (`index.ts`).
+// A bare name never stands in for a nested path: `launch.ts` does not name
+// `clients/lsp/launch.ts` (#4605 F4).
+const PATH_TOKEN = /[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*/g;
+const URL_SPAN = /[a-z][a-z0-9+.-]*:\/\/\S+/gi;
+
+function pathTokens(text) {
+	return [...String(text ?? "").matchAll(PATH_TOKEN)].map((match) => match[0]);
+}
+
+function namesFile(text, file) {
+	const candidates = new Set([file, file.replace(/\.[cm]?ts$/, ".js")]);
+	return pathTokens(text).some((token) =>
+		candidates.has(token.replace(/^\.\//, "")),
+	);
+}
+
+// A row that names a file path is evidence about that path, whichever path it
+// is, so it can never stand in for a generic Windows read (#4605 F8). A bare
+// basename that ends in a source extension names a file too, so it is evidence
+// about that path rather than a generic read (#4605 V5). A URL is a link to the
+// run, not a path in this repository.
+const SOURCE_FILE_TOKEN =
+	/^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:[cm]?[jt]sx?|mjs|cjs|json|md|ya?ml|toml|py|go|rs|sh)$/i;
+
+function namesAnyPath(text) {
+	return pathTokens(String(text ?? "").replace(URL_SPAN, " ")).some(
+		(token) => token.includes("/") || SOURCE_FILE_TOKEN.test(token),
+	);
+}
+
+function namedChangedFiles(text, changedPaths) {
+	const found = new Set();
+	for (const token of pathTokens(text)) {
+		const path = token.replace(/^\.\//, "");
+		if (changedPaths.has(path)) found.add(path);
+	}
+	return found;
+}
+
+// A `mutation:` record proves only when it states the run's own result: an
+// explicit RED/FAIL line. Round 2 listed the words that mean "did not run", so
+// every unlisted spelling (`unable to run`, `n/a`, `did not execute`) passed
+// (#4605 V4). The default is inverted: a `mutation:` continuation that carries
+// no result word refuses the fence, and the fence must hold a result line.
+// The three spellings are listed whole: an optional `(?:ED|…)?` suffix splits
+// the tail off as a bare three-letter fragment, which the advisory
+// spellchecker reads as a misspelling.
+const MUTATION_RESULT =
+	/\bRED\b|\b(?:FAIL|FAILED|FAILURE)\b|\b[1-9]\d*\s+failed\b|[×✗✕]\s+\S/;
+
+// The tool prints `mutation: <file> (<find> -> <replace>)`; a hand-written
+// header may name the file alone. Any other tail is a claim about the run, so
+// it must state a result. That refuses `not run`, `unable to run`, `n/a` and
+// every spelling a bad-word list would miss (#4605 V4).
+function mutationHeaderProves(header, file) {
+	const remaining = String(header)
+		.replace(/^(?:\$\s+)?mutation:/i, "")
+		.replace(URL_SPAN, " ")
+		.split(/\s+/)
+		.filter(Boolean)
+		.filter((token) => !namesFile(token, file))
+		.join(" ");
+	return (
+		remaining === "" ||
+		/^\(.*->.*\)$/.test(remaining) ||
+		MUTATION_RESULT.test(remaining)
+	);
+}
+
+// A table row in the mutation section may name its file in the row, or sit
+// under a one-file opener. The label on the last cell lets a row point at a
+// failing fence below it, the shape `scripts/mutate.mjs` writes.
+function mutationTableRows(visibleRows) {
+	let mutationSection = false;
+	let mutationScope = "";
+	const rows = [];
+	for (const row of visibleRows) {
+		const heading = HEADING.exec(row);
+		if (heading) {
+			mutationSection = /\bmutations?\b/i.test(heading[1]);
+			mutationScope = "";
+			continue;
+		}
+		if (/^\s*(?:\*\*)?(?:Hand[- ]mutation|Mutations?)\b/i.test(row)) {
+			mutationSection = true;
+			mutationScope = row;
+			continue;
+		}
+		if (!mutationSection || !row.trim()) continue;
+		if (/^\s*\|/.test(row)) {
+			if (/^\s*\|[\s:|-]+\|?\s*$/.test(row)) continue;
+			const cells = row
+				.split("|")
+				.slice(1, -1)
+				.map((cell) => cell.trim());
+			const label = (cells.at(-1) ?? "").replace(/`/g, "").trim();
+			rows.push({
+				text: row,
+				scope: mutationScope,
+				label: /^[A-Za-z]*\d+$/.test(label) ? label : null,
+			});
+			continue;
+		}
+		mutationScope = row;
+	}
+	return rows;
+}
+
 /** Check the structural PR-body contract, including answered sections. */
+// #4585: body evidence answers the changed code, not a generic checklist.
+// Row 3 (model fidelity) remains reviewer judgement per issuecomment 6241755363.
+function lintDiffCompliance(body, options) {
+	const errors = [];
+	// A literal `<!--` inside a fence or an inline code span is quoted text, not
+	// a comment opener: the body of a PR that documents comment ends reads it as
+	// text, and blanking from it would hide every fence below (#4585 row 1 hit
+	// exactly that). Both a backticked span and a fence restore their literal
+	// `<!--`, and a real comment still hides what it contains.
+	const source = String(body);
+	const quotedSpans = codeSpanMasked(source);
+	const fencedSpans = sourceWithoutFencedBlocks(source, {
+		indentedCode: false,
+	});
+	const guarded = source.replace(/<!--/g, (marker, offset) =>
+		quotedSpans[offset] === " " || fencedSpans[offset] === " "
+			? "    "
+			: marker,
+	);
+	// `visibleRows` hides fenced examples (a quoted heading, control or table
+	// is an example, not a claim). `evidenceRows` keeps fence content, because
+	// an honest body quotes the Windows advisory row in a fence (#4605 F5).
+	const rawRows = blankHtmlComments(guarded).split(/\r?\n/);
+	const visibleRows = blankMarkdown(guarded).split(/\r?\n/);
+	const evidenceRows = rawRows;
+	const transcriptFences = [];
+	for (const block of markdownBlocks(body, { tilde: true })) {
+		if (!block.fence || !rawRows[block.start]?.trim()) continue;
+		const opener = /^\s*(`{3,}|~{3,})(.*)$/.exec(block.lines[0]);
+		const closer = /^\s*(`{3,}|~{3,})\s*$/.exec(block.lines.at(-1));
+		if (!opener || !closer || block.lines.length < 2) continue;
+		if (closer[1][0] !== opener[1][0] || closer[1].length < opener[1].length)
+			continue;
+		const lines = block.lines.slice(1, -1).filter((line) => line.trim());
+		if (!lines.length) continue;
+		transcriptFences.push({
+			start: block.start,
+			header: lines[0].trim(),
+			lines,
+			failure: isFailureQuote({ info: opener[2].trim(), text: lines }),
+		});
+	}
+	// Only a failing fence can vouch for a run, and a fence inside a real
+	// comment was removed above.
+	const transcripts = transcriptFences.filter((fence) => fence.failure);
+	const mutationRows = mutationTableRows(visibleRows);
+	const windowsReads = [];
+	for (const row of evidenceRows) {
+		if (!/\bWindows\b/i.test(row)) continue;
+		const reason =
+			/\b(?:cannot differ|platform.independent|platform.neutral)\b.*\bbecause\b\s+\S.+/i.test(
+				row,
+			);
+		const run =
+			/\b(?:advisory|lane|job)\b/i.test(row) &&
+			/\b(?:passed|failed|success|failure)\b/i.test(row) &&
+			/\b\d{5,}\b/.test(row) &&
+			!/\b(?:cancelled|canceled|skipped|pending|queued|not run|did not run)\b/i.test(
+				row,
+			);
+		if (reason || run) windowsReads.push(row);
+	}
+	const changedFiles = parseRuntimeHunks(options.diff);
+	const changedPaths = new Set();
+	for (const file of changedFiles) {
+		if (file.pre) changedPaths.add(file.pre);
+		if (file.post) changedPaths.add(file.post);
+	}
+	// A changed `.ts` file also answers to the `.js` specifier a body cites.
+	const namedPaths = new Set(changedPaths);
+	for (const path of changedPaths)
+		namedPaths.add(path.replace(/\.[cm]?ts$/, ".js"));
+	const rowFour = [];
+	const unclassified = [];
+	for (const file of changedFiles) {
+		// A whole-file deletion has no post-image: no added declaration, no
+		// post-image call to classify. Reading it as an unreadable post-image reded
+		// every deleted `clients/` or `scripts/` file with a notice no body
+		// evidence could clear (#4605 V2). A hunk that only deletes from a file
+		// that still exists is not this state.
+		if (file.deletedFile) continue;
+		const windowsPath = [file.pre, file.post].some((name) =>
+			/^clients\/(?:package-manager\.|lsp\/launch|path-utils\.|safe-spawn\.)/.test(
+				name,
+			),
+		);
+		const tests = /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file.post);
+		const production =
+			/\.[cm]?[jt]sx?$/.test(file.post) &&
+			!/\.d\.[cm]?ts$/.test(file.post) &&
+			(isRuntimeObservabilityPath(file.post) ||
+				file.post.startsWith("scripts/"));
+		// A `trySpawn` caller owes row 4 for any hunk it changes, a deletion
+		// included, so its post-image is read even when the diff adds nothing to
+		// it (#4605 F6). A seam file named by path needs no post-image for row 4.
+		const seamCaller = production && !windowsPath;
+		if (windowsPath)
+			rowFour.push({
+				file: file.post,
+				read: windowsReads.some((row) => namesFile(row, file.post)),
+			});
+		if (!tests && !production) continue;
+		if (!file.added.size && !seamCaller) continue;
+		const source = headFileSource(file.post, {
+			...options,
+			postBlob: file.postBlob,
+		});
+		const rows = typeof source === "string" ? sourceLines(source) : [];
+		// The post-image identity is what the alias closure and the byte-mapped
+		// line numbers need. Without it the added lines still decide row 2 and
+		// row 4, and row 1 reads the added lines alone; a declaration that opens
+		// there but whose title sits on an unchanged line cannot be classified,
+		// so it is refused rather than passed.
+		// Every added line must sit at its own line number in the post-image; an
+		// unreadable source has no rows, so it fails here without a second guard.
+		const exact = [...file.added].every(
+			([line, text]) => rows[line - 1] === text,
+		);
+		// A deletion-only file has no added line to compare, so `exact` alone
+		// cannot say the post-image was read; the source itself must be a string.
+		const readable = typeof source === "string" && exact;
+		const { text } = readable
+			? blankCommentsAndStrings(source)
+			: { text: [...file.added.values()].join("\n") };
+		const addedCode = readable
+			? (() => {
+					const codeRows = text.split("\n");
+					return [...file.added.keys()]
+						.map((line) => codeRows[line - 1] ?? "")
+						.join("\n");
+				})()
+			: text;
+		const unclassifiable =
+			tests && /(?<![\w$.])(?:it|test)\b[^\n;]*?\(/.test(addedCode);
+		if (!readable && (unclassifiable || production))
+			unclassified.push(file.post);
+		if (tests && readable) {
+			// Per-occurrence accounting (#4605 V3): a removal credits one addition
+			// of the same trimmed line, so a re-indent or a move is not new content
+			// while a second identical copy is (#4605 F4, V3).
+			const removedCounts = new Map();
+			for (const line of file.removed) {
+				const trimmed = line.trim();
+				if (trimmed)
+					removedCounts.set(trimmed, (removedCounts.get(trimmed) ?? 0) + 1);
+			}
+			const newAddedLine = new Map();
+			for (const [line, value] of file.added) {
+				const trimmed = value.trim();
+				const left = trimmed ? (removedCounts.get(trimmed) ?? 0) : 0;
+				if (!trimmed) newAddedLine.set(line, false);
+				else if (left > 0) {
+					removedCounts.set(trimmed, left - 1);
+					newAddedLine.set(line, false);
+				} else newAddedLine.set(line, true);
+			}
+			// Row 1 is file-level (#4585 as amended by issuecomment-6252599595):
+			// a changed test file owes one fenced red-first transcript naming it
+			// that shows a failure from it, or a Controls row naming it with a
+			// reason. A declaration opener on a genuinely new line is what makes
+			// the file owe; its title, table and chain are not read. The callees
+			// are read from the source: the `it`/`test` names, an alias, and a
+			// `vitest` namespace import.
+			const names = new Set(["it", "test"]);
+			for (const match of text.matchAll(/\b(?:it|test)\s+as\s+(\w+)/g))
+				names.add(match[1]);
+			for (const match of source.matchAll(
+				/import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+["']vitest["']/g,
+			))
+				names.add(`${match[1]}\\s*\\.\\s*(?:it|test)`);
+			let changed = true;
+			while (changed) {
+				changed = false;
+				for (const match of text.matchAll(
+					/\b(?:const|let|var)\s+(\w+)\s*=\s*(\w+)\b/g,
+				)) {
+					if (names.has(match[2]) && !names.has(match[1])) {
+						names.add(match[1]);
+						changed = true;
+					}
+				}
+			}
+			const declarationOpener = new RegExp(
+				`(?<![\\w$.])(?:${[...names].join("|")})\\b[^\\n;]*?\\(`,
+			);
+			const codeRows = text.split("\n");
+			const newCode = [...newAddedLine.entries()]
+				.filter(
+					([line, isNew]) => isNew && line >= 1 && line <= codeRows.length,
+				)
+				.map(([line]) => codeRows[line - 1] ?? "")
+				.join("\n");
+			if (declarationOpener.test(newCode)) {
+				const proved = transcripts.some((fence) =>
+					transcriptNamesFile(fence, file.post),
+				);
+				const control = controlsNameFile(controlRows(visibleRows), file.post);
+				if (!proved && !control)
+					errors.push(
+						`PR body compliance row 1: ${file.post} adds or edits test declarations; the body needs one fenced red-first transcript naming that file with a failure from it, or a Controls row naming it with a reason.`,
+					);
+			}
+		}
+		if (
+			production &&
+			/\b(?:if|else|catch|switch|throw)\b|\?(?![.?:])|&&|\|\||\.(?:filter|slice)\s*\(|\bMath\.(?:min|max)\s*\(/.test(
+				addedCode,
+			)
+		) {
+			// #4575: a mutation row, or the tool's own `mutation:` transcript,
+			// names the file it proves. One file, one red (#4605 F1): a table row
+			// binds to the file it names (or to the one-file opener above it),
+			// and its red must be in that row or in a labelled failing fence. A
+			// `mutation:` fence proves only when it states the mutation's own
+			// result: an explicit RED/FAIL line, with every continuation
+			// `mutation:` line stating one too (#4605 V4).
+			const transcriptProves = transcriptFences.some((fence) => {
+				if (!fence.failure) return false;
+				if (!/^(?:\$\s+)?mutation:/i.test(fence.header)) return false;
+				if (!namesFile(fence.header, file.post)) return false;
+				if (!mutationHeaderProves(fence.header, file.post)) return false;
+				if (!fence.lines.some((line) => MUTATION_RESULT.test(line)))
+					return false;
+				return fence.lines
+					.filter((line) => /^(?:\$\s+)?mutation:/i.test(line))
+					.slice(1)
+					.every((line) => MUTATION_RESULT.test(line));
+			});
+			const rowProves = mutationRows.some((row) => {
+				if (!namesFile(row.text, file.post)) {
+					const scoped = namedChangedFiles(row.scope, changedPaths);
+					if (scoped.size !== 1 || !scoped.has(file.post)) return false;
+				}
+				if (BACKTICKED_RED.test(row.text)) return true;
+				if (!row.label) return false;
+				return transcriptFences.some(
+					(fence) =>
+						fence.failure &&
+						namesFile(fence.header, file.post) &&
+						new RegExp(`\\b${row.label}\\b`).test(fence.header),
+				);
+			});
+			if (!rowProves && !transcriptProves)
+				errors.push(
+					`PR body compliance row 2: ${file.post} needs a Mutation section naming that file and a quoted failing mutation transcript.`,
+				);
+		}
+		if (seamCaller && /\btrySpawn\b/.test(text))
+			rowFour.push({
+				file: file.post,
+				read: windowsReads.some((row) => namesFile(row, file.post)),
+			});
+	}
+	// #4605 F4: row 4 is per file. A Windows line that names the file covers it;
+	// a generic line covers a diff with exactly one seam file, where it cannot
+	// be ambiguous. A row that names any file path is evidence about that path,
+	// not a generic read (#4605 F8). A cancelled, skipped or pending run is not
+	// a read.
+	const genericRead = windowsReads.some(
+		(row) =>
+			!namesAnyPath(row) && namedChangedFiles(row, namedPaths).size === 0,
+	);
+	for (const seam of rowFour) {
+		if (seam.read || (rowFour.length === 1 && genericRead)) continue;
+		errors.push(
+			`PR body compliance row 4: ${seam.file} needs a Windows advisory-lane result with run id, or a reason it cannot differ (Windows: cannot differ because ...).`,
+		);
+	}
+	// A post-image the diff names but cannot be read or matched classifies no
+	// row, so the body owes the rows it may still hold. One bounded line names
+	// them: an unbounded per-file notice grows with the diff, and a silent skip
+	// would read as a clean body.
+	if (unclassified.length)
+		errors.push(
+			`PR body compliance: cannot classify rows 1, 2 and 4 for ${unclassified.length} changed file(s) whose post-image is missing, unreadable, or does not match the diff: ${unclassified.slice(0, UNCLASSIFIED_REPORT_LIMIT).join(", ")}${unclassified.length > UNCLASSIFIED_REPORT_LIMIT ? ` (+${unclassified.length - UNCLASSIFIED_REPORT_LIMIT} more)` : ""}.`,
+		);
+	return errors;
+}
+
 export function lintPrBody(body = "", options = {}) {
 	const rawLines = String(body ?? "").split(/\r?\n/);
 	const lines = sourceWithoutFencedBlocks(body).split(/\r?\n/);
@@ -2037,7 +3928,7 @@ export function lintPrBody(body = "", options = {}) {
 			});
 	}
 	const placeholders = templatePlaceholderLines();
-	const errors = [];
+	const errors = options.diff ? lintDiffCompliance(body, options) : [];
 	const summary = headings.find((heading) => hasSection(heading, "summary"));
 	const firstHeading = headings[0]?.index ?? lines.length;
 	const nextSectionHeading = (heading) =>
@@ -2109,11 +4000,24 @@ export function lintPrBody(body = "", options = {}) {
 					".",
 			);
 	}
-	if (options.bugClosing) errors.push(...lintDetectionSection(body));
+	if (options.bugClosing)
+		errors.push(
+			...lintDetectionSection(body, {
+				existsOnBase: options.existsOnBase,
+				shapeCatalog: options.shapeCatalog,
+				requireShape: true,
+			}),
+		);
+	errors.push(...lintBehaviorEquivalence(body, headings, options.title));
 	if (options.diff)
 		errors.push(
 			...lintRuntimeObservability(lines, headings, options.diff, options),
 		);
+	// #4597: its own rule with its own call site, beside the record-naming
+	// check, so a later diff-keyed rule (issue #4585) merges without touching
+	// either function.
+	if (options.diff)
+		errors.push(...lintObservabilityRecordsTested(lines, headings, options));
 	errors.push(...lintCodeCitations(body, options));
 	errors.push(...lintTestReferences(body, options));
 	errors.push(...lintMasterClaims(body));
@@ -2144,23 +4048,7 @@ export function lintPrBody(body = "", options = {}) {
  * @returns {Promise<{body: string, normalized: boolean, title: string | undefined}>}
  */
 export async function fetchLivePrBody(payloadPr, fetchImpl) {
-	const token = process.env.GITHUB_TOKEN;
-	if (!token) throw new Error("GITHUB_TOKEN is not set");
-	const apiUrl = process.env.GITHUB_API_URL;
-	const repository = process.env.GITHUB_REPOSITORY;
-	if (!apiUrl || !repository)
-		throw new Error("GITHUB_API_URL or GITHUB_REPOSITORY is missing");
-	const response = await fetchImpl(
-		`${apiUrl}/repos/${repository}/pulls/${payloadPr.number}`,
-		{
-			signal: AbortSignal.timeout(10_000),
-			headers: {
-				Accept: "application/vnd.github+json",
-				Authorization: `Bearer ${token}`,
-				"X-GitHub-Api-Version": "2022-11-28",
-			},
-		},
-	);
+	const response = await githubGet(`/pulls/${payloadPr.number}`, fetchImpl);
 	if (!response.ok) throw new Error(`GitHub API returned ${response.status}`);
 	const data = await response.json();
 	if (data.body !== null && typeof data.body !== "string")
@@ -2197,22 +4085,9 @@ export async function resolveTouchesTests(
 	fetchImpl = globalThis.fetch,
 ) {
 	try {
-		const token = process.env.GITHUB_TOKEN;
-		if (!token) throw new Error("GITHUB_TOKEN is not set");
-		const apiUrl = process.env.GITHUB_API_URL;
-		const repository = process.env.GITHUB_REPOSITORY;
-		if (!apiUrl || !repository)
-			throw new Error("GITHUB_API_URL or GITHUB_REPOSITORY is missing");
-		const response = await fetchImpl(
-			`${apiUrl}/repos/${repository}/pulls/${payloadPr.number}/files?per_page=100`,
-			{
-				signal: AbortSignal.timeout(10_000),
-				headers: {
-					Accept: "application/vnd.github+json",
-					Authorization: `Bearer ${token}`,
-					"X-GitHub-Api-Version": "2022-11-28",
-				},
-			},
+		const response = await githubGet(
+			`/pulls/${payloadPr.number}/files?per_page=100`,
+			fetchImpl,
 		);
 		if (!response.ok) throw new Error(`GitHub API returned ${response.status}`);
 		if (/rel="next"/.test(response.headers.get("link") ?? ""))
@@ -2248,29 +4123,54 @@ export async function resolveTouchesTests(
 export async function resolveBugClosing(body, fetchImpl = globalThis.fetch) {
 	const issues = parseCloseKeywords(body).issues;
 	if (issues.length === 0) return false;
-	const token = process.env.GITHUB_TOKEN;
-	const apiUrl = process.env.GITHUB_API_URL;
-	const repository = process.env.GITHUB_REPOSITORY;
-	if (!token || !apiUrl || !repository) return null;
-	for (const number of issues) {
-		let data;
+	// A missing env makes githubGet reject, which anyIssueLabelledBug reads as
+	// "cannot read the label" (null), as the old early return did.
+	return anyIssueLabelledBug(issues, async (number) => {
+		const response = await githubGet(`/issues/${number}`, fetchImpl);
+		return response.ok ? await response.json() : null;
+	});
+}
+
+/**
+ * #4288 remainder: the local preflight reads the same labels through
+ * `gh api` (the repository placeholders resolve from `cwd`'s remote), so it
+ * agrees with CI instead of skipping the Detection rule offline. `null` when
+ * gh is missing, unauthenticated, or fails, exactly as for the CI reader.
+ */
+export async function resolveBugClosingViaGh(
+	body,
+	cwd = process.cwd(),
+	exec = execFileSync,
+) {
+	return anyIssueLabelledBug(parseCloseKeywords(body).issues, (number) => {
+		const raw = exec("gh", ["api", `repos/{owner}/{repo}/issues/${number}`], {
+			cwd,
+			encoding: "utf8",
+			timeout: 10_000,
+			killSignal: "SIGKILL",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		// gh output that is not JSON is unreadable label evidence, the same
+		// verdict a thrown exec already gets from anyIssueLabelledBug.
 		try {
-			const response = await fetchImpl(
-				`${apiUrl}/repos/${repository}/issues/${number}`,
-				{
-					signal: AbortSignal.timeout(10_000),
-					headers: {
-						Accept: "application/vnd.github+json",
-						Authorization: `Bearer ${token}`,
-						"X-GitHub-Api-Version": "2022-11-28",
-					},
-				},
-			);
-			if (!response.ok) return null;
-			data = await response.json();
+			return JSON.parse(raw);
 		} catch {
 			return null;
 		}
+	});
+}
+
+// The one label reader both transports share: `readIssue(number)` returns the
+// issue JSON, or null / throws when it cannot be read.
+async function anyIssueLabelledBug(issues, readIssue) {
+	for (const number of issues) {
+		let data;
+		try {
+			data = await readIssue(number);
+		} catch {
+			return null;
+		}
+		if (data === null) return null;
 		const labels = Array.isArray(data?.labels) ? data.labels : [];
 		if (
 			labels.some(
@@ -2336,21 +4236,20 @@ export async function lintPullRequestEvent(
 	try {
 		diff = diffImpl();
 	} catch (error) {
-		if (process.env.GITHUB_ACTIONS) {
-			const reason = error instanceof Error ? error.message : String(error);
-			throw new Error(`diff unavailable: ${reason}`);
-		}
-		// Local callers may not have an upstream ref. Preserve structural lint
-		// outside CI rather than inventing a runtime scope.
+		const reason = error instanceof Error ? error.message : String(error);
+		throw new Error(`diff unavailable: ${reason}`);
 	}
 	const result = lintPrBody(body, {
 		requireTestAssessment,
 		bugClosing: bugClosing === true,
+		existsOnBase: baseFileReader(),
+		shapeCatalog: shapeCatalogReader(),
 		diff,
 		workingTree: true,
 		// Existing open bodies were authored before #4280. Set PI_LENS_PROSE_GRACE=1
 		// for the transition job; local preflight remains blocking by default.
 		proseMode: process.env.PI_LENS_PROSE_GRACE === "1" ? "warn" : "block",
+		title: pullRequest.title,
 	});
 	const classSweep = lintClassSweep(body, { diff });
 	if (classSweep.length) {
@@ -2374,11 +4273,13 @@ export async function lintPullRequestEvent(
 }
 
 export function localDiff(cwd = process.cwd(), git = gitExecFileSync) {
+	// The same byte ceiling as a post-image read: a diff keyed to a large change
+	// (a captured fixture corpus, a generated file) must not fail as unavailable.
 	return git(["diff", "--unified=0", "--no-color", "origin/master...HEAD"], {
 		cwd,
 		encoding: "utf8",
 		// Upstream syncs exceed Node's 1 MiB default; retain a finite bound.
-		maxBuffer: 16 * 1024 * 1024,
+		maxBuffer: MAX_SOURCE_BYTES,
 	});
 }
 
@@ -2478,15 +4379,7 @@ export function lintWorkflowRunEvidence(
 	const unreadable = [];
 	// The merge base is what `localDiff` diffs from; no base image (an added
 	// file, a shallow checkout) reads as "not a comment-only edit".
-	let mergeBase = null;
-	try {
-		mergeBase = gitExecFileSync(["merge-base", "origin/master", "HEAD"], {
-			cwd,
-			encoding: "utf8",
-		}).trim();
-	} catch {
-		mergeBase = null;
-	}
+	const mergeBase = resolvePrBase(cwd);
 	const errors = evaluateWorkflowRunEvidence({
 		changedFiles: parseChangedFiles(diff),
 		body,
@@ -2539,24 +4432,45 @@ export function localTouchesTests(cwd = process.cwd(), git = gitExecFileSync) {
 	return names.split(/\r?\n/).some((name) => name.startsWith("tests/"));
 }
 
+/**
+ * True when the checkout has no `origin/master` at all (a shallow or uncloned
+ * base). The diff cannot be read there for a reason the #4404 hint names, and
+ * the diff-keyed rows stay unattempted rather than failing the whole preflight.
+ */
+function missingBaseRef(cwd, git = gitExecFileSync) {
+	try {
+		git(["rev-parse", "--verify", "origin/master"], {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return false;
+	} catch {
+		return true;
+	}
+}
+
 export function lintLocalPrBody(
 	body,
 	cwd = process.cwd(),
 	git = gitExecFileSync,
 	options = {},
 ) {
-	let diff;
+	let diff = "";
+	// #4585: a local preflight must judge the same range as CI. An unavailable
+	// diff cannot classify the diff-keyed rows, so it fails closed; the rest of
+	// the lint still runs, because its own base-resolution message names what to
+	// fetch. A clone with no base ref at all keeps the #4404 hint instead: there
+	// is no diff to read, and the missing base is what the reader must fix.
+	let diffUnavailable = false;
 	try {
 		diff = localDiff(cwd, git);
 	} catch {
-		// A local preflight must use the same range as CI. If the caller has no
-		// upstream ref, retain structural lint rather than inventing scope.
-		diff = "";
+		diffUnavailable = !missingBaseRef(cwd, git);
 	}
-	// #4288: the local preflight is offline. An injected resolver (tests) or an
-	// explicit tri-state wins; otherwise the label is unknown and a body that
-	// closes an issue warns instead of demanding a Detection section it cannot
-	// justify.
+	// #4288: an explicit tri-state (the CLI resolves it through gh before this
+	// call) or an injected resolver (tests) wins; otherwise the label is unknown
+	// and a body that closes an issue warns that the check was skipped.
 	let bugClosing = options.bugClosing;
 	if (bugClosing === undefined)
 		bugClosing =
@@ -2565,18 +4479,35 @@ export function lintLocalPrBody(
 				: null;
 	if (bugClosing === null && parseCloseKeywords(body).issues.length > 0)
 		console.warn(
-			'::warning::PR body check could not read the closed issue label offline, so the "## Detection" section is not required (#4288).',
+			'::warning::PR body check could not read the closed issue label (gh missing, unauthenticated, or failed), so the "## Detection" requirement check was skipped (#4288).',
 		);
+	const existsOnBase = baseFileReader(cwd, git);
+	const shapeCatalog = shapeCatalogReader(cwd, git);
 	const result = lintPrBody(body, {
 		requireTestAssessment: localTouchesTests(cwd, git),
 		bugClosing: bugClosing === true,
+		existsOnBase,
+		shapeCatalog,
 		diff,
 		cwd,
 		workingTree: true,
 		ref: options.ref,
 		headFiles: options.headFiles,
 		proseMode: options.proseMode,
+		title: options.title,
 	});
+	// #4288: a present section is validated whatever the label, so a prose-form
+	// answer reds here instead of at CI. `lintPrBody` already did it for a
+	// resolved bug.
+	if (bugClosing !== true) {
+		const detection = lintDetectionSection(body, {
+			ignoreUnfilled: true,
+			existsOnBase,
+			shapeCatalog,
+		});
+		result.errors.push(...detection);
+		if (detection.length) result.valid = false;
+	}
 	const classSweep = lintClassSweep(body, { diff });
 	if (classSweep.length) {
 		result.valid = false;
@@ -2597,15 +4528,19 @@ export function lintLocalPrBody(
 	const closeSyntax = lintCloseKeywords(body);
 	if (!closeSyntax.valid) {
 		result.valid = false;
-		result.errors.push(INVALID_CLOSE_KEYWORD_MESSAGE);
-		for (const line of closeSyntax.offendingLines)
-			result.errors.push(`  offending line: ${line}`);
+		result.errors.push(...closeKeywordErrors(closeSyntax));
 	}
 	const placement = lintCloseKeywordPlacement(options.title ?? "", body);
 	if (!placement.valid) {
 		result.valid = false;
 		result.errors.push(
 			closeKeywordPlacementMessage(placement.missingBodyIssues),
+		);
+	}
+	if (diffUnavailable) {
+		result.valid = false;
+		result.errors.push(
+			"PR body compliance: diff unavailable; cannot classify rows 1, 2 and 4.",
 		);
 	}
 	return result;
@@ -2618,33 +4553,54 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 	const bodyIndex = process.argv.indexOf("--body");
 	const titleIndex = process.argv.indexOf("--title");
 	const refIndex = process.argv.indexOf("--ref");
-	const title = titleIndex === -1 ? "" : process.argv[titleIndex + 1];
+	// The documented local form also takes the title positionally:
+	// `--lint-local <body-file> "<title>"` (docs/pi-lens-subagent.md). Without
+	// it a title-gated rule (Behavior equivalence) never fired locally (#4551).
+	const positionalTitle =
+		process.argv[2] === "--lint-local" &&
+		process.argv[4] &&
+		!process.argv[4].startsWith("--")
+			? process.argv[4]
+			: "";
+	// With neither, the handoff's commit subject stands in for the title, the
+	// proxy check-pr-title.mjs reads too, so pr-preflight and lane-check (which
+	// pass only the body) still apply the title-gated rules.
+	const commitSubject = () => {
+		try {
+			return readFileSync("COMMIT_MSG.txt", "utf8").split(/\r?\n/, 1)[0].trim();
+		} catch {
+			return "";
+		}
+	};
+	const title =
+		titleIndex !== -1
+			? process.argv[titleIndex + 1]
+			: positionalTitle ||
+				(process.argv[2] === "--lint-local" ? commitSubject() : "");
 	const ref = refIndex === -1 ? undefined : process.argv[refIndex + 1];
 	const proseMode = process.argv.includes("--prose-grace") ? "warn" : "block";
 	if (titleIndex !== -1 && !title) throw new Error("--title requires text");
 	if (refIndex !== -1 && !ref) throw new Error("--ref requires a revision");
-	if (bodyIndex !== -1) {
-		const bodyPath = process.argv[bodyIndex + 1];
-		if (!bodyPath) throw new Error("--body requires a file path");
+	const localBodyPath =
+		bodyIndex !== -1
+			? process.argv[bodyIndex + 1]
+			: process.argv[2] === "--lint-local"
+				? process.argv[3]
+				: undefined;
+	if (bodyIndex !== -1 && !localBodyPath)
+		throw new Error("--body requires a file path");
+	if (bodyIndex === -1 && process.argv[2] === "--lint-local" && !localBodyPath)
+		throw new Error("--lint-local requires a file path");
+	if (localBodyPath) {
 		// --title is accepted for preflight parity. Title validation belongs to
 		// check-pr-title.mjs, but preflight passes both local input files.
-		const result = lintLocalPrBody(
-			readFileSync(bodyPath, "utf8"),
-			process.cwd(),
-			gitExecFileSync,
-			{ title, ref, proseMode },
-		);
-		for (const error of result.errors) console.error(error);
-		process.exitCode = result.valid ? 0 : 1;
-	} else if (process.argv[2] === "--lint-local") {
-		const bodyPath = process.argv[3];
-		if (!bodyPath) throw new Error("--lint-local requires a file path");
-		const result = lintLocalPrBody(
-			readFileSync(bodyPath, "utf8"),
-			process.cwd(),
-			gitExecFileSync,
-			{ title, ref, proseMode },
-		);
+		const localBody = readFileSync(localBodyPath, "utf8");
+		const result = lintLocalPrBody(localBody, process.cwd(), gitExecFileSync, {
+			title,
+			ref,
+			proseMode,
+			bugClosing: await resolveBugClosingViaGh(localBody),
+		});
 		for (const error of result.errors) console.error(error);
 		process.exitCode = result.valid ? 0 : 1;
 	} else

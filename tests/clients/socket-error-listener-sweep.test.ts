@@ -42,8 +42,8 @@
 
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Lang, parse } from "@ast-grep/napi";
 import { describe, expect, it } from "vitest";
+import { parseRoot, walkAst } from "../support/ast-census.js";
 import {
 	assertNonEmptyScan,
 	codeMatches,
@@ -93,11 +93,6 @@ interface SocketScan {
 // oxlint-disable-next-line typescript/no-explicit-any
 type SgNode = any;
 
-function walk(node: SgNode, visit: (node: SgNode) => void): void {
-	visit(node);
-	for (const child of node.children()) walk(child, visit);
-}
-
 function enclosingFunctionText(node: SgNode): string | undefined {
 	for (let current = node.parent(); current; current = current.parent()) {
 		if (FUNCTION_KINDS.has(current.kind())) return current.text();
@@ -132,7 +127,7 @@ function scanSocketSites(source: string, relPath = "<source>"): SocketScan {
 		return { sites, unresolved };
 	}
 	const lines = source.split("\n");
-	walk(parse(Lang.TypeScript, source).root(), (node: SgNode) => {
+	walkAst(parseRoot(source), (node: SgNode) => {
 		if (node.kind() !== "call_expression") return;
 		const fn = node.field("function");
 		if (fn?.kind() !== "member_expression") return;

@@ -88,12 +88,28 @@ export interface RunClassifierArgs {
 	// without one, skipping every PR-comment step.
 	allowMissingPr?: boolean;
 }
+/** #4672: whether a CANCELLED run is the master-lane teardown race. */
+export type CancelledRunJudgment =
+	| { eligible: true; kind: "infra-kill"; detail: string }
+	| { eligible: false; reason: string };
+export declare function classifyCancelledRun(args: {
+	run: {
+		id?: number | string;
+		event?: string;
+		head_branch?: string;
+		conclusion?: string;
+	};
+	jobs: readonly unknown[];
+}): CancelledRunJudgment;
 export type SuccessfulClassifierRun = ClassifierDecision & {
 	sha: string;
 	prNumber: number | null;
-	jobId: number;
+	/** Null on the cancelled-run lane: there is no failed job to read. */
+	jobId: number | null;
 	jobName: string;
 	supersededByCommentId?: number;
+	// One line when a PR comment write was refused (#4382).
+	commentWarning?: string;
 };
 export type SkippedClassifierRun = {
 	skipped: true;

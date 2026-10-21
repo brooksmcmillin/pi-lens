@@ -1,5 +1,8 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TreeSitterParseCacheStats } from "../../clients/tree-sitter-client.js";
+import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
 function stats(
 	overrides: Partial<TreeSitterParseCacheStats> = {},
@@ -29,7 +32,8 @@ function stats(
 	};
 }
 
-// Allow this test to exercise the real logger (it mocks fs, so no disk I/O).
+// Allow this test to exercise the real logger. Most cases mock fs, so no disk
+// I/O; the diagnostic-record case reads the real file from its own home.
 process.env.PI_LENS_TEST_MODE = "0";
 
 describe("tree-sitter-logger", () => {
@@ -217,5 +221,51 @@ describe("tree-sitter-logger", () => {
 
 		const payload = JSON.parse(appendFile.mock.calls[0][1]);
 		expect(payload.filePath).toBe("<tree-sitter>");
+	});
+
+	// #4224 review R1: the record is what a bug report greps for, so the entry's
+	// `reason` and its whole `metadata` must survive the write. A case that only
+	// reads `filePath` passes while the logger drops the diagnosis. This one reads
+	// the real file the logger wrote (AGENTS.md: test telemetry by flushing and
+	// reading the real sink), from a home of its own: the sink binds its directory
+	// at module load, so the pin goes in before the import.
+	it("keeps a diagnostic entry's reason and metadata in the file it writes", async () => {
+		const priorHome = process.env.PI_LENS_HOME;
+		const env = setupTestEnvironment("pi-lens-tree-sitter-logger-");
+		process.env.PI_LENS_HOME = env.tmpDir;
+		try {
+			const mod = await import("../../clients/tree-sitter-logger.js");
+			mod.logTreeSitterDiagnostic({
+				subsystem: "tree-sitter-client",
+				message: "wasm aborted",
+				metadata: {
+					grammarFile: "tree-sitter-python.wasm",
+					outcome: "unavailable",
+				},
+			});
+			await mod.flushTreeSitterLog();
+
+			const file = mod.getTreeSitterLogPath();
+			// The row is in this case's own home, not the worker's or a maintainer's.
+			expect(file.startsWith(path.resolve(env.tmpDir))).toBe(true);
+			const rows = fs
+				.readFileSync(file, "utf8")
+				.split("\n")
+				.filter((line) => line.trim().length > 0)
+				.map((line) => JSON.parse(line));
+			expect(rows).toHaveLength(1);
+			const [row] = rows;
+			expect(row.phase).toBe("diagnostic");
+			expect(row.reason).toBe("wasm aborted");
+			expect(row.metadata).toEqual({
+				subsystem: "tree-sitter-client",
+				grammarFile: "tree-sitter-python.wasm",
+				outcome: "unavailable",
+			});
+		} finally {
+			if (priorHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = priorHome;
+			removeTempDirSync(env.tmpDir);
+		}
 	});
 });

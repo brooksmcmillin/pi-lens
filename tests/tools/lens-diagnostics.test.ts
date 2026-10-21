@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
+import * as lspConfig from "../../clients/lsp/config.js";
+import { LSP_SERVERS } from "../../clients/lsp/server.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
 import { PROJECT_DIAGNOSTICS_CACHE_VERSION } from "../../clients/project-diagnostics/cache.js";
@@ -21,7 +23,8 @@ import {
 	resetOncePerSessionPhases,
 } from "../../clients/latency-logger.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
-import { removeTempDirSync } from "../clients/test-utils.js";
+import { pinFixtureHome, removeTempDirSync } from "../clients/test-utils.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
 const projectDiagnosticsMocks = vi.hoisted(() => ({
@@ -99,7 +102,6 @@ const mockSummaries: ReturnType<
 	(typeof import("../../clients/widget-state.js"))["getFileDiagnosticSummaries"]
 > = [];
 
-let mockStaleDropped = 0;
 let mockDependencyDemoted = 0;
 
 const reconcileScanDiagnosticsMock = vi.fn().mockReturnValue(true);
@@ -111,7 +113,10 @@ vi.mock("../../clients/widget-state.js", async (importOriginal) => {
 	return {
 		...actual,
 		getFileDiagnosticSummaries: () => mockSummaries,
-		reconcileStaleWidgetFiles: async () => mockStaleDropped,
+		// No stale record exists in this file's mocked summaries, so the sweep
+		// reports nothing. The stale-evidence verdict runs against the real store in
+		// lens-diagnostics-session-evidence.test.ts.
+		reconcileStaleWidgetFiles: async () => 0,
 		reconcileStaleWidgetDependencyBlockers: async () => mockDependencyDemoted,
 		reconcileScanDiagnostics: (...args: unknown[]) =>
 			reconcileScanDiagnosticsMock(...args),
@@ -137,6 +142,10 @@ vi.mock(
 
 beforeEach(() => {
 	resetDegradationLedger();
+	// #4397: the once-per-session claims (`runner_coverage_retired` per runner)
+	// are process state shared by every case; a case that logs the row must not
+	// depend on which sibling consumed the claim first.
+	resetOncePerSessionPhases();
 	projectDiagnosticsMocks.scanProjectDiagnostics.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReset();
@@ -149,7 +158,6 @@ beforeEach(() => {
 		timings: {},
 	});
 	mockSummaries.length = 0;
-	mockStaleDropped = 0;
 	mockDependencyDemoted = 0;
 	reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
 	reconcileCorrelatedScanDiagnosticsMock.mockReset();
@@ -219,6 +227,7 @@ describe("lens_diagnostics compact filename", () => {
 		const file = path.join(cwd, "app.ts");
 		fs.writeFileSync(file, "const app = 1;\n");
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -247,6 +256,7 @@ describe("lens_diagnostics compact filename", () => {
 		fs.writeFileSync(diagnosed, "const diagnosed = 1;\n");
 		fs.writeFileSync(unrelated, "const unrelated = 1;\n");
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -273,6 +283,37 @@ describe("lens_diagnostics compact filename", () => {
 		} finally {
 			removeTempDirSync(cwd);
 		}
+	});
+});
+
+describe("lens_diagnostics compact line for a file no language server answered (#4322)", () => {
+	it("says no language server answered rather than that it cannot confirm clean", () => {
+		const tool = makeTool({}, {});
+		const rendered = (
+			tool.renderResult!(
+				{
+					content: [
+						{ type: "text", text: "Primary LSP (json): not available" },
+					],
+					details: {
+						source: "lsp",
+						mode: "file",
+						filePath: "/project/probe.json",
+						totalDiagnostics: 0,
+						unconfirmed: true,
+						primaryUnavailable: "Primary LSP (json): not available",
+					},
+				} as any,
+				{ expanded: false },
+				{} as Theme,
+				{ args: { source: "lsp", path: "/project/probe.json" } },
+			) as any
+		)
+			.render(200)
+			.join("\n");
+		expect(rendered).toContain(
+			"lens_diagnostics probe.json — unconfirmed (no language server answered)",
+		);
 	});
 });
 
@@ -319,6 +360,7 @@ describe("lens_diagnostics source and scope routing", () => {
 			),
 		);
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () =>
 				tiers.map(([_, message, severity]) => ({
@@ -398,6 +440,7 @@ describe("lens_diagnostics source and scope routing", () => {
 			),
 		);
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => [
 				{
@@ -443,6 +486,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		const file = path.join(cwd, "bad.ts");
 		fs.writeFileSync(file, "const value: number = 'bad';\n");
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => [
 				{
@@ -466,7 +510,13 @@ describe("lens_diagnostics source and scope routing", () => {
 			expect(result.details.source).toBe("lsp");
 			expect(result.details.scope).toBe("paths");
 			expect(result.content[0].text).toContain("probe finding");
-			expect(service.getDiagnostics).toHaveBeenCalledWith(file, "full");
+			// #4323: the third argument is the config-disabled auxiliaries; this
+			// tool is built without a flag resolver, so nothing is excluded.
+			expect(service.getDiagnostics).toHaveBeenCalledWith(
+				file,
+				"full",
+				undefined,
+			);
 		} finally {
 			removeTempDirSync(cwd);
 		}
@@ -479,6 +529,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		fs.writeFileSync(path.join(cwd, "one.ts"), "const one = 1;\n");
 		const service = {
 			runWorkspaceDiagnostics: vi.fn(async () => []),
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -509,6 +560,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		fs.writeFileSync(path.join(cwd, "outside.ts"), "const b = 1;\n");
 		const touched: string[] = [];
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async (file: string) => {
 				touched.push(file);
 				return undefined;
@@ -542,6 +594,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		const touchedByScope = new Map<string, string[]>();
 		function makeService(key: string) {
 			return {
+				announceCreatedFiles: vi.fn(),
 				touchFile: vi.fn(async (f: string) => {
 					touchedByScope.set(key, [...(touchedByScope.get(key) ?? []), f]);
 					return undefined;
@@ -709,16 +762,6 @@ describe("lens_diagnostics source=lsp compact render", () => {
 // ── schema ────────────────────────────────────────────────────────────────────
 
 describe("lens_diagnostics schema", () => {
-	it("exposes mode and severity parameters", () => {
-		const tool = makeTool();
-		const props = (tool.parameters as { properties: Record<string, unknown> })
-			.properties;
-		expect(props.mode).toBeDefined();
-		expect(props.severity).toBeDefined();
-		expect(props.refreshRunners).toBeDefined();
-		expect(props.analysisRoot).toBeDefined();
-	});
-
 	it("passes an explicit analysis root through mode=full (#2053)", async () => {
 		const lspService = {
 			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
@@ -736,6 +779,37 @@ describe("lens_diagnostics schema", () => {
 			expect.anything(),
 			expect.objectContaining({ analysisRoot: "/home/me/repo" }),
 		);
+	});
+
+	// #1617/#1625, folded onto the shared line by #1634: what the fresh
+	// analyzers dropped for a mark is counted with its lanes, in the text and in
+	// `details`. Recurrence: the analyzer note had no pin, and once mode=full
+	// gained its own count a second "suppressed by disposition" line (or a
+	// `details` count that overwrote the other) went unseen.
+	it("mode=full states what the analyzers dropped for a mark, with its lanes", async () => {
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: ["knip"],
+			analyzed: ["knip"],
+			cold: [],
+			timings: {},
+			failed: [],
+			dispositionSuppressed: 2,
+			dispositionSuppressedByLane: { knip: 2 },
+		});
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "all" },
+		);
+		const text = result.content[0].text;
+		expect(text).toContain(
+			"suppressed by disposition: 2 finding(s) (analyzer lanes: knip 2) dropped from this result",
+		);
+		expect(text.match(/suppressed by disposition/g)).toHaveLength(1);
+		expect(result.details).toMatchObject({
+			dispositionSuppressed: 2,
+			dispositionSuppressedByLane: { knip: 2 },
+		});
 	});
 
 	it("rejects an invalid explicit analysis root as a failed tool call (#2977 F2)", async () => {
@@ -841,7 +915,9 @@ describe("lens_diagnostics mode=delta", () => {
 
 	it("uses the server-owned cwd for the rendered row", async () => {
 		// #2846: the renderer must not independently rediscover a marker root.
-		const { LSP_SERVERS } = await import("../../clients/lsp/server.js");
+		// #4397: LSP_SERVERS is imported statically at the top of the file: a
+		// dynamic import after the wall-clock case's `vi.resetModules()` is a
+		// second copy the tool never reads.
 		const server = LSP_SERVERS.find((entry) => entry.id === "typescript");
 		if (!server) throw new Error("typescript server missing from registry");
 		const originalRoot = server.root;
@@ -1628,6 +1704,22 @@ function sum(
 }
 
 describe("lens_diagnostics mode=full", () => {
+	it("keeps active-scan outcomes outside the session evidence verdict", async () => {
+		// The session cache disclosure must not overwrite the established
+		// full-scan coverage taxonomy with a second aggregate verdict.
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full" },
+		);
+		expect(result.details).toMatchObject({
+			mode: "full",
+			lspFilesConfirmed: 0,
+			lspFilesUnconfirmed: 0,
+		});
+		expect(result.details).not.toHaveProperty("validationStatus");
+		expect(String(result.content[0].text)).not.toContain("Session cache");
+	});
+
 	it("retires only the analysed runner's retained row", async () => {
 		// Both directions: the analysed runner's row goes (R), and a row from a
 		// runner that did NOT analyse this call survives (O). #2154 round 3
@@ -3854,8 +3946,7 @@ describe("lens_diagnostics mode=all", () => {
 		// has no findings at all (dropped by withIssues), the `.ts` row
 		// renders — so the seam is called exactly once, for the rendered file.
 		// Pre-O2 the projection ran over every summary and the count was 2.
-		const config = await import("../../clients/lsp/config.js");
-		const seamSpy = vi.spyOn(config, "resolveLspCwdForFile");
+		const seamSpy = vi.spyOn(lspConfig, "resolveLspCwdForFile");
 		try {
 			mockSummaries.push({
 				filePath: "/proj/src/a.ts",
@@ -3946,16 +4037,6 @@ describe("lens_diagnostics mode=all", () => {
 			},
 		);
 		expect(flush).toHaveBeenCalledOnce();
-	});
-
-	it("notes stale files dropped by reconciliation (use mode=full)", async () => {
-		mockStaleDropped = 2;
-		mockSummaries.length = 0;
-		const result = await run(makeTool(), { mode: "all" });
-		const text = String(result.content[0].text);
-		expect(text).toContain("2 changed files omitted as stale");
-		expect(text).toContain("mode=full");
-		expect(result.details).toMatchObject({ staleDropped: 2 });
 	});
 
 	it("returns clean message when all files have zero issues", async () => {
@@ -4495,13 +4576,6 @@ describe("lens_diagnostics mode=all", () => {
 // ── paths scope restrictor (#461) ───────────────────────────────────────────────
 
 describe("lens_diagnostics paths", () => {
-	it("exposes paths in the schema", () => {
-		const tool = makeTool();
-		const props = (tool.parameters as { properties: Record<string, unknown> })
-			.properties;
-		expect(props.paths).toBeDefined();
-	});
-
 	it("mode=all: paths filter shows only listed files, excluding unrelated cached findings", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(sum("/proj/src/keep.ts", { warnings: 1 }));
@@ -4544,7 +4618,7 @@ describe("lens_diagnostics paths", () => {
 		expect(text).not.toContain("exclude this");
 	});
 
-	it("mode=all with paths hitting no cached files includes the cached-only/use-mode=full note", async () => {
+	it("mode=all with paths hitting no cached files names the targeted next check, not the older mode=full note", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(sum("/proj/src/unrelated.ts", { warnings: 1 }));
 		const result = await run(makeTool(), {
@@ -4552,8 +4626,11 @@ describe("lens_diagnostics paths", () => {
 			paths: ["/proj/src/never-dispatched.ts"],
 		});
 		const text = String(result.content[0].text);
-		expect(text).toContain("mode=full");
-		expect(text).toContain("cached findings");
+		// #4625 F5: the verdict carries one next step; the older advice beside it
+		// would be a second, different instruction.
+		expect(text).toContain("Session cache unverified");
+		expect(text).toContain("source=lsp scope=paths");
+		expect(text).not.toContain("mode=full");
 	});
 
 	it("mode=delta with paths hitting no cached files includes the cached-only/use-mode=full note", async () => {
@@ -4607,6 +4684,62 @@ describe("lens_diagnostics paths", () => {
 				expect.objectContaining({ files: [fileA, fileB] }),
 			);
 		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	// #4576: `paths` is a host-supplied tool input, so a `~` spelling must be
+	// expanded by the shared host resolver. A bare `path.resolve(cwd, entry)`
+	// pinned it under the session cwd and scanned a file that never existed.
+	it("mode=full: a ~ path resolves to $HOME, not under the session cwd (#4576)", async () => {
+		mockSummaries.length = 0;
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-diag-tilde-4576-"),
+		);
+		// #4591: the fixture HOME is outside the fixture root this case deletes.
+		const { home, restore } = pinFixtureHome("diag-tilde-4576");
+		const realFile = path.join(home, "proj", "src", "tilde.ts");
+		fs.mkdirSync(path.dirname(realFile), { recursive: true });
+		fs.writeFileSync(realFile, "export const a = 1;\n");
+		try {
+			expect(os.homedir()).toBe(home);
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			projectDiagnosticsMocks.scanProjectDiagnostics.mockResolvedValue({
+				version: 1,
+				cwd,
+				tier: "cheap",
+				scannedAt: "2026-01-01T00:00:00.000Z",
+				filesScanned: 1,
+				runners: ["tree-sitter", "fact-rules", "ast-grep-napi"],
+				diagnostics: [],
+			});
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			await tool.execute(
+				"1",
+				{
+					mode: "full",
+					refreshRunners: "cheap",
+					paths: ["~/proj/src/tilde.ts"],
+				},
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+			expect(lspService.runWorkspaceDiagnostics).toHaveBeenCalledWith(
+				cwd,
+				expect.objectContaining({ files: [realFile] }),
+			);
+			expect(
+				projectDiagnosticsMocks.scanProjectDiagnostics,
+			).toHaveBeenCalledWith(expect.objectContaining({ files: [realFile] }));
+		} finally {
+			restore();
 			removeTempDirSync(cwd);
 		}
 	});
@@ -4917,6 +5050,10 @@ describe("lens_diagnostics honors the turn abort (ctx.signal)", () => {
 
 describe("lens_diagnostics wall-clock ceiling (never-hang guarantee)", () => {
 	it("stops mode=full and marks timedOut when the wall-clock budget is exceeded", async () => {
+		// The sweep ceiling is read once at module load (`FULL_SCAN_WALL_CLOCK_MS`),
+		// so this case needs a fresh module graph. #4397: that reset makes every
+		// later `await import(...)` return a SECOND copy; cases that patch a module
+		// the tool reads import it statically at the top of the file instead.
 		vi.resetModules();
 		process.env.PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS = "1";
 		const { createLensDiagnosticsTool: freshCreate } =
@@ -5673,6 +5810,124 @@ describe("lens_diagnostics mode=delta — per-entry freshness on a merged report
 			expect(rows.some((line) => line.includes("older.ts"))).toBe(true);
 			expect(rows.some((line) => line.includes("newer.ts"))).toBe(true);
 		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+});
+
+/**
+ * #4577 R2-2: `scope=workspace` with no explicit `path`/`paths` injects the
+ * session cwd as the scan target (`tools/lens-diagnostics.ts`). That path is
+ * pi-lens's own — it came from `ctx.cwd`, already absolute — so the probe must
+ * not put it through the host-argument stages again. The unicode-space fold
+ * rewrote a cwd holding U+00A0 into its U+0020 sibling and the whole workspace
+ * scan failed with `Path not found`: a caller that asked for the workspace got
+ * no scan at all. Nothing about this class is model-typed, so the fix states
+ * the provenance at the injection point.
+ */
+describe("lens_diagnostics injected workspace default (#4577 R2-2)", () => {
+	it("scans a cwd holding a host-unicode space instead of a folded sibling", async () => {
+		const parent = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-diag-ws-nbsp-"),
+		);
+		const cwd = path.join(parent, "proj\u00A0x");
+		fs.mkdirSync(cwd);
+		const file = path.join(cwd, "a.ts");
+		fs.writeFileSync(file, "export const a = 1;\n");
+		// `touchFile` answers nothing, so the batch collector falls through to
+		// `getDiagnostics`; the file it names proves which directory was scanned.
+		const getDiagnostics = vi.fn(async (_filePath: string) => []);
+		const service = makeLspServiceDouble({
+			touchFile: vi.fn(async (_filePath: string) => undefined),
+			getDiagnostics,
+		});
+		try {
+			const tool = makeTool({}, service);
+			const result = (await run(
+				tool,
+				{ source: "lsp", scope: "workspace" },
+				cwd,
+			)) as { isError?: boolean };
+			// Pre-fix: isError true, text `Path not found: …/proj x`.
+			expect(result.isError).toBeFalsy();
+			expect(getDiagnostics.mock.calls.map((call) => call[0])).toContain(file);
+		} finally {
+			removeTempDirSync(parent);
+		}
+	});
+});
+
+/**
+ * #4577 M2: the scalar `path` argument is a host-supplied tool path, so it
+ * resolves through the shared host resolver. A bare `path.resolve(cwd, path)`
+ * turned `~/x` into `<cwd>/~/x`, the tool answered "Path not found" for a file
+ * that exists, and the diagnostic never reached the server.
+ */
+describe("lens_diagnostics scalar path resolution (#4577 M2)", () => {
+	it("resolves a ~ path to $HOME, not under the session cwd", async () => {
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-diag-scalar-tilde-"),
+		);
+		const { home, restore } = pinFixtureHome("diag-scalar-tilde");
+		const realFile = path.join(home, "proj", "tilde.ts");
+		fs.mkdirSync(path.dirname(realFile), { recursive: true });
+		fs.writeFileSync(realFile, "export const a = 1;\n");
+		// No `touchFile` answer, so the route falls through to `getDiagnostics`;
+		// the path the tool touched is what proves which file it resolved.
+		const touchFile = vi.fn(async (_filePath: string) => undefined);
+		const getDiagnostics = vi.fn(async (_filePath: string) => []);
+		const service = makeLspServiceDouble({ touchFile, getDiagnostics });
+		try {
+			expect(os.homedir()).toBe(home);
+			const tool = makeTool({}, service);
+			const result = await run(
+				tool,
+				{ source: "lsp", path: "~/proj/tilde.ts" },
+				cwd,
+			);
+			expect((result as { isError?: boolean }).isError).toBeFalsy();
+			// The server was asked about the expanded file — the pre-fix spelling
+			// named `<cwd>/~/proj/tilde.ts`, which does not exist.
+			expect(touchFile.mock.calls[0]?.[0]).toBe(realFile);
+			expect(getDiagnostics.mock.calls[0]?.[0]).toBe(realFile);
+		} finally {
+			restore();
+			removeTempDirSync(cwd);
+		}
+	});
+
+	// The batch route resolves its entries through `expandPathsToFiles`, a
+	// second site with the same bare join — and the one the scalar case above
+	// does NOT reach (mode=full filters through `resolvePathsScope` instead).
+	it("resolves a ~ entry of the batch paths argument to $HOME", async () => {
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-diag-batch-tilde-"),
+		);
+		const { home, restore } = pinFixtureHome("diag-batch-tilde");
+		const realFile = path.join(home, "proj", "tilde.ts");
+		fs.mkdirSync(path.dirname(realFile), { recursive: true });
+		fs.writeFileSync(realFile, "export const a = 1;\n");
+		// No `touchFile` answer, so the route falls through to `getDiagnostics`;
+		// the path the tool touched is what proves which file it resolved.
+		const touchFile = vi.fn(async (_filePath: string) => undefined);
+		const getDiagnostics = vi.fn(async (_filePath: string) => []);
+		const service = makeLspServiceDouble({ touchFile, getDiagnostics });
+		try {
+			expect(os.homedir()).toBe(home);
+			const tool = makeTool({}, service);
+			const result = await run(
+				tool,
+				{ source: "lsp", paths: ["~/proj/tilde.ts"] },
+				cwd,
+			);
+			expect((result as { isError?: boolean }).isError).toBeFalsy();
+			expect(
+				[...touchFile.mock.calls, ...getDiagnostics.mock.calls].map(
+					(call) => call[0],
+				),
+			).toContain(realFile);
+		} finally {
+			restore();
 			removeTempDirSync(cwd);
 		}
 	});

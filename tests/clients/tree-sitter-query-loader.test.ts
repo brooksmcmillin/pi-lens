@@ -42,6 +42,13 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import * as fs from "node:fs";
+import { RuleCache } from "../../clients/cache/rule-cache.js";
+import {
+	clearLatencyLog,
+	flushLatencyLog,
+	getLatencyLogPath,
+	type LatencyEntry,
+} from "../../clients/latency-logger.js";
 import { _resetRuleCorpusCycleFingerprintsForTests } from "../../clients/custom-rule-locations.js";
 import {
 	getDegradationSummary,
@@ -1030,7 +1037,74 @@ describe("ruleFilesForLanguage — bundled root health (#2636)", () => {
 		}) as typeof fs.readdirSync);
 	}
 
-	it("records nothing for bash: zero files, but the REAL bundled root is healthy (no queries authored by design)", () => {
+	// #2678: the healthy-root memo used to leave no durable evidence that the
+	// check ran. Both callers must share one record, not log per file.
+	describe("bundled root check record (#2678)", () => {
+		beforeEach(async () => {
+			vi.stubEnv("PI_LENS_TEST_MODE", "0");
+			clearLatencyLog();
+			await flushLatencyLog();
+		});
+
+		afterEach(async () => {
+			await flushLatencyLog();
+			vi.unstubAllEnvs();
+		});
+
+		async function readRootChecks(): Promise<LatencyEntry[]> {
+			await flushLatencyLog();
+			return fs
+				.readFileSync(getLatencyLogPath(), "utf8")
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => JSON.parse(line) as LatencyEntry)
+				.filter((row) => row.phase === "tree_sitter_queries_root_checked");
+		}
+
+		it.each(["healthy", "absent", "empty", "unreadable"] as const)(
+			"records one %s root check across 50 dispatch pairs and re-arms on a new generation",
+			async (status) => {
+				const root = makeTempRulesRoot();
+				const entryCount = actualFsRef.readdirSync(BUNDLED_QUERIES_ROOT).length;
+				vi.mocked(fs.readdirSync).mockImplementation(((dir, ...rest) => {
+					if (dir === BUNDLED_QUERIES_ROOT && status !== "healthy") {
+						if (status === "empty") return [];
+						throw Object.assign(new Error("root unavailable"), {
+							code: status === "absent" ? "ENOENT" : "EACCES",
+						});
+					}
+					return (actualFsRef.readdirSync as any)(dir, ...rest);
+				}) as typeof fs.readdirSync);
+
+				for (let i = 0; i < 50; i++) {
+					ruleFilesForLanguage("bash", root);
+					void new RuleCache("bash", root);
+				}
+				const rows = await readRootChecks();
+				expect(rows).toHaveLength(1);
+				expect(rows[0]).toMatchObject({
+					type: "phase",
+					metadata: {
+						status,
+						entryCount: status === "healthy" ? entryCount : 0,
+					},
+				});
+
+				vi.mocked(fs.readdirSync).mockImplementation(actualFsRef.readdirSync);
+				resetDegradationLedger();
+				void new RuleCache("bash", root);
+				ruleFilesForLanguage("bash", root);
+				const nextRows = await readRootChecks();
+				expect(nextRows).toHaveLength(2);
+				expect(nextRows[1]?.metadata).toEqual({
+					status: "healthy",
+					entryCount,
+				});
+			},
+		);
+	});
+
+	it("records no degradation for bash: zero files, but the REAL bundled root is healthy (no queries authored by design)", () => {
 		const root = makeTempRulesRoot();
 		expect(ruleFilesForLanguage("bash", root)).toEqual([]);
 		expect(degradationGroup()).toBeUndefined();
@@ -1124,14 +1198,9 @@ describe("ruleFilesForLanguage — bundled root health (#2636)", () => {
 		).toHaveLength(1);
 	});
 
-	// #2636 review round 2, F2: the ONLY observability record for this branch
-	// is the degradation ledger row — no separate phase/latency record (see
-	// the source comment). `incrementDegradationCount` bounds durable writes
-	// to power-of-two milestones on its own; this pins that MANY occurrences
-	// of the same failure still write exactly ONE bounded row (not one raw
-	// row per dispatched file), directly answering "what would 200 touches
-	// of a broken root cost" — the ledger's in-memory `count` is the exact
-	// total regardless of how many of those are durably persisted.
+	// #2636: repeated failures share one in-memory ledger row with an exact
+	// count; durable degradation records remain power-of-two bounded. The
+	// #2678 check record above is separate and only emitted on a memo miss.
 	it("tallies many occurrences into the ledger's exact count, never a raw per-call record", () => {
 		mockBundledQueriesRootAbsent();
 		const root = makeTempRulesRoot();

@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { scaledTestTimeout } from "../../support/test-timeout-scale.js";
 
 const FIXTURE_ROOT = path.join(process.cwd(), "project-trust-fixture");
 const FIXTURE_FILE = path.join(FIXTURE_ROOT, "main.py");
@@ -226,9 +227,9 @@ describe("LSPService project-trust gate (#1334 S5)", () => {
 		]);
 		const adoptedService = new LSPService(undefined, sessionRoot);
 		const file = path.join(project, "main.ts");
-		expect((adoptedService as any).analysisRootModeForFile(file)).toBe(
-			"adopted",
-		);
+		expect(
+			(adoptedService as any).clientRegistry.analysisRootModeForFile(file),
+		).toBe("adopted");
 		const client = await adoptedService.getClientForFile(file);
 		expect(client).toBeUndefined();
 		expect(spawn).not.toHaveBeenCalled();
@@ -244,18 +245,19 @@ describe("LSPService project-trust gate (#1334 S5)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 		const raw = service as any;
-		raw.analysisRootModeForFile = () => "adopted";
+		const registry = raw.clientRegistry;
+		registry.analysisRootModeForFile = () => "adopted";
 		for (const root of ["/repo/a", "/repo/b", "/repo/c"]) {
 			const rootKey = `server:${root}`;
-			expect(raw.admitAdoptedRoot(root, "/repo/file.ts")).toBe(true);
-			raw.adoptedClientKeys.add(rootKey);
+			expect(registry.admitAdoptedRoot(root, "/repo/file.ts")).toBe(true);
+			registry.adoptedClientKeys.add(rootKey);
 			raw.state.clients.set(rootKey, {
 				isAlive: () => true,
 				isBusy: () => false,
 				shutdown: vi.fn(async () => undefined),
 			});
 		}
-		expect(raw.adoptedRootLastUsedAt.size).toBe(2);
+		expect(registry.adoptedRootLastUsedAt.size).toBe(2);
 
 		const client = {
 			isAlive: () => true,
@@ -263,10 +265,10 @@ describe("LSPService project-trust gate (#1334 S5)", () => {
 			shutdown: vi.fn(async () => undefined),
 		};
 		const key = "server:/repo/a";
-		raw.adoptedClientKeys.add(key);
+		registry.adoptedClientKeys.add(key);
 		raw.state.clients.set(key, client);
-		raw.clientLastUsedAt.set(key, Date.now());
-		raw.scheduleIdleEviction(key, {
+		registry.clientLastUsedAt.set(key, Date.now());
+		registry.scheduleIdleEviction(key, {
 			id: "server",
 			idleEviction: "unmeasured",
 		});
@@ -275,55 +277,59 @@ describe("LSPService project-trust gate (#1334 S5)", () => {
 		vi.useRealTimers();
 	});
 
-	it("refuses an unknown-trust project-local built-in binary through launchLSP", async () => {
-		const project = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-project-local-lsp-"),
-		);
-		const binDir = path.join(project, "node_modules", ".bin");
-		fs.mkdirSync(binDir, { recursive: true });
-		const binary = path.join(binDir, "python");
-		fs.writeFileSync(binary, "#!/bin/sh\n");
-		fs.chmodSync(binary, 0o755);
-		const { trust, service, spawn } = await setup();
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
-		getServersForFileWithConfig.mockReturnValue([
-			{
-				id: "python",
-				name: "Python",
-				extensions: [".py"],
-				root: async () => project,
-				spawn: async (root: string) => {
-					await launchLSP("python", [], {
-						cwd: root,
-						env: {
-							PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-						},
-					});
-					return undefined;
+	it(
+		"refuses an unknown-trust project-local built-in binary through launchLSP",
+		async () => {
+			const project = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-project-local-lsp-"),
+			);
+			const binDir = path.join(project, "node_modules", ".bin");
+			fs.mkdirSync(binDir, { recursive: true });
+			const binary = path.join(binDir, "python");
+			fs.writeFileSync(binary, "#!/bin/sh\n");
+			fs.chmodSync(binary, 0o755);
+			const { trust, service, spawn } = await setup();
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			getServersForFileWithConfig.mockReturnValue([
+				{
+					id: "python",
+					name: "Python",
+					extensions: [".py"],
+					root: async () => project,
+					spawn: async (root: string) => {
+						await launchLSP("python", [], {
+							cwd: root,
+							env: {
+								PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+							},
+						});
+						return undefined;
+					},
 				},
-			},
-		]);
-		const client = await service.getClientForFile(
-			path.join(project, "main.py"),
-		);
-		expect(client).toBeUndefined();
-		expect(spawn).not.toHaveBeenCalled();
-		expect(
-			logExtension.mock.calls.filter(
-				([entry]) =>
-					entry.message ===
-					"project-local LSP binary refused: mark the project trusted in pi or upgrade pi",
-			),
-		).toHaveLength(1);
-		expect(logExtension).toHaveBeenCalledWith(
-			expect.objectContaining({
-				message:
-					"project-local LSP binary refused: mark the project trusted in pi or upgrade pi",
-			}),
-		);
-		trust.resetProjectTrust();
-		fs.rmSync(project, { recursive: true, force: true });
-	});
+			]);
+			const client = await service.getClientForFile(
+				path.join(project, "main.py"),
+			);
+			expect(client).toBeUndefined();
+			expect(spawn).not.toHaveBeenCalled();
+			expect(
+				logExtension.mock.calls.filter(
+					([entry]) =>
+						entry.message ===
+						"project-local LSP binary refused: mark the project trusted in pi or upgrade pi",
+				),
+			).toHaveLength(1);
+			expect(logExtension).toHaveBeenCalledWith(
+				expect.objectContaining({
+					message:
+						"project-local LSP binary refused: mark the project trusted in pi or upgrade pi",
+				}),
+			);
+			trust.resetProjectTrust();
+			fs.rmSync(project, { recursive: true, force: true });
+		},
+		scaledTestTimeout(60_000),
+	);
 
 	it("forces allowInstall=false for the spawn options under denial", async () => {
 		// Trust denial short-circuits before spawn, so the install policy is

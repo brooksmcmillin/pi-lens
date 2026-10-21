@@ -10,10 +10,37 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/php",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "syntax-error.php",
 	"exitCode": 255,
 	"stdout": "\nParse error: syntax error, unexpected variable \"$name\", expecting \";\" in syntax-error.php on line 6\nErrors parsing syntax-error.php\n",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "php",
+			"argv": [
+				"--version"
+			],
+			"version": "8.5.4",
+			"exitCode": 0,
+			"stdout": "PHP 8.5.4 (cli) (built: Sep  2 2026 14:42:18) (NTS)\nCopyright (c) The PHP Group\nBuilt by Ubuntu\nZend Engine v4.5.4, Copyright (c) Zend Technologies\n    with Zend OPcache v8.5.4, Copyright (c), by Zend Technologies\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/php-lint",
+		"file": "syntax-error.php",
+		"argv": [
+			"-l",
+			"syntax-error.php"
+		],
+		"version": "8.5.4",
+		"exitCode": 0,
+		"stdout": "No syntax errors detected in syntax-error.php\n",
+		"stderr": ""
+	}
 }

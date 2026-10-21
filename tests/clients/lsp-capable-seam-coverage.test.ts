@@ -253,9 +253,17 @@ describe("lspCapable seam coverage", () => {
 	// Dockerfile.<suffix> were not reachable at all before this fix.
 	// terragrunt.hcl/root.hcl stay out of scope: terragrunt is lspCapable:
 	// false, so no server ever sees their languageId.
+	//
+	// #4636 moved the registry's DECLARED filenames ahead of the extension
+	// lookup, so Makefile now takes the `shell` entry's `lspId` instead of
+	// file-kinds.ts's per-kind id: `shellscript`, the spelling the entry's own
+	// comment calls the LSP spec's, and the one every `.sh` file already
+	// announced. The old `shell` was the same kind-id/spec-id drift this pin
+	// exists to catch, reachable only because the seam never consulted the
+	// registry's filename column.
 	it("pins the language ids reachable through basename classification", () => {
 		expect(getLanguageId("CMakeLists.txt")).toBe("cmake");
-		expect(getLanguageId("Makefile")).toBe("shell");
+		expect(getLanguageId("Makefile")).toBe("shellscript");
 		expect(getLanguageId("Dockerfile")).toBe("dockerfile");
 		expect(getLanguageId("Dockerfile.dev")).toBe("dockerfile");
 		expect(getLanguageId("Dockerfile.prod")).toBe("dockerfile");

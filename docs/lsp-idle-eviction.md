@@ -15,7 +15,7 @@ respawned server reports every finding it reported before eviction; the
 content-bound coverage check the auxiliary freeze depends on. A server that
 cannot demonstrate it is never proposed for eviction on perf grounds alone.
 
-_Last generated: 2026-10-12 on linux; 49 registry servers: 7 eligible, 0 vetoed, 8 inconclusive, 34 unavailable (0 not reached: budget)._
+_Last generated: 2026-10-18 on linux; 49 registry servers: 17 eligible, 0 vetoed, 18 inconclusive, 14 unavailable (0 not reached: budget)._
 
 ## Per-server rows
 
@@ -36,28 +36,28 @@ step log only, because it flaps.
 | server | role | declared | result | reason | respawn | coverage |
 |---|---|---|---|---|---|---|
 | ast-grep | auxiliary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
-| bash | primary | transparent | unavailable | server-not-started | n/a | n/a |
-| clojure | primary | transparent | unavailable | server-not-started | n/a | n/a |
-| cmake | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
+| bash | primary | transparent | eligible | · | ok | preserved |
+| clojure | primary | transparent | eligible | · | ok | preserved |
+| cmake | primary | unmeasured | inconclusive | no-baseline | n/a | unproven |
 | cpp | primary | transparent | eligible | · | ok | preserved |
 | csharp | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| css | primary | transparent | unavailable | server-not-started | n/a | n/a |
+| css | primary | transparent | eligible | · | ok | preserved |
 | cue | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | dart | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | deno | primary | transparent | eligible | · | ok | preserved |
-| docker | primary | transparent | unavailable | server-not-started | n/a | n/a |
+| docker | primary | transparent | eligible | · | ok | preserved |
 | docker-official | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | elixir | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| expert | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
-| fish | primary | transparent | unavailable | server-not-started | n/a | n/a |
+| expert | primary | unmeasured | inconclusive | no-baseline | n/a | unproven |
+| fish | primary | transparent | eligible | · | ok | preserved |
 | fsharp | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | gleam | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | go | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | haskell | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| html | primary | transparent | unavailable | server-not-started | n/a | n/a |
+| html | primary | transparent | eligible | · | ok | preserved |
 | java | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | json | primary | transparent | eligible | · | ok | preserved |
-| kotlin | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
+| kotlin | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | lean | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
 | lua | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | marksman | primary | transparent | eligible | · | ok | preserved |
@@ -65,42 +65,29 @@ step log only, because it flaps.
 | ocaml | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | omnisharp | primary | unmeasured | unavailable | no-fixture | n/a | n/a |
 | opengrep | auxiliary | transparent | eligible | · | ok | preserved |
-| php | primary | transparent | unavailable | server-not-started | n/a | n/a |
-| powershell | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
-| prisma | primary | transparent | unavailable | server-not-started | n/a | n/a |
-| python | primary | transparent | unavailable | server-not-started | n/a | n/a |
+| php | primary | transparent | eligible | · | ok | preserved |
+| powershell | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
+| prisma | primary | transparent | eligible | · | ok | preserved |
+| python | primary | transparent | eligible | · | ok | preserved |
 | python-jedi | primary | transparent | eligible | · | ok | preserved |
 | ruby | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| rust | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
+| rust | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | shuck | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
-| svelte | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
+| svelte | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | swift | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| terraform | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
-| tinymist | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
+| terraform | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
+| tinymist | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | toml | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | typescript | primary | transparent | eligible | · | ok | preserved |
 | typos | auxiliary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
-| vue | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
-| yaml | primary | transparent | unavailable | server-not-started | n/a | n/a |
-| zig | primary | unmeasured | unavailable | server-not-started | n/a | n/a |
+| vue | primary | unmeasured | inconclusive | no-baseline | n/a | unproven |
+| yaml | primary | transparent | eligible | · | ok | preserved |
+| zig | primary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 | zizmor | auxiliary | unmeasured | inconclusive | not-evicted | not-evicted | n/a |
 
 ## Declared versus measured
 
-`drift` means the registry evicts a server the measurement vetoes. A `proposal`
-or `info` line is for a maintainer to act on in a follow-up; this run changed
-nothing.
-
-- **bash** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **clojure** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **css** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **docker** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **fish** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **html** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **php** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **prisma** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **python** [info] declared transparent with no evidence this run: unavailable (server-not-started)
-- **yaml** [info] declared transparent with no evidence this run: unavailable (server-not-started)
+No divergence between declared policy and this run's measurement.
 
 ## Reasons
 

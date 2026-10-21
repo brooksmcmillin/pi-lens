@@ -54,6 +54,23 @@ function runOxlint(targetFile: string) {
 	);
 }
 
+/**
+ * Run a node entry (the lint wrapper) in `cwd` with the shipped oxlint on
+ * PATH, as the wrapper spawns `oxlint` by name. One spawn site for every
+ * type-aware planted-probe case (#3244, #4402).
+ */
+function runNodeWithOxlint(args: string[], cwd: string) {
+	return spawnSync(process.execPath, args, {
+		encoding: "utf8",
+		cwd,
+		env: {
+			...process.env,
+			PATH: `${path.dirname(OXLINT_ENTRY)}${path.delimiter}${process.env.PATH ?? ""}`,
+		},
+		timeout: SPAWN_TIMEOUT_MS * 2,
+	});
+}
+
 describe("lint:js (#2439 — oxlint wired over .mjs/.cjs)", () => {
 	it("package.json wires lint:js into npm run lint", () => {
 		const pkg = JSON.parse(
@@ -238,16 +255,7 @@ describe("lint:js:tests (#3244 — required type-aware test population)", () => 
 					configPath,
 					fixture,
 				];
-				const run = (args: string[]) =>
-					spawnSync(process.execPath, args, {
-						encoding: "utf8",
-						cwd: tmpDir,
-						env: {
-							...process.env,
-							PATH: `${path.dirname(OXLINT_ENTRY)}${path.delimiter}${process.env.PATH ?? ""}`,
-						},
-						timeout: SPAWN_TIMEOUT_MS * 2,
-					});
+				const run = (args: string[]) => runNodeWithOxlint(args, tmpDir);
 				const result = run(commandArgs);
 				expect(result.status, result.stdout + result.stderr).not.toBe(0);
 				expect(result.stdout + result.stderr).toContain(
@@ -267,6 +275,147 @@ describe("lint:js:tests (#3244 — required type-aware test population)", () => 
 			}
 		},
 		SPAWN_TIMEOUT_MS * 2 + 5_000,
+	);
+});
+
+/**
+ * #4402 (#4413 r2 verify D1): a promise a worker `message` listener drops
+ * rejects outside its try, and pi's crash guard rethrows an unhandled
+ * rejection, the same host death as #4400. The message-handler ratchet has no
+ * type information, so an un-voided call to an imported async function, or to
+ * a sync function that returns a promise, passed it. `lint:js:promises` runs
+ * the type-aware floating-promise rules over the shipped roots inside the
+ * gating `npm run lint`.
+ */
+describe("lint:js:promises (#4402 — floating promises in shipped code)", () => {
+	const SCRIPT = "lint:js:promises";
+	const ROOTS = "clients mcp tools index.ts";
+	const PROBES = [
+		[
+			"an un-voided imported async call in a message handler",
+			[
+				'import { persist } from "./store.js";',
+				'declare const port: { on(event: "message", h: (m: unknown) => void): void };',
+				'port.on("message", (message: unknown) => {',
+				"\ttry {",
+				"\t\tpersist(message);",
+				"\t} catch (err) {",
+				"\t\tconsole.error(err);",
+				"\t}",
+				"});",
+			],
+			"no-floating-promises",
+			(text: string) => text.replace(/\t\t(persist|save)\(/, "\t\tvoid $1("),
+		],
+		[
+			"a sync function returning a promise, called un-voided",
+			[
+				"function save(message: unknown): Promise<void> {",
+				"\treturn Promise.resolve(message).then(() => undefined);",
+				"}",
+				"export function handle(message: unknown): void {",
+				"\ttry {",
+				"\t\tsave(message);",
+				"\t} catch (err) {",
+				"\t\tconsole.error(err);",
+				"\t}",
+				"}",
+			],
+			"no-floating-promises",
+			(text: string) => text.replace(/\t\t(persist|save)\(/, "\t\tvoid $1("),
+		],
+		[
+			// #4428 step 1 (#4411 review shape): an `await` of a value that is not
+			// a thenable reads as if it waited, and hides a call that lost its
+			// promise (a sync refactor that left the `await` behind).
+			"an await of a value that is not a thenable",
+			[
+				"declare function load(): number;",
+				"export async function handle(): Promise<number> {",
+				"\treturn await load();",
+				"}",
+			],
+			"await-thenable",
+			(text: string) => text.replace("return await load()", "return load()"),
+		],
+	] as const;
+
+	function readScript(): string {
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
+		);
+		return pkg.scripts[SCRIPT];
+	}
+
+	it("is wired through the real lint wrapper and required by npm run lint", () => {
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
+		);
+		expect(pkg.scripts.lint).toContain(`npm run ${SCRIPT}`);
+		const script = readScript();
+		expect(script).toMatch(
+			/^node scripts\/lint-js-advisory\.mjs\s+--deny-warnings\s+--format unix\s+--type-aware/,
+		);
+		expect(script).toContain("-D typescript/await-thenable");
+		expect(script).toContain("-D typescript/no-floating-promises");
+		expect(script).toContain("-D typescript/no-misused-promises");
+		expect(script.endsWith(` ${ROOTS}`)).toBe(true);
+	});
+
+	it.each(PROBES)(
+		"the real required command fails on %s, and passes once it is repaired",
+		(_label, lines, rule, repair) => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-lint-js-4402-");
+			const fixture = path.join(tmpDir, "clients", "probe.ts");
+			fs.mkdirSync(path.dirname(fixture), { recursive: true });
+			fs.copyFileSync(OXLINT_CONFIG, path.join(tmpDir, ".oxlintrc.json"));
+			fs.symlinkSync(
+				path.join(REPO_ROOT, "node_modules"),
+				path.join(tmpDir, "node_modules"),
+				"dir",
+			);
+			fs.writeFileSync(
+				path.join(tmpDir, "tsconfig.json"),
+				JSON.stringify({
+					compilerOptions: {
+						strict: true,
+						module: "nodenext",
+						moduleResolution: "nodenext",
+					},
+				}),
+			);
+			fs.writeFileSync(
+				path.join(tmpDir, "clients", "store.ts"),
+				"export async function persist(_message: unknown): Promise<void> {}\n",
+			);
+			// The package.json argv itself, with the shipped roots swapped for the
+			// fixture: never a re-typed rule list.
+			const argv = readScript()
+				.replace(/^node\s+scripts\/lint-js-advisory\.mjs\s+/, "")
+				.replace(` ${ROOTS}`, "")
+				.split(/\s+/);
+			const run = () =>
+				runNodeWithOxlint(
+					[
+						path.join(REPO_ROOT, "scripts/lint-js-advisory.mjs"),
+						...argv,
+						fixture,
+					],
+					tmpDir,
+				);
+			try {
+				fs.writeFileSync(fixture, `${lines.join("\n")}\n`);
+				const planted = run();
+				expect(planted.status, planted.stdout + planted.stderr).not.toBe(0);
+				expect(planted.stdout + planted.stderr).toContain(rule);
+				fs.writeFileSync(fixture, `${repair(lines.join("\n"))}\n`);
+				const voided = run();
+				expect(voided.status, voided.stdout + voided.stderr).toBe(0);
+			} finally {
+				cleanup();
+			}
+		},
+		SPAWN_TIMEOUT_MS * 4 + 5_000,
 	);
 });
 

@@ -14,12 +14,10 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Lang, parse } from "@ast-grep/napi";
 
-import {
-	clientSourceFiles,
-	clientsRelative,
-	stripCommentsAndStrings,
-} from "./session-state-scan.js";
+import type { SgNode } from "../../clients/deps/ast-grep-napi.js";
+import { clientSourceFiles, clientsRelative } from "./session-state-scan.js";
 
 /** One `inFlight`-named declaration the scan found. */
 export interface InFlightDeclaration {
@@ -33,104 +31,272 @@ export interface InFlightDeclaration {
 	key: string;
 }
 
+/** Every `inFlight` spelling in one source, classified or reported. */
+export interface InFlightScan {
+	declarations: InFlightDeclaration[];
+	/** `unclassified spelling at <file>:<line>: <text> (<kind> under <parent>)`. */
+	unclassified: string[];
+}
+
 /**
- * Declarations this scan can see, and the three it cannot.
+ * What the scan classifies (#4429: a population-deriving scanner fails closed).
  *
- * IN, three forms:
+ * The needle is every identifier-like syntax node whose name contains
+ * `inFlight` or `InFlight`, read from the TypeScript AST, so a comment or a
+ * string that names one is not a node and never counts. Each node lands in
+ * exactly one role, decided by the grammar position it fills:
  *
- * 1. module-level `const`/`let`/`var` at column 0;
- * 2. class fields carrying an accessibility, `readonly`, `static` or `abstract`
- *    modifier, at any indent;
- * 3. modifier-less class fields — both `#private` ones, which the `#` makes
- *    unambiguous, and plain ones carrying a TYPE ANNOTATION. Review round 1
- *    caught this gap: `probeInFlight: Promise<void> | null = null;` is the
- *    migrated sites' exact field minus the word `private`, and the first
- *    version of this regex sailed straight past it.
+ * - `state`, counted: a variable declarator's binding outside every function
+ *   (module state, destructured or not), a class field (any modifier set,
+ *   `#private`, annotated or not, or a constructor parameter property), an
+ *   interface or type member, and an
+ *   object-literal key (the false-positive direction, kept from the regex scan
+ *   this replaced: a person dismisses it with one exemption line).
+ * - `local`: a binding inside a function (a plain parameter, a function-scoped
+ *   declarator, a `catch` or `for…of` binding). State a factory closes over is
+ *   the documented false negative: by shape it is any function local.
+ * - `name`: the name of a function, method, class, interface, type or enum.
+ * - `reference`: a read, a call, an assignment to an existing binding (the
+ *   clear-in-finally), a member access, an import or export specifier, a type
+ *   reference.
  *
- * OUT, stated rather than papered over:
- *
- * 1. state closed over inside a factory function (`createChecker`'s
- *    `inFlightByCwd` in `runner-helpers.ts`) — indistinguishable from a plain
- *    function local by shape alone, and flagging every local named `inFlight`
- *    would make the ratchet noise rather than signal;
- * 2. in-flight state whose name does not contain `inFlight`
- *    (`refreshRepullRunning` in `lsp/client.ts` is exactly that, which is part
- *    of why #1687 went unnoticed);
- * 3. a modifier-less, UNANNOTATED class field (`inFlight = new Map();` with no
- *    `private` and no type). By shape that is identical to a bare assignment to
- *    a closure variable — `ensureInFlight = null;` at
- *    `dispatch/runners/utils/toolchain-availability.ts:139` is exactly that —
- *    and this scan chooses the false negative over flagging every
- *    clear-in-finally in the repo.
- *
- * All three are FALSE NEGATIVES. The ratchet still catches the common case,
- * which is the copy someone writes by pattern-matching a sibling client.
- *
- * FALSE POSITIVES are the safe direction, which is why they are not enumerated:
- * they announce themselves. The widened regex also matches things that are not
- * declarations at all — object-literal properties and parameter annotations —
- * so `lsp/index.ts`'s `inFlight` matches both at its interface member (:204)
- * and at its object-literal initializer (:1198). Both collapse to one
- * `file:symbol` key, and any such match simply demands an exemption that a
- * person then writes or dismisses. A false negative is silent and ships the
- * next copy of the bug; a false positive costs one line and a moment's thought.
+ * A node in any other position is UNCLASSIFIED and reported with its file and
+ * line, never skipped: a declaration form this table does not know must red
+ * until it is classified here. The regex scan this replaced missed
+ * `override`, `declare` and `accessor` fields, unannotated fields and
+ * multi-declarator lines, and said nothing.
  */
-/**
- * Three alternatives, in the order the doc comment lists them: a module-level
- * binding, a modified class field, and a modifier-less class field that is
- * either `#private` or type-annotated.
- */
-const DECLARATION = new RegExp(
-	[
-		"^(?:",
-		/*  1 */ "(?:export\\s+)?(?:const|let|var)\\s+#?",
-		"|",
-		/*  2 */ "[\\t ]+(?:(?:private|protected|public|static|readonly|abstract)\\s+)+#?",
-		"|",
-		/* 3a */ "[\\t ]+#",
-		")([\\w$]*[iI]nFlight[\\w$]*)\\s*[:=]",
-		/* 3b */ "|^[\\t ]+([\\w$]*[iI]nFlight[\\w$]*)\\s*(?:\\?\\s*)?:(?!:)",
-	].join(""),
-	"gm",
-);
+const NEEDLE_KINDS = [
+	"identifier",
+	"property_identifier",
+	"private_property_identifier",
+	"shorthand_property_identifier",
+	"shorthand_property_identifier_pattern",
+	"type_identifier",
+] as const;
+
+type Role = "state" | "local" | "name" | "reference";
+
+/** Parents whose child identifier is always an expression or type use. */
+const REFERENCE_PARENTS = new Set([
+	"arguments",
+	"array",
+	"arrow_function",
+	"as_expression",
+	"assignment_expression",
+	"augmented_assignment_expression",
+	"await_expression",
+	"binary_expression",
+	"call_expression",
+	"export_specifier",
+	"expression_statement",
+	"generic_type",
+	"import_specifier",
+	"member_expression",
+	"new_expression",
+	"non_null_expression",
+	"object",
+	"parenthesized_expression",
+	"return_statement",
+	"satisfies_expression",
+	"sequence_expression",
+	"spread_element",
+	"subscript_expression",
+	"template_substitution",
+	"ternary_expression",
+	"throw_statement",
+	"type_annotation",
+	"type_arguments",
+	"type_query",
+	"unary_expression",
+	"union_type",
+	"update_expression",
+	"yield_expression",
+]);
+
+/** Declarations whose `name` field is a callable or type name, not state. */
+const NAME_PARENTS = new Set([
+	"abstract_class_declaration",
+	"class_declaration",
+	"enum_declaration",
+	"function_declaration",
+	"function_expression",
+	"generator_function_declaration",
+	"interface_declaration",
+	"method_definition",
+	// A method SIGNATURE declares a callable, like `method_definition`, not a
+	// field of at-a-time state: `hasNotifyInFlight?(filePath): boolean`
+	// (`LSPClient`, #4532 gap 9 round 3) asks the queue a question.
+	"method_signature",
+	"type_alias_declaration",
+]);
+
+/** Ancestors that make a binding function-scoped. */
+const FUNCTION_SCOPES = new Set([
+	"arrow_function",
+	"class_static_block",
+	"function_declaration",
+	"function_expression",
+	"generator_function",
+	"generator_function_declaration",
+	"method_definition",
+]);
+
+/** Parameter children that make a constructor parameter a class field. */
+const PARAMETER_PROPERTY_MODIFIERS = new Set([
+	"accessibility_modifier",
+	"override_modifier",
+	"readonly",
+]);
+
+/** Destructuring wrappers a binding can sit inside. */
+const PATTERN_KINDS = new Set([
+	"array_pattern",
+	"assignment_pattern",
+	"object_assignment_pattern",
+	"object_pattern",
+	"pair_pattern",
+	"rest_pattern",
+]);
+
+function sameNode(a: SgNode | null | undefined, b: SgNode): boolean {
+	if (!a) return false;
+	const ra = a.range();
+	const rb = b.range();
+	return ra.start.index === rb.start.index && ra.end.index === rb.end.index;
+}
+
+function insideFunction(node: SgNode): boolean {
+	for (let up = node.parent(); up; up = up.parent()) {
+		if (FUNCTION_SCOPES.has(String(up.kind()))) return true;
+	}
+	return false;
+}
+
+/** The role of a binding nested in a destructuring pattern, or undefined. */
+function patternBindingRole(node: SgNode): Role | undefined {
+	let child = node;
+	let up = node.parent();
+	while (up && PATTERN_KINDS.has(String(up.kind()))) {
+		child = up;
+		up = up.parent();
+	}
+	if (!up) return undefined;
+	const kind = String(up.kind());
+	if (kind === "variable_declarator" && sameNode(up.field("name"), child)) {
+		return insideFunction(up) ? "local" : "state";
+	}
+	if (
+		(kind === "required_parameter" || kind === "optional_parameter") &&
+		sameNode(up.field("pattern"), child)
+	) {
+		return "local";
+	}
+	return undefined;
+}
+
+function roleOf(node: SgNode): Role | undefined {
+	const parent = node.parent();
+	if (!parent) return undefined;
+	const kind = String(parent.kind());
+	const fills = (field: string) => sameNode(parent.field(field), node);
+	if (node.kind() === "shorthand_property_identifier_pattern") {
+		return patternBindingRole(node);
+	}
+	if (PATTERN_KINDS.has(kind)) return patternBindingRole(node);
+	switch (kind) {
+		case "variable_declarator":
+			if (!fills("name")) return "reference";
+			return insideFunction(parent) ? "local" : "state";
+		case "public_field_definition":
+		case "property_signature":
+			return fills("name") ? "state" : "reference";
+		case "pair":
+			return fills("key") ? "state" : "reference";
+		case "required_parameter":
+		case "optional_parameter":
+			if (!fills("pattern")) return "reference";
+			// A constructor parameter with an accessibility, `readonly` or
+			// `override` modifier is a parameter property: a class field.
+			return parent
+				.children()
+				.some((child) => PARAMETER_PROPERTY_MODIFIERS.has(String(child.kind())))
+				? "state"
+				: "local";
+		case "catch_clause":
+			// The grammar puts only the binding directly under the clause.
+			return "local";
+		case "for_in_statement":
+			// `for (const x of y)` binds `x`; `for (x of y)` assigns an existing one.
+			if (!fills("left")) return "reference";
+			return parent.field("kind") ? "local" : "reference";
+	}
+	if (NAME_PARENTS.has(kind)) return fills("name") ? "name" : undefined;
+	if (REFERENCE_PARENTS.has(kind)) return "reference";
+	return undefined;
+}
+
+const NEEDLE_TEXT = /[iI]nFlight/;
+
+/** Classify every `inFlight` spelling in one source text. */
+export function classifyInFlightSpellings(
+	file: string,
+	source: string,
+): InFlightScan {
+	const scan: InFlightScan = { declarations: [], unclassified: [] };
+	if (!NEEDLE_TEXT.test(source)) return scan;
+	const lines = source.split("\n");
+	const root = parse(Lang.TypeScript, source).root();
+	const nodes = root.findAll({
+		rule: {
+			any: NEEDLE_KINDS.map((kind) => ({ kind, regex: NEEDLE_TEXT.source })),
+		},
+	});
+	for (const node of nodes) {
+		const line = node.range().start.line + 1;
+		const role = roleOf(node);
+		if (role === undefined) {
+			scan.unclassified.push(
+				`unclassified spelling at ${file}:${line}: ${lines[line - 1]?.trim() ?? ""} (${node.kind()} under ${node.parent()?.kind()})`,
+			);
+			continue;
+		}
+		if (role !== "state") continue;
+		const symbol = node.text().replace(/^#/, "");
+		scan.declarations.push({ file, symbol, line, key: `${file}:${symbol}` });
+	}
+	scan.declarations.sort((a, b) => a.line - b.line);
+	return scan;
+}
 
 /** Find every `inFlight`-named module-state declaration in one source text. */
 export function findInFlightDeclarations(
 	file: string,
 	source: string,
 ): InFlightDeclaration[] {
-	// Comments and strings are blanked first, length-preserving, so a doc
-	// comment that merely NAMES a field cannot be read as a declaration of it —
-	// the same false-positive mode `session-state-scan.ts` documents.
-	const stripped = stripCommentsAndStrings(source);
-	const found: InFlightDeclaration[] = [];
-	DECLARATION.lastIndex = 0;
-	for (;;) {
-		const match = DECLARATION.exec(stripped);
-		if (match === null) break;
-		// Group 1 is the modified/module form, group 2 the annotated
-		// modifier-less field. Exactly one of them participates per match.
-		const symbol = match[1] ?? match[2];
-		found.push({
-			file,
-			symbol,
-			line: stripped.slice(0, match.index).split("\n").length,
-			key: `${file}:${symbol}`,
-		});
-	}
-	return found;
+	return classifyInFlightSpellings(file, source).declarations;
 }
 
 /** The module that owns the primitive, which is exempt by definition. */
 const PRIMITIVE_MODULE = "single-flight.ts";
 
+/** Classify every `inFlight` spelling in every `clients/` source. */
+export function scanInFlightSpellings(): InFlightScan {
+	const total: InFlightScan = { declarations: [], unclassified: [] };
+	for (const absolute of clientSourceFiles()) {
+		const file = clientsRelative(absolute);
+		if (path.posix.basename(file) === PRIMITIVE_MODULE) continue;
+		const scan = classifyInFlightSpellings(
+			file,
+			fs.readFileSync(absolute, "utf8"),
+		);
+		total.declarations.push(...scan.declarations);
+		total.unclassified.push(...scan.unclassified);
+	}
+	return total;
+}
+
 /** Scan every `clients/` source for hand-rolled in-flight declarations. */
 export function scanInFlightDeclarations(): InFlightDeclaration[] {
-	return clientSourceFiles()
-		.map((absolute) => ({
-			file: clientsRelative(absolute),
-			source: fs.readFileSync(absolute, "utf8"),
-		}))
-		.filter(({ file }) => path.posix.basename(file) !== PRIMITIVE_MODULE)
-		.flatMap(({ file, source }) => findInFlightDeclarations(file, source));
+	return scanInFlightSpellings().declarations;
 }

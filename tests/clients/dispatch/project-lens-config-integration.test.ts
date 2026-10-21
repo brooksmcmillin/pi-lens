@@ -7,8 +7,6 @@ import { applyProjectLensConfig } from "../../../clients/dispatch/integration.js
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import { highComplexityRule } from "../../../clients/dispatch/rules/high-complexity.js";
 import { highFanOutRule } from "../../../clients/dispatch/rules/high-fan-out.js";
-import { resetHighComplexityThresholds } from "../../../clients/dispatch/rules/high-complexity.js";
-import { resetHighFanOutThreshold } from "../../../clients/dispatch/rules/high-fan-out.js";
 import {
 	resetProjectLensConfigCache,
 	type PiLensProjectConfig,
@@ -78,15 +76,11 @@ let tmpDir: string;
 
 beforeEach(() => {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-apply-cfg-"));
-	resetHighComplexityThresholds();
-	resetHighFanOutThreshold();
 	resetProjectLensConfigCache();
 });
 
 afterEach(() => {
 	removeTempDirSync(tmpDir);
-	resetHighComplexityThresholds();
-	resetHighFanOutThreshold();
 	resetProjectLensConfigCache();
 });
 
@@ -278,24 +272,5 @@ describe("applyProjectLensConfig", () => {
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
 		const ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(0);
-	});
-
-	it("resetHighComplexityThresholds restores defaults after applyProjectLensConfig", () => {
-		fs.writeFileSync(
-			path.join(tmpDir, ".pi-lens.json"),
-			JSON.stringify({
-				rules: { "high-complexity": { threshold: 5 } },
-			}),
-		);
-
-		const config = applyProjectLensConfig(tmpDir);
-		resetHighComplexityThresholds();
-
-		const filePath = "/tmp/a.ts";
-		const facts = new FactStore();
-		// Project config is context-scoped and still applies after fallback reset.
-		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
-		const ctx = makeCtx(filePath, facts, config);
-		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 });

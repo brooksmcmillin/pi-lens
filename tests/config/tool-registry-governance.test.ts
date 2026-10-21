@@ -2,14 +2,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import extension from "../../index.js";
 import {
 	TOOL_REGISTRY,
 	toolRegistryEntryForMcp,
 	toolRegistryEntryForPi,
 } from "../../clients/tool-config.js";
 import { McpHarness } from "../mcp/harness.js";
-import { createPiMock } from "../support/pi-mock.js";
+import { startPiRunner } from "../support/pi-runner.js";
 
 describe("model-facing tool registry governance (#2800)", () => {
 	let piNames: string[];
@@ -17,9 +16,9 @@ describe("model-facing tool registry governance (#2800)", () => {
 	let mcpNames: string[];
 
 	beforeAll(async () => {
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-		piNames = [...pi.tools.keys()];
+		// The real host's registries, not the arguments `index.ts` passed (#4632).
+		const pi = await startPiRunner();
+		piNames = pi.getAllRegisteredTools().map((tool) => tool.definition.name);
 		mcp = new McpHarness();
 		const listed = await mcp.request(1, "tools/list");
 		mcpNames = (

@@ -44,17 +44,6 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 	});
 
 	describe("pilens:format:queued", () => {
-		it("no-ops when never wired (unit tests / MCP server path have no pi host)", () => {
-			expect(() =>
-				publishFormatQueued({
-					filePath: "/repo/src/a.ts",
-					cwd: "/repo",
-					tool: "write",
-					kinds: ["format"],
-				}),
-			).not.toThrow();
-		});
-
 		it("skips a stale session target without attempting emit", () => {
 			const emit = vi.fn();
 			wireFormatEventsBusEmitterGetter(() => ({

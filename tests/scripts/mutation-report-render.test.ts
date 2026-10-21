@@ -1033,3 +1033,42 @@ describe("scripts/mutation-report.mjs (CLI)", () => {
 		).toThrow();
 	});
 });
+
+describe("renderMutationMarkdown survivor code spans (#4490 M1)", () => {
+	it("prints a backslash in a survivor's code span exactly as the source has it", () => {
+		// Recurrence (#4490 review M1): the survivor original/replacement sit
+		// inside a backtick code span, where a backslash is literal. Doubling
+		// it here printed `/\\d+\\s/` for the source `/\d+\s/`, so every regex
+		// or string-escape survivor in the nightly report and job summary
+		// showed a wrong source text.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "Regex",
+							replacement: '"a\\n"',
+							original: "/\\d+\\s/",
+							status: "Survived",
+							location: {
+								start: { line: 3, column: 1 },
+								end: { line: 3, column: 9 },
+							},
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234567890",
+				zeroMutants: null,
+				counts: { Survived: 1 },
+				score: "0.00",
+			},
+		});
+
+		expect(markdown).toContain('`/\\d+\\s/` → `"a\\n"`');
+		expect(markdown).not.toContain("\\\\d");
+	});
+});

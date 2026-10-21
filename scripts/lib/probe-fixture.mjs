@@ -8,8 +8,10 @@ import * as path from "node:path";
 import {
 	classifyCleanBehavior,
 	classifyFirstPublish,
+	COMPARABLE_FIRST_PUBLISH,
 	resolveProbeServerId,
 } from "./clean-signal.mjs";
+import { touchAnsweredDiagnostics } from "./touch-result.mjs";
 
 // Budgets (reuse the original probe's generosity — this is off the hot path).
 const CLIENT_WAIT_MS = 30000; // cold spawn + initialize
@@ -46,7 +48,8 @@ function commentFor(file) {
 /**
  * @param {object} deps the script's live collaborators: `lsp`, `repoRoot`,
  *   `install`, `ensureTool`, `initLSPConfig`, `getServersForFileWithConfig`,
- *   `bootstrapFixtureWorkspace`, `drainPublishTrace`, `pubLogSize`, `sleep`.
+ *   `bootstrapFixtureWorkspace`, `trustRefusal`, `drainPublishTrace`,
+ *   `pubLogSize`, `sleep`.
  */
 export function createProbeFixture(deps) {
 	const {
@@ -57,6 +60,7 @@ export function createProbeFixture(deps) {
 		initLSPConfig,
 		getServersForFileWithConfig,
 		bootstrapFixtureWorkspace,
+		trustRefusal,
 		drainPublishTrace,
 		pubLogSize,
 		sleep,
@@ -86,15 +90,18 @@ export function createProbeFixture(deps) {
 
 		const auxIds = fx.auxiliaryServerIds ?? [];
 		const useAux = auxIds.length > 0;
+		const touchOptions = {
+			diagnostics: "document",
+			collectDiagnostics: true,
+			clientScope: useAux ? "with-auxiliary" : "primary",
+			...(useAux ? { auxiliaryServerIds: auxIds } : {}),
+			maxClientWaitMs: CLIENT_WAIT_MS,
+			source: "clean-probe",
+		};
 		const touch = (content, diagWaitMs) =>
 			lsp.touchFile(absFile, content, {
-				diagnostics: "document",
-				collectDiagnostics: true,
-				clientScope: useAux ? "with-auxiliary" : "primary",
-				...(useAux ? { auxiliaryServerIds: auxIds } : {}),
-				maxClientWaitMs: CLIENT_WAIT_MS,
+				...touchOptions,
 				maxDiagnosticsWaitMs: diagWaitMs,
-				source: "clean-probe",
 			});
 
 		const dirtyContent = fs.readFileSync(absFile, "utf8");
@@ -121,7 +128,11 @@ export function createProbeFixture(deps) {
 			support = await lsp.getWorkspaceDiagnosticsSupport(absFile);
 			await sleep(SETTLE_MS);
 			// Phase boundary: every publish written so far is the dirty touch's.
-			drainPublishTrace(dirtyPubs, row.serverId);
+			// The trace is scoped to (server, THIS fixture's document) — several
+			// live clients share a server id, and the sink's byte offset marks the
+			// flush position, not the arrival position, so a foreign client's late
+			// line can land inside this phase (#4615).
+			drainPublishTrace(dirtyPubs, row.serverId, absFile);
 
 			fs.writeFileSync(
 				absFile,
@@ -131,7 +142,7 @@ export function createProbeFixture(deps) {
 			await touch(fs.readFileSync(absFile, "utf8"), STEP_WAIT_MS);
 			await sleep(SETTLE_MS);
 		} finally {
-			drainPublishTrace(cleanPubs, row.serverId);
+			drainPublishTrace(cleanPubs, row.serverId, absFile);
 		}
 
 		row.mode = support?.mode ?? "unknown";
@@ -149,15 +160,46 @@ export function createProbeFixture(deps) {
 			cleanTransitionPublishes: cleanPubs.length,
 			cleanTransitionVersioned: cleanPubs.filter((p) => p.versioned).length,
 		};
-		const dirtyDiagCount = Array.isArray(dirtyResult) ? dirtyResult.length : 0;
+		const dirtyDiagCount =
+			touchAnsweredDiagnostics(dirtyResult, touchOptions, lsp)?.length ?? 0;
 		const verdict = classifyCleanBehavior(obs);
+		// #4514: a server trust kept from launching published nothing, which reads
+		// exactly like a slow one. Name the refusal instead of "no publish
+		// observed"; the row stays `unknown`, so the matrix merge never writes it.
+		const refused =
+			obs.dirtyPublishes === 0 && obs.cleanTransitionPublishes === 0
+				? await trustRefusal?.()
+				: undefined;
+		if (refused) {
+			if (row.mode === "unknown") row.mode = refused;
+			row.detail = refused;
+			return;
+		}
 		// #3310: the first-publish class comes from the dirty phase's publish ORDER,
 		// which this trace already holds — no extra touch, no extra server time.
 		const firstPublishVerdict = classifyFirstPublish(dirtyPubs);
 		row.firstPublish = firstPublishVerdict.firstPublish;
+		// #4615: a `clean: true` fixture's file carries no diagnostic, so ANY
+		// comparable class from it is not a measurement of this axis — not only
+		// `direct` (a finding-bearing publish) but equally `empty-first` (its own
+		// empty publish, then a finding-bearing one): a clean file has no finding
+		// to publish, so such a trace is another document's line, or the fixture's
+		// `clean` flag is stale. Its own honest class is `empty-only`. Refuse the
+		// class at the producer (the conservative reading) so nothing clean-authored
+		// can be stored or handed to the matrix; `resolveTargetLangRows` refuses it
+		// again at the seam, because the guard keys on who may AUTHOR the axis, not
+		// on which class arrived.
+		let firstPublishReason = firstPublishVerdict.reason;
+		if (
+			fx.clean &&
+			COMPARABLE_FIRST_PUBLISH.has(firstPublishVerdict.firstPublish)
+		) {
+			row.firstPublish = "unknown";
+			firstPublishReason = `refused (#4615): a clean fixture's file has no finding to publish, so this is not its measurement — ${firstPublishVerdict.reason}`;
+		}
 		row.behavior = verdict.behavior;
 		row.tier = verdict.tier;
 		row.tierLabel = verdict.tierLabel;
-		row.detail = `dirtyPubs=${obs.dirtyPublishes}(v:${obs.dirtyVersioned}) cleanPubs=${obs.cleanTransitionPublishes}(v:${obs.cleanTransitionVersioned}) dirtyDiags=${dirtyDiagCount} first-publish=${row.firstPublish} — ${verdict.reason}; ${firstPublishVerdict.reason}`;
+		row.detail = `dirtyPubs=${obs.dirtyPublishes}(v:${obs.dirtyVersioned}) cleanPubs=${obs.cleanTransitionPublishes}(v:${obs.cleanTransitionVersioned}) dirtyDiags=${dirtyDiagCount} first-publish=${row.firstPublish} — ${verdict.reason}; ${firstPublishReason}`;
 	};
 }

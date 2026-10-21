@@ -11,10 +11,38 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/css",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.css",
 	"exitCode": 2,
 	"stdout": "",
-	"stderr": "[{\"source\":\"__WORKSPACE__\\\\bad.css\",\"deprecations\":[],\"invalidOptionWarnings\":[],\"parseErrors\":[],\"errored\":true,\"warnings\":[{\"line\":3,\"column\":10,\"endLine\":3,\"endColumn\":14,\"rule\":\"color-no-invalid-hex\",\"severity\":\"error\",\"text\":\"Invalid hex color \\\"#zzz\\\" (color-no-invalid-hex)\"}]}]"
+	"stderr": "[{\"source\":\"__WORKSPACE__\\\\bad.css\",\"deprecations\":[],\"invalidOptionWarnings\":[],\"parseErrors\":[],\"errored\":true,\"warnings\":[{\"line\":3,\"column\":10,\"endLine\":3,\"endColumn\":14,\"rule\":\"color-no-invalid-hex\",\"severity\":\"error\",\"text\":\"Invalid hex color \\\"#zzz\\\" (color-no-invalid-hex)\"}]}]",
+	"availability": [
+		{
+			"command": "stylelint",
+			"argv": [
+				"--version"
+			],
+			"version": "17.16.0",
+			"exitCode": 0,
+			"stdout": "17.16.0\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/stylelint",
+		"file": "bad.css",
+		"argv": [
+			"--formatter",
+			"json",
+			"bad.css"
+		],
+		"version": "17.16.0",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": "[{\"source\":\"__WORKSPACE__/bad.css\",\"deprecations\":[],\"invalidOptionWarnings\":[],\"parseErrors\":[],\"errored\":false,\"warnings\":[]}]"
+	}
 }

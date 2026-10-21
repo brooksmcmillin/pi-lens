@@ -361,6 +361,19 @@ describe("TLA+ coverage rule", () => {
 		expect(result.errors).toHaveLength(1);
 	});
 
+	// Recurrence (#4448 round 3): folding this blanker onto the shared one made
+	// the 4-space code-block rule hide a declaration written as a list
+	// continuation, which GitHub renders as list text. The fold keeps the rule
+	// off here (`indentedCode: false`).
+	it("accepts a declaration written as an indented list continuation", () => {
+		const result = evaluateTlaCoverage({
+			map: READ_GUARD_MAP,
+			changedFiles: ["clients/read-guard.ts"],
+			body: "- Notes\n\n    TLA+ unaffected: read-guard — only a local helper moved.",
+		});
+		expect(result).toEqual({ errors: [], advisories: [] });
+	});
+
 	it("accepts a declaration that follows a closed fence and comment", () => {
 		const result = evaluateTlaCoverage({
 			map: READ_GUARD_MAP,
@@ -466,16 +479,19 @@ describe("lintTlaCoverage seam (#3802)", () => {
 });
 
 // #3906 AC2: the #3799 delivery decision in clients/dispatch/dispatcher.ts is a
-// lifecycle/delivery seam with no formal family, so the row is `unmodelled`
-// with a real reason. The row gates the seam record rule; the TLA axis stays an
-// advisory. The #3799 corpus that exercises the refusal is in
+// lifecycle/delivery seam the seam record rule gates. #4484 modelled the
+// file's delta split (formal/blocker-pending), so the row now names that
+// family and gates on the TLA axis; the coverage notice stays unmodelled and
+// its note says so. The #3799 corpus that exercises the refusal is in
 // tests/scripts/check-pr-body.test.ts.
-describe("dispatcher seam row (#3906 AC2)", () => {
-	it("maps clients/dispatch/dispatcher.ts as unmodelled with a real reason", () => {
-		expect(map.map?.["clients/dispatch/dispatcher.ts"]).toBe("unmodelled");
+describe("dispatcher seam row (#3906 AC2, #4484)", () => {
+	it("maps clients/dispatch/dispatcher.ts to blocker-pending and names the unmodelled coverage notice", () => {
+		expect(map.map?.["clients/dispatch/dispatcher.ts"]).toEqual([
+			"blocker-pending",
+		]);
 		const reason = map.notes?.["clients/dispatch/dispatcher.ts"];
 		expect(typeof reason).toBe("string");
-		expect(reason?.length ?? 0).toBeGreaterThan(40);
+		expect(reason).toContain("filterDelta");
 		expect(reason).toContain("buildCoverageNotice");
 		expect(reason).toMatch(/no formal family|unmodelled/i);
 	});
@@ -487,16 +503,26 @@ describe("dispatcher seam row (#3906 AC2)", () => {
 		expect(unlisted).toContain("dispatch/utils/format-utils");
 	});
 
-	it("keeps the dispatcher advisory on the TLA axis", () => {
-		const result = evaluateTlaCoverage({
+	// Recurrence: #4484. The delta split decided what a blocker record keeps,
+	// and no model saw it; a dispatcher change that moves the split must now
+	// touch the family or say why it is unaffected.
+	it("gates a dispatcher change on the blocker-pending family", () => {
+		const bare = evaluateTlaCoverage({
 			map,
 			changedFiles: ["clients/dispatch/dispatcher.ts"],
 			body: "",
 		});
-		expect(result.errors).toEqual([]);
-		expect(result.advisories.join(" ")).toContain(
-			"clients/dispatch/dispatcher.ts",
-		);
+		expect(bare.errors).toHaveLength(1);
+		expect(bare.errors[0]).toContain("TLA+ unaffected: blocker-pending");
+		const withModel = evaluateTlaCoverage({
+			map,
+			changedFiles: [
+				"clients/dispatch/dispatcher.ts",
+				"formal/blocker-pending/ClearOnCurrent.cfg",
+			],
+			body: "",
+		});
+		expect(withModel.errors).toEqual([]);
 	});
 });
 
@@ -568,6 +594,8 @@ describe("index.ts hook anchors (#3878)", () => {
 			tool_result: ["on", "onToolResult"],
 			tool_execution_end: ["on"],
 			context: ["on"],
+			// #4631: the pi 0.87+ request hook, an inline registration like `context`.
+			context_with_system: ["on"],
 		});
 	});
 

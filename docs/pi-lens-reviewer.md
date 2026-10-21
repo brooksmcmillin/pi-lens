@@ -50,6 +50,53 @@ a brief supplies only `lane=<name>`, scope, and the grant.
 7. Clean up: revert mutations, delete probes, and leave
    `git status --porcelain` empty.
 
+## Compliance pass
+
+Run this over the merge-base diff at step 2, before the adversarial probes in
+step 4. Each row is a rule a bot can decide from what the diff touches; the
+probes still prove behaviour. Quote the named evidence in the review, and name
+the anchor in the finding so the fixer can route it. A row with no recurrence
+does not ship.
+
+| Diff touches | Check | Evidence to quote | Recurrence |
+| --- | --- | --- | --- |
+| A new `it(` or `test(` title, or a case added to a table test | Red first: the case fails on the pre-fix source, with the failure the defect names (principles §2 "Red first") | The pre-fix transcript, with its `Tests N failed` line naming the new titles | #4577 (Greptile, 2026-10-17: round-4 cases shipped with no red) |
+| A new guard, branch, filter, cap or fallback | Mutation red on that predicate, both directions, in a compile-valid change (principles §2 "Mutation output is quoted") | The `scripts/mutate.mjs` transcript and its `RED` status line, with the one test it reds | #4575 (Greptile r4304045025: no mutation red for the saveOnly rule) |
+| A file under `clients/lsp/`, `formal/`, or any path `formal/switch-pins.json` names | The model moves with the code: a `.tla`/`.cfg` hunk and its TLC verdict, or a `TLA+ unaffected:` line; a flipped constant flips its config and its pin (AGENTS shape 68) | The line, or the model diff plus the verdict, and the pin's test name for a flipped constant | #4575 (Greptile r4304045020: the model did not move with the code), #4387, #4393 |
+| A spawn, shell or path seam: `clients/package-manager.ts`, `clients/lsp/launch.ts`, `clients/path-utils.ts`, `clients/safe-spawn.ts`, or any `trySpawn` caller | Read the Windows lane, and keep a shim cell that asserts the platform command (AGENTS "Test requirements"; "Dispatch, runners, formatters, and installers") | The `Unit tests Windows` row on the head, or the shim cell's platform assertion | #4566 (Greptile r4304149666: the `.cmd` cells), #4356, #4263 |
+| A rung that can execute project code | Judge the rung by the resolved target under every trust state, never by the name it was called with (AGENTS "LSP, trust, and process execution") | The target table: each spelling, its resolved path, and the verdict under trusted, unknown and denied | #4566 (an empty `PATH` and a global link each ran project code), #4530 |
+| A new shared helper | Net-count rule: delete a same-shape sibling in this change (principles §1 "Net-count rule for shared helpers") | The deleted sibling in `Change outline`, or the unsafe-to-fold reason with its follow-up link | #2585 r1, #2617 r1 (an existing override and scan set bypassed or recopied), #3064, #3065, #3066, #3068 (a fold's newly sole predicate left untested) |
+| A second writer, reader or mirror of one shared record | Design shared state once, with a reason or kind discriminator per writer (principles §1 "Design shared state once"; AGENTS shape 24) | The writers-by-axis table, and the discriminator each writer carries | #1631/#1641 (the `stale` collision that was green alone), #1633, #1703 |
+| A durable record whose shape changes, or a new version of one | Keep the fixture corpus: every version that produced the record still parses (principles §2 "Keep fixture corpora") | The fixture path and the parser test that replays it | #3594 R2-F1 (AGENTS shape 57) |
+| A cache or memo key | Key every input the value depends on, trust scope and install state included (AGENTS shape 6) | The key's input list beside the value's dependencies, and the mutation that changes one input | #4562 (a large update left a cached answer), #4566 (a trust change left tools missing) |
+| A test-side source scan, census, ratchet or detector | Detectors match code, not prose, and fail closed on an unlisted spelling (principles §2 "Detectors match code"; AGENTS shape 69) | The blanked-source read, and three plants the author did not design for: an alias, an indirect call, a value through another binding | #2693 (a ratchet counted four sites where six existed), #4439 |
+| A workflow, action or job | The edited lane runs on a pull request, or a branch run is quoted with its run id (AGENTS "Commands and gates") | `gh workflow run <file> --ref <branch>` with its run id, or the PR-eligible cell's name | #3043, #3085 |
+| A `continue-on-error` producer or a nightly floor | The producer reports to `scripts/assert-evaluated.mjs`, and its floor reds below the measured count (AGENTS "LSP, trust, and process execution") | The floor value beside the run's evaluated count | #4518 |
+| A path a host tool was given (a `~`, an `@` prefix, a `file://` URL), or a path re-resolved after it left disk | Resolve by provenance, one seam per provenance; a generated or recovered path is never re-resolved (AGENTS shape 74) | The resolver the caller uses, and the path form it accepts, before and after | #4576, #4577 (a bash operand resolved on the host-argument ladder, then an absolute spelling rewritten) |
+| A path recovered from disk, a synthetic write event, or a path pi-lens generates | The path carries its provenance, host argument, shell token, recovered or generated, and nothing re-derives it (AGENTS shape 58) | The provenance the caller states at the injection point, and the resolver it therefore skips | #4577 (a recovered name was re-folded), #4558 |
+| A path-keyed map, normalizer or path comparison | Normalize on write, read, delete and rehydrate, and test Windows separators and casing (AGENTS shape 1) | The writer and reader table, with the normalizer each one calls | #3178 (four rounds, two inverted arms, one unmeasured swap) |
+| A session, lifecycle, generation or turn-end seam | Capture the generation before the await, and key the state by the session that owns it (AGENTS shapes 21 and 22; "Session, telemetry, and delivery") | The captured scope or generation the write checks, and the test that races it | #4258 (a stale activation rebinding a held bridge), #4154 |
+| A lifecycle, ownership or queue-ordering change | Name a cell and a mutation per axis: owner and identity, last leave, and queue ordering (principles §1 "Identity and lifecycle rules"; AGENTS shapes 21 and 22) | The state table with one row per axis, and the mutation transcript for each cell | #4563 (seven lifecycle findings), #4575 (a slow send overwrote a newer edit), #4562 |
+| A lifecycle change | The TLA+ model moves with the code, and `docs/pi-lens-monitor.md` gains the row for a new store or hand-off branch (AGENTS shape 68; "Session, telemetry, and delivery") | The model diff or `TLA+ unaffected:` line, and the monitor-doc row | #4563, #4569 (held documents undercounted), #4575 |
+| A delivery surface, or a bound on findings that reach the model | A bound discloses its truncation on the rendered surface, and a skipped or unavailable result is not clean (AGENTS shape 10) | The rendered truncation line, or the skip reason from `RUNNER_SKIP_REASONS` | #3166 r2 (an 80-finding input bound zeroed a neighbour's errors) |
+| A relaxed or rewritten existing assertion | Mutate the behaviour the test is named for; a rewrite that stays green is a deleted test (AGENTS "Issue and PR design contract"; principles §2) | The red on the new assertion, with that behaviour broken | #4390 (the eviction smoke's rewrite passed with root re-registration broken) |
+| A new decision branch on a session, lifecycle or delivery seam | Name its record, sink plus kind, and read it back through the real seam (AGENTS "Session, telemetry, and delivery"; shape 31) | The record literal, and the test that reads it back | #3873 (a fix that could not be shown to fire live), #3875 |
+| A new failure path, catch or silent return | One bounded record per distinct event, in a stream a monitor reads without asking (principles §1 "Every new failure path gets bounded observability"; shape 31) | The record literal and its sink, or `none:` with its reason | #4562 (a failed log write stayed silent), #4575 (a failed save left no trace) |
+| Every diff, every changed file, tests included | Read the whole diff file by file. Check each PR-body claim against the diff, and look in the body for proof before calling it missing (principles §3 "Reviewing and delegating") | The body line or transcript quoted beside a claim the diff cannot show, or the finding names the body line that lacks it | #4574 F2, #4582 F1; 3 of Greptile's 4 false positives were a transcript already in the body (#4572, #4573, #4577) |
+
+Rows 1, 2 and 4 are mechanical from #4585: `scripts/check-pr-body.mjs`
+(`lintDiffCompliance`, wired into both entry points) reds a body that omits
+their evidence, and it keys each item to the diff: a red belongs to the title
+its table names and to the file whose path it spells, and a Windows read
+belongs to the seam file it names or to a diff with exactly one seam file.
+Row 1 is file-level: a changed test file owes one fenced red-first transcript
+that names it and shows a failure from it, or a Controls row naming it with a
+reason. The lint does not read a title, a table row or a suite chain, so a red
+from the file proves the file whatever the new case is called (#4605). Row 3
+stays a reviewer judgement row; the lint never decides what a model means. Confirm the lint passed on the head, then spend
+this pass on the rest — a quoted mutation-table red is not a red-first
+transcript, and a body that names the right file is still yours to judge.
+
 ## Verification
 
 For each new or changed `vi.mock` or hand-built double of a `clients/` module,
@@ -61,10 +108,20 @@ real seam. Check that every gate the diff adds is exercised through that path.
   a lifecycle, dispatch, or ownership seam, run EVERY suite that exercises the
   behaviour the seam governs and name the list; a curated file set cannot
   clear what it omits (#3622).
+- **Challenge the population query.** Re-run the fixer's sibling search with
+  a wider query of your own, by primitive or mechanism instead of the fixer's
+  call names. Report what the fixer's query missed; a population that a wider
+  query extends is a finding (#4536).
+- **Severity and live population.** Every finding carries HIGH, MEDIUM or LOW
+  and its live population (how many sites in the tree hit it today). The
+  verdict follows the merge bar in `docs/pi-lens-merge-policy.md` "Filing
+  issues": no HIGH plus green gating checks is merge-ready, and a MEDIUM or
+  LOW names whether it folds or stays an accepted residual.
 - **Generalization verdict.** When a mechanism, policy, guard, or optimisation
   targets N of M members (registry entries, servers, tools, languages,
   stores), name M, why the others are excluded, and their default, and end
-  with *widen in this PR*, *follow-up issue* (with its seam group), or *stay
+  with *widen in this PR*, *accepted residual* (named `p3`, with its live population),
+  *follow-up issue* (p2 or higher only, with its seam group), or *stay
   specific* (with the reason). A missing verdict is a finding (#3622; the
   optional ast-grep assist is #3684).
 - Review the pre-push self-scan with `npm run astgrep:self-scan`; `pr-preflight`
@@ -77,13 +134,20 @@ real seam. Check that every gate the diff adds is exercised through that path.
   callers. Absent, stale, partial, and zero-mutant reports are not clean;
   scores and unevaluated populations alone do not gate. The nightly report
   complements the per-PR report.
+- For every relaxed or rewritten existing assertion, mutate the behaviour the
+  test is named for; a rewrite that stays green is a finding (#4390). This is
+  required hand-mutation proof.
 - Repeat the pattern and population sweeps. Check blast radius, bounded
   observability, changelog, commit, and PR-body requirements.
 - Re-run the PR's `## Class sweep` search yourself and widen it when the
   named shape is broader than the touched seam (#4273, #4268).
 - On a bug-closing PR, check the `## Detection` lesson: the layer named under
   `Should have been caught by:` must be one that would actually have caught
-  the bug, and `Gap:` must be a real issue, test, or reason (#4288).
+  the bug, and `Gap:` must be a real issue, test, or reason (#4288). Judge
+  `Shape:` and `Enforcer:` too: the lint checks the catalog number and that the
+  path is on the base and named by the entry, not that the test scans the
+  shape's whole population, so open the enforcer and decide whether it does
+  (#4439).
 - For LSP, dispatch, cache, runner, or tool changes, test one non-TypeScript
   registry entry through the same seam.
 - On a net-count fold, mutate every predicate the deleted sibling used to
@@ -96,6 +160,9 @@ real seam. Check that every gate the diff adds is exercised through that path.
 ## Standing probes
 
 Run every probe the diff can trip and say which ran and what each returned.
+For LSP diagnostics, the formatter, the review graph and `rename_file`, start
+from the `verify-pi-lens` skill (`.claude/skills/verify-pi-lens/SKILL.md`)
+instead of rebuilding the probe.
 
 - **Ladder and deletion sweep.** Every ask names the ladder rung it serves. An
   ask that adds a guard names its recurrence; an ask that deletes a defensive
@@ -115,6 +182,12 @@ Run every probe the diff can trip and say which ran and what each returned.
   except `index.ts`, which gates on the lifecycle hook handler a hunk lands in.
   A green `TLA+ models` run over an unchanged model proves nothing about the
   new code.
+  For a `TLA+ unaffected` line, read the family's as-built config constants:
+  a diff that changes a behaviour one of them encodes refutes the line and is
+  a finding (#4387: #4235 changed read-guard authorship while the as-built
+  switches kept the old behaviour). `formal/switch-pins.json` names each
+  pinned constant's test (#4393); a changed behaviour with no flipped value
+  and pin is the same finding.
 - **Red-proof audit.** A claimed red without its quoted transcript is a finding
   of its own; reproduce it (step 3).
 - **Quoted-evidence audit.** Diff every CI line the body quotes against the job
@@ -152,6 +225,26 @@ Run every probe the diff can trip and say which ran and what each returned.
   `// flake-shape: <detector> — <reason>` header and `wallClockBudgetInclude`
   membership (#2547). A pinned file whose count falls below its pin needs its
   baseline tightened; a stale ceiling re-admits regrowth.
+- **Hot-path timing.** When the diff touches dispatch, `session_start`, LSP
+  diagnostics, a cache lookup or turn-end, re-run the body's before/after
+  timing on the real path, at a small and a large input (file size, file
+  count). A regression the body does not name and justify is a finding (#4344
+  r1: replay went from 6 ms to 321 ms; #4368 r1: import extraction took 190 ms
+  at 1.6k lines and 9.2 s at 12k). Read the `Hot-path latency (advisory)` job
+  summary on the head (#4363) first; it covers `session_start`, dispatch and
+  replay, and a red there is a finding unless the body justifies it. Green
+  means no regression of 1.25x and 5 ms; a "slower, below threshold" row is
+  still a number to read.
+- **Shutdown-path parity.** When the diff moves or rewraps code that stops a
+  child (a server, a client, a spawned tool), compare the stop path before and
+  after: does the child still get its graceful signal (stdin end, shutdown
+  request) before any kill, and do its exit-time records and files still
+  appear? Count them over a few runs on both heads. A green suite proves
+  nothing here (#4366 r2: a shared-client fold swapped stdin end for SIGTERM;
+  the shutdown record went from 3/3 to 0/12 and 11 sockets leaked).
+- **Windows path shapes.** A new test or runtime comparison of paths goes
+  through `toPosix` or `path.win32` (`AGENTS.md`). A host-default separator is
+  a finding even when Linux CI is green (#4356: Windows advisory red).
 - **Platform skips and session-start resets.** Apply the `AGENTS.md` test
   screens and the `SessionStartClassification` invariant.
 
@@ -199,8 +292,10 @@ the rate they remove them.
 
 ## Findings and verdict
 
-Classify every finding as **fold** or **file** with a one-word reason
-(`docs/pi-lens-subagent.md` "Follow-ups"). Order findings `CRITICAL`, `HIGH`,
+Classify every finding as **fold**, **accepted residual** (named `p3`) or
+**file** with a one-word reason and its live population (`docs/pi-lens-subagent.md`
+"Follow-ups"; the merge bar is in `docs/pi-lens-merge-policy.md` "Filing
+issues"). Order findings `CRITICAL`, `HIGH`,
 `MEDIUM`, `LOW`, `NITPICK`. Each carries a stable id, a file or symbol anchor,
 the reproduction command or probe output, expected and observed behaviour, the
 root cause, cost, and a concrete remedy, and whether it is an
@@ -219,6 +314,19 @@ merge-order interactions with other open PRs, plus:
 - `Disposition table`: each prior finding as `fixed`, `not fixed`,
   `new defect`, or `withdrawn (reason)`.
 - Cleared categories (one compact list) and exact-head identity.
+- **Bot threads and code-scanning alerts.** When bot threads or code-scanning
+  alerts exist, read and dispose of each one: list every unresolved review
+  thread on the PR (`reviewThreads`, `isResolved == false`) and every open
+  code-scanning alert on the branch, both read at the exact head with the
+  commands in `docs/pi-lens-fixer.md` "Fix rounds". Rate each one as a
+  finding with its probe, or `refuted` with the probe that refutes it, so an
+  item nobody probed cannot read as cleared. A missing bot review is never
+  evidence of anything: never wait for one, never read its absence as a clear
+  signal, and let your own pass stand alone. No `merge-ready` verdict while
+  any thread or alert stays undisposed; the merge condition is
+  `docs/pi-lens-merge-policy.md` "The loop, per PR" step 1 and step 4
+  (`:34`, `:81`). Recurrence: #4566 and #4575 (2026-10-17), where the threads
+  outlived the rounds that should have read them.
 
 Use short, active, plain prose.
 

@@ -35,6 +35,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeEvaluatedRecord } from "./lib/assert-evaluated.mjs";
 import {
 	buildIdleEvictionDriftBody,
 	driftIssueState,
@@ -50,6 +51,7 @@ import {
 	residentTreeBytes,
 } from "./lib/lsp-idle-eviction-probe.mjs";
 import {
+	adoptFixtureProjectTrust,
 	bootstrapFixtureWorkspace,
 	withScratchHome,
 } from "./lib/lsp-fixture-workspace.mjs";
@@ -108,6 +110,10 @@ const { getLSPService, resetLSPService } = await imp(
 const serverModule = await imp("dist/clients/lsp/server.js");
 const { LSP_SERVERS } = serverModule;
 const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
+// #4514: this script is a standalone host, not pi. Adopt project trust before
+// the first touch, or the launch gate refuses every project-local and
+// project-code server and the rows read as unavailable.
+await adoptFixtureProjectTrust({ repoRoot });
 const { sampleProcesses, walkDescendantPids } = await imp(
 	"dist/clients/resource-sampler.js",
 );
@@ -262,6 +268,13 @@ if (serverFilter.length === 0) {
 } else {
 	console.error("\nFiltered run: document not written.");
 }
+// #4514: a server that was spawned is one the run evaluated; `unavailable` is
+// the symptom a refused or missing launch lands as. The step's only failing
+// exit is a declared-versus-measured veto, so the floor step reads this.
+writeEvaluatedRecord({
+	producer: "measure-lsp-idle-eviction",
+	input: counts,
+});
 console.error(
 	`${counts.total} registry servers: ${counts.eligible} eligible, ${counts.vetoed} vetoed, ${counts.inconclusive} inconclusive, ${counts.unavailable} unavailable (${counts.budget} not reached: budget).`,
 );

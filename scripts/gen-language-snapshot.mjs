@@ -45,7 +45,13 @@ export const SNAPSHOT_PATH = path.join(
 	"language-identity-snapshot.json",
 );
 
-/** Special filenames worth snapshotting (basename classifiers, not extensions). */
+/**
+ * Special filenames worth snapshotting (basename classifiers, not extensions).
+ * `tsconfig.app.json` is the #4636 row whose answers deliberately disagree:
+ * kind `json` (the coarse classifier reads the suffix), LSP id `jsonc` (the
+ * registry declares the name), grammar `json`. Its siblings' answers for the
+ * same path are what a regression would move.
+ */
 const SPECIAL_FILENAME_SAMPLES = [
 	"CMakeLists.txt",
 	"Dockerfile",
@@ -53,6 +59,7 @@ const SPECIAL_FILENAME_SAMPLES = [
 	"Makefile",
 	"root.hcl",
 	"terragrunt.hcl",
+	"tsconfig.app.json",
 ];
 
 /** Every extension any table in the union knows about. */

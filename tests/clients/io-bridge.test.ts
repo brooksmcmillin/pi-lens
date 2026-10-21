@@ -135,10 +135,14 @@ const mutationDeps: MutationBridgeDeps = {
 	},
 };
 
-// ── Bridge absent — must run before the describe's beforeAll fires ───────────
+// ── Bridge absent before registration ────────────────────────────────────────
+// Read at module load, before any hook runs, so the assertion holds in any test
+// order (the #4549 read-bridge idiom). Reading the global inside the test redded
+// whenever the describe's beforeAll ran first (#4561, shuffle seed 424).
+const bridgeAbsentAtLoad = !(IO_BRIDGE_SYMBOL in (globalThis as object));
 
 it("bridge is absent before registerIOBridge is called", () => {
-	expect(IO_BRIDGE_SYMBOL in (globalThis as object)).toBe(false);
+	expect(bridgeAbsentAtLoad).toBe(true);
 });
 
 describe("io-bridge v2", () => {

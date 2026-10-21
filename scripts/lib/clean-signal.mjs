@@ -34,6 +34,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { isAuxiliary } from "../../dist/clients/lsp/server-traits.js";
+import { MEASURED_CLEAN_BEHAVIORS } from "./md-matrix.mjs";
 
 // #594: the fixed path probe-clean-signal.mjs (writer) and
 // notify-clean-signal-drift.mjs (reader) agree on for the machine-readable
@@ -131,11 +132,28 @@ export function resolveProbeServerId(fx, servers) {
 }
 
 /**
- * Keep a phase trace scoped to the server whose row is being measured. The
- * extension log is shared by every live LSP client in the process.
+ * Keep a phase trace scoped to the fixture whose row is being measured. The
+ * extension log is shared by every live LSP client in the process, and five
+ * fixtures share the "typescript" server id, so BOTH parts are load-bearing:
+ * `#3390` showed another server's publish becoming a row's evidence, and
+ * `#4615` showed another CLIENT of the SAME server doing it. A row with no
+ * document path is unattributable and dropped (fail closed): an old line from a
+ * writer that predates the path stamp must never decide a classification.
+ *
+ * @param {Array<{ server?: string, path?: string }>} publishes
+ * @param {string} serverId
+ * @param {string} fixturePath  the fixture's OWN document, compared as a key
+ * @param {(path: string) => string} documentPathKey  client and probe normalize
+ *   the same document through the same function (the client stamps its map key)
  */
-function filterPublishTrace(publishes, serverId) {
-	return (publishes ?? []).filter((publish) => publish?.server === serverId);
+function filterPublishTrace(publishes, serverId, fixturePath, documentPathKey) {
+	const fixtureKey = documentPathKey(fixturePath);
+	return (publishes ?? []).filter(
+		(publish) =>
+			publish?.server === serverId &&
+			typeof publish.path === "string" &&
+			documentPathKey(publish.path) === fixtureKey,
+	);
 }
 
 const PUB_MESSAGE_RE =
@@ -145,10 +163,20 @@ const PUB_MESSAGE_RE =
  * Build the append-only sink drainer used by probe-clean-signal. The readLog
  * seam keeps the production offset/parser/filter path testable with a bounded
  * fixture while the probe still supplies the real extension.log reader.
+ *
+ * `documentPathKey` is the client's own document-key normalizer
+ * (`normalizeMapKey` in the probe): the client stamps its normalized map key
+ * into the row and the probe passes its fixture's raw path, so both sides must
+ * agree through one function. Identity is the unit-test default, where the
+ * fixture and the rows share one literal spelling.
  */
-export function createPublishTraceDrainer({ readLog, echoTrace = false }) {
+export function createPublishTraceDrainer({
+	readLog,
+	echoTrace = false,
+	documentPathKey = (path) => path,
+}) {
 	let offset = 0;
-	function drainPublishTrace(sink, serverId) {
+	function drainPublishTrace(sink, serverId, fixturePath) {
 		const { size, read } = readLog(offset);
 		if (size < offset) offset = 0;
 		if (size === offset) return;
@@ -175,15 +203,22 @@ export function createPublishTraceDrainer({ readLog, echoTrace = false }) {
 			if (row?.subsystem !== "lsp-pub") continue;
 			const match = PUB_MESSAGE_RE.exec(String(row.message ?? ""));
 			if (!match) continue;
-			if (echoTrace) console.error(`[lsp-pub] ${row.message}`);
+			const documentPath = row.metadata?.path;
+			if (echoTrace)
+				console.error(
+					`[lsp-pub] ${row.message}${typeof documentPath === "string" ? ` path=${documentPath}` : " path=<unattributable>"}`,
+				);
 			publishes.push({
 				server: match[1],
 				pubVersion: match[2],
 				diags: Number(match[4]),
 				versioned: match[2] !== "undefined",
+				...(typeof documentPath === "string" ? { path: documentPath } : {}),
 			});
 		}
-		sink.push(...filterPublishTrace(publishes, serverId));
+		sink.push(
+			...filterPublishTrace(publishes, serverId, fixturePath, documentPathKey),
+		);
 	}
 	drainPublishTrace.reset = (nextOffset) => {
 		offset = nextOffset;
@@ -431,20 +466,12 @@ export const COMPARABLE_FIRST_PUBLISH = new Set(["empty-first", "direct"]);
 
 /**
  * The matrix `clean-behavior` values that are a measurement of anything.
- * `unknown` is evidence in neither direction (the #240 doctrine), so it never
- * enters a comparison. Shared by `scripts/probe-clean-signal.mjs` (through
- * `buildMatrixObservations` and its row filter) and
- * `tests/config/lsp-clean-behavior-census.test.ts` (the marker census), which
- * previously kept two independent spellings of the same set (#3401).
- * `scripts/lib/md-matrix.mjs` deliberately does NOT import it: that writer is
- * copied alone into a scratch checkout by `tests/scripts/release-qa.test.ts`,
- * so it stays dependency-free and receives already-classified observations.
+ * Defined in `md-matrix.mjs` (dependency-free) so `assert-evaluated.mjs`, which
+ * the refresh-PR job runs on a fresh checkout with no `dist/`, can count rows
+ * without importing this file's `dist/` import (#4518). The census test and
+ * `scripts/probe-clean-signal.mjs` keep importing it from here.
  */
-export const MEASURED_CLEAN_BEHAVIORS = new Set([
-	"publishes-versioned",
-	"publishes-unversioned",
-	"silent",
-]);
+export { MEASURED_CLEAN_BEHAVIORS };
 
 /**
  * The matrix lang a probe fixture writes to: a `clean: true` fixture
@@ -479,6 +506,115 @@ export function buildMatrixObservations(targetLangRows) {
 		cleanBehavior: MEASURED_CLEAN_BEHAVIORS.has(r.behavior) ? r.behavior : null,
 		tier: r.tierLabel || String(r.tier),
 	}));
+}
+
+/**
+ * The first-publish class a row may AUTHOR, or `undefined`. Only a DIRTY
+ * fixture can: a `clean: true` fixture's file has no finding to publish, so a
+ * comparable class from it (`direct`, and equally `empty-first` — its own empty
+ * publish followed by a finding-bearing one) is not that axis's measurement
+ * (#4615). This is the seam's half of the refusal `createProbeFixture` applies
+ * at the producer: a class that reached a clean row anyway (a row built by
+ * another caller, or a producer that regressed) cannot be stored or handed to
+ * the matrix.
+ *
+ * @param {{ cleanFixture?: boolean, firstPublish?: string }} row
+ * @returns {string | undefined}
+ */
+function authoredFirstPublish(row) {
+	return !row.cleanFixture && COMPARABLE_FIRST_PUBLISH.has(row.firstPublish)
+		? row.firstPublish
+		: undefined;
+}
+
+/**
+ * Resolve each fixture row onto the matrix row it writes, one row per target
+ * lang. Shared by the drift report, the console summary and the matrix refresh
+ * so they never disagree (#3310); the matrix writer itself stays
+ * dependency-free.
+ *
+ * Each AXIS has its own authoritative fixture (#4615). `clean-behavior` is a
+ * clean→clean observation, so a `clean: true` fixture wins for it (the
+ * production clean-file case, #240). `first-publish` is defined on a DIRTY file
+ * — is the first publish for a file WITH findings the answer, or an empty
+ * placeholder while an index builds? — and a clean fixture's file has no
+ * finding to publish, so it can never author that axis. A clean row's
+ * comparable class is normalised to `unknown` here and never becomes the
+ * row's first-publish arm. Before #4615 the clean fixture supplied both, which
+ * is how a leaked publish from another live client — or the clean fixture's own
+ * empty-then-finding trace — put a class on the `typescript` row; the dirty
+ * fixture `typescript` measures `direct` in every recorded run.
+ *
+ * @param {Array<{ lang: string, cleanFixture?: boolean, behavior?: string, firstPublish?: string, targetLang?: string }>} measuredRows
+ * @returns {Array<Record<string, unknown> & { lang: string, targetLang: string }>}
+ */
+export function resolveTargetLangRows(measuredRows) {
+	const measurable = (measuredRows ?? []).filter(
+		(r) =>
+			MEASURED_CLEAN_BEHAVIORS.has(r.behavior) ||
+			COMPARABLE_FIRST_PUBLISH.has(r.firstPublish),
+	);
+	const byTargetLang = new Map();
+	for (const r of measurable) {
+		const targetLang = targetLangForFixture(r.lang, r.cleanFixture);
+		const authored = authoredFirstPublish(r);
+		const resolved = {
+			...r,
+			lang: targetLang,
+			targetLang,
+			// A clean row keeps its own non-comparable evidence (`empty-only`)
+			// verbatim; a comparable class from it is refused, not passed on.
+			firstPublish:
+				r.cleanFixture && COMPARABLE_FIRST_PUBLISH.has(r.firstPublish)
+					? "unknown"
+					: r.firstPublish,
+			firstPublishFrom: authored ? r.lang : undefined,
+		};
+		const prev = byTargetLang.get(targetLang);
+		if (!prev) {
+			byTargetLang.set(targetLang, resolved);
+			continue;
+		}
+		const cleanBehaviorRow = r.cleanFixture ? resolved : prev;
+		const firstPublishRow = !r.cleanFixture ? resolved : prev;
+		// The arm that supplies the class must also supply its author: a dirty
+		// sibling's class is kept even when this row refused (or never observed)
+		// its own, and a clean row never names one.
+		const firstPublishArm = authoredFirstPublish(firstPublishRow)
+			? firstPublishRow
+			: authoredFirstPublish(cleanBehaviorRow)
+				? cleanBehaviorRow
+				: undefined;
+		byTargetLang.set(targetLang, {
+			...cleanBehaviorRow,
+			firstPublish:
+				firstPublishArm?.firstPublish ?? cleanBehaviorRow.firstPublish,
+			firstPublishFrom: firstPublishArm?.firstPublishFrom,
+		});
+	}
+	return [...byTargetLang.values()];
+}
+
+/**
+ * The nightly log line naming the fixture behind each matrix row's first-publish
+ * class. `firstPublishFrom` is the resolution's own author field, and it used to
+ * reach only the tests, so a class a `clean: true` fixture supplied would have
+ * been committed with nothing in the log naming it. A clean fixture can no
+ * longer author the axis (the producer's refusal plus this seam's
+ * normalisation), and this line is the record that would name one that did —
+ * the cheapest closure for the whole clean-authored shape.
+ *
+ * Pure, so the probe's summary line is testable: `resolveTargetLangRows` output
+ * in, one string out.
+ *
+ * @param {Array<{ targetLang?: string, firstPublishFrom?: string }>} targetLangRows
+ * @returns {string}
+ */
+export function describeFirstPublishAuthors(targetLangRows) {
+	const pairs = (targetLangRows ?? [])
+		.filter((row) => row.firstPublishFrom && row.targetLang)
+		.map((row) => `${row.targetLang} <- ${row.firstPublishFrom}`);
+	return pairs.length ? pairs.join(", ") : "none";
 }
 
 /**

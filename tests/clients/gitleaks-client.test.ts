@@ -259,7 +259,7 @@ describe("GitleaksClient.scan requireSignal option (#608)", () => {
 	it("requireSignal:false skips the strict gate and attempts a scan on a bare git repo", async () => {
 		const env = setupTestEnvironment("pi-lens-gitleaks-loose-gate-");
 		try {
-			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			// #4560: the shared fixture marker is the bare repo marker here.
 			const client = new GitleaksClient(false) as unknown as {
 				ensureAvailable: () => Promise<boolean>;
 				runScan: (cwd: string) => Promise<{
@@ -290,7 +290,11 @@ describe("GitleaksClient.scan requireSignal option (#608)", () => {
 
 describe("hasGitRepo (#608 mode=full smart-default gate)", () => {
 	it("returns false for a project with no .git", () => {
-		const env = setupTestEnvironment("pi-lens-gitleaks-nogit-");
+		// #4560: the cell is about a project with NO repository marker, so it
+		// opts out of the shared fixture marker.
+		const env = setupTestEnvironment("pi-lens-gitleaks-nogit-", {
+			rootMarker: false,
+		});
 		try {
 			expect(hasGitRepo(env.tmpDir)).toBe(false);
 		} finally {
@@ -301,7 +305,6 @@ describe("hasGitRepo (#608 mode=full smart-default gate)", () => {
 	it("returns true when .git is a directory (normal clone)", () => {
 		const env = setupTestEnvironment("pi-lens-gitleaks-gitdir-");
 		try {
-			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			expect(hasGitRepo(env.tmpDir)).toBe(true);
 		} finally {
 			env.cleanup();
@@ -309,7 +312,11 @@ describe("hasGitRepo (#608 mode=full smart-default gate)", () => {
 	});
 
 	it("returns true when .git is a file (worktree gitdir pointer)", () => {
-		const env = setupTestEnvironment("pi-lens-gitleaks-gitfile-");
+		// #4560: a `.git` FILE cannot share the directory the shared fixture
+		// marker plants, so this cell opts out.
+		const env = setupTestEnvironment("pi-lens-gitleaks-gitfile-", {
+			rootMarker: false,
+		});
 		try {
 			fs.writeFileSync(
 				path.join(env.tmpDir, ".git"),
@@ -324,7 +331,6 @@ describe("hasGitRepo (#608 mode=full smart-default gate)", () => {
 	it("is true even without any explicit gitleaks opt-in signal, unlike hasGitleaksSignal", () => {
 		const env = setupTestEnvironment("pi-lens-gitleaks-smartdefault-");
 		try {
-			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			expect(hasGitleaksSignal(env.tmpDir)).toBe(false);
 			expect(hasGitRepo(env.tmpDir)).toBe(true);
 		} finally {

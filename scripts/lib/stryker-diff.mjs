@@ -216,6 +216,23 @@ function normalized(file) {
 }
 
 /**
+ * True when a test's source reaches `sourceFile` through a relative import (or
+ * a path literal, as mapRelatedTests reads them). The same resolution
+ * mapRelatedTests applies, for one test at a time.
+ *
+ * @param {string} testFile repo-relative test path
+ * @param {string} content the test's source
+ * @param {string} sourceFile repo-relative mutation source
+ */
+export function importsMutationSource(testFile, content, sourceFile) {
+	const target = normalized(sourceFile);
+	return extractRelativeSpecifiers(content).some(
+		(specifier) =>
+			normalized(path.resolve(path.dirname(testFile), specifier)) === target,
+	);
+}
+
+/**
  * The heaviest `maxFiles` files by changed-line weight (#3810, from the #3797
  * review): the old alphabetical cut skipped the four files holding #3706's
  * actual change and mutated its label plumbing and an oxfmt reflow. Equal

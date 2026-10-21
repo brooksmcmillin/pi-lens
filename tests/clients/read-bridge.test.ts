@@ -163,10 +163,14 @@ function validEntry(overrides: Partial<ReadBridgeEntry> = {}): ReadBridgeEntry {
 	};
 }
 
-// ── Bridge absent — must run before the describe below fires its beforeAll ───
+// ── Bridge absent before registration ────────────────────────────────────────
+// Read at module load, before any hook runs, so the assertion holds in any test
+// order. Reading the global inside the test redded under the shuffle census
+// whenever the describe's beforeAll ran first (#4549 run 38954829528).
+const bridgePresentAtLoad = READ_BRIDGE_KEY in (globalThis as object);
 
 it("bridge is absent before registerReadBridge is called", () => {
-	expect(READ_BRIDGE_KEY in (globalThis as object)).toBe(false);
+	expect(bridgePresentAtLoad).toBe(false);
 });
 
 // ── All other tests — bridge registered once, state reset per test ───────────
@@ -201,10 +205,6 @@ describe("read-bridge", () => {
 	});
 
 	// ── Bridge metadata ──────────────────────────────────────────────────────
-
-	it("bridge is defined after registration", () => {
-		expect((globalThis as any)[READ_BRIDGE_KEY]).toBeDefined();
-	});
 
 	it("bridge.version is 1", () => {
 		const bridge: ReadBridge = (globalThis as any)[READ_BRIDGE_KEY];

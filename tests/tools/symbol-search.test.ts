@@ -1,3 +1,4 @@
+// flake-shape: ungoverned-wait-for — the cold build is fire-and-forget (triggerBackgroundWordIndexBuild exposes no awaitable), so a real-time vi.waitFor is the only join on the snapshot it publishes.
 /**
  * symbol_search pi tool (#348) — cold (available:false + hint + background
  * build kicked once) and warm (ranked results) paths, per the #517-slimmed
@@ -8,8 +9,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import {
 	PROJECT_SNAPSHOT_VERSION,
+	loadProjectSnapshot,
 	saveProjectSnapshot,
 } from "../../clients/project-snapshot.js";
+import { _resetWarmWordIndexCacheForTests } from "../../clients/mcp/analyze.js";
 import {
 	buildOrUpdateGraph,
 	clearReviewGraphWorkspaceCache,
@@ -27,6 +30,7 @@ import { createTempFile, setupTestEnvironment } from "../clients/test-utils.js";
 
 afterEach(() => {
 	_resetWordIndexBuildGuardForTests();
+	_resetWarmWordIndexCacheForTests();
 	clearReviewGraphWorkspaceCache();
 });
 
@@ -107,8 +111,6 @@ describe("symbol_search tool", () => {
 
 			// The cold query kicked off a bounded background build (#348 decision 3) —
 			// never blocking THIS call, but the index should show up shortly after.
-			const { loadProjectSnapshot } =
-				await import("../../clients/project-snapshot.js");
 			await vi.waitFor(
 				() => {
 					const snapshot = loadProjectSnapshot(env.tmpDir);
@@ -116,6 +118,49 @@ describe("symbol_search tool", () => {
 				},
 				{ timeout: 5000 },
 			);
+		} finally {
+			env.cleanup();
+		}
+	}, 10_000);
+
+	it("the cold query's own warm entry answers once that build finishes (#4583)", async () => {
+		const env = setupTestEnvironment("pi-lens-symbolsearch-cold-adopt-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"src/auth.ts",
+				"export function authenticateUser(id) { return id; }",
+			);
+			const tool = createSymbolSearchTool(() => env.tmpDir);
+			const cold = await tool.execute(
+				"1",
+				{ query: "authenticate user" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(cold.details).toMatchObject({
+				available: false,
+				unavailableReason: "building",
+			});
+
+			// The warm entry this process cached during the build must adopt the
+			// index the build published; otherwise every later query replays the
+			// "building" answer over an index that is already on disk (#4583).
+			await vi.waitFor(
+				() => {
+					expect(loadProjectSnapshot(env.tmpDir)?.wordIndex).toBeDefined();
+				},
+				{ timeout: 5000 },
+			);
+			const warm = await tool.execute(
+				"2",
+				{ query: "authenticate user" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(warm.details).toMatchObject({ available: true, count: 1 });
 		} finally {
 			env.cleanup();
 		}

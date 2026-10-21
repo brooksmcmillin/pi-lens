@@ -303,6 +303,23 @@ httpsGetMock.mockImplementation(
 	},
 );
 
+// Asset spellings verified against mvdan/sh's v3.12.0 release.
+function shfmtReleaseBody(tag: string): string {
+	return JSON.stringify({
+		tag_name: tag,
+		assets: [
+			"linux_amd64",
+			"windows_amd64.exe",
+			"darwin_amd64",
+			"darwin_arm64",
+			"linux_arm64",
+		].map((platform) => ({
+			name: `shfmt_${tag}_${platform}`,
+			browser_download_url: `https://github.com/mvdan/sh/releases/download/${tag}/shfmt_${tag}_${platform}`,
+		})),
+	});
+}
+
 /** A `releases/latest` route for shfmt returning `tag`, plus its asset. */
 function routeGitHubRelease(
 	tag: string,
@@ -324,23 +341,7 @@ function routeGitHubRelease(
 				headers: options.etag
 					? { etag: options.etag }
 					: ({} as Record<string, string>),
-				body: JSON.stringify({
-					tag_name: tag,
-					assets: [
-						{
-							name: `shfmt_${tag}_linux_amd64`,
-							browser_download_url: `https://github.com/mvdan/sh/releases/download/${tag}/shfmt_${tag}_linux_amd64`,
-						},
-						{
-							name: `shfmt_${tag}_windows_amd64.exe`,
-							browser_download_url: `https://github.com/mvdan/sh/releases/download/${tag}/shfmt_${tag}_windows_amd64.exe`,
-						},
-						{
-							name: `shfmt_${tag}_darwin_amd64`,
-							browser_download_url: `https://github.com/mvdan/sh/releases/download/${tag}/shfmt_${tag}_darwin_amd64`,
-						},
-					],
-				}),
+				body: shfmtReleaseBody(tag),
 			};
 		},
 	});
@@ -859,16 +860,7 @@ describe("github strategy", () => {
 					redirectedHeaders = headers;
 					return {
 						statusCode: 200,
-						body: JSON.stringify({
-							tag_name: "v3.12.0",
-							assets: [
-								{
-									name: "shfmt_v3.12.0_linux_amd64",
-									browser_download_url:
-										"https://github.com/mvdan/sh/releases/download/v3.12.0/shfmt_v3.12.0_linux_amd64",
-								},
-							],
-						}),
+						body: shfmtReleaseBody("v3.12.0"),
 					};
 				},
 			});
@@ -1452,10 +1444,17 @@ describe("verification-budget delivery across non-npm strategies", () => {
 		}
 	}
 
-	/** Every `--version` spawn's `timeout` option, across all calls. */
+	/**
+	 * Every version-probe spawn's `timeout` option, across all calls. SpotBugs
+	 * takes `-version`: it rejects `--version` (probed against 4.10.2).
+	 */
 	function versionProbeTimeouts(): Array<number | undefined> {
 		return spawnMock.mock.calls
-			.filter(([, args]) => (args ?? []).includes("--version"))
+			.filter(([, args]) =>
+				(args ?? []).some(
+					(arg: string) => arg === "--version" || arg === "-version",
+				),
+			)
 			.map(([, , options]) => (options as { timeout?: number })?.timeout);
 	}
 

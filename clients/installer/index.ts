@@ -853,7 +853,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "jscpd",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "jscpd@5.4.0", // v5.4.0 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
+		packageName: "jscpd@5.4.1", // v5.4.1 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
 		binaryName: "jscpd",
 	},
 	// Structural search and dead code detection
@@ -1011,8 +1011,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "helm",
 		name: "Helm",
 		checkCommand: "helm",
-		// intended: version --short — unverified against real binary (shape 16), do not wire until probed
-		checkArgs: ["--version"],
+		// Probed against helm 4.3.0: `--version` exits 1 ("unknown flag"), `version --short` exits 0.
+		checkArgs: ["version", "--short"],
 		installStrategy: "github",
 		binaryName: "helm",
 		github: {
@@ -1355,8 +1355,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "spotbugs",
 		name: "SpotBugs",
 		checkCommand: "spotbugs",
-		// intended: -version — unverified against real binary (shape 16), do not wire until probed
-		checkArgs: ["--version"],
+		// Probed against spotbugs 4.10.2 (JRE 21): `--version` exits 1 ("Unknown option"), `-version` prints 4.10.2.
+		checkArgs: ["-version"],
 		installStrategy: "archive",
 		binaryName: "spotbugs",
 		archive: {
@@ -1658,7 +1658,7 @@ export const TOOLS: ToolDefinition[] = [
 		id: "gitleaks",
 		name: "gitleaks",
 		checkCommand: "gitleaks",
-		// intended: version — unverified against real binary (shape 16), do not wire until probed
+		// Probed against gitleaks 8.30.1: `--version` exits 0.
 		checkArgs: ["--version"],
 		installStrategy: "github",
 		binaryName: "gitleaks",
@@ -1770,7 +1770,7 @@ export const TOOLS: ToolDefinition[] = [
 		id: "terraform-ls",
 		name: "terraform-ls",
 		checkCommand: "terraform-ls",
-		// intended: version — unverified against real binary (shape 16), do not wire until probed
+		// Probed against terraform-ls 0.39.0: `--version` exits 0.
 		checkArgs: ["--version"],
 		installStrategy: "github",
 		binaryName: "terraform-ls",
@@ -3207,12 +3207,22 @@ export function wasLastResolveTransient(toolId: string): boolean {
 	return lastResolveTransient.get(toolId) ?? false;
 }
 
-export async function getToolPath(toolId: string): Promise<string | undefined> {
+export async function getToolPath(
+	toolId: string,
+	opts?: {
+		/** #4515: read only pi-lens's own store; spawn nothing found on PATH. */
+		storeOnly?: boolean;
+	},
+): Promise<string | undefined> {
 	let sawTransient = false;
 	const markTransient = (): void => {
 		sawTransient = true;
 	};
-	const result = await getToolPathResolved(toolId, markTransient);
+	const result = await getToolPathResolved(
+		toolId,
+		markTransient,
+		opts?.storeOnly === true,
+	);
 	lastResolveTransient.set(toolId, sawTransient);
 	return result;
 }
@@ -3220,6 +3230,7 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 async function getToolPathResolved(
 	toolId: string,
 	onTransient: () => void,
+	storeOnly: boolean,
 ): Promise<string | undefined> {
 	const tool = TOOLS.find((t) => t.id === toolId);
 	if (!tool) return undefined;
@@ -3365,6 +3376,21 @@ async function getToolPathResolved(
 	) {
 		const githubPath = await findGitHubToolPath(tool.binaryName || tool.id);
 		if (githubPath) return githubPath;
+	}
+
+	// #4515: the store ends here, save pi-lens's own pip prefixes. Every other
+	// rung below spawns what a bare-name lookup resolves (`<cmd> --version`,
+	// `npm prefix -g`, `python -m site`).
+	if (storeOnly) {
+		return tool.installStrategy === "pip"
+			? findPipUserToolPath(
+					tool.binaryName || tool.id,
+					onTransient,
+					tool.checkArgs,
+					getToolVerificationTimeout(tool),
+					true,
+				)
+			: undefined;
 	}
 
 	// Check if global. `isCommandAvailable` is a PATH walk plus a stat — it
@@ -3621,12 +3647,14 @@ async function findPipUserToolPath(
 	onTransient?: () => void,
 	verificationArgs: string[] = ["--version"],
 	verificationTimeoutMs = 10_000,
+	/** #4515: skip the Python user base, which takes a PATH-resolved spawn. */
+	piLensPrefixesOnly = false,
 ): Promise<string | undefined> {
 	const isWindows = installerPlatform() === "win32";
 	const userBaseCandidates = [
 		path.join(getGlobalPiLensDir(), "pip-tools"),
 		path.join(getGlobalPiLensDir(), "pip-user"),
-		...(await getPythonUserBaseCandidates()),
+		...(piLensPrefixesOnly ? [] : await getPythonUserBaseCandidates()),
 	];
 
 	for (const userBase of userBaseCandidates) {
@@ -5247,6 +5275,8 @@ export async function swapExtractedDir(
 		await fs.rename(finalDir, backupDir);
 		hadPrevious = true;
 	} catch (err) {
+		// none: ENOENT means there was no previous install to move aside — the
+		// tree is absent, not a failure to read it; every other code rethrows.
 		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 	}
 	try {

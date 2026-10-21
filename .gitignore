@@ -178,6 +178,13 @@ BUG_*.md
 # grammar-health corpus (#4012) — one real multi-construct file per grammar;
 # un-ignored so javascript.js is not hidden by the global *.js ignore above.
 !tests/fixtures/grammar-health/**
+# Captured clean workspaces (#4522) — the inputs a runner analysed to produce a
+# fixture's `clean` bytes, so the clean half replays a real run. The global
+# *.js / *.md ignores above hid eslint's, biome's, markdownlint's, oxlint's,
+# spellcheck's and vale's inputs, and five fixtures then named workspaces no
+# fresh checkout had (#4522 F1). Census: tests/clients/dispatch/
+# smoke-fixture-coverage.test.ts asks git which fixture inputs are ignored.
+!tests/fixtures/runner-output-clean/**
 
 clients/dispatch/debug.log
 clients/lsp/.intelephense/

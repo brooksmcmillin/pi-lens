@@ -173,7 +173,7 @@ SACall(i) ==
     /\ SConcurrent \/ rpc \in {"idle", "done"}
     /\ SCallInRun => rpc \in {"run", "rread", "rlock", "rrecheck", "rwrite"}
     /\ sa' = [sa EXCEPT ![i] = "called"]
-    /\ infl' = IF Registered \/ CarryPreRunCalls THEN infl \cup {i} ELSE infl
+    /\ infl' = IF Registered \/ (CarryPreRunCalls /\ rpc = "idle") THEN infl \cup {i} ELSE infl
     \* The displaced rule (noteAgentCallStart): a call begins on a file whose
     \* latest capture the disk contradicts, and no in-flight own call accounts
     \* for the gap (Accounted). The code tests no verdict here, and neither does

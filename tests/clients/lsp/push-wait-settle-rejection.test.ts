@@ -75,6 +75,7 @@ function makeClient(delayMs: number, serverId: string) {
 		getDiagnosticsVersionForPath: vi.fn((p: string) => stamps.get(p) ?? 0),
 		getDiagnostics: vi.fn(() => []),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			close: vi.fn(async () => {}),

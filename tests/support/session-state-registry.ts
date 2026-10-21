@@ -123,9 +123,17 @@ import {
 	resetTreeSitterClientLoadState,
 } from "../../clients/tree-sitter-shared.js";
 import {
+	noteWorkspaceFileCreated,
 	resetWorkspaceDiagnosticsCacheSession,
 	workspaceDiagnosticsCacheSessionStart,
+	workspaceFileCreatedAtFor,
 } from "../../clients/lsp/workspace-diagnostics-session.js";
+import {
+	noteAtomicReplace,
+	notePathAppeared,
+	pathBirthtimeMs,
+	resetPathBirthForTests,
+} from "../../clients/path-birth.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import { clearFormatterCache } from "../../clients/formatters.js";
 import * as formattersModule from "../../clients/formatters.js";
@@ -361,6 +369,24 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		},
 	},
 	{
+		id: "cascade-format:cascadeUnansweredPrimariesDelivered",
+		module: "cascade-format.ts",
+		state: "cascadeUnansweredPrimariesDelivered",
+		policy: "session_start",
+		resetName: "resetCascadeUnansweredPrimariesDelivered",
+		reason:
+			"#4403: the primaries whose cascade 'no language server answered' line reached this session's agent; the next session's agent has not been told.",
+	},
+	{
+		id: "cascade-format:pendingNeighbors",
+		module: "cascade-format.ts",
+		state: "pendingNeighbors",
+		policy: "session_start",
+		resetName: "resetCascadePendingNeighbors",
+		reason:
+			"#4487: cascade neighbour errors this session's agent was shown and no later observation cleared; the next session's agent was never shown them, and the tree may have changed between sessions.",
+	},
+	{
 		id: "cascade-tier:outstandingTouches",
 		module: "lsp/cascade-tier.ts",
 		state:
@@ -529,11 +555,11 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		id: "dispatch-integration:sessionCaches",
 		module: "dispatch/integration.ts",
 		state:
-			"recentlyCleanNeighborCache, primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts",
+			"primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts, preEditCaptureFacts",
 		policy: "session_start",
 		resetName: "resetDispatchBaselines",
 		reason:
-			"Every one of these is a claim about the tree as this session found it; `sessionFacts` is cleared by a method call inside this same reset, so the reset is the registered seam.",
+			"Every one of these is a claim about the tree as this session found it; `sessionFacts` and `preEditCaptureFacts` (#4483) are cleared by a method call inside this same reset, so the reset is the registered seam.",
 	},
 	{
 		id: "dispatcher:coverageNoticeSeen",
@@ -842,6 +868,25 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		},
 	},
 	{
+		id: "lsp-workspace-diagnostics-cache:fileCreatedAt",
+		module: "lsp/workspace-diagnostics-session.ts",
+		state: "_fileCreations; _allFilesChangedAt",
+		policy: "session_start",
+		resetName: "resetWorkspaceDiagnosticsCacheSession",
+		reason:
+			"#4320, #4346: each client's latest Created send per path refuses older cached entries whose dependency scope holds that path, under that client's root (#4476: or a declaration file pi-lens saw change on disk, for any server), and `_allFilesChangedAt` holds what the bound evicted and the last dependency install; kept across sessions they would refuse every later session's entries.",
+		probe: {
+			arm: () =>
+				noteWorkspaceFileCreated("probe-server", "/", ["/probe-created.ts"], 1),
+			isArmed: () =>
+				workspaceFileCreatedAtFor(
+					() => true,
+					() => true,
+				) === 0,
+			reset: () => resetWorkspaceDiagnosticsCacheSession(),
+		},
+	},
+	{
 		id: "lsp-workspace-diagnostics-cache:sessionClock",
 		module: "lsp/workspace-diagnostics-session.ts",
 		state: "_sessionStartedAt",
@@ -963,11 +1008,12 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "opaque-mutation-scan:baselineStore+gitMemo",
 		module: "opaque-mutation-scan.ts",
-		state: "OpaqueBaselineStore pending map, gitRepoMemo, gitToplevelMemo",
+		state:
+			"OpaqueBaselineStore pending map, gitRepoMemo, gitToplevelMemo, headRecords, headLooks",
 		policy: "session_start",
 		resetName: "resetOpaqueMutationState",
 		reason:
-			"#2000 phase 2: pending pre-command baselines are keyed cwd:generation (plus the tool-call id, #4137) and become unreachable when the session generation advances; and the git-worktree and toplevel memos must re-probe after a session that may have seen a directory become a worktree, or become a LINKED worktree of another (#2007). Without the reset the baselines leak per session and the memos mis-answer forever.",
+			"#2000 phase 2: pending pre-command baselines are keyed cwd:generation (plus the tool-call id, #4137) and become unreachable when the session generation advances; and the git-worktree and toplevel memos must re-probe after a session that may have seen a directory become a worktree, or become a LINKED worktree of another (#2007). Without the reset the baselines leak per session and the memos mis-answer forever. #4493: the per-session HEAD records (capped at 64) and the per-key HEAD-look flights clear at the same boundary, where the LSP service resets too, so no record outlives the documents it guards.",
 	},
 
 	// ── The rest of the session_start reset chain ────────────────────────────
@@ -990,6 +1036,50 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		sessionStartClosureReset: true,
 		reason:
 			"#2319: the verified path-attribution guess tally is a per-session counter that emits one path_attribution_verified_rollup row at session end; PR #2312's class sweep flagged the module-scope `let` as the same latent shape as the bind rollup, so it now rides getProcessSingleton (shape 25). Its reset runs in index.ts's session_start closure after the #473 decision and only on the primary path, so a secondary cannot erase the primary's tally; the count is memory-only best-effort observability, so a lost tally is noise, not data.",
+	},
+	{
+		id: "path-birth:appearedPaths",
+		module: "path-birth.ts",
+		state: "appearedPaths",
+		policy: "process_lifetime",
+		resetName: "resetPathBirthForTests",
+		reason:
+			"#4368 r1 row 13: `appearedPaths` records that the import resolver saw a path absent and then present, so a module moved into place (old inode) answers with that later observation. A fact about files on disk, not about a session: a client started after the observation reads the path as older than itself and sends nothing, so keeping it across sessions changes no answer, and a session_start clear would only lose the record for a client that is still live. Bounded (1024).",
+		probe: {
+			arm: () => notePathAppeared("/session-state-probe/moved.py", 20_000),
+			// Unarmed, the path answers its inode's own birth.
+			isArmed: () =>
+				pathBirthtimeMs(
+					{ dev: 1, ino: 7, birthtimeMs: 5_000, ctimeMs: 5_001 },
+					"/session-state-probe/moved.py",
+				) !== 20_000,
+			reset: () => resetPathBirthForTests(),
+		},
+	},
+	{
+		id: "path-birth:replacedPathBirths",
+		module: "path-birth.ts",
+		state: "replacedPathBirths; birthIsCtimeAlias",
+		policy: "process_lifetime",
+		resetName: "resetPathBirthForTests",
+		reason:
+			"#4320 r2: `replacedPathBirths` records that an inode pi-lens installed by an atomic partial edit stands for a path born earlier. That is a fact about files on disk, not about a session: a session_start clear would make the next first open of every file this process edited read as a creation and send the server a Created. Bounded (1024), keyed by the installed inode's own birth so a reused inode number never inherits it. `birthIsCtimeAlias` memoises whether libuv fell back from statx, a property of the process that cannot change.",
+		probe: {
+			arm: () =>
+				noteAtomicReplace(
+					{ dev: 1, ino: 7, birthtimeMs: 1_000, ctimeMs: 1_001 },
+					{ dev: 1, ino: 8, birthtimeMs: 9_000, ctimeMs: 9_001 },
+				),
+			// Unarmed, the installed inode answers anything but the carried birth.
+			isArmed: () =>
+				pathBirthtimeMs({
+					dev: 1,
+					ino: 8,
+					birthtimeMs: 9_000,
+					ctimeMs: 9_001,
+				}) !== 1_000,
+			reset: () => resetPathBirthForTests(),
+		},
 	},
 	{
 		id: "pending-runner-findings:pending",
@@ -1419,7 +1509,7 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"lsp/spawn-history.ts":
 		"successful spawn duration history intentionally spans session boundaries within the host process so later sessions can avoid waits that prior evidence proves cannot succeed",
 	"lsp/workspace-diagnostics-cache.ts":
-		"#1669 review F1/F2/N3: a sweep-cwd discovery registry (idempotent — re-registers on every createWorkspaceDiagnosticsCacheContext call) plus a per-cwd cache epoch. Neither needs a session_start reset, but a session boundary is NOT harmless for the registry: a refresh for a cwd this process has not yet swept clears nothing on disk (the review's N3 finding) until that cwd is finally reached, at which point clearWorkspaceDiagnosticsCache's state.root fallback and the epoch's on-disk generation field (durable across the boundary, unlike the in-memory map alone) recover it. A session_start wipe would only widen that window, not close it, so exemption is still correct — the fix is durability at the write site, not a reset seam here.",
+		"#1669 review F1/F2/N3: a sweep-cwd discovery registry (idempotent — re-registers on every createWorkspaceDiagnosticsCacheContext call) plus a per-cwd cache epoch. Neither needs a session_start reset, but a session boundary is NOT harmless for the registry: a refresh for a cwd this process has not yet swept clears nothing on disk (the review's N3 finding) until that cwd is finally reached, at which point clearWorkspaceDiagnosticsCache's state.root fallback and the epoch's on-disk generation field (durable across the boundary, unlike the in-memory map alone) recover it. A session_start wipe would only widen that window, not close it, so exemption is still correct — the fix is durability at the write site, not a reset seam here. #4322 adds `RELEASED_OLDER_CACHE_VERSIONS`, an import-time constant set of released cache versions that nothing writes after load (SWEEP_HEURISTIC_LIMITS item 5); a session boundary cannot change it.",
 	"mcp/analyze.ts":
 		"warm word-index cache keyed by path with its own freshness check. #2455 fix round 2: the widened detector (any class declared in clients/, not just clear()/delete()-owning ones) also now flags `warmGraphFacts`, a module-scope FactStore. #2455 fix round 3, F3: an earlier draft of this exemption claimed the MCP server has no pi session_start boundary to hook into. That is false — `clients/mcp/session.ts`'s runSessionStart calls handleSessionStart, and `mcp/server.ts` runs it both at boot (:252) and from the `pilens_session_start` tool (:1631) — so the exemption rests only on its real merits. `warmGraphFacts` is deliberately reused across calls by design (#536: buildOrUpdateGraph's incremental/cached tiers key off a stable instance, so a fresh store per call would defeat that reuse), and its entity-snapshot diff self-heals on eviction (wasBoundedSessionFactEvicted). It is NOT risk-free: the entity-snapshot key has no cwd component, so a warm process serving two projects that share a relative path could cross-contaminate a diff — filed as #2477, out of scope for the detector fix itself.",
 	"mcp/session.ts":
@@ -1513,6 +1603,11 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"bus-publish.ts": 0,
 	// #1071 added the per-session miss-attribution ledger (1 → 2).
 	"cache-observability.ts": 2,
+	// #4403 round 5 (V1): the primaries whose cascade line was delivered,
+	// registered above and reset by resetDispatchBaselines.
+	// #4487: the cascade pending-error record (1 -> 2), registered above and
+	// reset by resetDispatchBaselines.
+	"cascade-format.ts": 2,
 	// #2418: the one warn-once latch behind all three config loaders, moved
 	// here out of lens-config.ts and project-lens-config.ts.
 	// #2426: 1 -> 2. The second symbol is `DEPRECATION_NOUN_BY_CODE`, an
@@ -1562,7 +1657,14 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// prefix, so `CASCADE_GRAPH_KINDS` (an exported module-level `new Set`) is
 	// counted (10 -> 11). Import-time frozen vocabulary, same class as this
 	// file's other constant lookups above — SWEEP_HEURISTIC_LIMITS item 5.
-	"dispatch/integration.ts": 11,
+	// #4485: the recently-clean neighbour cache is deleted (11 -> 10); the
+	// pending record in cascade-format.ts replaces it.
+	// #4483 (10 -> 12): `preEditCaptureFacts`, the pre-edit capture's file
+	// facts, cleared by `resetDispatchBaselines` (the sessionCaches entry); and
+	// `preEditCapturesInFlight`, which holds an entry only while that file's
+	// capture runs (at most four); reset aborts each controller and each capture
+	// releases its slot after teardown, preventing overlap across resets.
+	"dispatch/integration.ts": 12,
 	// #3968: the runner-id identity leaf beside the dispatcher — one Set fed
 	// by `RunnerRegistry.register` and re-derived at every process start
 	// (registration state, not session state); see the file-level exemption
@@ -1652,17 +1754,28 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// cannot be evicted while its root is still served. `configInFlight` alone
 	// remains here.
 	"lsp/config.ts": 1,
-	"lsp/index.ts": 2,
+	// #2372 slice 3: 2 -> 1. The never-mutated `OPTIONAL_LSP_SERVER_IDS` set
+	// moved to lsp/client-registry.ts with the spawn path that reads it; that
+	// module exports no reset, so the scan does not flag it.
+	"lsp/index.ts": 1,
 	"lsp/jvm-runtime.ts": 0,
 	// #2324 R2-A added `napiFallbackCoverage`, the napi-run hand-off map
 	// (1 → 2). Registered above and cleared by the same
 	// `resetPendingAuxiliaryCoverage`.
 	"lsp/pending-aux-coverage.ts": 2,
-	"lsp/server.ts": 6,
+	// #4547: 6 -> 8. `PYTHON_BOUNDARY_MARKERS` and `PYTHON_EXTENSIONS` are
+	// import-time constant sets that nothing writes after load
+	// (SWEEP_HEURISTIC_LIMITS item 5); a session boundary cannot change them.
+	"lsp/server.ts": 8,
 	"lsp/service-singleton.ts": 0,
 	"lsp/session-roots.ts": 1,
 	"lsp/spawn-history.ts": 1,
-	"lsp/workspace-diagnostics-cache.ts": 1,
+	// #4322: `RELEASED_OLDER_CACHE_VERSIONS`, an import-time constant set the
+	// scan cannot tell from state (1 -> 2). Exempted above, never written.
+	"lsp/workspace-diagnostics-cache.ts": 2,
+	// #4320 r2: `_fileCreations`, the bounded Created markers (per server,
+	// root and path since #4346), registered above with `_allFilesChangedAt`.
+	"lsp/workspace-diagnostics-session.ts": 1,
 	"lsp/workspace-sweep-hold.ts": 0,
 	// #2455 fix round 2: `warmGraphFacts` (`new FactStore("mcp-analyze")`) is now
 	// counted (1 → 2) under the widened "declared in clients/" predicate. See
@@ -1688,7 +1801,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// no session identity, so they need no reset (SWEEP_HEURISTIC_LIMITS item 5).
 	// #2007 added `gitToplevelMemo`, the worktree-identity cache (3 → 4). It
 	// is registered above and cleared by the same `resetOpaqueMutationState`.
-	"opaque-mutation-scan.ts": 4,
+	// #4493: 4 -> 5, the HEAD records and the HEAD-look single-flight, both
+	// in the entry above and cleared by `resetOpaqueMutationState`.
+	"opaque-mutation-scan.ts": 5,
 	// #1602 added `globalBinDirCache` (1 → 2), cleared by the same
 	// `_resetPackageManagerCache` the registry entry above names.
 	"package-manager.ts": 2,
@@ -1696,6 +1811,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// module-scope scan sees no container here; the getProcessSingleton SIGNAL
 	// is what flags this file now.
 	"path-attribution-telemetry.ts": 0,
+	// #4320 r2: `replacedPathBirths`, registered above (process_lifetime).
+	// #4368 r1 row 13: `appearedPaths` (1 -> 2), registered above.
+	"path-birth.ts": 2,
 	// #2506: the container key is a Symbol.for constant, so the scan sees no
 	// mutable module-scope container here — the same shape as
 	// process-singletons.ts just below.

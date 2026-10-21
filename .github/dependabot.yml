@@ -13,7 +13,12 @@ updates:
         update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
-    directory: /
+    # The composite action under .github/actions pins the same actions/cache SHA
+    # as ci.yml; tests/config/action-pin-split.test.ts reds when a bump reaches
+    # only one of them (#4358).
+    directories:
+      - /
+      - /.github/actions/tool-tree-cache
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

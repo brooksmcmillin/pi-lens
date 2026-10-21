@@ -1,5 +1,8 @@
+import * as fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
+import { tryExpandRead } from "../../clients/read-expansion.js";
+import { lineContentHash } from "../../clients/read-guard.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -229,6 +232,60 @@ describe("read-expansion LSP enrichment (#158)", () => {
 			expect(serialized).toContain("runSynthesis");
 			expect(serialized).not.toContain('"enriched":true');
 			expect(event?.symbol).toBe("runSynthesis");
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #1649: the tool_call reads the file once before the expansion (its line
+ * count) and again after it, for the record. The released capture ran at
+ * recordRead, after the expansion's await, over the range the expansion
+ * settled on. Recurrences prevented: hashes taken from the pre-expansion pass
+ * cover only the requested lines, so a widened read lost its hashes; and
+ * bytes read before the await hash a file another writer has since changed.
+ */
+describe("read accounting around the expansion await (#1649)", () => {
+	const hashesOf = (text: string, first: number, last: number) =>
+		Object.fromEntries(
+			text
+				.split("\n")
+				.slice(first - 1, last)
+				.map((line, i) => [first + i, lineContentHash(line)]),
+		);
+
+	it("hashes the widened range the expansion settled on", async () => {
+		const env = setupTestEnvironment("pi-lens-1649-expand-");
+		try {
+			getWarmClientForFileMock.mockResolvedValue(undefined);
+			const filePath = createTempFile(env.tmpDir, "src/wide.ts", SOURCE);
+			const deps = makeDeps(env.tmpDir, filePath);
+			await runHandlerExpectingNoThrow(() => handleToolCall(deps));
+			const record = deps.runtime.readGuard.getReadHistory(filePath).at(-1);
+			expect(record).toMatchObject({ effectiveOffset: 1, effectiveLimit: 12 });
+			expect(record?.lineHashes).toEqual(hashesOf(SOURCE, 1, 12));
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hashes the bytes on disk after the expansion's await", async () => {
+		const env = setupTestEnvironment("pi-lens-1649-expand-race-");
+		try {
+			getWarmClientForFileMock.mockResolvedValue(undefined);
+			const filePath = createTempFile(env.tmpDir, "src/race.ts", SOURCE);
+			const rewritten = SOURCE.replace(/line\(\)/g, "other()");
+			// The expansion finds nothing, but another writer lands while it runs.
+			vi.mocked(tryExpandRead).mockImplementationOnce(async () => {
+				fs.writeFileSync(filePath, rewritten);
+				return undefined;
+			});
+			const deps = makeDeps(env.tmpDir, filePath);
+			await runHandlerExpectingNoThrow(() => handleToolCall(deps));
+			const record = deps.runtime.readGuard.getReadHistory(filePath).at(-1);
+			expect(record).toMatchObject({ effectiveOffset: 6, effectiveLimit: 2 });
+			expect(record?.lineHashes).toEqual(hashesOf(rewritten, 6, 7));
 		} finally {
 			env.cleanup();
 		}

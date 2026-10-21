@@ -67,6 +67,9 @@
 		"tests/mcp/session-end.smoke.test.ts",
 		"tests/clients/*.test.ts",
 		"tests/clients/**/*.test.ts",
+		// #4583: a tools test is a wall-clock lane member now, and the lane
+		// coverage gate (#2837) requires every member to be a knip entry.
+		"tests/tools/*.test.ts",
 		"tests/scripts/*.test.ts"
 		// tools/*.ts and vitest's setupFiles are NOT listed here: both are
 		// already reached without help — tools/*.ts via index.ts's and
@@ -144,7 +147,12 @@
 		"typescript-language-server",
 		// The packaging workflow reads this pinned devDependency to install
 		// publint in its production-only job, then invokes its binary directly.
-		"publint"
+		"publint",
+		// #4513: scripts/bundle-dist.mjs reads this devDependency's locked
+		// version and spawns it through `npm exec --package esbuild@<version>`,
+		// never an import, so knip cannot credit it. It is a direct dependency
+		// because pi 1.2 dropped the host package that carried it into the lock.
+		"esbuild"
 	],
 	"ignoreBinaries": [
 		// .github/workflows/lint.yml installs this with `--no-save`

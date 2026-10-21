@@ -4,7 +4,12 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LSPClientInfo } from "../../../clients/lsp/client.js";
 import { LSPService } from "../../../clients/lsp/index.js";
-import type { LSPServerInfo } from "../../../clients/lsp/server.js";
+import {
+	type LSPServerInfo,
+	PythonJediServer,
+	PythonServer,
+	TypeScriptServer,
+} from "../../../clients/lsp/server.js";
 import {
 	initLSPConfig,
 	resetLSPConfigStateForTests,
@@ -30,10 +35,12 @@ type RootPolicyHarness = {
 		clients: Map<string, LSPClientInfo>;
 		inFlight: Map<string, Promise<unknown>>;
 	};
-	resolveServerRoot(
-		server: LSPServerInfo,
-		filePath: string,
-	): Promise<string | undefined>;
+	clientRegistry: {
+		resolveServerRoot(
+			server: LSPServerInfo,
+			filePath: string,
+		): Promise<string | undefined>;
+	};
 };
 
 const dirs: string[] = [];
@@ -95,7 +102,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		);
 
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "ci.yml")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "ci.yml"),
+			),
 		).resolves.toBe(project);
 		expect(service.state.clients.size).toBe(1);
 		cwdSpy.mockRestore();
@@ -117,7 +127,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		);
 
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "README.md")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "README.md"),
+			),
 		).resolves.toBe(nested);
 		cwdSpy.mockRestore();
 	});
@@ -135,7 +148,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		};
 
 		await expect(
-			service.resolveServerRoot(server, path.join(foreign, "app.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(foreign, "app.ts"),
+			),
 		).resolves.toBeUndefined();
 	});
 
@@ -159,7 +175,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 
 		// projectA initialized FIRST and projectB LAST; projectA must still serve.
 		await expect(
-			service.resolveServerRoot(server, path.join(projectA, "a.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(projectA, "a.ts"),
+			),
 		).resolves.toBe(projectA);
 	});
 
@@ -251,7 +270,7 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			"/pi-lens-case-outcome/project/src/app.ts",
 			{ caseInsensitiveProbe },
 		);
-		expect(result).toBe(CASE_SENSITIVE_FILESYSTEM ? false : true);
+		expect(result).toBe(false);
 		expect(caseInsensitiveProbe).toHaveBeenCalledOnce();
 	});
 
@@ -280,7 +299,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		};
 
 		await expect(
-			service.resolveServerRoot(server, path.join(foreign, "app.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(foreign, "app.ts"),
+			),
 		).resolves.toBe(foreign);
 	});
 
@@ -301,7 +323,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			fakeClient(project),
 		);
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "app.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "app.ts"),
+			),
 		).resolves.toBe(project);
 	});
 
@@ -327,7 +352,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			fakeClient("C:\\Repo"),
 		);
 		await expect(
-			service.resolveServerRoot(server, "c:\\repo\\nested\\app.ts"),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				"c:\\repo\\nested\\app.ts",
+			),
 		).resolves.toBe("C:\\Repo");
 	});
 
@@ -348,10 +376,98 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		);
 
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "README.md")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "README.md"),
+			),
 		).resolves.toBe(nested);
 		cwdSpy.mockRestore();
 	});
+
+	// #4547: a nested Python project marked only by requirements.txt, setup.py
+	// or setup.cfg was folded into a live ancestor client, so pyright never
+	// read that project's own config or venv. The cases come from the servers'
+	// own root markers: a marker added there without a boundary entry reds.
+	const pythonRootMarkerCases = [PythonServer, PythonJediServer].flatMap(
+		(server) =>
+			(server.root.rootMarkers ?? []).map((marker) => ({
+				server,
+				marker,
+			})),
+	);
+
+	it("derives the Python root-marker cases from the real servers", () => {
+		expect(pythonRootMarkerCases.map(({ marker }) => marker)).toEqual(
+			expect.arrayContaining(["requirements.txt", "setup.py", "setup.cfg"]),
+		);
+	});
+
+	it.each(pythonRootMarkerCases)(
+		"keeps a nested $server.id root marked only by $marker apart from a hosted ancestor",
+		async ({ server, marker }) => {
+			const project = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-python-boundary-"),
+			);
+			dirs.push(project);
+			vi.spyOn(process, "cwd").mockReturnValue(project);
+			const nested = path.join(project, "smoke");
+			fs.mkdirSync(nested, { recursive: true });
+			if (marker === ".git") fs.mkdirSync(path.join(nested, marker));
+			else fs.writeFileSync(path.join(nested, marker), "\n");
+
+			const service = new LSPService() as unknown as RootPolicyHarness;
+			service.state.clients.set(
+				`${server.id}:${normalizeMapKey(project)}`,
+				fakeClient(project),
+			);
+
+			await expect(
+				service.clientRegistry.resolveServerRoot(
+					server,
+					path.join(nested, "qq.py"),
+				),
+			).resolves.toBe(nested);
+		},
+	);
+
+	// #4548: Python packaging manifests must not split a TypeScript client at a
+	// nested directory; the shared boundary predicate used to overreach here.
+	it.each(["requirements.txt", "setup.py", "setup.cfg"])(
+		"does not treat a Python $0 as a TypeScript project boundary",
+		async (marker) => {
+			const project = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-typescript-python-boundary-"),
+			);
+			dirs.push(project);
+			vi.spyOn(process, "cwd").mockReturnValue(project);
+			const nested = path.join(project, "smoke");
+			fs.mkdirSync(nested, { recursive: true });
+			fs.writeFileSync(path.join(nested, marker), "\n");
+
+			const service = new LSPService() as unknown as RootPolicyHarness;
+			service.state.clients.set(
+				`typescript:${normalizeMapKey(project)}`,
+				fakeClient(project),
+			);
+			service.state.clients.set(
+				`python:${normalizeMapKey(project)}`,
+				fakeClient(project),
+			);
+
+			await expect(
+				service.clientRegistry.resolveServerRoot(
+					TypeScriptServer,
+					path.join(nested, "app.ts"),
+				),
+			).resolves.toBe(project);
+			await expect(
+				service.clientRegistry.resolveServerRoot(
+					PythonServer,
+					path.join(nested, "qq.py"),
+				),
+			).resolves.toBe(nested);
+		},
+	);
 
 	it("collapses the observed nested-marker fixture below ceiling pressure", async () => {
 		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pressure-"));
@@ -379,7 +495,7 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			service.state.clients.set(projectKey, fakeClient(project));
 			roots.add(projectKey);
 			for (const relative of shapes) {
-				const root = await service.resolveServerRoot(
+				const root = await service.clientRegistry.resolveServerRoot(
 					server,
 					path.join(
 						project,

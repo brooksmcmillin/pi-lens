@@ -1,0 +1,46 @@
+{
+	"provenance": {
+		"runner": "elixir-check",
+		"tool": "mix",
+		"version": "1.20.4",
+		"command": "mix compile --warnings-as-errors",
+		"argv": [
+			"compile",
+			"--warnings-as-errors"
+		],
+		"workspace": "tests/fixtures/tool-smoke/elixir-mix",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "lib/bad.ex",
+	"exitCode": 1,
+	"stdout": "Compiling 1 file (.ex)\n",
+	"stderr": "    error: undefined function undefined_function/0 (expected Smoke to define such a function or for it to be imported, but none are available)\n    │\n  4 │     undefined_function()\n    │     ^^^^^^^^^^^^^^^^^^\n    │\n    └─ lib/bad.ex:4:5: Smoke.greet/0\n\n\n== Compilation error in file lib/bad.ex ==\n** (CompileError) lib/bad.ex: cannot compile module Smoke (errors have been logged)\n\n",
+	"availability": [
+		{
+			"command": "mix",
+			"argv": [
+				"--version"
+			],
+			"version": "1.18.3",
+			"exitCode": 0,
+			"stdout": "Erlang/OTP 27 [erts-15.2.7.4] [source] [64-bit] [smp:32:32] [ds:32:32:10] [async-threads:1] [jit:ns]\n\nMix 1.18.3 (compiled with Erlang/OTP 27)\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/elixir-check",
+		"file": "lib/bad.ex",
+		"argv": [
+			"compile",
+			"--warnings-as-errors"
+		],
+		"version": "15.2.7",
+		"exitCode": 0,
+		"stdout": "Compiling 1 file (.ex)\nGenerated smoke app\n",
+		"stderr": ""
+	}
+}

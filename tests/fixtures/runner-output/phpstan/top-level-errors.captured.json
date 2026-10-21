@@ -12,10 +12,38 @@
 		"workspace": "tests/fixtures/tool-smoke/phpstan-internal",
 		"platform": "win32-x64",
 		"capturedAt": "2026-08-21",
-		"note": "an unmatched ignore pattern: a finding phpstan reports outside files{}"
+		"note": "an unmatched ignore pattern: a finding phpstan reports outside files{}",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "clean.php",
 	"exitCode": 1,
 	"stdout": "{\"totals\":{\"errors\":1,\"file_errors\":0},\"files\":{},\"errors\":[\"Ignored error pattern #Never emitted by this fixture# was not matched in reported errors.\"]}",
-	"stderr": "Note: Using configuration file __WORKSPACE__\\phpstan.neon.\r\n"
+	"stderr": "Note: Using configuration file __WORKSPACE__\\phpstan.neon.\r\n",
+	"availability": [
+		{
+			"command": "phpstan",
+			"argv": [
+				"--version"
+			],
+			"version": "2.2.8",
+			"exitCode": 0,
+			"stdout": "PHPStan - PHP Static Analysis Tool 2.2.8\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/phpstan",
+		"file": "clean.php",
+		"argv": [
+			"analyse",
+			"--error-format=json",
+			"--no-progress"
+		],
+		"version": "2.2.8",
+		"exitCode": 0,
+		"stdout": "{\"totals\":{\"errors\":0,\"file_errors\":0},\"files\":{},\"errors\":[]}",
+		"stderr": "Note: Using configuration file __WORKSPACE__/phpstan.neon.\n"
+	}
 }

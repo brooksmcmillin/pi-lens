@@ -367,6 +367,8 @@ describe("#3477 — renameFile closes a document whose open is in flight (trace 
 			notify: {
 				open: (p: string, content: string, languageId: string) =>
 					clientModule.handleNotifyOpen(state, p, content, languageId),
+				watchedFileChange: (p: string, type: number) =>
+					clientModule.handleNotifyExternalChange(state, p, type),
 			},
 			willRenameFiles: async () => null,
 			getOperationSupport: () => ({

@@ -78,6 +78,29 @@ describe("blocker freshness — forward-import resolution (#1631)", () => {
 		expect(imports.map((p) => path.resolve(p))).toContain(path.resolve(dep));
 	});
 
+	// #4438: the import query also captures `import("x")` and `require("x")`.
+	// The JavaScript grammar shares the TypeScript query, and one pattern a
+	// grammar lacks fails the whole query, so a JS file proves the widened
+	// query still compiles there: its static import must still resolve.
+	it("resolves static, dynamic and require imports of a JavaScript file", async () => {
+		const dir = makeDir("pi-lens-fresh-dynamic-");
+		for (const name of ["stat", "dyn", "req"]) {
+			fs.writeFileSync(path.join(dir, `${name}.js`), "export const x = 1;\n");
+		}
+		const consumer = path.join(dir, "consumer.js");
+		fs.writeFileSync(
+			consumer,
+			'import { x } from "./stat.js";\nconst r = require("./req.js");\nexport const f = () => import("./dyn.js");\n',
+		);
+
+		const imports = await extractForwardImportPaths(dir, consumer);
+		expect(imports.map((p) => path.basename(p)).sort()).toEqual([
+			"dyn.js",
+			"req.js",
+			"stat.js",
+		]);
+	});
+
 	it("returns empty for a file with no tree-sitter language", async () => {
 		const dir = makeDir("pi-lens-fresh-nolang-");
 		const file = path.join(dir, "notes.unknownext");

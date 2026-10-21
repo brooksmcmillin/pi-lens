@@ -1,3 +1,4 @@
+// flake-shape: service-double — #4485: the silent-push wait reads a language-server client's per-file publish version and waits on it; a real server cannot be made to publish, or stay silent, inside the wait on demand
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -64,6 +65,29 @@ const lspError = (message = "cascade error") => ({
 	code: "X1",
 	source: "test-lsp",
 });
+
+/**
+ * #4486: the compute reads a cached diagnostics entry only when it was
+ * published after the compute started (`isPostEditObservation`). Doubles that
+ * stand for a current snapshot stamp it one second ahead, a publish landing
+ * while the compute runs.
+ */
+const postEditTs = () => Date.now() + 1_000;
+
+/**
+ * #4485: a silent-push client double that never publishes: the touch's
+ * bounded wait resolves with no new publish for the file.
+ */
+function silentClient(serverId = "typescript") {
+	return {
+		serverId,
+		diagnosticsVersion: 0,
+		getDiagnosticsVersionForPath: () => 0,
+		waitForDiagnostics: async (): Promise<void> => undefined,
+		getDiagnostics: (_file: string): ReturnType<typeof lspError>[] => [],
+		isAlive: () => true,
+	};
+}
 
 // #1095: attach a content `binding` the way the REAL producers do — a
 // NON-enumerable property (getAllDiagnostics uses a lazy getter, touchFile a
@@ -150,7 +174,7 @@ describe("computeCascadeForFile", () => {
 						new Map([
 							[
 								neighbor.split(path.sep).join("/"),
-								{ diags: [lspError()], ts: Date.now() },
+								{ diags: [lspError()], ts: postEditTs() },
 							],
 						]),
 					),
@@ -203,11 +227,11 @@ describe("computeCascadeForFile", () => {
 					new Map([
 						[
 							direct.split(path.sep).join("/"),
-							{ diags: [lspError("d")], ts: Date.now() },
+							{ diags: [lspError("d")], ts: postEditTs() },
 						],
 						[
 							indirect.split(path.sep).join("/"),
-							{ diags: [lspError("i")], ts: Date.now() },
+							{ diags: [lspError("i")], ts: postEditTs() },
 						],
 					]),
 				),
@@ -323,7 +347,7 @@ describe("computeCascadeForFile", () => {
 						new Map([
 							[
 								reference.split(path.sep).join("/"),
-								{ diags: [lspError("reference broken")], ts: Date.now() },
+								{ diags: [lspError("reference broken")], ts: postEditTs() },
 							],
 						]),
 					),
@@ -415,7 +439,7 @@ describe("computeCascadeForFile", () => {
 						new Map([
 							[
 								reference.split(path.sep).join("/"),
-								{ diags: [lspError("reference broken")], ts: Date.now() },
+								{ diags: [lspError("reference broken")], ts: postEditTs() },
 							],
 						]),
 					),
@@ -593,7 +617,7 @@ describe("computeCascadeForFile", () => {
 						new Map([
 							[
 								fallbackFile.split(path.sep).join("/"),
-								{ diags: [lspError("fallback error")], ts: Date.now() },
+								{ diags: [lspError("fallback error")], ts: postEditTs() },
 							],
 						]),
 					),
@@ -663,11 +687,11 @@ describe("computeCascadeForFile", () => {
 					new Map([
 						[
 							noLspNeighbor.split(path.sep).join("/"),
-							{ diags: [lspError("no-server error")], ts: Date.now() },
+							{ diags: [lspError("no-server error")], ts: postEditTs() },
 						],
 						[
 							unrelated.split(path.sep).join("/"),
-							{ diags: [lspError("unrelated error")], ts: Date.now() },
+							{ diags: [lspError("unrelated error")], ts: postEditTs() },
 						],
 					]),
 				),
@@ -769,7 +793,11 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
-	it("#458: skips the in-lane wait for a tier-3 (push-only, silent-on-clean) neighbor touch and records it outstanding", async () => {
+	// #4485: a silent server with nothing to pull with (no
+	// typescript.tsserverRequest advertised) is touched without collecting and
+	// given a bounded wait for a publish; silence records it outstanding and
+	// marks the run unconfirmed, never clean.
+	it("#458: a tier-3 neighbor with no command to pull with waits for a publish and records it outstanding on silence", async () => {
 		const env = setupTestEnvironment("cascade-tier3-skip-");
 		try {
 			const primary = path.join(env.tmpDir, "src", "primary.ts");
@@ -782,7 +810,7 @@ describe("computeCascadeForFile", () => {
 			const beforeTouch = Date.now();
 			const touchFile = vi.fn();
 			const getClientForFile = vi.fn().mockResolvedValue({
-				client: { serverId: "typescript" },
+				client: silentClient(),
 			});
 			const getCapabilitySnapshots = vi.fn().mockResolvedValue([
 				{
@@ -837,10 +865,11 @@ describe("computeCascadeForFile", () => {
 			// racing the record can never be misread as pre-touch at reconcile.
 			expect(outstanding[0].touchedAt).toBeGreaterThanOrEqual(beforeTouch);
 			expect(outstanding[0].touchedAt).toBeLessThanOrEqual(Date.now());
-			// No trustworthy diagnostics were produced by this touch, so the
-			// degraded-fallback path (empty diagnostics, not "clean") applies —
-			// never a false "no errors" for a skipped wait.
+			// No answer came, so the run is not clean: it names the neighbour as
+			// unconfirmed for turn_end's pending line.
 			expect(result?.result?.neighbors[0]?.diagnostics ?? []).toEqual([]);
+			expect(result.skipReason).toBe("indeterminate");
+			expect(result.unconfirmed?.servers[0]?.paths).toEqual([neighbor]);
 		} finally {
 			env.cleanup();
 		}
@@ -904,7 +933,7 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
-	it("#1444: native-ts7 skips the in-lane wait and records a collect-later touch", async () => {
+	it("#1444: native-ts7 waits for its publish and records a collect-later touch on silence", async () => {
 		const env = setupTestEnvironment("cascade-native-ts7-collect-later-");
 		try {
 			const primary = path.join(env.tmpDir, "src", "primary.ts");
@@ -926,7 +955,7 @@ describe("computeCascadeForFile", () => {
 					},
 				]),
 				getClientForFile: vi.fn().mockResolvedValue({
-					client: { serverId: "typescript" },
+					client: silentClient(),
 				}),
 				touchFile,
 				getDiagnostics: vi.fn(),
@@ -1002,54 +1031,6 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
-	it("#1446 item 5: cascade_result records recentlyCleanHits when the recently-clean cache short-circuits a re-touch", async () => {
-		const env = setupTestEnvironment("cascade-recently-clean-hits-");
-		try {
-			const primary = path.join(env.tmpDir, "model.py");
-			const neighbor = path.join(env.tmpDir, "api.py");
-			fs.writeFileSync(primary, "class User: pass\n");
-			fs.writeFileSync(neighbor, "from model import User\n");
-			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
-			const touchFile = vi.fn().mockResolvedValue({ diags: [] });
-			mocks.getLSPService.mockReturnValue({
-				...makeLspServiceDouble(),
-				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
-				touchFile,
-				getDiagnostics: vi.fn(),
-			});
-
-			const { computeCascadeForFile } =
-				await import("../../clients/dispatch/integration.js");
-
-			// First cascade: a confirmed clean touch seeds recentlyCleanNeighborCache.
-			await computeCascadeForFile(primary, env.tmpDir, {
-				turnSeq: 1,
-				writeSeq: 1,
-			});
-			expect(touchFile).toHaveBeenCalledTimes(1);
-			mocks.logCascade.mockClear();
-
-			// Second cascade, one turn later (within RECENTLY_CLEAN_TTL_TURNS = 5):
-			// must short-circuit without touching the LSP again, and the skip must
-			// be counted rather than silently disappearing into "no signal".
-			await computeCascadeForFile(primary, env.tmpDir, {
-				turnSeq: 2,
-				writeSeq: 2,
-			});
-			expect(touchFile).toHaveBeenCalledTimes(1);
-			expect(mocks.logCascade).toHaveBeenCalledWith(
-				expect.objectContaining({
-					phase: "cascade_result",
-					metadata: expect.objectContaining({
-						recentlyCleanHits: 1,
-					}),
-				}),
-			);
-		} finally {
-			env.cleanup();
-		}
-	});
-
 	// #1899: this used to assert the same-write `neighborTouchCache` short-
 	// circuited the re-touch. That cache is gone. It could only hit when two
 	// cascades ran inside ONE write, and `writeSeq` (pi's per-write index)
@@ -1095,30 +1076,30 @@ describe("computeCascadeForFile", () => {
 			);
 			const metadata = (resultCall![0] as { metadata: Record<string, unknown> })
 				.metadata;
-			expect(metadata).toMatchObject({ coldTouches: 1, recentlyCleanHits: 0 });
+			expect(metadata).toMatchObject({ coldTouches: 1 });
 			expect(metadata).not.toHaveProperty("cacheHits");
+			// #4486: the recently-clean cache went the same way.
+			expect(metadata).not.toHaveProperty("recentlyCleanHits");
 		} finally {
 			env.cleanup();
 		}
 	});
 
 	// F1 (adversarial review of #1446): `coldTouches` used to be derived from
-	// `coldSnapshotPaths.length`, a list finalized BEFORE the cache-hit checks
-	// inside the touch pool run — so a coldSnapshotPaths neighbour that then hit
-	// recentlyCleanNeighborCache was double-counted (cold AND
-	// cache/clean), while a non-autopropagate (activePaths) neighbour that missed
-	// both caches and took a genuine touch was counted in neither bucket. This
-	// exercises the touch-pool outcomes in ONE run: `neighborColdTs` (.ts,
-	// autoPropagate) sits in `coldSnapshotPaths` on every run (its snapshot is
-	// never valid) and takes a genuine cold touch — the double-count case —
-	// while `neighborCold` (.py, activePaths) takes a genuine cold touch too and
-	// would be invisible to the old `coldSnapshotPaths.length` derivation
-	// entirely — the silent-drop case. The counters must still partition the
-	// touched-neighbour count exactly.
+	// `coldSnapshotPaths.length`, a list finalized BEFORE the outcome checks
+	// inside the touch pool run — so a neighbour could double-count or vanish
+	// from every bucket. This exercises the touch-pool outcomes in ONE run:
+	// `neighborColdTs` (.ts, autoPropagate) sits in `coldSnapshotPaths` on every
+	// run (its snapshot is never valid) and takes a genuine cold touch, while
+	// `neighborCold` (.py, activePaths) takes a genuine cold touch too and would
+	// be invisible to the old `coldSnapshotPaths.length` derivation entirely.
+	// The counters must still partition the touched-neighbour count exactly.
 	//
 	// #1899 dropped the `cacheHits` bucket with the dead `neighborTouchCache`;
-	// the partition invariant is unchanged and now spans three buckets.
-	it("F1: recentlyCleanHits/coldTouches/deferredTouches partition the touched-neighbour set", async () => {
+	// #4486 dropped `recentlyCleanHits` with the recently-clean cache (the
+	// clean neighbour is touched again), and #4485 split the silent-push touch
+	// into `silentWaitTouches` with its unanswered subset `deferredTouches`.
+	it("F1: coldTouches/silentWaitTouches partition the touched-neighbour set", async () => {
 		const env = setupTestEnvironment("cascade-f1-partition-");
 		try {
 			const primary = path.join(env.tmpDir, "hub.py");
@@ -1156,7 +1137,7 @@ describe("computeCascadeForFile", () => {
 					];
 				});
 			const getClientForFile = vi.fn().mockResolvedValue({
-				client: { serverId: "typescript" },
+				client: silentClient(),
 			});
 			mocks.getLSPService.mockReturnValue({
 				...makeLspServiceDouble(),
@@ -1170,8 +1151,8 @@ describe("computeCascadeForFile", () => {
 			const { computeCascadeForFile } =
 				await import("../../clients/dispatch/integration.js");
 
-			// Setup run: seeds recentlyCleanNeighborCache (neighborClean, a
-			// confirmed clean touch) at turnSeq=1/writeSeq=1.
+			// Setup run: a confirmed clean touch of neighborClean, which the
+			// recently-clean cache used to answer for on the next run.
 			mocks.computeImpactCascade.mockReturnValueOnce(
 				impact(primary, [neighborColdTs, neighborClean]),
 			);
@@ -1182,8 +1163,7 @@ describe("computeCascadeForFile", () => {
 			expect(touchFile).toHaveBeenCalledTimes(2);
 			mocks.logCascade.mockClear();
 
-			// Main run, SAME turnSeq/writeSeq, plus two new neighbours the
-			// recently-clean cache has not seen.
+			// Main run, SAME turnSeq/writeSeq, plus two new neighbours.
 			mocks.computeImpactCascade.mockReturnValueOnce(
 				impact(primary, [
 					neighborColdTs,
@@ -1204,27 +1184,26 @@ describe("computeCascadeForFile", () => {
 			const metadata = (
 				resultCall![0] as {
 					metadata: {
-						recentlyCleanHits: number;
 						coldTouches: number;
+						silentWaitTouches: number;
 						deferredTouches: number;
 					};
 				}
 			).metadata;
 			expect(metadata).toMatchObject({
-				recentlyCleanHits: 1,
-				coldTouches: 2,
+				coldTouches: 3,
+				silentWaitTouches: 1,
 				deferredTouches: 1,
 			});
+			expect(metadata).not.toHaveProperty("recentlyCleanHits");
 			// The partition invariant: every touched neighbour (the 4 in this
 			// run's pool) lands in EXACTLY one bucket — no double-count (the old
 			// coldSnapshotPaths.length bug), no silent drop (the old activePaths
 			// undercounting bug).
 			const touchedNeighbourCount = 4;
-			expect(
-				metadata.recentlyCleanHits +
-					metadata.coldTouches +
-					metadata.deferredTouches,
-			).toBe(touchedNeighbourCount);
+			expect(metadata.coldTouches + metadata.silentWaitTouches).toBe(
+				touchedNeighbourCount,
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -1530,7 +1509,7 @@ describe("computeCascadeForFile", () => {
 						new Map([
 							[
 								neighbor.split(path.sep).join("/"),
-								{ diags: [lspError("existing warning")], ts: Date.now() },
+								{ diags: [lspError("existing warning")], ts: postEditTs() },
 							],
 						]),
 					),
@@ -1556,7 +1535,12 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
-	it("filters repeated cascade diagnostics through cascade delta baselines", async () => {
+	// #4487: deliberately INVERTED. This test pinned the rolling delta
+	// (`applyCascadeDeltaBaselines`), which hid an error on the second run
+	// because the first run had seen it, so a persistent neighbour error read
+	// clean from then on. The delta is gone; every run lists what it observed
+	// and turn_end labels what it delivered before.
+	it("lists a repeated cascade diagnostic on every run (no rolling delta)", async () => {
 		const env = setupTestEnvironment("cascade-delta-");
 		try {
 			const primary = path.join(env.tmpDir, "src", "primary.ts");
@@ -1573,7 +1557,7 @@ describe("computeCascadeForFile", () => {
 						new Map([
 							[
 								neighbor.split(path.sep).join("/"),
-								{ diags: [lspError("same error")], ts: Date.now() },
+								{ diags: [lspError("same error")], ts: postEditTs() },
 							],
 						]),
 					),
@@ -1593,7 +1577,8 @@ describe("computeCascadeForFile", () => {
 			});
 
 			expect(first?.result?.formatted).toContain("same error");
-			expect(second?.result).toBeUndefined();
+			expect(second?.result?.formatted).toContain("same error");
+			expect(second?.skipReason).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}
@@ -1660,9 +1645,8 @@ describe("computeCascadeForFile", () => {
 	it("suppresses an ignored neighbour from cascade snapshot output (#297)", async () => {
 		const env = setupTestEnvironment("cascade-ignore-snapshot-");
 		try {
-			// Anchor the ignore matcher at tmpDir (a .git marker stops
+			// Anchor the ignore matcher at tmpDir (the shared fixture `.git` stops
 			// resolveGitIgnoreRoot's upward walk) and ignore test files there.
-			fs.mkdirSync(path.join(env.tmpDir, ".git"), { recursive: true });
 			fs.writeFileSync(
 				path.join(env.tmpDir, ".pi-lens.json"),
 				JSON.stringify({ ignore: ["**/*.test.ts"] }),
@@ -1688,7 +1672,7 @@ describe("computeCascadeForFile", () => {
 						new Map([
 							[
 								ignoredNeighbor.split(path.sep).join("/"),
-								{ diags: [lspError("countTotal not found")], ts: Date.now() },
+								{ diags: [lspError("countTotal not found")], ts: postEditTs() },
 							],
 						]),
 					),
@@ -1714,7 +1698,6 @@ describe("computeCascadeForFile", () => {
 	it("suppresses an ignored neighbour from cascade fallback output (#297)", async () => {
 		const env = setupTestEnvironment("cascade-ignore-fallback-");
 		try {
-			fs.mkdirSync(path.join(env.tmpDir, ".git"), { recursive: true });
 			fs.writeFileSync(
 				path.join(env.tmpDir, ".pi-lens.json"),
 				JSON.stringify({ ignore: ["**/*.test.ts"] }),
@@ -1733,16 +1716,17 @@ describe("computeCascadeForFile", () => {
 			);
 			mocks.getLSPService.mockReturnValue({
 				...makeLspServiceDouble(),
-				getAllDiagnostics: vi
-					.fn()
-					.mockResolvedValue(
-						new Map([
-							[
-								ignoredOpen.split(path.sep).join("/"),
-								{ diags: [lspError("ignored fallback error")], ts: Date.now() },
-							],
-						]),
-					),
+				getAllDiagnostics: vi.fn().mockResolvedValue(
+					new Map([
+						[
+							ignoredOpen.split(path.sep).join("/"),
+							{
+								diags: [lspError("ignored fallback error")],
+								ts: postEditTs(),
+							},
+						],
+					]),
+				),
 				touchFile: vi.fn(),
 				getDiagnostics: vi.fn(),
 			});
@@ -1796,11 +1780,11 @@ describe("computeCascadeForFile", () => {
 					new Map([
 						[
 							sourceNeighbor.split(path.sep).join("/"),
-							{ diags: [lspError("consumer error")], ts: Date.now() },
+							{ diags: [lspError("consumer error")], ts: postEditTs() },
 						],
 						[
 							testNeighbor.split(path.sep).join("/"),
-							{ diags: [lspError("test error")], ts: Date.now() },
+							{ diags: [lspError("test error")], ts: postEditTs() },
 						],
 					]),
 				),
@@ -1893,11 +1877,11 @@ describe("computeCascadeForFile", () => {
 					new Map([
 						[
 							sourceRef.split(path.sep).join("/"),
-							{ diags: [lspError("consumer broke")], ts: Date.now() },
+							{ diags: [lspError("consumer broke")], ts: postEditTs() },
 						],
 						[
 							testRef.split(path.sep).join("/"),
-							{ diags: [lspError("test broke")], ts: Date.now() },
+							{ diags: [lspError("test broke")], ts: postEditTs() },
 						],
 					]),
 				),
@@ -1931,7 +1915,6 @@ describe("computeCascadeForFile", () => {
 	it("drops an unignored test file from fallback, keeps source, still drops ignored (#1080/#297)", async () => {
 		const env = setupTestEnvironment("cascade-test-role-fallback-");
 		try {
-			fs.mkdirSync(path.join(env.tmpDir, ".git"), { recursive: true });
 			fs.writeFileSync(
 				path.join(env.tmpDir, ".pi-lens.json"),
 				JSON.stringify({ ignore: ["**/vendored.test.ts"] }),
@@ -1956,15 +1939,15 @@ describe("computeCascadeForFile", () => {
 					new Map([
 						[
 							normalSource.split(path.sep).join("/"),
-							{ diags: [lspError("normal source error")], ts: Date.now() },
+							{ diags: [lspError("normal source error")], ts: postEditTs() },
 						],
 						[
 							unignoredTest.split(path.sep).join("/"),
-							{ diags: [lspError("unignored test error")], ts: Date.now() },
+							{ diags: [lspError("unignored test error")], ts: postEditTs() },
 						],
 						[
 							ignoredTest.split(path.sep).join("/"),
-							{ diags: [lspError("ignored test error")], ts: Date.now() },
+							{ diags: [lspError("ignored test error")], ts: postEditTs() },
 						],
 					]),
 				),
@@ -2319,7 +2302,7 @@ describe("computeCascadeForFile", () => {
 							new Map([
 								[
 									neighbor.split(path.sep).join("/"),
-									{ diags: [], ts: Date.now() },
+									{ diags: [], ts: postEditTs() },
 								],
 							]),
 						),
@@ -2614,7 +2597,7 @@ describe("computeCascadeForFile", () => {
 					getDiagnostics: vi.fn(),
 				});
 
-				const { computeCascadeForFile, getDispatchCascadeCacheStats } =
+				const { computeCascadeForFile } =
 					await import("../../clients/dispatch/integration.js");
 				const { recordDiagnostics, getFileDiagnostics } =
 					await import("../../clients/widget-state.js");
@@ -2653,9 +2636,8 @@ describe("computeCascadeForFile", () => {
 				expect(neighborTouchEntry?.metadata).toMatchObject({
 					inconclusive: true,
 				});
-				expect(
-					getDispatchCascadeCacheStats().recentlyCleanNeighborCacheSize,
-				).toBe(0);
+				// #4487: not an observation turn_end may clear a pending error with.
+				expect(run.observedNeighborPaths).toBeUndefined();
 				expect(run.result?.neighbors[0]).toMatchObject({
 					inconclusive: true,
 				});
@@ -2727,8 +2709,8 @@ describe("computeCascadeForFile", () => {
 				// the primary answered — but an auxiliary was cut off by the aux grace
 				// timer, so the merged result is missing that scanner's coverage. Pre-
 				// fix, `isConfirmedTouch` read only `inconclusive`, so this wiped the
-				// live finding and seeded the recently-clean cache, making the wipe
-				// self-sustaining on the next cascade.
+				// live finding and seeded the (since deleted, #4486) recently-clean
+				// cache, making the wipe self-sustaining on the next cascade.
 				mocks.getLSPService.mockReturnValue({
 					...makeLspServiceDouble(),
 					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
@@ -2740,7 +2722,7 @@ describe("computeCascadeForFile", () => {
 					getDiagnostics: vi.fn(),
 				});
 
-				const { computeCascadeForFile, getDispatchCascadeCacheStats } =
+				const { computeCascadeForFile } =
 					await import("../../clients/dispatch/integration.js");
 				const { recordDiagnostics, getFileDiagnostics } =
 					await import("../../clients/widget-state.js");
@@ -2758,7 +2740,7 @@ describe("computeCascadeForFile", () => {
 					1,
 				);
 
-				await computeCascadeForFile(primary, env.tmpDir, {
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
 					turnSeq: 1,
 					writeSeq: 5,
 				});
@@ -2766,10 +2748,8 @@ describe("computeCascadeForFile", () => {
 				const diags = getFileDiagnostics(neighbor);
 				expect(diags).toHaveLength(1);
 				expect(diags?.[0]?.message).toBe("live cross-file error");
-				// Not cached as a confirmed neighbor result either.
-				expect(
-					getDispatchCascadeCacheStats().recentlyCleanNeighborCacheSize,
-				).toBe(0);
+				// #4487: not an observation turn_end may clear a pending error with.
+				expect(run.observedNeighborPaths).toBeUndefined();
 				// The third unconfirmed-touch cause is named in cascade.log, so it is
 				// distinguishable from the inconclusive and bound-false causes.
 				const neighborTouchEntry = mocks.logCascade.mock.calls
@@ -2944,7 +2924,7 @@ describe("computeCascadeForFile", () => {
 							new Map([
 								[
 									neighbor.split(path.sep).join("/"),
-									{ diags: [], ts: Date.now() },
+									{ diags: [], ts: postEditTs() },
 								],
 							]),
 						),
@@ -2998,21 +2978,24 @@ describe("computeCascadeForFile", () => {
 				fs.writeFileSync(primary, "export const x = 1;\n");
 				fs.writeFileSync(neighbor, "import { x } from './primary';\n");
 				mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
-				// The snapshot is 20s old (still within CASCADE_TTL_MS) and reports an
-				// error — a valid, confirmed observation, but an AGING one.
-				const snapshotTs = Date.now() - 20_000;
+				// The snapshot reports an error and was published after the compute
+				// started (#4486), but 200 ms before the read returns it: a valid,
+				// confirmed observation, older than the moment it is reconciled.
+				let snapshotTs = 0;
 				mocks.getLSPService.mockReturnValue({
 					...makeLspServiceDouble(),
-					getAllDiagnostics: vi
-						.fn()
-						.mockResolvedValue(
-							new Map([
-								[
-									neighbor.split(path.sep).join("/"),
-									{ diags: [lspError("snapshot error")], ts: snapshotTs },
-								],
-							]),
-						),
+					getAllDiagnostics: vi.fn(async () => {
+						// Published 1 ms after the read was asked, returned 200 ms
+						// later: only Date is moved, no timer runs.
+						snapshotTs = Date.now() + 1;
+						vi.setSystemTime(snapshotTs + 200);
+						return new Map([
+							[
+								neighbor.split(path.sep).join("/"),
+								{ diags: [lspError("snapshot error")], ts: snapshotTs },
+							],
+						]);
+					}),
 					touchFile: vi.fn(),
 					getDiagnostics: vi.fn(),
 				});
@@ -3028,15 +3011,17 @@ describe("computeCascadeForFile", () => {
 				});
 				expect(getFileDiagnostics(neighbor)).toHaveLength(1);
 
-				// The neighbor file changed 10s ago — AFTER the snapshot's publish time
-				// but before now. touchedAt must be the snapshot's `ts` (now-20s), so
-				// the mtime-staleness gate drops the entry. Pre-fix (touchedAt=now, the
+				// The neighbor file changed AFTER the snapshot's publish time but
+				// before the reconcile. touchedAt must be the snapshot's `ts`, so the
+				// mtime-staleness gate drops the entry. Pre-fix (touchedAt=now, the
 				// re-arming defect this PR fixes for cache hits): it would survive.
-				const mtime = new Date(Date.now() - 10_000);
+				const mtime = new Date(snapshotTs + 100);
 				fs.utimesSync(neighbor, mtime, mtime);
 				expect(await reconcileStaleWidgetFiles()).toBe(1);
-				expect(getFileDiagnostics(neighbor)).toBeUndefined();
+				// Shed, not vanished: the record stays as unfinished evidence (#4625).
+				expect(getFileDiagnostics(neighbor)).toEqual([]);
 			} finally {
+				vi.useRealTimers();
 				env.cleanup();
 			}
 		});
@@ -3141,7 +3126,7 @@ describe("computeCascadeForFile", () => {
 								[
 									neighbor.split(path.sep).join("/"),
 									withBinding(
-										{ diags: [lspError("pre-fix error")], ts: Date.now() },
+										{ diags: [lspError("pre-fix error")], ts: postEditTs() },
 										false,
 									),
 								],
@@ -3207,7 +3192,7 @@ describe("computeCascadeForFile", () => {
 								withBinding(
 									{
 										diags: [lspError("unknown-bound error")],
-										ts: Date.now(),
+										ts: postEditTs(),
 									},
 									"unknown",
 								),
@@ -3260,7 +3245,7 @@ describe("computeCascadeForFile", () => {
 								[
 									neighbor.split(path.sep).join("/"),
 									withBinding(
-										{ diags: [lspError("bound-true error")], ts: Date.now() },
+										{ diags: [lspError("bound-true error")], ts: postEditTs() },
 										true,
 									),
 								],
@@ -3392,7 +3377,7 @@ describe("computeCascadeForFile", () => {
 								withBinding(
 									{
 										diags: [lspError("stale pre-fix error")],
-										ts: Date.now(),
+										ts: postEditTs(),
 									},
 									false,
 								),
@@ -3451,7 +3436,7 @@ describe("computeCascadeForFile", () => {
 								withBinding(
 									{
 										diags: [lspError("unknown-bound stale error")],
-										ts: Date.now(),
+										ts: postEditTs(),
 									},
 									"unknown",
 								),
@@ -3503,14 +3488,17 @@ describe("computeCascadeForFile", () => {
 								withBinding(
 									{
 										diags: [lspError("stale collateral error")],
-										ts: Date.now(),
+										ts: postEditTs(),
 									},
 									false,
 								),
 							],
 							[
 								liveFile.split(path.sep).join("/"),
-								{ diags: [lspError("live collateral error")], ts: Date.now() },
+								{
+									diags: [lspError("live collateral error")],
+									ts: postEditTs(),
+								},
 							],
 						]),
 					),
@@ -3558,7 +3546,7 @@ describe("computeCascadeForFile", () => {
 								withBinding(
 									{
 										diags: [lspError("unknown-bound fallback error")],
-										ts: Date.now(),
+										ts: postEditTs(),
 									},
 									"unknown",
 								),
@@ -3605,7 +3593,7 @@ describe("computeCascadeForFile", () => {
 								withBinding(
 									{
 										diags: [lspError("withheld stale error")],
-										ts: Date.now(),
+										ts: postEditTs(),
 									},
 									false,
 								),
@@ -3629,6 +3617,819 @@ describe("computeCascadeForFile", () => {
 				expect(result?.skipReason).toBe("indeterminate");
 				expect(result?.indeterminate?.reason).toBe("lsp_binding_rejected");
 				expect(result?.result).toBeUndefined();
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
+	// #4438: a change reaches files no import names: a Go file's package peers,
+	// and every JS/TS file for a file that feeds the global scope. The cascade
+	// took its neighbours from import and call edges only, so those files were
+	// listed only by the degraded fallback, from the passive snapshot, and a Go
+	// peer was never re-touched. Red on base ff67dd428.
+	describe("implicit-scope dependents (#4438)", () => {
+		function graphWith(files: string[]): ReviewGraph {
+			const graph = emptyGraph();
+			for (const file of files) {
+				graph.fileNodes.set(normalizeMapKey(file), `file:${file}`);
+			}
+			return graph;
+		}
+
+		it("touches a Go file's package peer as a neighbour", async () => {
+			const env = setupTestEnvironment("cascade-4438-go-");
+			try {
+				const primary = path.join(env.tmpDir, "b.go");
+				const peer = path.join(env.tmpDir, "a.go");
+				const other = path.join(env.tmpDir, "q", "c.go");
+				fs.mkdirSync(path.dirname(other), { recursive: true });
+				fs.writeFileSync(primary, "package p\n\nconst Y = 1\n");
+				fs.writeFileSync(peer, "package p\n\nvar X = Y\n");
+				fs.writeFileSync(other, "package q\n\nconst Z = 1\n");
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				const touchFile = vi
+					.fn()
+					.mockResolvedValue({ diags: [lspError("undefined: Y")] });
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile,
+					getDiagnostics: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const result = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(touchFile.mock.calls.map(([file]) => file)).toEqual([peer]);
+				const neighbor = result?.result?.neighbors[0];
+				expect(neighbor?.filePath).toBe(peer);
+				expect(neighbor?.reason).not.toBe("fallback");
+				expect(neighbor?.lspTouched).toBe(true);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("lists the JS/TS files as neighbours when an ambient file changes", async () => {
+			const env = setupTestEnvironment("cascade-4438-ambient-");
+			try {
+				const primary = path.join(env.tmpDir, "globals.d.ts");
+				const user = path.join(env.tmpDir, "use.ts");
+				fs.writeFileSync(primary, "declare const FOO: string;\n");
+				fs.writeFileSync(user, "export const u: number = FOO;\n");
+				mocks.buildOrUpdateGraph.mockResolvedValue(graphWith([user]));
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(
+						new Map([
+							[
+								user.split(path.sep).join("/"),
+								{
+									diags: [lspError("Type 'string' is not assignable")],
+									ts: postEditTs(),
+								},
+							],
+						]),
+					),
+					touchFile: vi.fn(),
+					getDiagnostics: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const result = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				const neighbor = result?.result?.neighbors[0];
+				expect(neighbor?.filePath).toBe(user);
+				expect(neighbor?.reason).not.toBe("fallback");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// The bound: an ambient file reaches every JS/TS file of the project, so
+		// the expansion takes the most central ones and says it stopped.
+		it("caps the ambient expansion and discloses the cut", async () => {
+			const env = setupTestEnvironment("cascade-4438-ambient-cap-");
+			try {
+				const primary = path.join(env.tmpDir, "globals.d.ts");
+				fs.writeFileSync(primary, "declare const FOO: string;\n");
+				const users: string[] = [];
+				for (let i = 0; i < 14; i++) {
+					const user = path.join(env.tmpDir, `u${i}.ts`);
+					fs.writeFileSync(user, `export const u${i} = FOO;\n`);
+					users.push(user);
+				}
+				mocks.buildOrUpdateGraph.mockResolvedValue(graphWith(users));
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile: vi.fn(),
+					getDiagnostics: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const result = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(result?.indeterminate?.reason).toBe("budget_truncated");
+				expect(result?.indeterminate?.detail).toContain(
+					"implicit-scope expansion checked 10 of 14 JS/TS files",
+				);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// #4438 r2 (F1): a changed file the classifier cannot read (here over
+		// the LSP sync limits, as `clients/lsp/index.ts` is) is no evidence of
+		// a global-scope feed. Round 1 asked the cache's fail-closed answer,
+		// touched 10 unrelated files and rendered a false budget advisory.
+		it("adds no implicit neighbour when the changed module is over the sync limits", async () => {
+			const env = setupTestEnvironment("cascade-4438-oversized-");
+			try {
+				const primary = path.join(env.tmpDir, "big.ts");
+				const lines = ["import * as fs from 'node:fs';"];
+				for (let i = 0; i < 5_100; i++) {
+					lines.push(`export const v${i} = ${i};`);
+				}
+				fs.writeFileSync(primary, `${lines.join("\n")}\n`);
+				const users: string[] = [];
+				for (let i = 0; i < 14; i++) {
+					const user = path.join(env.tmpDir, `u${i}.ts`);
+					fs.writeFileSync(user, `export const u${i} = 1;\n`);
+					users.push(user);
+				}
+				mocks.buildOrUpdateGraph.mockResolvedValue(graphWith(users));
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				const touchFile = vi.fn();
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile,
+					getDiagnostics: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const result = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(touchFile).not.toHaveBeenCalled();
+				expect(result?.neighborCount).toBe(0);
+				expect(result?.indeterminate).toBeUndefined();
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// #4438 r2 (F2): the cascade's Go peers need the same evidence as the
+		// sweep's: same package clause, in the host build. A test file is
+		// already dropped by the cascade's test-role filter.
+		it("touches only the Go peers of the changed file's package build", async () => {
+			const env = setupTestEnvironment("cascade-4438-go-evidence-");
+			try {
+				const primary = path.join(env.tmpDir, "b.go");
+				const peer = path.join(env.tmpDir, "a.go");
+				const otherOs = process.platform === "win32" ? "darwin" : "windows";
+				fs.writeFileSync(primary, "package p\n\nconst Y = 1\n");
+				fs.writeFileSync(peer, "package p\n\nvar X = Y\n");
+				fs.writeFileSync(
+					path.join(env.tmpDir, "gen.go"),
+					"package q\n\nconst Z = 1\n",
+				);
+				fs.writeFileSync(
+					path.join(env.tmpDir, "c.go"),
+					`//go:build ${otherOs}\n\npackage p\n\nvar W = Y\n`,
+				);
+				fs.writeFileSync(
+					path.join(env.tmpDir, `d_${otherOs}.go`),
+					"package p\n\nvar V = Y\n",
+				);
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				const touchFile = vi
+					.fn()
+					.mockResolvedValue({ diags: [lspError("undefined: Y")] });
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile,
+					getDiagnostics: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(touchFile.mock.calls.map(([file]) => file)).toEqual([peer]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// #4438 r3 (review V3): a write is evidence for a peer only when the
+		// written file is in that peer's build, so an in-package test file or a
+		// file outside the host build touches no non-test peer.
+		it.each([
+			["an in-package test file", "a_test.go"],
+			[
+				"a file outside the host build",
+				`x_${process.platform === "win32" ? "darwin" : "windows"}.go`,
+			],
+		])("touches no peer when the changed file is %s", async (_label, name) => {
+			const env = setupTestEnvironment("cascade-4438-go-direction-");
+			try {
+				const primary = path.join(env.tmpDir, name);
+				fs.writeFileSync(primary, "package p\n\nconst Y = 1\n");
+				fs.writeFileSync(
+					path.join(env.tmpDir, "b.go"),
+					"package p\n\nvar X = Y\n",
+				);
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				const touchFile = vi.fn().mockResolvedValue({ diags: [] });
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile,
+					getDiagnostics: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(touchFile).not.toHaveBeenCalled();
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("adds no implicit neighbour when the changed file is a module", async () => {
+			const env = setupTestEnvironment("cascade-4438-module-");
+			try {
+				const primary = path.join(env.tmpDir, "mod.ts");
+				const user = path.join(env.tmpDir, "use.ts");
+				fs.writeFileSync(primary, "export const m = 1;\n");
+				fs.writeFileSync(user, "export const u = 1;\n");
+				mocks.buildOrUpdateGraph.mockResolvedValue(graphWith([user]));
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				const getAllDiagnostics = vi.fn().mockResolvedValue(new Map());
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics,
+					touchFile: vi.fn(),
+					getDiagnostics: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const result = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(result?.neighborCount).toBe(0);
+				expect(result?.indeterminate).toBeUndefined();
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
+	// #4485/#4486/#4487: cascade delivery. Each case drives the production
+	// compute (`computeCascadeForFile`) with the LSP service double standing in
+	// for the language server, the host boundary.
+	describe("cascade delivery (#4485, #4486, #4487)", () => {
+		const tsSnapshot = (root: string, advertisedCommands: string[]) => [
+			{
+				serverId: "typescript",
+				root,
+				operationSupport: {},
+				workspaceDiagnosticsSupport: { mode: "push-only" },
+				launchVariant: "classic",
+				advertisedCommands,
+				rawCapabilityKeys: [],
+			},
+		];
+
+		/** A snapshot read whose publish landed while the compute ran: the
+		 * stamp is later than the compute's own start (`postEditTs`). */
+		const publishedDuringCompute =
+			(rows: Array<[string, ReturnType<typeof lspError>[]]>) => async () =>
+				new Map(
+					rows.map(([filePath, diags]) => [
+						normalizeMapKey(filePath),
+						{ diags, ts: postEditTs() },
+					]),
+				);
+
+		function project(prefix: string) {
+			const env = setupTestEnvironment(prefix);
+			const primary = path.join(env.tmpDir, "src", "primary.ts");
+			const neighbor = path.join(env.tmpDir, "src", "neighbor.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(neighbor, "import { x } from './primary';\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
+			return { env, primary, neighbor };
+		}
+
+		// Recurrence (#4485): 77% of real neighbour outcomes were classic
+		// tsserver neighbours deferred to the quiet window, which mostly never
+		// came; the #707 sync confirm in the in-lane touch was never reached.
+		it("a tier-3 neighbour whose server advertises typescript.tsserverRequest is answered in-lane and records no outstanding touch", async () => {
+			const { env, primary, neighbor } = project("cascade-4485-cmdpull-");
+			try {
+				const touchFile = vi.fn(
+					async (_path: string, _content: string, options: any) =>
+						options?.collectDiagnostics
+							? { diags: [lspError("Type 'string' is not assignable")] }
+							: undefined,
+				);
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					getCapabilitySnapshots: vi
+						.fn()
+						.mockResolvedValue(
+							tsSnapshot(env.tmpDir, ["typescript.tsserverRequest"]),
+						),
+					// A client that would stay silent through a silent-push wait,
+					// so only the command-pull tier reaches the sync confirm.
+					getClientForFile: vi
+						.fn()
+						.mockResolvedValue({ client: silentClient() }),
+					touchFile,
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const { _getOutstandingCascadeTouchesForTests } =
+					await import("../../clients/lsp/cascade-tier.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(touchFile).toHaveBeenCalledWith(
+					neighbor,
+					expect.any(String),
+					expect.objectContaining({
+						collectDiagnostics: true,
+						clientScope: "primary",
+						maxClientWaitMs: 1000,
+					}),
+				);
+				expect(_getOutstandingCascadeTouchesForTests()).toEqual([]);
+				expect(run.result?.formatted).toContain(
+					"Type 'string' is not assignable",
+				);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#4485): 58 real runs whose every neighbour was deferred
+		// returned `no_neighbors`, the value a genuine leaf returns.
+		it("a run whose selected neighbours were all unanswered carries unconfirmed and never no_neighbors/clean", async () => {
+			const { env, primary, neighbor } = project("cascade-4485-silent-");
+			try {
+				const waitForDiagnostics = vi.fn(async () => undefined);
+				const client = {
+					...silentClient(),
+					diagnosticsVersion: 7,
+					waitForDiagnostics,
+				};
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					getCapabilitySnapshots: vi
+						.fn()
+						.mockResolvedValue(tsSnapshot(env.tmpDir, [])),
+					getClientForFile: vi.fn().mockResolvedValue({ client }),
+					touchFile: vi.fn(async () => undefined),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				// The wait is bounded and asks for a publish newer than the
+				// client-wide counter read before the touch.
+				expect(waitForDiagnostics).toHaveBeenCalledWith(neighbor, 1000, {
+					minVersion: 7,
+				});
+				expect(run.skipReason).not.toBe("no_neighbors");
+				expect(run.skipReason).not.toBe("clean");
+				expect(run.skipReason).toBe("indeterminate");
+				expect(run.unconfirmed).toEqual({
+					count: 1,
+					servers: [
+						{ serverId: "typescript", waitMs: 1000, paths: [neighbor] },
+					],
+				});
+				expect(run.selectedNeighborPaths).toEqual([neighbor]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("a silent-push neighbour that publishes inside the wait is answered with that publish", async () => {
+			const { env, primary, neighbor } = project("cascade-4485-silent-pub-");
+			try {
+				let version = 7;
+				const published = new Map<
+					string,
+					{ diags: ReturnType<typeof lspError>[]; ts: number }
+				>();
+				const client = Object.assign(silentClient(), {
+					diagnosticsVersion: version,
+					getDiagnosticsVersionForPath: () => version,
+				});
+				client.waitForDiagnostics = async () => {
+					version = 9;
+					published.set(normalizeMapKey(neighbor), {
+						diags: [lspError("published inside the wait")],
+						ts: Date.now() + 1,
+					});
+				};
+				client.getDiagnostics = (file: string) =>
+					published.get(normalizeMapKey(file))?.diags ?? [];
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					getCapabilitySnapshots: vi
+						.fn()
+						.mockResolvedValue(tsSnapshot(env.tmpDir, [])),
+					getClientForFile: vi.fn().mockResolvedValue({ client }),
+					touchFile: vi.fn(async () => undefined),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const { _getOutstandingCascadeTouchesForTests } =
+					await import("../../clients/lsp/cascade-tier.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(run.unconfirmed).toBeUndefined();
+				expect(run.result?.formatted).toContain("published inside the wait");
+				expect(_getOutstandingCascadeTouchesForTests()).toEqual([]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#4486): a 4 s old snapshot of c.ts was read as clean; the
+		// errors tsserver published 300 ms after the edit never reached the run.
+		it("#4486: a passive snapshot with ts <= cascadeStart is not served; the neighbour is touched", async () => {
+			const { env, primary, neighbor } = project("cascade-4486-pre-edit-");
+			try {
+				const touchFile = vi.fn(async () => ({
+					diags: [lspError("error published after the edit")],
+				}));
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					// Clean, and published before this compute started.
+					getAllDiagnostics: vi
+						.fn()
+						.mockResolvedValue(
+							new Map([
+								[normalizeMapKey(neighbor), { diags: [], ts: Date.now() - 50 }],
+							]),
+						),
+					touchFile,
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(touchFile).toHaveBeenCalledWith(
+					neighbor,
+					expect.any(String),
+					expect.objectContaining({ collectDiagnostics: true }),
+				);
+				expect(run.result?.formatted).toContain(
+					"error published after the edit",
+				);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("#4486: a passive snapshot published after the cascade started serves the neighbour without a touch", async () => {
+			const { env, primary, neighbor } = project("cascade-4486-post-edit-");
+			try {
+				const touchFile = vi.fn();
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn(
+						publishedDuringCompute([[neighbor, [lspError("fresh error")]]]),
+					),
+					touchFile,
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(touchFile).not.toHaveBeenCalled();
+				expect(run.result?.neighbors[0]?.lspTouched).toBe(false);
+				expect(run.result?.formatted).toContain("fresh error");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#4487): a clean run carries no result, so a neighbour the
+		// passive snapshot showed clean would never clear its pending error,
+		// and the unresolved line would keep naming a fixed file.
+		it("a clean passive snapshot published after the cascade started counts as an observation of the neighbour", async () => {
+			const { env, primary, neighbor } = project("cascade-4487-clean-obs-");
+			try {
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn(publishedDuringCompute([[neighbor, []]])),
+					touchFile: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(run.result).toBeUndefined();
+				expect(run.observedNeighborPaths).toEqual([neighbor]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Same shape as the passive snapshot (#4486 sweep): the touch-error
+		// fallback served any TTL-fresh entry as the neighbour's state.
+		it("#4486: the touch-error fallback does not display a snapshot from before the cascade started", async () => {
+			const { env, primary, neighbor } = project("cascade-4486-touch-err-");
+			try {
+				// Python neighbour: no passive read, an active touch that throws.
+				const pyNeighbor = path.join(env.tmpDir, "src", "dep.py");
+				fs.writeFileSync(pyNeighbor, "import os\n");
+				mocks.computeImpactCascade.mockReturnValue(
+					impact(primary, [pyNeighbor]),
+				);
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi
+						.fn()
+						.mockResolvedValue(
+							new Map([
+								[
+									normalizeMapKey(pyNeighbor),
+									{ diags: [lspError("pre-edit error")], ts: Date.now() - 50 },
+								],
+							]),
+						),
+					touchFile: vi.fn(async () => {
+						throw new Error("touch failed");
+					}),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(run.result?.formatted ?? "").not.toContain("pre-edit error");
+				void neighbor;
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("#4486: the degraded fallback does not display cache entries from before the cascade started", async () => {
+			const { env, primary } = project("cascade-4486-degraded-");
+			try {
+				const other = path.join(env.tmpDir, "src", "other.ts");
+				fs.writeFileSync(other, "export const o = 1;\n");
+				mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(
+						new Map([
+							[
+								normalizeMapKey(other),
+								{
+									diags: [lspError("stale collateral")],
+									ts: Date.now() - 50,
+								},
+							],
+						]),
+					),
+					touchFile: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+
+				expect(run.result?.formatted ?? "").not.toContain("stale collateral");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#4486 sweep): the recently-clean cache answered clean for
+		// five turns without a touch, so an edit that broke a neighbour checked
+		// clean one turn earlier read clean.
+		it("a neighbour checked clean on an earlier turn is checked again after the next edit", async () => {
+			const { env, primary } = project("cascade-4486-recheck-");
+			try {
+				const pyNeighbor = path.join(env.tmpDir, "src", "dep.py");
+				fs.writeFileSync(pyNeighbor, "import os\n");
+				mocks.computeImpactCascade.mockReturnValue(
+					impact(primary, [pyNeighbor]),
+				);
+				const touchFile = vi
+					.fn()
+					.mockResolvedValueOnce({ diags: [] })
+					.mockResolvedValueOnce({ diags: [lspError("broken by the edit")] });
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile,
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const first = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+				const second = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 2,
+					writeSeq: 1,
+				});
+
+				expect(touchFile).toHaveBeenCalledTimes(2);
+				// The clean answer is a fresh observation turn_end can clear a
+				// pending neighbour error with (#4487).
+				expect(first.skipReason).toBe("clean");
+				expect(first.observedNeighborPaths).toEqual([pyNeighbor]);
+				expect(second.result?.formatted).toContain("broken by the edit");
+				expect(second.observedNeighborPaths).toEqual([pyNeighbor]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#4487): three cascades over four live tsserver errors
+		// returned clean, then the errors, then clean.
+		it("#4487: three cascades over a persistent neighbour error list it each time", async () => {
+			const { env, primary, neighbor } = project("cascade-4487-persist-");
+			try {
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn(
+						publishedDuringCompute([[neighbor, [lspError("same error")]]]),
+					),
+					touchFile: vi.fn(),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const runs = [];
+				for (const turnSeq of [1, 2, 3]) {
+					runs.push(
+						await computeCascadeForFile(primary, env.tmpDir, {
+							turnSeq,
+							writeSeq: 1,
+						}),
+					);
+				}
+
+				// The "still present since turn N" label is turn_end's (it names
+				// the turn the error was first delivered), covered in
+				// cascade-turn-merge.test.ts.
+				for (const run of runs) {
+					expect(run.skipReason).toBeUndefined();
+					expect(run.result?.formatted).toContain("same error");
+				}
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#4495 round-2 verify R2-1): the pending record took its
+		// stamp from turn_end's delivery, after any write that landed between
+		// the compute's read and turn_end, so the freshness gate never saw a
+		// neighbour fixed in that window. The run carries its read bound.
+		it("a run that lists neighbour errors carries its read time: the compute's start, before every read", async () => {
+			const { env, primary, neighbor } = project("cascade-4495-checked-at-");
+			try {
+				const reads: number[] = [];
+				const getAllDiagnostics = publishedDuringCompute([
+					[neighbor, [lspError("read error")]],
+				]);
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn(async () => {
+						reads.push(Date.now());
+						return getAllDiagnostics();
+					}),
+					touchFile: vi.fn(),
+				});
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const before = Date.now();
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+				expect(run.result?.formatted).toContain("read error");
+				expect(reads.length).toBeGreaterThan(0);
+				expect(run.checkedAt).toBeGreaterThanOrEqual(before);
+				expect(run.checkedAt).toBeLessThanOrEqual(Math.min(...reads));
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#4485 row 7): once the #4403 "no language server
+		// answered" line was delivered, a later run over the same unavailable
+		// server listed no neighbour and returned `no_neighbors`, a leaf's
+		// all-clear, although nothing was checked.
+		it("a run whose unavailable-server line was already delivered is indeterminate, not a leaf, and repeats no line", async () => {
+			const { env, primary } = project("cascade-4485-told-");
+			try {
+				mocks.getLSPService.mockReturnValue({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile: vi.fn(async () => ({
+						diags: [],
+						inconclusive: true,
+						inconclusiveReason: "primary-unavailable",
+						inconclusiveServerIds: ["typescript"],
+						primaryUnavailableCause: "disabled",
+					})),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const { markCascadeUnansweredPrimariesDelivered } =
+					await import("../../clients/cascade-format.js");
+				const first = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+				expect(first.result?.unansweredPrimaries?.notes).toHaveLength(1);
+				markCascadeUnansweredPrimariesDelivered(["typescript"]);
+
+				const later = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 2,
+					writeSeq: 1,
+				});
+				expect(later.result).toBeUndefined();
+				expect(later.skipReason).toBe("indeterminate");
+				expect(later.unconfirmed).toBeUndefined();
 			} finally {
 				env.cleanup();
 			}

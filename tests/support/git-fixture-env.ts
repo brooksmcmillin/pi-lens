@@ -30,20 +30,41 @@ const SCRUBBED_GIT_VARIABLES = [
 // pair is unbounded, so it is scrubbed by pattern instead of by name.
 const GIT_CONFIG_KV_PATTERN = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/;
 
-/** Build the only environment a test fixture may use for a real Git process. */
-export function gitFixtureEnv(fixtureDir: string): Record<string, string> {
+// #4552: `git commit` calls `run_auto_maintenance`, which forks a DETACHED
+// `git maintenance run --auto --quiet --detach` child. The child outlives the
+// fixture cell and writes inside `.git` (maintenance.lock, packed-refs.lock,
+// repack temp files) while the test's teardown removes the directory, so the
+// gating Unit shard failed in `afterEach` teardown with ENOTEMPTY on the
+// fixture `.git` instead of in an assertion. A fixture never needs background
+// maintenance, so the global config every fixture Git process reads (below) is
+// the checked-in policy that turns the auto hook and auto-gc off: no child is
+// forked, and the writer cannot outlive the cell. A config FILE, not
+// GIT_CONFIG_KEY_<n> in the environment: worker sandboxes refuse env- and
+// argv-injected config keys, and a path is what the helper already owns.
+const FIXTURE_GIT_CONFIG = path.resolve(
+	import.meta.dirname,
+	"../fixtures/git-fixture-global.gitconfig",
+);
+
+/**
+ * Build the only environment a test fixture may use for a real Git process.
+ *
+ * The fixture directory no longer selects the global config: the global config
+ * is the repo-level fixture policy (`tests/fixtures/git-fixture-global.gitconfig`),
+ * identical for every fixture, because a worker sandbox refuses config injected
+ * through `GIT_CONFIG_KEY_<n>` and a fixture never needs a writable global
+ * config. The call sites keep passing the directory they own.
+ */
+export function gitFixtureEnv(_fixtureDir: string): Record<string, string> {
 	const env = Object.fromEntries(
 		Object.entries(process.env).filter(
 			(entry): entry is [string, string] => entry[1] !== undefined,
 		),
 	);
-	return scrubGitFixtureEnv(fixtureDir, env);
+	return scrubGitFixtureEnv(env);
 }
 
-function scrubGitFixtureEnv(
-	fixtureDir: string,
-	base: NodeJS.ProcessEnv,
-): Record<string, string> {
+function scrubGitFixtureEnv(base: NodeJS.ProcessEnv): Record<string, string> {
 	const env = Object.fromEntries(
 		Object.entries(base).filter(
 			(entry): entry is [string, string] => entry[1] !== undefined,
@@ -53,8 +74,9 @@ function scrubGitFixtureEnv(
 	for (const key of Object.keys(env))
 		if (GIT_CONFIG_KV_PATTERN.test(key)) delete env[key];
 	// These are fixture policy, not caller overrides. The harness itself may
-	// already be contaminated, so delete inherited values before setting them.
-	env.GIT_CONFIG_GLOBAL = path.join(fixtureDir, "gitconfig");
+	// already be contaminated, so delete inherited values before setting them:
+	// the checked-in policy file carries the fixture's Git policy (#4552).
+	env.GIT_CONFIG_GLOBAL = FIXTURE_GIT_CONFIG;
 	env.GIT_CONFIG_NOSYSTEM = "1";
 	return env;
 }
@@ -63,7 +85,7 @@ function gitFixtureEnvWithOverrides(
 	fixtureDir: string,
 	overrides: NodeJS.ProcessEnv | undefined,
 ): Record<string, string> {
-	return scrubGitFixtureEnv(fixtureDir, {
+	return scrubGitFixtureEnv({
 		...gitFixtureEnv(fixtureDir),
 		...overrides,
 	});

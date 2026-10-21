@@ -1046,11 +1046,12 @@ describe("turn-end resolved blockers (#3218 criterion 2)", () => {
 			try {
 				const { runtime, cacheManager } = newTurn();
 				const name = [
-					"d".repeat(250),
-					"e".repeat(250),
-					"f".repeat(250),
-					`${"g".repeat(250)}.ts`,
+					"d".repeat(200),
+					"e".repeat(200),
+					"f".repeat(200),
+					`${"g".repeat(200)}.ts`,
 				].join("/");
+				expect(name.length).toBeGreaterThan(400);
 				retire(runtime, env.tmpDir, name);
 
 				const content = await runTurnEnd(runtime, cacheManager, env.tmpDir);

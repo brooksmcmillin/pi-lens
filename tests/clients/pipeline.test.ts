@@ -87,6 +87,13 @@ vi.mock("../../clients/lsp/capabilities.js", () => ({
 }));
 
 import { getLSPService } from "../../clients/lsp/capabilities.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
+
+// #4019: the Windows lane declares PI_LENS_TEST_TIMEOUT_SCALE=3 because a
+// native path-canonicalization syscall per pipeline run makes a population
+// test cost several times its Linux time; the factor is the lane's, and
+// `scaledTestTimeout` is its one home (#4592 review F5 fold). 1 everywhere
+// else, so no POSIX budget moves.
 
 describe("Pipeline", () => {
 	let tmpDir: string;
@@ -389,6 +396,45 @@ describe("Pipeline", () => {
 			sha256: createHash("sha256").update("const x = 1;\n").digest("hex"),
 		});
 	});
+
+	it.each([2 * 1024 * 1024, 2 * 1024 * 1024 + 1])(
+		"preserves inline baseline byte boundary at %i",
+		async (size) => {
+			const filePath = createTempFile(
+				tmpDir,
+				"clean-baseline.ts",
+				"x".repeat(size),
+			);
+			vi.mocked(dispatchLintWithResult).mockImplementationOnce(async () => ({
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "clean",
+				blockerOutput: "",
+				hasBlockers: false,
+			}));
+
+			const result = await runPipeline(
+				createMockContext(filePath, { allowAutonomousWriters: false }),
+				createMockDeps(),
+			);
+
+			expect(result.hasBlockers).toBe(false);
+			expect(result.inlineBlockerFileContent).toEqual(
+				size <= 2 * 1024 * 1024
+					? {
+							size,
+							sha256: createHash("sha256")
+								.update("x".repeat(size))
+								.digest("hex"),
+						}
+					: undefined,
+			);
+		},
+	);
 
 	it("states why a delta-promoted unused finding blocks in the enriched STOP block (#3218)", async () => {
 		// The turn-end replay renders through `formatDiagnostics`, but the inline
@@ -793,68 +839,79 @@ describe("Pipeline", () => {
 			expect(result.output).not.toContain("OPAQUE-BLOCKER");
 		});
 
-		it("bounds opaque ownership telemetry across many paths (#3226 review P2)", async () => {
-			// Recurrence: per-path once keys made opaque recovery retain one hidden
-			// identity per artifact. Drive the real pipeline seam with the reviewer's
-			// 10,000-path population and inspect both hidden ledger populations and
-			// the independent public count/dropped evidence.
-			vi.mocked(dispatchLintWithResult).mockResolvedValue({
-				diagnostics: [],
-				blockers: [],
-				warnings: [],
-				baselineWarningCount: 0,
-				fixed: [],
-				resolvedCount: 0,
-				output: "",
-				blockerOutput: "",
-				hasBlockers: false,
-			});
-			const deps = createMockDeps({ getFormatService: () => ({}) as any });
-			const firstPath = path.join(tmpDir, "opaque-0.js");
-			await runPipeline(
-				createMockContext(firstPath, { allowAutonomousWriters: false }),
-				deps,
-			);
-			await runPipeline(
-				createMockContext(firstPath, { allowAutonomousWriters: false }),
-				deps,
-			);
-			for (let index = 1; index < 10_000; index++) {
+		it(
+			"bounds opaque ownership telemetry across many paths (#3226 review P2)",
+			async () => {
+				// Recurrence: per-path once keys made opaque recovery retain one hidden
+				// identity per artifact. Drive the real pipeline seam with the reviewer's
+				// 10,000-path population and inspect both hidden ledger populations and
+				// the independent public count/dropped evidence.
+				vi.mocked(dispatchLintWithResult).mockResolvedValue({
+					diagnostics: [],
+					blockers: [],
+					warnings: [],
+					baselineWarningCount: 0,
+					fixed: [],
+					resolvedCount: 0,
+					output: "",
+					blockerOutput: "",
+					hasBlockers: false,
+				});
+				const deps = createMockDeps({ getFormatService: () => ({}) as any });
+				const firstPath = path.join(tmpDir, "opaque-0.js");
 				await runPipeline(
-					createMockContext(path.join(tmpDir, `opaque-${index}.js`), {
-						allowAutonomousWriters: false,
-					}),
+					createMockContext(firstPath, { allowAutonomousWriters: false }),
 					deps,
 				);
-			}
+				await runPipeline(
+					createMockContext(firstPath, { allowAutonomousWriters: false }),
+					deps,
+				);
+				for (let index = 1; index < 10_000; index++) {
+					await runPipeline(
+						createMockContext(path.join(tmpDir, `opaque-${index}.js`), {
+							allowAutonomousWriters: false,
+						}),
+						deps,
+					);
+				}
 
-			const state = _getDegradationLedgerStateForTests();
-			expect(state.onceKeys).toBe(0);
-			expect(state.tallies).toBe(1);
-			expect(state.retainedEntries).toBe(1);
-			expect(getDegradationSummary()).toEqual([
-				expect.objectContaining({
-					kind: "opaque-mutation-ownership-boundary",
-					count: 10_001,
-					droppedCount: 10_001 - 1,
-					latestReasons: expect.arrayContaining([
-						expect.objectContaining({ subject: "pipeline" }),
-					]),
-				}),
-			]);
+				const state = _getDegradationLedgerStateForTests();
+				expect(state.onceKeys).toBe(0);
+				expect(state.tallies).toBe(1);
+				expect(state.retainedEntries).toBe(1);
+				expect(getDegradationSummary()).toEqual([
+					expect.objectContaining({
+						kind: "opaque-mutation-ownership-boundary",
+						count: 10_001,
+						droppedCount: 10_001 - 1,
+						latestReasons: expect.arrayContaining([
+							expect.objectContaining({ subject: "pipeline" }),
+						]),
+					}),
+				]);
 
-			resetDegradationLedger();
-			expect(_getDegradationLedgerStateForTests()).toEqual({
-				onceKeys: 0,
-				tallies: 0,
-				retainedEntries: 0,
-			});
-			expect(getDegradationSummary()).toEqual([]);
-			// 10,000 sequential real pipeline runs: ~0.7 s on Linux, past Vitest's
-			// 5 s default on the Windows runner where every run pays native
-			// path-canonicalization syscalls (#4019). The population is the claim, so
-			// the budget grows rather than the population shrinking.
-		}, 60_000);
+				resetDegradationLedger();
+				expect(_getDegradationLedgerStateForTests()).toEqual({
+					onceKeys: 0,
+					tallies: 0,
+					retainedEntries: 0,
+				});
+				expect(getDegradationSummary()).toEqual([]);
+				// 10,000 sequential real pipeline runs: ~0.7 s on Linux, past Vitest's
+				// 5 s default on the Windows runner where every run pays native
+				// path-canonicalization syscalls (#4019). The population is the claim, so
+				// the budget grows rather than the population shrinking.
+				//
+				// #4518: the fixed 60 s budget was still a coin flip there -- measured
+				// 36.8 s on a green master run and past 60 s on two red ones
+				// (jobs 117494029210 green, 117489510490 and 117436379966 red), which
+				// is what kept the lane red before it could gate. The lane's own scale
+				// is the margin (180 s on Windows, unchanged on POSIX) rather than a
+				// second magic constant.
+			},
+			scaledTestTimeout(60_000),
+		);
 
 		it("surfaces formatter failures instead of plain clean output", async () => {
 			const filePath = createTempFile(

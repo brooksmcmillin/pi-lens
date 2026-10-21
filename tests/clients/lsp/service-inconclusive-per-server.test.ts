@@ -177,6 +177,7 @@ function makeClient(
 			return contentHash === undefined ? undefined : { contentHash };
 		}),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn((filePath: string, content: string) => {
 				writeCount += 1;
 				if (

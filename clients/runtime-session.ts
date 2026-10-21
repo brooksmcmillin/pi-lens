@@ -84,7 +84,10 @@ import {
 	saveRuntimeProjectSnapshot,
 } from "./project-snapshot.js";
 import { scanProjectRules } from "./rules-scanner.js";
-import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import type {
+	RuntimeCoordinator,
+	StartupTaskName,
+} from "./runtime-coordinator.js";
 import { resetRustAvailability } from "./rust-client.js";
 import { resetSafeSpawnWindowsCommandCache } from "./safe-spawn.js";
 import {
@@ -1106,6 +1109,7 @@ async function buildOrRefreshWordIndex(args: {
 			refreshWordIndexIncrementally,
 			countWordIndexPostingEntries,
 			estimateWordIndexResidentBytes,
+			notifyWordIndexPublished,
 		} = await import("./word-index.js");
 		const deserializeStartMs = Date.now();
 		const index = deserializeWordIndex(snapshot.wordIndex);
@@ -1136,6 +1140,7 @@ async function buildOrRefreshWordIndex(args: {
 					});
 				} else {
 					runtime.wordIndex = index;
+					notifyWordIndexPublished(snapshotRoot, index, "session_start");
 					let snapshotSaveSyncMs = 0;
 					// A stale project seq must be advanced even when mtimes prove every
 					// indexed document reusable. Fresh snapshots with no changes avoid
@@ -1219,6 +1224,7 @@ async function buildOrRefreshWordIndex(args: {
 		collectWordIndexDocs,
 		countWordIndexPostingEntries,
 		estimateWordIndexResidentBytes,
+		notifyWordIndexPublished,
 	} = await import("./word-index.js");
 	const docs = await collectWordIndexDocs(
 		analysisRoot,
@@ -1246,6 +1252,7 @@ async function buildOrRefreshWordIndex(args: {
 	}
 	if (!runtime.isCurrentSession(sessionGeneration)) return;
 	runtime.wordIndex = rebuiltIndex;
+	notifyWordIndexPublished(snapshotRoot, rebuiltIndex, "session_start");
 	saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 	dbg(
 		`session_start word-index: rebuilt (absent/stale, seq=${effectiveSeq}) ` +
@@ -1274,6 +1281,20 @@ async function buildOrRefreshWordIndex(args: {
 		reused: 0,
 	};
 }
+
+// Some background scans are CPU-heavy and arrive on the event loop just as the
+// user is most likely typing (right after /new). Defer those by a few seconds so
+// the perceptible 50-100ms sync bursts they contain land during LLM streaming
+// idle time instead. All other tasks (those not listed here) run on the next
+// `setImmediate` tick as before. The delays are deliberately staggered (200ms
+// apart) so two heavy tasks don't both run on the same macrotask. Keys are
+// `StartupTaskName`, so a misspelled key fails the build; a key whose task
+// was removed (#4352, "project index") is caught by the defer-table test.
+export const STARTUP_TASK_DEFER_MS: Partial<Record<StartupTaskName, number>> = {
+	"call-graph": 5000,
+	"codebase-model": 5200,
+	"ast-grep-exports": 5400,
+};
 
 // Fire off heavy scans as background tasks — don't block session start.
 // Each consumer already handles the "not ready yet" case gracefully
@@ -1345,22 +1366,13 @@ function scheduleStartupScansWithClients(
 		});
 	}
 
-	// Some background scans are CPU-heavy and arrive on the event loop
-	// just as the user is most likely typing (right after /new). Defer
-	// those by a few seconds so the perceptible 50-100ms sync bursts they
-	// contain land during LLM streaming idle time instead. All other
-	// tasks (those not listed here) run on the next `setImmediate` tick
-	// as before. The delays are deliberately staggered (200ms apart) so
-	// two heavy tasks don't both run on the same macrotask.
-	const taskDeferMsByName: Record<string, number> = {
-		"call-graph": 5000,
-		"codebase-model": 5200,
-		"ast-grep exports": 5400,
-		"project index": 5400,
-	};
-	const runTask = (name: string, task: () => Promise<void>): Promise<void> => {
+	const runTask = (
+		name: StartupTaskName,
+		task: () => Promise<void>,
+	): Promise<void> => {
 		const queuedAt = Date.now();
-		dbg(`session_start task ${name}: scheduled`);
+		const delay = STARTUP_TASK_DEFER_MS[name] ?? 0;
+		dbg(`session_start task ${name}: scheduled deferMs=${delay}`);
 		runtime.markStartupScanInFlight(name, sessionGeneration);
 		const completion = new Promise<void>((resolve) => {
 			const fire = (): void => {
@@ -1386,7 +1398,6 @@ function scheduleStartupScansWithClients(
 						resolve();
 					});
 			};
-			const delay = taskDeferMsByName[name] ?? 0;
 			if (delay > 0) {
 				// #1154: unref to match the repo-wide convention that every
 				// background timer is `.unref()`'d. Full-mode deferred scans only
@@ -1402,9 +1413,9 @@ function scheduleStartupScansWithClients(
 	};
 
 	const canRunJsTsHeavyScans = canRunStartupHeavyScans(languageProfile, "jsts");
-	const scanNames = ["todo", "dead-code"];
+	const scanNames: StartupTaskName[] = ["todo", "dead-code"];
 	if (canRunJsTsHeavyScans) {
-		scanNames.push("knip", "jscpd", "ast-grep exports", "project index");
+		scanNames.push("knip", "jscpd", "ast-grep-exports");
 	}
 	dbg(`session_start: launching background scans (${scanNames.join(", ")})`);
 
@@ -1451,7 +1462,7 @@ function scheduleStartupScansWithClients(
 	const isSubagent = isSubagentSession();
 	const skipHeavyweightScans = isSlowFs(analysisRoot) || isSubagent;
 	const runHeavyweightTask = (
-		name: string,
+		name: StartupTaskName,
 		task: () => Promise<void>,
 	): void => {
 		const flag = `no-${name}`;
@@ -1917,7 +1928,6 @@ function scheduleDeferredToolProbes(
 	deps: SessionStartDeps,
 	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
 	startupDefaults: string[],
-	startupScansWillRun: boolean,
 	dbg: SessionStartDeps["dbg"],
 ): void {
 	// #2467: same deferral as `scheduleStartupScans` — the probes were already
@@ -1936,7 +1946,6 @@ function scheduleDeferredToolProbes(
 			resolved,
 			languageProfile,
 			startupDefaults,
-			startupScansWillRun,
 			dbg,
 		);
 	})();
@@ -1947,10 +1956,9 @@ function scheduleDeferredToolProbesWithClients(
 	deps: BootstrapResolvedDeps,
 	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
 	startupDefaults: string[],
-	startupScansWillRun: boolean,
 	dbg: SessionStartDeps["dbg"],
 ): void {
-	const { biomeClient, ruffClient, depChecker } = deps;
+	const { biomeClient, ruffClient } = deps;
 	const defaultTools = new Set(startupDefaults);
 	const probes: Array<[name: string, run: () => Promise<boolean>]> = [];
 
@@ -1962,9 +1970,6 @@ function scheduleDeferredToolProbesWithClients(
 	}
 	if (languageProfile.present.python && !defaultTools.has("ruff")) {
 		probes.push(["ruff", () => ruffClient.ensureAvailable()]);
-	}
-	if (startupScansWillRun) {
-		probes.push(["madge", () => depChecker.ensureAvailable()]);
 	}
 
 	if (probes.length === 0) {
@@ -1991,6 +1996,135 @@ function scheduleDeferredToolProbesWithClients(
 			`session_start tools (deferred probes complete, ${Date.now() - warmStart}ms): ${summary}`,
 		);
 	})();
+}
+
+/** Reset owner-held session state, including state shared across module graphs.
+ * Host-injected runtime and analyzer clients remain the host's responsibility.
+ */
+export function resetSessionScopedState(
+	cwd?: string,
+	sessionStartMs: number = Date.now(),
+): void {
+	// #806: clear the shared per-directory marker index and registered
+	// topology-derived caches only at session start. Mid-session edits are NOT
+	// detected; #805's tsconfig matcher cache follows the same registry reset.
+	resetWorkspaceTopology();
+	// #2000: opaque-recovery baselines are keyed cwd:generation (unreachable
+	// after reset) and the git-worktree memo must re-probe after a session
+	// that may have seen a non-git dir become one.
+	resetOpaqueMutationState();
+	// #2430: the observational net's pending baselines are keyed by tool-call
+	// id and its content ledger describes the previous session's files; both
+	// mis-answer forever without this. The learned attribution map is cleared
+	// and then RE-PRIMED from this project's persisted file, so a tool an
+	// earlier session observed is classified by name with no snapshot at all.
+	resetObservedMutationNet();
+	resetMutationAttribution();
+	primePersistedMutationAttribution(cwd);
+	// #2026: pending auxiliary baselines are unreachable after generation bump.
+	resetPendingAuxiliaryCoverage();
+	// #817/#1199: Windows command resolution is cached per (command, canonical
+	// effective child PATH/PATHEXT/cwd/per-drive provenance); drop it each
+	// session so environment changes (e.g.
+	// a tool installed mid-session or a differently-scoped managed bin) are
+	// picked up fresh.
+	resetSafeSpawnWindowsCommandCache();
+	// #1266: install-failure suppression in dispatch runner availability
+	// checkers (`noteInstallFailure`) is meant to last only until "the next
+	// session", per #1222 — but nothing called the reset helper, so a
+	// transient install failure (npm registry blip, locked file) suppressed
+	// the tool for the rest of the process lifetime. Clear it here, same
+	// boundary as the other per-session caches on this line.
+	resetDispatchAvailabilityState();
+	// Runner collect-later observations and their late findings are session
+	// scoped. A new session must re-probe rather than inherit a process latch.
+	resetObservedRunnerLatency();
+	resetPendingRunnerFindings();
+	// #1995: a command that TIMED OUT (not merely failed a probe) cools down
+	// for the rest of the session so a hot loop of edits cannot hand the same
+	// wedged .cmd shim a second budget. A new session may retry: the executable
+	// or its environment may have changed.
+	resetSpawnTimeoutCooldowns();
+	// #1895: formatter PATH verdicts are session-scoped, but they live in
+	// formatters.ts and are not covered by the dispatch generation. Re-arm them
+	// here so a formatter installed or removed between sessions is observed by
+	// the next session. `clearFormatterCache` drops the per-cwd selection cache
+	// as well as the which latches, which is what a real re-probe needs: the
+	// selection cache answers a same-cwd lookup before any probe runs, so
+	// clearing the latches alone would leave the stale verdict standing in the
+	// one directory the user is working in.
+	clearFormatterCache();
+	// #1535: same #1266 pattern, one caller earlier — the `gh auth token` latch
+	// zizmor's spawn reads is process-lived storage whose durability contract is
+	// per SESSION, not per process. Without this, a user who runs `gh auth
+	// login` and starts a fresh session still reads the previous session's
+	// stale "no token" verdict until the cooldown (if any) happens to expire.
+	resetZizmorTokenAvailability();
+	// #2455: same #1496/#1535 process-lifetime-latch shape, one caller later —
+	// the `goClient`/`rustClient` singletons each hold their own
+	// `createAvailabilityLatch()` outside the dispatch generation counter above
+	// (they predate `createCwdCachedProbe`). A "missing" verdict never expires
+	// on its own, so without these a go/cargo install between sessions stayed
+	// unobserved for the rest of the process's life. Found by hand while
+	// auditing #2455's detector widening, NOT surfaced by it: the sweep skips
+	// any file exporting no reset at all, and neither client module exported
+	// one, so no container predicate could have yielded them (#2455 fix round 4,
+	// F5 — an earlier draft of this comment had the causality backwards).
+	resetGoAvailability();
+	resetRustAvailability();
+	// psscriptanalyzer's three latches (interpreter, module, -File exec) are
+	// module-local, so the generation counter above does not reach them
+	// (#1490, #1540).
+	resetPsScriptAnalyzerAvailability();
+	// #1497: the install-class retry ceiling is terminal for a SESSION, but the
+	// latches holding it live on process-lived client instances (bootstrap builds
+	// them once). Same #1266/#1490/#1535 shape — without this line "terminal for
+	// the session" is terminal for the process, and a repaired network never
+	// re-earns its `go install`.
+	resetInstallRetryLatches();
+	// #1537: the lazy-install seam's hold (`gem install rubocop`, `rustup
+	// component add`) is durable for a SESSION. Its map is module-local, so the
+	// generation counter above does not reach it — same #1490/#1497 shape. It
+	// belongs on THIS line and not on the turn_end path: the first cut cleared it
+	// from `clearFormatterRuntimeState()`, which runs every turn, so a failing
+	// install re-spawned every turn instead of once per session.
+	resetLazyInstallAttempts();
+	// #1897: direct-LSP negative availability and bare installer paths are
+	// session facts. A command or PATH entry can appear between sessions.
+	resetDirectLspCommandAvailability();
+	// #2052: a root may not exist when the case-sensitivity probe first sees it.
+	// Re-probe it at the next session boundary after the workspace is created.
+	resetLSPCaseSensitivityState();
+	resetResolvedPathCache();
+	// #1653: pnpm/yarn/bun/npm's availability latches (package-manager.ts) are
+	// module-local, same #1490/#1535 shape as the two lines above — the
+	// generation counter above does not reach them. Without this line, a
+	// pnpm/yarn/bun install done mid-day stayed invisible: a genuine "missing"
+	// verdict from one session latched into the next until a process restart.
+	_resetPackageManagerCache();
+	// #1730: the managed-tool refresh budget is a per-SESSION allowance (at most
+	// one `npm update` per session). Left process-lived, one long-running pi
+	// would refresh a single tool at launch and never look at the other 21
+	// again — the same latch shape as the two lines above. The weekly cadence
+	// itself is NOT reset here: it lives in the persisted per-tool stamp, so
+	// re-arming the budget only restores the session's right to ask.
+	resetManagedToolRefreshSession();
+	// #1123 item 3: a fresh session can re-report smells that a prior session
+	// already surfaced once (see `checkSmellsAndNoteOnce`'s once-per-session gate).
+	resetSmellsSessionState();
+	// #2800 item 8: the situational-tool dead-weight observation (which tools
+	// this session never activated or called) is session-scoped, so its sets
+	// and once-latch re-arm here beside the other registered resets. Both hosts
+	// open the session's row through startSituationalToolTelemetrySession()
+	// BEFORE this handler runs, and a repeated MCP session_start refresh
+	// legitimately re-runs this handler — so the reset only acts when no
+	// telemetry session is open; clearing a live session here would wipe the
+	// calls recorded before the refresh.
+	resetSituationalToolTelemetry();
+	// #1782: re-arm the workspace-diagnostics cache session clock. Entries
+	// written before this instant assert findings from a session that is over,
+	// so they must revalidate before they can be served as current again.
+	resetWorkspaceDiagnosticsCacheSession(sessionStartMs);
 }
 
 /**
@@ -2506,126 +2640,7 @@ export async function handleSessionStart(
 	clearFileTimeSessions();
 	runtime.complexityBaselines.clear();
 	resetDispatchBaselines(ctxCwd);
-	// #806: clear the shared per-directory marker index and registered
-	// topology-derived caches only at session start. Mid-session edits are NOT
-	// detected; #805's tsconfig matcher cache follows the same registry reset.
-	resetWorkspaceTopology();
-	// #2000: opaque-recovery baselines are keyed cwd:generation (unreachable
-	// after reset) and the git-worktree memo must re-probe after a session
-	// that may have seen a non-git dir become one.
-	resetOpaqueMutationState();
-	// #2430: the observational net's pending baselines are keyed by tool-call
-	// id and its content ledger describes the previous session's files; both
-	// mis-answer forever without this. The learned attribution map is cleared
-	// and then RE-PRIMED from this project's persisted file, so a tool an
-	// earlier session observed is classified by name with no snapshot at all.
-	resetObservedMutationNet();
-	resetMutationAttribution();
-	primePersistedMutationAttribution(ctxCwd);
-	// #2026: pending auxiliary baselines are unreachable after generation bump.
-	resetPendingAuxiliaryCoverage();
-	// #817/#1199: Windows command resolution is cached per (command, canonical
-	// effective child PATH/PATHEXT/cwd/per-drive provenance); drop it each
-	// session so environment changes (e.g.
-	// a tool installed mid-session or a differently-scoped managed bin) are
-	// picked up fresh.
-	resetSafeSpawnWindowsCommandCache();
-	// #1266: install-failure suppression in dispatch runner availability
-	// checkers (`noteInstallFailure`) is meant to last only until "the next
-	// session", per #1222 — but nothing called the reset helper, so a
-	// transient install failure (npm registry blip, locked file) suppressed
-	// the tool for the rest of the process lifetime. Clear it here, same
-	// boundary as the other per-session caches on this line.
-	resetDispatchAvailabilityState();
-	// Runner collect-later observations and their late findings are session
-	// scoped. A new session must re-probe rather than inherit a process latch.
-	resetObservedRunnerLatency();
-	resetPendingRunnerFindings();
-	// #1995: a command that TIMED OUT (not merely failed a probe) cools down
-	// for the rest of the session so a hot loop of edits cannot hand the same
-	// wedged .cmd shim a second budget. A new session may retry: the executable
-	// or its environment may have changed.
-	resetSpawnTimeoutCooldowns();
-	// #1895: formatter PATH verdicts are session-scoped, but they live in
-	// formatters.ts and are not covered by the dispatch generation. Re-arm them
-	// here so a formatter installed or removed between sessions is observed by
-	// the next session. `clearFormatterCache` drops the per-cwd selection cache
-	// as well as the which latches, which is what a real re-probe needs: the
-	// selection cache answers a same-cwd lookup before any probe runs, so
-	// clearing the latches alone would leave the stale verdict standing in the
-	// one directory the user is working in.
-	clearFormatterCache();
-	// #1535: same #1266 pattern, one caller earlier — the `gh auth token` latch
-	// zizmor's spawn reads is process-lived storage whose durability contract is
-	// per SESSION, not per process. Without this, a user who runs `gh auth
-	// login` and starts a fresh session still reads the previous session's
-	// stale "no token" verdict until the cooldown (if any) happens to expire.
-	resetZizmorTokenAvailability();
-	// #2455: same #1496/#1535 process-lifetime-latch shape, one caller later —
-	// the `goClient`/`rustClient` singletons each hold their own
-	// `createAvailabilityLatch()` outside the dispatch generation counter above
-	// (they predate `createCwdCachedProbe`). A "missing" verdict never expires
-	// on its own, so without these a go/cargo install between sessions stayed
-	// unobserved for the rest of the process's life. Found by hand while
-	// auditing #2455's detector widening, NOT surfaced by it: the sweep skips
-	// any file exporting no reset at all, and neither client module exported
-	// one, so no container predicate could have yielded them (#2455 fix round 4,
-	// F5 — an earlier draft of this comment had the causality backwards).
-	resetGoAvailability();
-	resetRustAvailability();
-	// psscriptanalyzer's three latches (interpreter, module, -File exec) are
-	// module-local, so the generation counter above does not reach them
-	// (#1490, #1540).
-	resetPsScriptAnalyzerAvailability();
-	// #1497: the install-class retry ceiling is terminal for a SESSION, but the
-	// latches holding it live on process-lived client instances (bootstrap builds
-	// them once). Same #1266/#1490/#1535 shape — without this line "terminal for
-	// the session" is terminal for the process, and a repaired network never
-	// re-earns its `go install`.
-	resetInstallRetryLatches();
-	// #1537: the lazy-install seam's hold (`gem install rubocop`, `rustup
-	// component add`) is durable for a SESSION. Its map is module-local, so the
-	// generation counter above does not reach it — same #1490/#1497 shape. It
-	// belongs on THIS line and not on the turn_end path: the first cut cleared it
-	// from `clearFormatterRuntimeState()`, which runs every turn, so a failing
-	// install re-spawned every turn instead of once per session.
-	resetLazyInstallAttempts();
-	// #1897: direct-LSP negative availability and bare installer paths are
-	// session facts. A command or PATH entry can appear between sessions.
-	resetDirectLspCommandAvailability();
-	// #2052: a root may not exist when the case-sensitivity probe first sees it.
-	// Re-probe it at the next session boundary after the workspace is created.
-	resetLSPCaseSensitivityState();
-	resetResolvedPathCache();
-	// #1653: pnpm/yarn/bun/npm's availability latches (package-manager.ts) are
-	// module-local, same #1490/#1535 shape as the two lines above — the
-	// generation counter above does not reach them. Without this line, a
-	// pnpm/yarn/bun install done mid-day stayed invisible: a genuine "missing"
-	// verdict from one session latched into the next until a process restart.
-	_resetPackageManagerCache();
-	// #1730: the managed-tool refresh budget is a per-SESSION allowance (at most
-	// one `npm update` per session). Left process-lived, one long-running pi
-	// would refresh a single tool at launch and never look at the other 21
-	// again — the same latch shape as the two lines above. The weekly cadence
-	// itself is NOT reset here: it lives in the persisted per-tool stamp, so
-	// re-arming the budget only restores the session's right to ask.
-	resetManagedToolRefreshSession();
-	// #1123 item 3: a fresh session can re-report smells that a prior session
-	// already surfaced once (see `checkSmellsAndNoteOnce`'s once-per-session gate).
-	resetSmellsSessionState();
-	// #2800 item 8: the situational-tool dead-weight observation (which tools
-	// this session never activated or called) is session-scoped, so its sets
-	// and once-latch re-arm here beside the other registered resets. Both hosts
-	// open the session's row through startSituationalToolTelemetrySession()
-	// BEFORE this handler runs, and a repeated MCP session_start refresh
-	// legitimately re-runs this handler — so the reset only acts when no
-	// telemetry session is open; clearing a live session here would wipe the
-	// calls recorded before the refresh.
-	resetSituationalToolTelemetry();
-	// #1782: re-arm the workspace-diagnostics cache session clock. Entries
-	// written before this instant assert findings from a session that is over,
-	// so they must revalidate before they can be served as current again.
-	resetWorkspaceDiagnosticsCacheSession(sessionStartMs);
+	resetSessionScopedState(ctxCwd, sessionStartMs);
 	// Some embedders inject a capability-shaped Knip client rather than the
 	// concrete KnipClient. Session reset is an optional lifecycle capability;
 	// its absence must not make session_start fail.
@@ -3203,18 +3218,8 @@ export async function handleSessionStart(
 		deps.projectConfig?.startup?.scans?.enabled ??
 		deps.globalConfig?.startup?.scans?.enabled ??
 		true;
-	const startupScansWillRun =
-		allowBootstrapTasks && startupScan.canWarmCaches && startupScansEnabled;
-	const jstsHeavyScansWillRun =
-		startupScansWillRun && canRunStartupHeavyScans(languageProfile, "jsts");
 	if (allowBootstrapTasks) {
-		scheduleDeferredToolProbes(
-			deps,
-			languageProfile,
-			startupDefaults,
-			jstsHeavyScansWillRun,
-			dbg,
-		);
+		scheduleDeferredToolProbes(deps, languageProfile, startupDefaults, dbg);
 		scheduleManagedToolRefresh(dbg);
 	}
 

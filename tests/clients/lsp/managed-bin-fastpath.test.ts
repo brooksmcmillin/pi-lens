@@ -76,16 +76,20 @@ class CompositionScanClient extends SecurityScanClient<string> {
 	}
 }
 
-describe("resolveAndLaunch — managed-bin fast path (#2140)", () => {
-	beforeEach(() => {
-		launchLSP.mockReset();
-		findManagedToolBinary.mockReset();
-		findManagedToolBinary.mockResolvedValue(undefined);
-		ensureTool.mockReset();
-		getInstallAttempt.mockReset();
-		getInstallAttempt.mockReturnValue({ outcome: "succeeded", at: Date.now() });
-	});
+// Recurrence (#4561, shuffle seed 202): the case that overwrites the
+// installer's last attempt leaves `getInstallAttempt` answering with its
+// "failed" record, and a sibling case then reads that verdict as this launch's
+// evidence. One file-scope default covers every case in both describes.
+beforeEach(() => {
+	launchLSP.mockReset();
+	findManagedToolBinary.mockReset();
+	findManagedToolBinary.mockResolvedValue(undefined);
+	ensureTool.mockReset();
+	getInstallAttempt.mockReset();
+	getInstallAttempt.mockReturnValue({ outcome: "succeeded", at: Date.now() });
+});
 
+describe("resolveAndLaunch — managed-bin fast path (#2140)", () => {
 	it("tries the managed release binary BEFORE the bare PATH candidate", async () => {
 		const managedPath = "/home/user/.pi-lens/bin/opengrep";
 		findManagedToolBinary.mockImplementation(async (toolId: string) =>
@@ -190,10 +194,6 @@ function metadataOf(record: Record<string, unknown>): Record<string, unknown> {
 
 describe("resolveAndLaunch — managed-bin availability telemetry (#2140)", () => {
 	beforeEach(async () => {
-		launchLSP.mockReset();
-		findManagedToolBinary.mockReset();
-		findManagedToolBinary.mockResolvedValue(undefined);
-		ensureTool.mockReset();
 		clearLatencyLog();
 		await flushLatencyLog();
 	});

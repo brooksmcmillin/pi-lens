@@ -59,7 +59,7 @@
  *                      the current repo (CI passes the just-packed tarball)
  */
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -74,6 +74,7 @@ import {
 	countEntriesSince,
 } from "./lib/latency-log-phases.mjs";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
+import { startRpcSession } from "./rpc-load-check.mjs";
 
 const isWindows = process.platform === "win32";
 const HEAVYWEIGHT_SCAN_PHASES = [
@@ -151,9 +152,8 @@ function runPiRpc({
 	timeoutMs = 45000,
 }) {
 	return new Promise((resolve, reject) => {
-		const child = spawn(
-			piBin,
-			[
+		const pi = startRpcSession(piBin, {
+			args: [
 				"--mode",
 				"rpc",
 				"--no-session",
@@ -161,46 +161,28 @@ function runPiRpc({
 				"--extension",
 				extensionPath,
 			],
-			{
-				cwd,
-				shell: isWindows,
-				stdio: ["pipe", "pipe", "inherit"],
-				env: {
-					...process.env,
-					PI_LENS_HOME: logHome,
-					...env,
-					ANTHROPIC_API_KEY:
-						process.env.ANTHROPIC_API_KEY || "sk-ant-dummy-compat-smoke",
-				},
+			cwd,
+			shell: isWindows,
+			stderr: "inherit",
+			env: {
+				...process.env,
+				PI_LENS_HOME: logHome,
+				...env,
+				ANTHROPIC_API_KEY:
+					process.env.ANTHROPIC_API_KEY || "sk-ant-dummy-compat-smoke",
 			},
-		);
+		});
 
-		let buf = "";
 		let settled = false;
 		let commandCount = -1;
 		const timer = setTimeout(() => {
 			if (settled) return;
 			settled = true;
-			try {
-				child.kill("SIGKILL");
-			} catch {}
+			pi.kill();
 			reject(new Error("TIMEOUT waiting for pi RPC session"));
 		}, timeoutMs);
 
-		function finish() {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			resolve({ commandCount });
-		}
-
-		function handleLine(line) {
-			let msg;
-			try {
-				msg = JSON.parse(line);
-			} catch {
-				return;
-			}
+		pi.onMessage((msg) => {
 			if (msg.type === "response" && msg.command === "get_commands") {
 				const cmds = (msg.data && msg.data.commands) || [];
 				commandCount = cmds.length;
@@ -208,24 +190,18 @@ function runPiRpc({
 				// trigger and runs its normal teardown path (session_shutdown
 				// fires, pi-lens tears down its LSP fleet) before exiting.
 				try {
-					child.stdin.end();
+					pi.child.stdin.end();
 				} catch {}
-			}
-		}
-
-		child.stdout.on("data", (chunk) => {
-			buf += chunk.toString();
-			let i = buf.indexOf("\n");
-			while (i >= 0) {
-				const line = buf.slice(0, i).replace(/\r$/, "");
-				buf = buf.slice(i + 1);
-				if (line.trim()) handleLine(line);
-				i = buf.indexOf("\n");
 			}
 		});
 
-		child.on("exit", () => finish());
-		child.on("error", (err) => {
+		pi.onExit(() => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve({ commandCount });
+		});
+		pi.child.on("error", (err) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
@@ -233,11 +209,7 @@ function runPiRpc({
 		});
 
 		// Give extensions a moment to register before asking for the command list.
-		setTimeout(() => {
-			try {
-				child.stdin.write(`${JSON.stringify({ type: "get_commands" })}\n`);
-			} catch {}
-		}, 3000);
+		setTimeout(() => pi.send({ type: "get_commands" }), 3000);
 	});
 }
 

@@ -128,6 +128,7 @@ function makeClient(serverId: string, root: string) {
 		recentStderr: () => "",
 		checkAlive: () => undefined,
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => undefined),
 			change: vi.fn(async () => undefined),
 		},
@@ -278,9 +279,11 @@ describe("sweep warm-up treats a fallbackFor pair as one family (#3939 F1)", () 
 			it("neither: the group is still skipped as a warm-up failure and names both members", async () => {
 				const { results, service } = await sweep(family, "neither");
 				expect(results).toHaveLength(1);
+				// #4403: a primary that never warmed did not answer; it is not a
+				// notify-write or diagnostics-wait deadline.
 				expect(results[0]).toMatchObject({
 					timedOut: true,
-					unconfirmedReason: "inconclusive",
+					unconfirmedReason: "primary_unavailable",
 					skippedWarmupFailure: true,
 				});
 				await service.shutdown();

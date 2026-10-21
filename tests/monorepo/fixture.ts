@@ -102,7 +102,8 @@ export function makeMonorepo(spec: MonorepoSpec): Monorepo {
 
 	// A `.git` marker so root-resolution treats this as a real project root
 	// (findNearestProjectRoot / PROJECT_ROOT_MARKERS), matching a real checkout.
-	fs.mkdirSync(path.join(root, ".git"), { recursive: true });
+	// `setupTestEnvironment` plants that marker for every fixture (#4560), so this
+	// root needs no second copy.
 
 	if (spec.rootGitignore) {
 		writeFile(root, ".gitignore", spec.rootGitignore.join("\n") + "\n");

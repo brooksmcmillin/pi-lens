@@ -46,6 +46,9 @@ CONSTANTS
                    \*              mtime fast path, then the hash
                    \* "eq":        workspace-cache own file: recorded stat must
                    \*              equal the current stat (mtime [, size])
+                   \* "eqTouch": eq, allowing mtime drift only with a matching bound hash
+                   \* Touch configs model files within CONTENT_HASH_MAX_BYTES.
+                   \* Above that budget the implementation uses strict eq (no hash read).
     ForceHash,     \* "sizeMtime": skip the mtime fast path, always hash
     SizeOnly,      \* "content": compare size only (mutant: no hash tier)
     StatAt,        \* "eq": "before" or "after" the read: when the recorded stat is taken
@@ -130,7 +133,7 @@ Start ==
     /\ comp' = IF comp = "idle" THEN "started" ELSE "read"
     /\ startAt' = now
     /\ ref' = IF Stamp = "start" THEN now ELSE ref
-    /\ IF Gate = "eq" /\ StatAt = "before"
+    /\ IF Gate \in {"eq", "eqTouch"} /\ StatAt = "before"
          THEN recMtime' = mtime /\ recSize' = size /\ recMtimeId' = mtimeId
          ELSE UNCHANGED <<recMtime, recSize, recMtimeId>>
     /\ UNCHANGED <<recHash, mtimeId, now, disk, size, mtime, writesLeft, lastWriteAt, readVer, readSize,
@@ -159,7 +162,7 @@ Record ==
     /\ comp = "read"
     /\ comp' = "done"
     /\ ref' = IF Stamp = "end" THEN now ELSE ref
-    /\ IF Gate = "eq" /\ StatAt = "after"
+    /\ IF Gate \in {"eq", "eqTouch"} /\ StatAt = "after"
          THEN recMtime' = mtime /\ recSize' = size /\ recMtimeId' = mtimeId
          ELSE UNCHANGED <<recMtime, recSize, recMtimeId>>
     /\ recHash' = IF BindingAt = "record" THEN disk ELSE recHash
@@ -176,6 +179,10 @@ IsStale ==
       [] Gate = "content"   -> size /= readSize \/ (~SizeOnly /\ HashDiffers)
       [] Gate = "sizeMtime" -> \/ size /= readSize
                                \/ (ForceHash \/ MtimeStale) /\ HashDiffers
+      [] Gate = "eqTouch"   -> \/ SizeKey /\ size /= recSize
+                               \/ Binding /\ disk /= recHash
+                               \/ (mtime /= recMtime \/ mtimeId /= recMtimeId)
+                                  /\ ~(Binding /\ disk = recHash)
       [] Gate = "eq"        -> \/ mtime /= recMtime \/ mtimeId /= recMtimeId
                                \/ SizeKey /\ size /= recSize
                                \/ Binding /\ disk /= recHash

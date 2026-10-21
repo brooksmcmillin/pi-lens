@@ -22,7 +22,7 @@ jobs:
   # #3801: classify the diff once. `code` is false ONLY for a pull_request whose
   # every changed path is on the strict docs allowlist (root *.md, docs/**,
   # .changelog/**; scripts/ci-changed-files.mjs), and then the HEAVY ADVISORY
-  # jobs (CodeQL, the Windows run) do not start. The Unit shards, the Install
+  # job (CodeQL) does not start. The Unit shards, the Install
   # tests and every other test job still run for a docs-only diff: a docs edit
   # can red tests/clients and tests/scripts (docs/public-api-stability.md,
   # docs/*_rules_catalog.md are read by them), so the suite is never skipped.
@@ -54,7 +54,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       - name: Classify the changed files
@@ -86,7 +86,7 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -123,7 +123,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -178,9 +178,30 @@ jobs:
   # estimate this comment used to carry. The job id `tla-models` and the check
   # name `TLA+ models` stay with the aggregate below (CodeQL `needs:` it, and
   # the ruleset requires that name); the shard jobs are `tla-shards`.
-  # scripts/check-tla-models.mjs partitions the sorted config list round-robin,
-  # and tests/config/tla-models-shard-workflow.test.ts pins that every config
-  # lands in exactly one shard. Measured per-shard times: PENDING this PR's run.
+  # Measured per-shard WALL time on master run 39380875926 (attempt 1):
+  # 268 s, 349 s, 494 s and 726 s -- the round-robin split was unbalanced by
+  # ~2.7x and shard 4 owned the tail. That shard hit the 12-minute cap TWICE,
+  # every step of it concluded `success` both times: attempt 1 job
+  # 118491126416 was `cancelled` at 735 s, attempt 2 job 118632989721 at 726 s.
+  # Each cancellation reded the required `TLA+ models` check with no model
+  # violation, and a rerun lost the same race.
+  #
+  # #4672: scripts/check-tla-models.mjs now partitions by MEASURED COST
+  # (longest-processing-time pack over scripts/tla-model-costs.json), not
+  # round-robin by config count. Round-robin was the defect: configs' TLC times
+  # run 1.2 s to 422 s, so on that run the four shards summed 733 s / 1255 s /
+  # 1617 s / 2148 s of TLC time (2.9x). Same four shards, measured cost table,
+  # summed work per shard: 1538 s / 1539 s / 1538 s / 1538 s (1.00x).
+  # tests/config/tla-models-shard-workflow.test.ts pins that every config lands
+  # in exactly one shard and that the measured split stays balanced.
+  # Measured per-shard WALL time over 15 model-checking runs (master pushes and
+  # PR heads, 2026-10-20; `started_at` -> `completed_at` of each
+  # `TLA+ models (shard k/N)` job): per-shard-position p50/p90 465/510 s
+  # (shard 1), 334/357 s (shard 2), 337/348 s (shard 3), 685/700 s (shard 4).
+  # The balanced partition's projected worst shard is 1538 s of TLC work, which
+  # is 505 s at that run's measured 3.05 s-of-work-per-second-of-wall. The
+  # first CI run on this change observes it (a ci.yml or checker edit is a
+  # `formal` trigger).
   tla-shards:
     name: TLA+ models (shard ${{ matrix.shard }}/${{ strategy.job-total }})
     needs: changes
@@ -198,7 +219,26 @@ jobs:
     # refs #3572, #3517: each shard runs its configs through the CPU-sized
     # concurrency pool in scripts/check-tla-models.mjs, one TLC worker per
     # config (deterministic first violation).
-    timeout-minutes: 12
+    #
+    # #4672 cap sizing (the #3123 rule: measured maximum plus margin). The
+    # 12-minute cap was AT the measured maximum, so a slower runner turned
+    # finished work into `cancelled`: 735 s and then 726 s against 720 s on run
+    # 39380875926, with every step `success` both times, and 20 minutes is the
+    # floor of the next whole step above that tail (the way #3591 raised the
+    # pre-shard job 10 -> 20). Measured over 15 model-checking runs
+    # (2026-10-20, both master pushes and PR heads): per-shard-position p90
+    # 510 s (shard 1), 357 s (shard 2), 348 s (shard 3), 700 s (shard 4) --
+    # that window excludes the two attempts the 720 s cap cut short, so its
+    # 724 s maximum is not the worst shard ever observed: the censored 735 s
+    # attempt named above is. The tail is shard 4 because the old partition packed
+    # it by count while its configs cost 2.9x the others. After the
+    # cost-weighted partition the projected worst shard is 505 s of wall, so
+    # 20 min is 2.4x the projected worst and 1.63x the worst shard ever
+    # observed (735 s), the `test` job's
+    # documented measured-max x2 rule (#3111). The cap is the SECOND mechanism:
+    # the partition removes the tail, the cap and the cancelled-shard verdict
+    # keep a slow runner's teardown race from reddening a required check.
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -217,7 +257,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: needs.changes.outputs.formal != 'false'
         with:
           node-version: '22'
@@ -233,28 +273,55 @@ jobs:
   # #3918: the ONE check-run named exactly `TLA+ models`, the name branch
   # protection requires. A job whose `needs` failed is SKIPPED by default, and
   # GitHub counts a skipped required check as passing, so `if: always()` is
-  # what makes a red or cancelled shard red here instead of green-by-skip.
-  # `needs.tla-shards.result` must be exactly `success`: skipped, cancelled and
-  # failure all fail this job.
+  # what makes a red shard red here instead of green-by-skip.
+  #
+  # #4672: the verdict itself is `scripts/check-shard-verdict.mjs`, the ONE
+  # seam both sharded aggregates share. `needs.tla-shards.result == 'success'`
+  # still passes without any API read; any other result is classified from the
+  # run's own job list, because a shard that FINISHED its model check and then
+  # lost the race against its own `timeout-minutes` reports `cancelled` with
+  # every step `success` (run 39380875926, shard 4/4, 735 s against 720 s).
+  # That reading is kept as a pass with a recorded `::warning::`; a shard
+  # cancelled BEFORE its model-check step finished stays red, and unreadable
+  # evidence fails closed. The reasoning is in the script's header.
   tla-models:
     name: TLA+ models
     needs: tla-shards
     if: always()
     runs-on: ubuntu-latest
-    # Runs one `echo` and a comparison; 10 min is the repo's floor (refs #3123).
+    # Runs a checkout, one `node` and one API read; 10 min is the repo's floor
+    # (refs #3123).
     timeout-minutes: 10
     permissions:
       contents: read
+      # #4672: the cancelled-shard verdict reads this run's job list
+      # (GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs). Read-only, and
+      # the narrowest scope that endpoint accepts.
+      actions: read
     env:
       SHARDS_RESULT: ${{ needs.tla-shards.result }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Require every TLA+ models shard to succeed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SHARD_JOB_PATTERN: '^TLA\+ models \(shard [0-9]+/[0-9]+\)$'
+          SHARD_CHECK_STEP: "Model-check formal/ against each config's expected verdict"
         run: |
           echo "TLA+ models shard jobs (tla-shards): ${SHARDS_RESULT}"
-          if [[ "${SHARDS_RESULT}" != "success" ]]; then
-            echo "::error::a TLA+ models shard did not succeed (${SHARDS_RESULT}); the mismatched models are in that shard's own log, check-run 'TLA+ models (shard k/N)'"
-            exit 1
-          fi
+          node scripts/check-shard-verdict.mjs \
+            --label "TLA+ models" \
+            --result "${SHARDS_RESULT}" \
+            --shard-pattern "${SHARD_JOB_PATTERN}" \
+            --check-step "${SHARD_CHECK_STEP}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --run "${GITHUB_RUN_ID}"
 
   lint-and-typecheck:
     name: Lint & type-check
@@ -272,7 +339,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -333,7 +400,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -361,6 +428,27 @@ jobs:
         # --include-ci-only admits the real-spawn suites that exceed the local
         # pre-push budget (#3426 H3432-1); this job is their CI row.
         run: node scripts/pre-push-targeted-tests.mjs --skip-build --include-ci-only
+
+      # #4397: a test file that depends on case order or on a sibling file
+      # passes in CI's file order and reds on a reorder or a shard split
+      # (#4390, #4391). Run the test files this PR adds or changes under two
+      # fixed shuffle seeds, and each alone. Advisory like the rest of this job:
+      # `continue-on-error` above keeps a red from gating, and the step still
+      # reds so the job row shows it. Flip plan: when 20 consecutive PR runs
+      # show no false red, move this step to its own job named
+      # `Changed tests shuffled` and add it to the required set. The script
+      # bounds itself to 7 min (BUDGET_MS), 1 min under this step's cap; the
+      # steps before it take ~5.5 min, so the job stays under its 15. Files the
+      # PR adds run alone first; the time budget is the only bound (#4456).
+      # The SHAs reach the script through `env`, never the `run:` text.
+      - name: Changed test files, alone and shuffled
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/ci-shuffle-changed-tests.mjs --base "$BASE_SHA" --head "$HEAD_SHA"
 
   # #3753: the suite runs as parallel `vitest --shard=k/N` jobs, N being the
   # matrix length (`strategy.job-total`, so the count has ONE source). This job
@@ -419,12 +507,12 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
       - name: Cache npm cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-node-22-${{ hashFiles('package-lock.json') }}
@@ -433,7 +521,7 @@ jobs:
         run: npm install --no-audit --no-fund
 
       - name: Verify ast-grep CLI is on PATH
-        run: npx ast-grep --version
+        run: node_modules/.bin/ast-grep --version
 
       - name: Build
         run: npm run build
@@ -551,7 +639,7 @@ jobs:
 
       - name: Upload per-file test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unit-test-results-linux-shard-${{ matrix.shard }}
           path: |
@@ -646,31 +734,62 @@ jobs:
   # requires and every tool (ci-verdict) keys on. A job
   # whose `needs` failed is SKIPPED by default, and GitHub
   # counts a skipped required check as passing, so `if: always()` is what
-  # makes a red or cancelled shard red here instead of green-by-skip.
-  # `needs.test.result` must be exactly `success`: skipped, cancelled and
-  # failure all fail this job.
+  # makes a red shard red here instead of green-by-skip.
+  #
+  # #4672: same verdict seam as `tla-models` above
+  # (`scripts/check-shard-verdict.mjs`), with this aggregate's own shard-job
+  # pattern and check step. The shard count is NOT baked in anywhere: the
+  # pattern matches `Unit tests (shard k/N)` for any N, so a future re-shard
+  # (#3753) moves the matrix and nothing here.
   unit-tests:
     name: Unit tests
     needs: test
     if: always()
     runs-on: ubuntu-latest
-    # Runs one `echo` and a comparison; 10 min is the repo's floor (refs #3123).
+    # Runs a checkout, one `node` and one API read; 10 min is the repo's floor
+    # (refs #3123).
     timeout-minutes: 10
     permissions:
       contents: read
+      # #4672: readable job list for the cancelled-shard verdict, as above.
+      actions: read
     env:
       SHARDS_RESULT: ${{ needs.test.result }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Require every Unit tests shard to succeed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SHARD_JOB_PATTERN: '^Unit tests \(shard [0-9]+/[0-9]+\)$'
+          # The step that runs the tests...
+          SHARD_CHECK_STEP: 'Run tests'
+          # ...and the gate that runs AFTER it in the same job. `--check-step`
+          # is repeatable and every listed step must have concluded: a cancel
+          # between `Run tests` and this step leaves a real gate (tmp entries
+          # another file leaked) unjudged, so one step was not enough (#4672
+          # review, V2b). A NEW gating step added after `Run tests` belongs in
+          # this list -- tests/config/unit-tests-shard-workflow.test.ts reds
+          # until it is, because it reads the job's own step order.
+          SHARD_TRAILING_CHECK_STEP: 'Tmp-fixture hygiene owner'
         run: |
           echo "Unit tests shard jobs (test): ${SHARDS_RESULT}"
-          if [[ "${SHARDS_RESULT}" != "success" ]]; then
-            echo "::error::a Unit tests shard did not succeed (${SHARDS_RESULT}); the failing tests are in that shard's own log, check-run 'Unit tests (shard k/N)'"
-            exit 1
-          fi
+          node scripts/check-shard-verdict.mjs \
+            --label "Unit tests" \
+            --result "${SHARDS_RESULT}" \
+            --shard-pattern "${SHARD_JOB_PATTERN}" \
+            --check-step "${SHARD_CHECK_STEP}" \
+            --check-step "${SHARD_TRAILING_CHECK_STEP}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --run "${GITHUB_RUN_ID}"
 
-  # #3801: the heavy ADVISORY jobs (CodeQL, the Windows Vitest subset) start
-  # only after every required check passed on this head. A runner-slot pool
+  # #3801: the heavy ADVISORY jobs (CodeQL) start only after every required
+  # check passed on this head. A runner-slot pool
   # shared by 10+ PRs made them compete with the required jobs for slots
   # (about 40 jobs per push against about 20 concurrent slots), and on a head
   # whose required checks are red they were pure waste.
@@ -685,7 +804,9 @@ jobs:
   # check, the gate step reports `ready=false` and FAILS, so the row is red and a
   # run that was deferred for that reason is visible and distinguishable from a
   # dropped one (ci-verdict reads it). The job name ends in `(advisory)` so
-  # ci-verdict never gates on it, red or not.
+  # ci-verdict never gates on it, red or not. The Windows Vitest subset was
+  # released here until #4518's promotion: it gates now, so it must start on
+  # every event, including the docs-only diff this gate skips.
   heavy-gate:
     name: Heavy advisory gate (advisory)
     needs:
@@ -695,7 +816,8 @@ jobs:
       - unit-tests
       - install-test
     # #3801: only a code diff starts the heavy jobs: a docs-only pull request
-    # runs every test job but not CodeQL or the Windows run. Every
+    # runs every test job but not CodeQL, the one heavy job left behind this
+    # gate (#4518 promoted the Windows unit leg out of it). Every
     # needed job must have succeeded (the implicit `success()`), so a red or
     # skipped one skips the gate.
     if: needs.changes.outputs.code == 'true'
@@ -714,7 +836,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       - name: Require the lint.yml required checks, then release the heavy advisory jobs
@@ -724,13 +846,15 @@ jobs:
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: node scripts/ci-heavy-gate.mjs --repo "$GITHUB_REPOSITORY" --sha "$HEAD_SHA" --context knip --context "oxfmt format check"
 
-  # Windows coverage starts as advisory because the repository has no prior Windows Vitest signal.
-  # Promote this job to gating once the Run Windows Vitest subset step outcome has been success
-  # on 7 consecutive master/PR runs.
+  # GATING since #4518 (maintainer decision, 2026-10-17): the Windows unit leg
+  # runs the real `win32` gates, and advisory reds were waved through (#4566
+  # r14's `.cmd` branch, #4551). It therefore starts on every event like the
+  # Unit shards -- never behind `heavy-gate`, whose docs-only skip would leave a
+  # required row absent -- and it is not named `(advisory)` any more, so
+  # ci-verdict gates it. Branch protection must still list `Unit tests Windows`
+  # as a required status check; until it does, ci-verdict is the enforcement.
   unit-tests-windows:
-    name: Unit tests Windows (advisory)
-    needs: heavy-gate
-    if: needs.heavy-gate.outputs.ready == 'true'
+    name: Unit tests Windows
     runs-on: windows-latest
     outputs:
       windows_vitest: ${{ steps.windows-vitest.outcome }}
@@ -739,13 +863,11 @@ jobs:
       contents: read
 
     steps:
-      # #3926: this checkout starts only after `heavy-gate` releases the heavy
-      # advisory jobs, which is after the required checks pass -- and therefore
-      # after auto-merge may have deleted the mutable `refs/pull/<n>/merge` that
-      # `github.ref` names. Leave `ref` unset: the pinned action then fetches the
-      # captured commit (`github.sha`, the validated test-merge tree) exactly as
-      # the sibling gated job `codeql` does; the commit survives
-      # the ref's deletion. Do not restore `ref: ${{ github.ref }}`.
+      # #3926: leave `ref` unset. The pinned action then fetches the captured
+      # commit (`github.sha`, the validated test-merge tree) exactly as the
+      # gated sibling `codeql` does, so this checkout survives a merge that
+      # deletes the mutable `refs/pull/<n>/merge` while the lane is queued.
+      # Do not restore `ref: ${{ github.ref }}`.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -757,7 +879,7 @@ jobs:
         shell: bash
         run: echo "PI_LENS_HOME=$RUNNER_TEMP/pi-lens-home" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -780,7 +902,6 @@ jobs:
 
       - name: Run Windows Vitest subset
         id: windows-vitest
-        continue-on-error: true
         shell: bash
         env:
           PI_LENS_TEST_TIMEOUT_SCALE: '3'
@@ -814,15 +935,20 @@ jobs:
             echo "windows_vitest=$outcome"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail Windows advisory when Vitest fails
+      - name: Fail a failed or under-executed Windows Vitest subset
         if: always()
         shell: bash
         run: |
           if [[ "${{ steps.windows-vitest.outcome }}" == "failure" ]]; then
             failures="$(node scripts/lib/windows-vitest-failure-count.mjs "$RUNNER_TEMP/windows-vitest.log")"
-            echo "::error title=Windows advisory::${failures:-unknown} Vitest tests failed"
+            echo "::error title=Windows Vitest subset::${failures:-unknown} Vitest tests failed"
             exit 1
           fi
+          # #4518: a subset whose files all skip (or whose log has no summary) is
+          # green on the outcome alone. 2516 tests ran on the measured leg
+          # (tests/fixtures/nightly-floors/measurements.json); the floor is just over half.
+          executed="$(node scripts/lib/windows-vitest-failure-count.mjs "$RUNNER_TEMP/windows-vitest.log" --executed 2>/dev/null || true)"
+          node scripts/assert-evaluated.mjs --count "windows-vitest=${executed}" --floor 1260
 
   # Simulates pi's real install path: a `git:` install runs `npm install
   # --omit=dev`, which triggers `prepare` → `build:dist` FROM SOURCE with the
@@ -845,7 +971,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -1039,7 +1165,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -1051,12 +1177,13 @@ jobs:
       # manufacture their fixture with a case-variant symlink on the
       # case-sensitive ubuntu lane; here they exercise the real aliasing, which
       # is where #1024 was actually live. No extra install cost: `npm install`
-      # above already ran `prepare`, so devDependencies and the core grammars
-      # the vitest globalSetup pre-warms are already present.
-      # ADVISORY for now (`continue-on-error`), like the Windows Vitest subset
-      # above: this job's install/pack/smoke steps gate, and a macOS-only unit
-      # flake must not block an unrelated PR on its first outings. Promotion to
-      # gating is a separate decision after several green legs (#3159 round 3).
+      # above already ran `prepare`, so devDependencies and the 12 core grammars
+      # are present; the vitest globalSetup fetches the other grammars once
+      # before the files run (#4342).
+      # ADVISORY for now (`continue-on-error`) while this job's install/pack/
+      # smoke steps gate: a macOS-only unit flake must not block an unrelated PR
+      # on its first outings. Promotion to gating is a separate decision after
+      # several green legs (#3159 round 3).
       - name: POSIX case-insensitive anchors (APFS)
         if: matrix.os == 'macos-latest'
         continue-on-error: true
@@ -1064,7 +1191,25 @@ jobs:
         run: |
           set -euo pipefail
           npm run build
-          node_modules/.bin/vitest run tests/clients/path-utils.test.ts tests/clients/diagnostic-dispositions.test.ts --configLoader runner
+          node_modules/.bin/vitest run tests/clients/path-utils.test.ts tests/clients/diagnostic-dispositions.test.ts --configLoader runner --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/apfs-anchors.json"
+
+      # #4518: the step above stays advisory about test RESULTS, but a run that
+      # evaluated nothing (a build that did not compile, a file that did not
+      # load, a reporter that wrote no file) read as an ordinary advisory red,
+      # or as green when vitest's filter matched nothing. This step is NOT
+      # continue-on-error: it fails the leg only when fewer than 100 tests ran
+      # (passed plus failed; 223 ran on the measured macOS leg, tests/fixtures/
+      # nightly-floors/measurements.json). The summary table it appends is the
+      # counter the promotion decision above reads. 100 is under half of the
+      # measured 223: the step exists to catch a run that executed nothing, and
+      # a tight margin would red the required leg on a legitimate test removal.
+      - name: APFS anchors evaluated floor
+        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          count="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(j.numPassedTests+j.numFailedTests)}catch{}' "$RUNNER_TEMP/apfs-anchors.json")"
+          node scripts/assert-evaluated.mjs --count "apfs-anchors=${count}" --floor 100
 
       - name: Rule catalog report (non-blocking)
         continue-on-error: true
@@ -1298,7 +1443,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -1362,7 +1507,7 @@ jobs:
       - name: Render job summary
         if: always()
         run: node scripts/mutation-report.mjs --out "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: mutation-report
@@ -1404,10 +1549,10 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: mutation-report
           path: reports/mutation
@@ -1473,7 +1618,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           languages: ${{ matrix.language }}
           build-mode: none
@@ -1482,6 +1627,6 @@ jobs:
               - cases
               - tests/fixtures
               - dist
-      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           category: "/language:${{ matrix.language }}"

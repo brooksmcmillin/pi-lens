@@ -1407,7 +1407,7 @@ describe("no-predicate runner reported-path attribution (#3295 r3)", () => {
 				{
 					file: reported,
 					errors: [
-						{ line: 4, col: 5, detail: MARKER, ruleId: "standard:test" },
+						{ line: 4, column: 5, message: MARKER, rule: "standard:test" },
 					],
 				},
 			]),
