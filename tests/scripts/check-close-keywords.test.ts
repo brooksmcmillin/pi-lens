@@ -1155,6 +1155,8 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 			["wrong base", "range metadata"],
 			["fractional total", "range metadata"],
 			["zero total", "range metadata"],
+			["negative total", "range metadata"],
+			["unknown empty range", "range metadata"],
 			["over cap", "range metadata"],
 			["changed total", "range metadata"],
 			["missing list", "range metadata"],
@@ -1200,6 +1202,14 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 						if (fault === "wrong base") data.base_commit.sha = "b".repeat(40);
 						if (fault === "fractional total") data.total_commits = 301.5;
 						if (fault === "zero total") data.total_commits = 0;
+						if (fault === "negative total") data.total_commits = -1;
+						if (fault === "unknown empty range")
+							return Response.json({
+								...data,
+								total_commits: 0,
+								commits: [],
+								status: "ahead",
+							});
 						if (fault === "over cap") data.total_commits = 10_001;
 						if (fault === "changed total") data.total_commits = 302;
 						if (fault === "missing list")

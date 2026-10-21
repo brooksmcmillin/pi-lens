@@ -45,7 +45,8 @@
  *     `export` segment's redirect, abbreviated long options (`--target=`),
  *     `${TMPDIR:-/tmp}`, an unset `$TMPDIR` (bash expands it to empty) and
  *     other unresolvable expansions, the `mktemp` FILE form, `ln -s`,
- *     `tar -C /tmp`, `/var/tmp`, `/dev/shm`, and macOS's `/private/tmp`.
+ *     `tar -C /tmp`, `/var/tmp`, `/dev/shm`, and `/private/tmp` when it is
+ *     distinct from `/tmp` (filesystem-proven aliases are protected).
  *   - a git HOOK BYPASS on `git commit`/`push`/`merge`/`rebase` (#3778, the
  *     #3703 class): `--no-verify`, `-n` (commit only -- on `push` it is
  *     `--dry-run`), `-c core.hooksPath=…`, a `git config core.hooksPath`
