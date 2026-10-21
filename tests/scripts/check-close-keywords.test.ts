@@ -1096,6 +1096,162 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 			log.mockRestore();
 		});
 
+		// PR26 exceeded the PR-list endpoint's cap; compare pagination must cover
+		// the pinned range, not silently accept its first 250 commits.
+		it.each([250, 301])(
+			"scans all %i pinned commits beyond the PR-list cap",
+			async (count) => {
+				env();
+				const errorLog = vi
+					.spyOn(console, "error")
+					.mockImplementation(() => {});
+				const log = vi.spyOn(console, "log").mockImplementation(() => {});
+				const base = "a".repeat(40);
+				const many = Array.from({ length: count }, (_, i) =>
+					commit("refs #55", (i + 1).toString(16).padStart(40, "0")),
+				);
+				const head = many.at(-1)!.sha;
+				const fetchPr = prFetch(
+					{ title: TITLE, body: BODY },
+					many.slice(0, 250),
+				);
+				const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+					if (!String(url).includes("/compare/")) return fetchPr(url);
+					expect(String(url)).toContain(`/compare/${base}...${head}?`);
+					const page = Number(new URL(String(url)).searchParams.get("page"));
+					return Response.json({
+						total_commits: count,
+						base_commit: { sha: base },
+						commits: many
+							.slice((page - 1) * 100, page * 100)
+							.map(({ sha, message }) => ({ sha, commit: { message } })),
+					});
+				});
+				const event = {
+					pull_request: {
+						number: 26,
+						base: { sha: base },
+						head: { sha: head },
+					},
+				};
+				await lintPullRequest(fetchImpl, event);
+				expect(process.exitCode).toBeUndefined();
+				expect(log).toHaveBeenCalledWith(
+					"Close-keyword syntax OK (0 issues referenced).",
+				);
+				many.at(-1)!.message = "closes #55";
+				await lintPullRequest(fetchImpl, event);
+				expect(process.exitCode).toBe(1);
+				expect(errorLog.mock.calls.flat().join("\n")).toContain(
+					"would close #55",
+				);
+				errorLog.mockRestore();
+				log.mockRestore();
+			},
+		);
+
+		it.each([
+			["HTTP failure", "403"],
+			["wrong base", "range metadata"],
+			["fractional total", "range metadata"],
+			["zero total", "range metadata"],
+			["over cap", "range metadata"],
+			["changed total", "range metadata"],
+			["missing list", "range metadata"],
+			["oversized page", "range metadata"],
+			["bad sha", "invalid or duplicate commit"],
+			["missing message", "invalid or duplicate commit"],
+			["duplicate", "invalid or duplicate commit"],
+			["short page", "incomplete commit range"],
+			["excess commits", "incomplete commit range"],
+			["missing head", "omitted the pinned head"],
+		])(
+			"rejects comparison %s rather than accepting partial evidence",
+			async (fault, reason) => {
+				// A capped PR must not turn green on missing or mismatched API pages.
+				env();
+				const errorLog = vi
+					.spyOn(console, "error")
+					.mockImplementation(() => {});
+				const log = vi.spyOn(console, "log").mockImplementation(() => {});
+				const base = "a".repeat(40);
+				const many = Array.from({ length: 301 }, (_, i) =>
+					commit("x", (i + 1).toString(16).padStart(40, "0")),
+				);
+				const head = many.at(-1)!.sha;
+				const fetchPr = prFetch(
+					{ title: TITLE, body: BODY },
+					many.slice(0, 250),
+				);
+				const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+					if (!String(url).includes("/compare/")) return fetchPr(url);
+					const page = Number(new URL(String(url)).searchParams.get("page"));
+					const data = {
+						base_commit: { sha: base },
+						total_commits: 301,
+						commits: many
+							.slice((page - 1) * 100, page * 100)
+							.map(({ sha, message }) => ({ sha, commit: { message } })),
+					};
+					if (page === (fault === "changed total" ? 2 : 1)) {
+						if (fault === "HTTP failure")
+							return new Response("denied", { status: 403 });
+						if (fault === "wrong base") data.base_commit.sha = "b".repeat(40);
+						if (fault === "fractional total") data.total_commits = 301.5;
+						if (fault === "zero total") data.total_commits = 0;
+						if (fault === "over cap") data.total_commits = 10_001;
+						if (fault === "changed total") data.total_commits = 302;
+						if (fault === "missing list")
+							return Response.json({ ...data, commits: null });
+						if (fault === "oversized page")
+							data.commits.push({
+								sha: "e".repeat(40),
+								commit: { message: "x" },
+							});
+						if (fault === "bad sha") data.commits[0]!.sha = "not-a-sha";
+						if (fault === "missing message")
+							return Response.json({
+								...data,
+								commits: [{ sha: data.commits[0]!.sha }],
+							});
+						if (fault === "duplicate") data.commits[1]!.sha = many[0]!.sha;
+						if (fault === "short page") data.commits.pop();
+					}
+					if (page === 4 && fault === "excess commits")
+						data.commits.push({
+							sha: "e".repeat(40),
+							commit: { message: "x" },
+						});
+					if (page === 4 && fault === "missing head")
+						data.commits[0]!.sha = "e".repeat(40);
+					return Response.json(data);
+				});
+				await lintPullRequest(fetchImpl, {
+					pull_request: {
+						number: 26,
+						base: { sha: base },
+						head: { sha: head },
+					},
+				});
+				expect(process.exitCode).toBe(1);
+				expect(log).not.toHaveBeenCalled();
+				expect(errorLog.mock.calls.flat().join("\n")).toContain(reason);
+				const expectedPages =
+					fault === "changed total"
+						? 2
+						: ["excess commits", "missing head"].includes(fault)
+							? 4
+							: 1;
+				expect(
+					fetchImpl.mock.calls.filter(([url]) =>
+						String(url).includes("/compare/"),
+					),
+				).toHaveLength(expectedPages);
+				errorLog.mockRestore();
+				log.mockRestore();
+			},
+		);
+
 		it("fails closed on a PR at GitHub's 250-commit listing cap", async () => {
 			env();
 			const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});

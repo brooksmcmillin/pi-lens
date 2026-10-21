@@ -38,6 +38,58 @@ function eventPayload() {
 // #4371: GitHub lists at most 250 commits of a pull request, 100 per page.
 const COMMIT_PAGE_SIZE = 100;
 const COMMIT_LIST_CAP = 250;
+const COMPARISON_COMMIT_CAP = 10_000;
+
+// Unlike the PR-list endpoint, an explicitly paginated comparison includes
+// the complete range. Pin both ends so pages cannot mix moving branch tips.
+async function fetchComparedCommits(base, head, fetchImpl) {
+	const commits = [];
+	const seen = new Set();
+	let total;
+	for (let page = 1; ; page++) {
+		const response = await githubGet(
+			`/compare/${base}...${head}?per_page=${COMMIT_PAGE_SIZE}&page=${page}`,
+			fetchImpl,
+		);
+		if (!response.ok)
+			throw new Error(`GitHub comparison returned ${response.status}`);
+		const data = await response.json();
+		if (
+			data.base_commit?.sha !== base ||
+			!Number.isSafeInteger(data.total_commits) ||
+			data.total_commits < 1 ||
+			data.total_commits > COMPARISON_COMMIT_CAP ||
+			(total !== undefined && total !== data.total_commits) ||
+			!Array.isArray(data.commits) ||
+			data.commits.length > COMMIT_PAGE_SIZE
+		)
+			throw new Error(
+				"GitHub comparison has invalid or inconsistent range metadata",
+			);
+		total = data.total_commits;
+		for (const entry of data.commits) {
+			if (
+				typeof entry?.sha !== "string" ||
+				!/^[a-f0-9]{40}$/.test(entry.sha) ||
+				typeof entry?.commit?.message !== "string" ||
+				seen.has(entry.sha)
+			)
+				throw new Error("GitHub comparison has an invalid or duplicate commit");
+			seen.add(entry.sha);
+			commits.push({ sha: entry.sha, message: entry.commit.message });
+		}
+		if (
+			commits.length > total ||
+			(commits.length < total && data.commits.length !== COMMIT_PAGE_SIZE)
+		)
+			throw new Error("GitHub comparison returned an incomplete commit range");
+		if (commits.length === total) {
+			if (!seen.has(head))
+				throw new Error("GitHub comparison omitted the pinned head");
+			return commits;
+		}
+	}
+}
 
 // Throws when the list cannot be read in full, so the caller fails closed
 // instead of linting a partial list.
@@ -59,10 +111,19 @@ async function fetchPrCommits(payloadPr, fetchImpl) {
 		}
 		if (data.length < COMMIT_PAGE_SIZE) break;
 	}
-	if (commits.length >= COMMIT_LIST_CAP)
-		throw new Error(
-			`the pull request has ${COMMIT_LIST_CAP} or more commits, which is all GitHub lists`,
-		);
+	if (commits.length >= COMMIT_LIST_CAP) {
+		const base = payloadPr.base?.sha;
+		const head = payloadPr.head?.sha;
+		if (
+			![base, head].every(
+				(sha) => typeof sha === "string" && /^[a-f0-9]{40}$/.test(sha),
+			)
+		)
+			throw new Error(
+				`the pull request has ${COMMIT_LIST_CAP} or more commits; pinned base and head SHAs are required`,
+			);
+		return fetchComparedCommits(base, head, fetchImpl);
+	}
 	return commits;
 }
 

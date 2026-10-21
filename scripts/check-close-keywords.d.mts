@@ -45,7 +45,12 @@ export declare function commitCloseKeywordErrors(result: {
 export declare function lintPullRequest(
 	fetchImpl?: typeof fetch,
 	event?: {
-		pull_request?: { number: number; body?: string | null };
+		pull_request?: {
+			number: number;
+			body?: string | null;
+			base?: { sha: string };
+			head?: { sha: string };
+		};
 	},
 ): Promise<void>;
 export declare function verifyMergedPullRequest(
