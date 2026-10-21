@@ -1160,6 +1160,7 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 			["missing list", "range metadata"],
 			["oversized page", "range metadata"],
 			["bad sha", "invalid or duplicate commit"],
+			["array sha", "invalid or duplicate commit"],
 			["missing message", "invalid or duplicate commit"],
 			["duplicate", "invalid or duplicate commit"],
 			["short page", "incomplete commit range"],
@@ -1209,6 +1210,14 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 								commit: { message: "x" },
 							});
 						if (fault === "bad sha") data.commits[0]!.sha = "not-a-sha";
+						if (fault === "array sha")
+							return Response.json({
+								...data,
+								commits: [
+									{ ...data.commits[0], sha: [data.commits[0]!.sha] },
+									...data.commits.slice(1),
+								],
+							});
 						if (fault === "missing message")
 							return Response.json({
 								...data,
@@ -1252,6 +1261,169 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 			},
 		);
 
+		// D11: imported close references cannot authorize closing open fork items.
+		it.each([
+			["missing issue", true, ""],
+			["closed issue", true, ""],
+			["repeated upstream issue", true, ""],
+			["open issue", false, "would close #55"],
+			["issue unavailable", false, "500"],
+			["invalid issue", false, "invalid issue"],
+			["wrong issue", false, "invalid issue"],
+			["private fork", false, "public fork"],
+			["wrong fork", false, "public fork"],
+			["provenance unavailable", false, "403"],
+			["fork-authored commit", false, "would close #55"],
+			["mixed authorship", false, "commit 222222222 would close #55"],
+			["fork unavailable", false, "403"],
+			["already imported", false, "would close #55"],
+			["missing base", false, "pinned base and head"],
+			["other repository", false, "would close #55"],
+		])(
+			"applies frozen-upstream admission for %s",
+			async (scenario, accepted, reason) => {
+				env();
+				const repository =
+					scenario === "other repository"
+						? "someone/pi-lens"
+						: "brooksmcmillin/pi-lens";
+				vi.stubEnv("GITHUB_REPOSITORY", repository);
+				const errorLog = vi
+					.spyOn(console, "error")
+					.mockImplementation(() => {});
+				const log = vi.spyOn(console, "log").mockImplementation(() => {});
+				const base = "a".repeat(40);
+				const imported = "1".repeat(40);
+				const head = "3".repeat(40);
+				const approved = "7f5af3a48ce72a7ad6b2ef712b09aa113541c1ac";
+				const fetchPr = prFetch({ title: TITLE, body: BODY }, [
+					commit(
+						"closes #55",
+						scenario === "fork-authored commit" ? "2".repeat(40) : imported,
+					),
+					commit("x", head),
+					...(scenario === "repeated upstream issue"
+						? [commit("closes #55", approved)]
+						: []),
+					...(scenario === "mixed authorship"
+						? [commit("fixes #55", "2".repeat(40))]
+						: []),
+				]);
+				const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+					const target = String(url);
+					if (target.includes("/compare/")) {
+						expect(target).toContain(`/compare/${base}...${approved}?`);
+						if (scenario === "provenance unavailable")
+							return new Response("denied", { status: 403 });
+						const commits =
+							scenario === "already imported"
+								? []
+								: [imported, approved].map((sha) => ({
+										sha,
+										commit: {
+											message:
+												sha === imported ||
+												scenario === "repeated upstream issue"
+													? "closes #55"
+													: "x",
+										},
+									}));
+						return Response.json({
+							base_commit: { sha: base },
+							total_commits: commits.length,
+							status: commits.length ? "diverged" : "behind",
+							commits,
+						});
+					}
+					if (
+						target.endsWith(`/repos/${repository}`) &&
+						scenario === "fork unavailable"
+					)
+						return new Response("denied", { status: 403 });
+					if (target.endsWith(`/repos/${repository}`))
+						return Response.json({
+							full_name:
+								scenario === "wrong fork" ? "other/pi-lens" : repository,
+							private: scenario === "private fork",
+						});
+					if (target.endsWith("/issues/55")) {
+						if (scenario === "missing issue")
+							return new Response("missing", { status: 404 });
+						if (scenario === "issue unavailable")
+							return new Response("failed", { status: 500 });
+						return Response.json({
+							number: scenario === "wrong issue" ? 56 : 55,
+							state:
+								scenario === "invalid issue"
+									? "unknown"
+									: scenario === "open issue"
+										? "open"
+										: "closed",
+						});
+					}
+					return fetchPr(url);
+				});
+				await lintPullRequest(fetchImpl, {
+					pull_request: {
+						number: 26,
+						base: scenario === "missing base" ? undefined : { sha: base },
+						head: { sha: head },
+					},
+				});
+				if (accepted) {
+					expect(process.exitCode).toBeUndefined();
+					expect(log).toHaveBeenCalledWith(
+						"Close-keyword syntax OK (0 issues referenced).",
+					);
+					expect(log.mock.calls.flat().join("\n")).toContain(
+						`admitted ${scenario === "repeated upstream issue" ? 2 : 1} imported reference`,
+					);
+					expect(
+						fetchImpl.mock.calls.filter(([url]) =>
+							String(url).endsWith("/issues/55"),
+						),
+					).toHaveLength(1);
+				} else {
+					expect(process.exitCode).toBe(1);
+					expect(errorLog.mock.calls.flat().join("\n")).toContain(reason);
+				}
+				if (
+					[
+						"fork-authored commit",
+						"already imported",
+						"other repository",
+					].includes(scenario)
+				)
+					expect(
+						fetchImpl.mock.calls.some(
+							([url]) =>
+								String(url).includes("/issues/") ||
+								String(url).endsWith(`/repos/${repository}`),
+						),
+					).toBe(false);
+				errorLog.mockRestore();
+				log.mockRestore();
+			},
+		);
+
+		it("keeps an authorized fork declaration independent of provenance availability", async () => {
+			env();
+			vi.stubEnv("GITHUB_REPOSITORY", "brooksmcmillin/pi-lens");
+			const log = vi.spyOn(console, "log").mockImplementation(() => {});
+			const fetchImpl = prFetch({ title: TITLE, body: "Closes #55" }, [
+				commit("closes #55"),
+			]);
+			await lintPullRequest(fetchImpl, { pull_request: { number: 26 } });
+			expect(process.exitCode).toBeUndefined();
+			expect(log).toHaveBeenCalledWith(
+				"Close-keyword syntax OK (1 issue referenced).",
+			);
+			expect(
+				fetchImpl.mock.calls.some(([url]) => String(url).includes("/compare/")),
+			).toBe(false);
+			log.mockRestore();
+		});
+
 		it("fails closed on a PR at GitHub's 250-commit listing cap", async () => {
 			env();
 			const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1263,7 +1435,9 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 			await lintPullRequest(fetchImpl, { pull_request: { number: 4380 } });
 
 			expect(process.exitCode).toBe(1);
-			expect(errorLog.mock.calls[0]?.[0]).toContain("250 or more commits");
+			expect(errorLog.mock.calls[0]?.[0]).toContain(
+				"pinned base and head SHAs",
+			);
 			errorLog.mockRestore();
 		});
 	});

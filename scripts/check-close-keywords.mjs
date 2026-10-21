@@ -39,10 +39,19 @@ function eventPayload() {
 const COMMIT_PAGE_SIZE = 100;
 const COMMIT_LIST_CAP = 250;
 const COMPARISON_COMMIT_CAP = 10_000;
+// Operator-approved apmantza/pi-lens snapshot; never take this pin from PR input.
+const APPROVED_UPSTREAM = "7f5af3a48ce72a7ad6b2ef712b09aa113541c1ac";
+const PROVENANCE_FORK = "brooksmcmillin/pi-lens";
 
 // Unlike the PR-list endpoint, an explicitly paginated comparison includes
 // the complete range. Pin both ends so pages cannot mix moving branch tips.
 async function fetchComparedCommits(base, head, fetchImpl) {
+	if (
+		![base, head].every(
+			(sha) => typeof sha === "string" && /^[a-f0-9]{40}$/.test(sha),
+		)
+	)
+		throw new Error("pinned base and head SHAs are required");
 	const commits = [];
 	const seen = new Set();
 	let total;
@@ -57,7 +66,9 @@ async function fetchComparedCommits(base, head, fetchImpl) {
 		if (
 			data.base_commit?.sha !== base ||
 			!Number.isSafeInteger(data.total_commits) ||
-			data.total_commits < 1 ||
+			data.total_commits < 0 ||
+			(data.total_commits === 0 &&
+				!["behind", "identical"].includes(data.status)) ||
 			data.total_commits > COMPARISON_COMMIT_CAP ||
 			(total !== undefined && total !== data.total_commits) ||
 			!Array.isArray(data.commits) ||
@@ -84,7 +95,7 @@ async function fetchComparedCommits(base, head, fetchImpl) {
 		)
 			throw new Error("GitHub comparison returned an incomplete commit range");
 		if (commits.length === total) {
-			if (!seen.has(head))
+			if (total > 0 && !seen.has(head))
 				throw new Error("GitHub comparison omitted the pinned head");
 			return commits;
 		}
@@ -114,17 +125,51 @@ async function fetchPrCommits(payloadPr, fetchImpl) {
 	if (commits.length >= COMMIT_LIST_CAP) {
 		const base = payloadPr.base?.sha;
 		const head = payloadPr.head?.sha;
-		if (
-			![base, head].every(
-				(sha) => typeof sha === "string" && /^[a-f0-9]{40}$/.test(sha),
-			)
-		)
-			throw new Error(
-				`the pull request has ${COMMIT_LIST_CAP} or more commits; pinned base and head SHAs are required`,
-			);
 		return fetchComparedCommits(base, head, fetchImpl);
 	}
 	return commits;
+}
+
+async function admitImportedClosures(result, base, fetchImpl) {
+	const upstream = new Set(
+		(await fetchComparedCommits(base, APPROVED_UPSTREAM, fetchImpl)).map(
+			({ sha }) => sha,
+		),
+	);
+	const imported = result.offenses.filter(({ sha }) => upstream.has(sha));
+	if (imported.length === 0) return result;
+
+	// Only a verified public repository makes a missing issue an unambiguous
+	// absence rather than a private-resource authorization failure.
+	const response = await githubGet("", fetchImpl);
+	if (!response.ok) throw new Error(`Fork lookup returned ${response.status}`);
+	const repository = await response.json();
+	if (repository.full_name !== PROVENANCE_FORK || repository.private !== false)
+		throw new Error("Imported references require the verified public fork");
+	const harmless = new Set();
+	for (const number of new Set(imported.map((offense) => offense.number))) {
+		const issueResponse = await githubGet(`/issues/${number}`, fetchImpl);
+		if (issueResponse.status === 404) {
+			harmless.add(number);
+			continue;
+		}
+		if (!issueResponse.ok)
+			throw new Error(
+				`Issue #${number} lookup returned ${issueResponse.status}`,
+			);
+		const issue = await issueResponse.json();
+		if (issue.number !== number || !["open", "closed"].includes(issue.state))
+			throw new Error(`GitHub returned an invalid issue #${number}`);
+		if (issue.state === "closed") harmless.add(number);
+	}
+	const offenses = result.offenses.filter(
+		({ sha, number }) => !(upstream.has(sha) && harmless.has(number)),
+	);
+	const admitted = result.offenses.length - offenses.length;
+	console.log(
+		`Close-keyword provenance: admitted ${admitted} imported reference(s) from ${APPROVED_UPSTREAM}.`,
+	);
+	return { ...result, valid: offenses.length === 0, offenses };
 }
 
 export async function lintPullRequest(
@@ -177,7 +222,25 @@ export async function lintPullRequest(
 		process.exitCode = 1;
 		return;
 	}
-	const commitResult = lintCommitCloseKeywords(commits, title, body);
+	let commitResult = lintCommitCloseKeywords(commits, title, body);
+	if (
+		!commitResult.valid &&
+		process.env.GITHUB_REPOSITORY === PROVENANCE_FORK
+	) {
+		try {
+			commitResult = await admitImportedClosures(
+				commitResult,
+				pullRequest.base?.sha,
+				fetchImpl,
+			);
+		} catch (error) {
+			console.error(
+				`::error::Close-keyword provenance could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			process.exitCode = 1;
+			return;
+		}
+	}
 	if (!commitResult.valid) {
 		for (const line of commitCloseKeywordErrors(commitResult))
 			console.error(line);

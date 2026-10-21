@@ -92,6 +92,12 @@ Issue references are optional in PR titles and commit subjects; conventional
 PR-title prefixes remain required. CI and local preflight do not validate PR-body
 structure, and CI does not gate on production dependency audit findings.
 
+Fork-sync close-reference admission belongs to `scripts/check-close-keywords.mjs`.
+Only commits verified against `APPROVED_UPSTREAM` may omit fork-body declarations,
+and only for absent or closed items in the verified public fork. The exception
+never authorizes closing an open fork item; unavailable evidence fails closed.
+Changing the approved upstream pin requires maintainer approval, not PR input.
+
 - Issues and PRs lead with the outcome, then evidence, root cause (or a labeled
   hypothesis), acceptance criteria, non-goals, failure semantics, test matrix,
   observability, and class-sweep coverage. Closing keywords go in the body,
