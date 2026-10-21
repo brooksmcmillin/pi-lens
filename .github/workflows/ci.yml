@@ -390,7 +390,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 15
+    timeout-minutes: 40
     permissions:
       contents: read
 
@@ -424,7 +424,14 @@ jobs:
       - name: Build dist
         run: npm run build:dist
 
+      # Direct node entry points do not receive npm run's local-bin PATH.
+      - name: Expose local tool binaries
+        run: echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
+
       - name: Run targeted tests
+        # PR26's 589-file integration exceeded 15 minutes. Leave 8 minutes for
+        # shuffle and 2 for setup/cleanup beneath the 40-minute job cap.
+        timeout-minutes: 30
         # --include-ci-only admits the real-spawn suites that exceed the local
         # pre-push budget (#3426 H3432-1); this job is their CI row.
         run: node scripts/pre-push-targeted-tests.mjs --skip-build --include-ci-only
@@ -438,7 +445,7 @@ jobs:
       # show no false red, move this step to its own job named
       # `Changed tests shuffled` and add it to the required set. The script
       # bounds itself to 7 min (BUDGET_MS), 1 min under this step's cap; the
-      # steps before it take ~5.5 min, so the job stays under its 15. Files the
+      # targeted step has its own 30-minute cap beneath the 40-minute job. Files the
       # PR adds run alone first; the time budget is the only bound (#4456).
       # The SHAs reach the script through `env`, never the `run:` text.
       - name: Changed test files, alone and shuffled

@@ -770,6 +770,42 @@ describe("targeted advisory workflow contract (#3215)", () => {
 		expect(selector).toContain("cap exceeded");
 	});
 
+	it("exposes installed tools before either direct-node test runner", () => {
+		const steps = readWorkflow().jobs["targeted-tests-advisory"].steps ?? [];
+		const tools = steps.findIndex(
+			(step) => step.name === "Expose local tool binaries",
+		);
+		expect(tools).toBeGreaterThan(
+			steps.findIndex((step) => step.name === "Install dependencies"),
+		);
+		expect(steps[tools]?.run).toBe(
+			'echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"',
+		);
+		for (const name of [
+			"Run targeted tests",
+			"Changed test files, alone and shuffled",
+		]) {
+			expect(tools).toBeLessThan(steps.findIndex((step) => step.name === name));
+		}
+	});
+
+	it("reserves shuffle and cleanup time after a large integration's targeted run", () => {
+		const job = readWorkflow().jobs["targeted-tests-advisory"];
+		const steps = job.steps ?? [];
+		const targeted = steps.find((step) => step.name === "Run targeted tests")?.[
+			"timeout-minutes"
+		];
+		const shuffle = steps.find(
+			(step) => step.name === "Changed test files, alone and shuffled",
+		)?.["timeout-minutes"];
+		// PR26 selected 589 files and was still running at the old 15-minute cap.
+		expect(targeted).toBe(30);
+		expect(shuffle).toBe(8);
+		expect(job["timeout-minutes"]).toBeGreaterThanOrEqual(
+			(targeted ?? Infinity) + (shuffle ?? Infinity) + 2,
+		);
+	});
+
 	// #4397 recurrence: a PR's new test file that depends on case order passes
 	// in CI's file order and reds on a reorder or a shard split (#4390, #4391).
 	// The step below is the only thing that reorders it before merge, so a
@@ -802,7 +838,7 @@ describe("targeted advisory workflow contract (#3215)", () => {
 		// A red selector must not skip it, and a cancelled run must.
 		expect(step.if).toBe("${{ !cancelled() }}");
 		// The script's own budget sits a minute under the step cap (the kill and
-		// the summary, #4456), the step cap under the job's (15 min).
+		// the summary, #4456), the step cap under the job's.
 		const stepCap = step["timeout-minutes"] ?? Infinity;
 		expect(stepCap * 60_000).toBeGreaterThanOrEqual(BUDGET_MS + 60_000);
 		expect(stepCap).toBeLessThan(job?.["timeout-minutes"] ?? 0);
