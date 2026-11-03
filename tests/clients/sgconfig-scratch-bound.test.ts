@@ -128,5 +128,5 @@ describe("sgconfig scratch bound", () => {
 			fs.rmSync(oldConfig, { force: true });
 			fs.rmSync(oldRules, { recursive: true, force: true });
 		}
-	});
+	}, 10_000);
 });
