@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { suspendAt } from "../clients/interleaving-kit.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
@@ -501,16 +502,13 @@ describe("lsp_diagnostics tool", () => {
 		);
 		const files = ["a.ts", "b.ts"].map((name) => path.join(tmpDir, name));
 		for (const file of files) fs.writeFileSync(file, "const value = 1;\n");
-		// #5005 F3: the abort lands while a file is in flight, constructed from the
-		// file's own touch instead of a 20 ms wall-clock timer. The answer route
-		// looks for out-of-band changes before the batch (#4532 gap 5), and that
-		// look legitimately precedes the first file, so a short timer can fire
-		// inside the look and leave the batch with no file in flight.
-		(mocked.service as any).touchFile = vi.fn(() => {
-			setTimeout(() => controller.abort(), 0);
-			return new Promise(() => {});
-		});
-		const started = Date.now();
+		// Discovery may precede the first touch. Judge cancellation only once
+		// that touch is pending, without letting the 1000ms file deadline fire.
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const touch = vi.fn();
+		(mocked.service as any).touchFile = touch;
+		const suspended = suspendAt(touch, () => new Promise(() => {}));
+		let settled = false;
 		const pending = tool.execute(
 			"diag-abort-contract",
 			{ paths: files, concurrency: 1, waitMs: 1 },
@@ -518,14 +516,22 @@ describe("lsp_diagnostics tool", () => {
 			null,
 			{ cwd: process.cwd() },
 		);
+		const completion = pending.then((result) => {
+			settled = true;
+			return result;
+		});
 		try {
-			const result = (await pending) as any;
-			// Below the 1000 ms per-file deadline, so the abort is what released the
-			// in-flight file rather than the deadline expiring.
-			expect(Date.now() - started).toBeLessThan(500);
+			await suspended.admitted;
+			controller.abort();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(settled, "abort completes before the file deadline").toBe(true);
+			const result = (await completion) as any;
 			expect(result.details?.outcomeCounts?.inconclusive).toBe(1);
 			expect(result.details?.incompleteFiles).toBe(1);
 		} finally {
+			suspended.restore();
+			vi.clearAllTimers();
+			vi.useRealTimers();
 			removeTempDirSync(tmpDir);
 			if (previous === undefined) delete process.env.PI_LENS_LSP_BATCH_FILE_MS;
 			else process.env.PI_LENS_LSP_BATCH_FILE_MS = previous;

@@ -200,8 +200,7 @@
 		"scripts/playground-verify-rule-bounded-wait.test.ts": 2,
 		"scripts/prune-agent-worktrees.test.ts": 1,
 		"scripts/suite-lock.test.ts": 1,
-		"support/fault-injection.test.ts": 1,
-		"tools/lsp-diagnostics.test.ts": 1
+		"support/fault-injection.test.ts": 1
 	},
 	"raw-timer-wait": {
 		"clients/actionable-warnings-bounds.test.ts": 2,
@@ -326,8 +325,7 @@
 		"tools/lens-diagnostics.test.ts": 1,
 		"tools/lsp-diagnostics-inline-blocker-retire.test.ts": 1,
 		"tools/lsp-diagnostics-per-server-concurrency.test.ts": 1,
-		"tools/lsp-diagnostics-silent-clean-flow.test.ts": 1,
-		"tools/lsp-diagnostics.test.ts": 1
+		"tools/lsp-diagnostics-silent-clean-flow.test.ts": 1
 	},
 	"ungoverned-wait-for": {
 		"clients/dependency-checker-state-generation.test.ts": 3,
@@ -404,8 +402,7 @@
 		"index-2939-read-path-witness.test.ts": 1,
 		"index-2939-tool-result-budget-witness.test.ts": 1,
 		"scripts/mutate-fixture.test.ts": 1,
-		"tools/lsp-diagnostics-silent-clean-flow.test.ts": 1,
-		"tools/lsp-diagnostics.test.ts": 1
+		"tools/lsp-diagnostics-silent-clean-flow.test.ts": 1
 	},
 	"in-process-mock": {
 		"clients/actionable-warnings-deferred-bounds.test.ts::clients/actionable-warnings-logger": 1,
