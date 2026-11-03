@@ -4,10 +4,10 @@
  * Runs `go vet` for Go files to catch common mistakes.
  */
 
-import { relative, resolve, sep, posix } from "node:path";
+import { resolve } from "node:path";
 
 import { goClient } from "../../go-client.js";
-import { pathsEqual } from "../../path-utils.js";
+import { pathsEqual, relativeInside } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { stripAnsi } from "../../sanitize.js";
@@ -43,15 +43,16 @@ const goVetRunner: RunnerDefinition = {
 		// (resolveLanguageRootForFile, markers ["go.mod"]), so vet the file's
 		// package from there.
 		const cwd = resolveRunnerCwd(ctx, "go-vet");
-		const fileRel = relative(cwd, ctx.filePath).split(sep).join(posix.sep);
-		const pkgPath = fileRel.startsWith("../")
-			? // File isn't under ctx.cwd (unexpected — ctx.cwd is the go.mod root).
-				// Vet the root package as a safe fallback rather than emit `./../x`;
-				// the filename filter below still prevents mis-attribution.
-				"."
-			: fileRel.includes("/")
-				? "./" + fileRel.slice(0, fileRel.lastIndexOf("/"))
-				: ".";
+		const fileRel = relativeInside(cwd, ctx.filePath);
+		const pkgPath =
+			fileRel === undefined
+				? // File isn't under ctx.cwd (unexpected — ctx.cwd is the go.mod root).
+					// Vet the root package as a safe fallback rather than emit `./../x`;
+					// the filename filter below still prevents mis-attribution.
+					"."
+				: fileRel.includes("/")
+					? "./" + fileRel.slice(0, fileRel.lastIndexOf("/"))
+					: ".";
 
 		const result = await safeSpawnAsync(goExe, ["vet", pkgPath], {
 			timeout: 30000,

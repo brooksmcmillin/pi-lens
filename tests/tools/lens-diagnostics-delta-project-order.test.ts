@@ -149,3 +149,61 @@ describe("mode=delta project-diagnostics row order (#3196 round 2, L1)", () => {
 		expect(ageIdx, text).toBeGreaterThan(projectIdx);
 	});
 });
+
+describe("mode=delta groups one file once under a session root spelled through a link (#4689)", () => {
+	// RECURRENCE GUARDED: #4689 review r2 B. Delta rows reach
+	// `getDeltaFileGroup` from producers on either axis: actionable warnings
+	// are keyed by the dispatch's path identity, a quality row may carry the
+	// session's spelling. The group was keyed and rendered by a lexical
+	// `path.relative` of each against the session root, so under a root
+	// reached through a link one file split into a `../repo/src/a.ts` group
+	// and a `src/a.ts` group.
+	it("renders the actionable and the quality row under one src/a.ts header", async (ctx) => {
+		const real = path.join(tmp, "repo");
+		const alias = path.join(tmp, "repo-alias");
+		fs.mkdirSync(path.join(real, "src"), { recursive: true });
+		try {
+			fs.symlinkSync("repo", alias, "dir");
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+		const spelled = path.join(alias, "src", "a.ts");
+		fs.writeFileSync(spelled, "const a = 1;\n");
+		const identity = fs.realpathSync.native(spelled);
+		const generatedAt = new Date().toISOString();
+		const warning = (message: string) => [
+			{ line: 1, rule: "r", tool: "eslint", message },
+		];
+		const tool = createLensDiagnosticsTool(
+			makeCacheManager({
+				"actionable-warnings": {
+					files: [{ filePath: identity, warnings: warning("from-actionable") }],
+					generatedAt,
+					summary: { warnings: 1 },
+				},
+				"code-quality-warnings": {
+					files: [{ filePath: spelled, warnings: warning("from-quality") }],
+					generatedAt,
+					summary: { warnings: 1 },
+				},
+			}) as any,
+			() => alias,
+		);
+		const result = (await tool.execute(
+			"1",
+			{ mode: "delta" },
+			undefined,
+			null,
+			{ cwd: alias },
+		)) as { content: Array<{ type: "text"; text: string }> };
+		const text = result.content.map((p) => p.text).join("\n");
+		// Premise: both producers' rows render.
+		expect(text).toContain("from-actionable");
+		expect(text).toContain("from-quality");
+		const headers = text
+			.split("\n")
+			.filter((line) => line.replace(/\\/g, "/").endsWith("src/a.ts"));
+		expect(headers, text).toEqual(["src/a.ts"]);
+		expect(text).not.toContain("../");
+	});
+});

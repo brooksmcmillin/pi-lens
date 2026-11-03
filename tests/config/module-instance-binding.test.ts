@@ -30,12 +30,6 @@ import { createAvailabilityChecker } from "../../clients/dispatch/runners/utils/
 // The reset under demonstration. Re-spell THIS one `.ts` to reproduce red.
 import { resetDispatchAvailabilityState } from "../../clients/dispatch/runners/utils/runner-helpers.js";
 
-vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
-	...(await importOriginal()),
-	logLatency: vi.fn(),
-	getLastLoggedPhase: () => undefined,
-}));
-
 vi.mock("../../clients/sessionstart-logger.js", () => ({
 	logSessionStart: vi.fn(),
 }));

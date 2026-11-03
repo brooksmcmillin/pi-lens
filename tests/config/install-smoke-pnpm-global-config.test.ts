@@ -242,8 +242,23 @@ function assertPnpmInstallPath(workflow: Workflow, jobName: string): void {
 	const rpcLines = executableLines(
 		stepRun(workflow, jobName, "Verify pi-lens loads via RPC"),
 	).join("\n");
+	if (jobName === "pi-load") {
+		expect(rpcLines).toContain(
+			'node "$GITHUB_WORKSPACE/scripts/rpc-load-check.mjs" "$(command -v pi)"',
+		);
+		return;
+	}
+	// Recurrence: install-smoke run 40173352720 (master 2026-10-24, after #4821).
+	// `$(command -v pi)` is a mise shim; the RPC smoke pins HOME to a scratch
+	// dir, so the shim resolves nothing and pi exits ("mise ERROR pi is not a
+	// valid shim"). The mise leg passes mise's real pi, and puts mise's own node
+	// first so pi's `#!/usr/bin/env node` does not fall through to the runner's
+	// system node under the same pin.
+	expect(rpcLines).not.toContain('"$(command -v pi)"');
+	expect(rpcLines).toContain('PI_BIN="$(mise which pi)"');
+	expect(rpcLines).toContain('MISE_NODE_DIR="$(dirname "$(mise which node)")"');
 	expect(rpcLines).toContain(
-		'node "$GITHUB_WORKSPACE/scripts/rpc-load-check.mjs" "$(command -v pi)"',
+		'PATH="$MISE_NODE_DIR:$PATH" node "$GITHUB_WORKSPACE/scripts/rpc-load-check.mjs" "$PI_BIN"',
 	);
 }
 

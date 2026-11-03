@@ -50,7 +50,7 @@
  *
  * ## The baseline
  *
- * The population this rule finds today predates it: 1,188 handlers across 246
+ * The population this rule finds today predates it: 1,188 handlers across 247
  * files swallow by design or by history, and rewriting them is not this
  * change. Each file's silent count AND the content identity of its admitted
  * handler set are pinned together, so a NEW silent handler reds even when an
@@ -88,6 +88,8 @@ import {
 	type CatchSite,
 	scanSilentCatches,
 } from "../support/silent-catch-scan.js";
+import { currentPeakRssMb, reportPeakRss } from "../support/worker-peak-rss.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -132,7 +134,7 @@ const SHARP_HOST =
 
 /**
  * The population on the merge of `origin/master` (`d7f85d909`) and this change,
- * one row per file: 1,188 silent handlers in 246 files, each row pinned by
+ * one row per file: 1,188 silent handlers in 247 files, each row pinned by
  * count and by the content identity of its admitted set. Shrink only.
  */
 const BASELINE: Readonly<Record<string, Admission>> = {
@@ -145,17 +147,17 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		silent: 4,
 		identities: "4be1802a08b42400",
 		reason: PRE_RULE,
-	}, // :49, :70, :186, :384
+	}, // :55, :76, :197, :396
 	"clients/agent-nudge.ts": {
 		silent: 3,
 		identities: "3009ae881ca29582",
 		reason: PRE_RULE,
 	}, // :427, :431, :615
 	"clients/analysis-root.ts": {
-		silent: 2,
-		identities: "1ba786260b8caf72",
+		silent: 1,
+		identities: "7b52b635719a3045",
 		reason: PRE_RULE,
-	}, // :43, :67
+	}, // :50 (2 -> 1, #4689: `realPathOrResolved` folded onto path-utils)
 	"clients/ast-grep-client.ts": {
 		silent: 5,
 		identities: "e0171caad3e9bf11",
@@ -228,9 +230,9 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 	}, // :299, :345, :362, :386, :400, :623
 	"clients/cache-observability.ts": {
 		silent: 10,
-		identities: "765e8cbdadc92783",
+		identities: "1386f1967c2c9482",
 		reason: PRE_RULE,
-	}, // :507, :837, :862, :882, :1176, :1186, :1239, :1264, :1427, :1587
+	}, // :589, :1118, :1143, :1163, :1648, :1658, :1711, :1736, :1949, :2246
 	"clients/cache/rule-cache.ts": {
 		silent: 5,
 		identities: "4332dc8628e97e3b",
@@ -351,9 +353,15 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		identities: "809dfcb662f6df93",
 		reason: PRE_RULE,
 	}, // :239, :254, :343, :363, :400
+	"clients/disk-change-subscribers.ts": {
+		silent: 2,
+		identities: "c7b556989b96b5f2",
+		reason:
+			"#4535 slice 2 moved both here verbatim from `clients/runtime-tool-result.ts`'s held-primary pass, and they are the same two best-effort reads they were there: a document whose disk bytes cannot be read is still a held document whose server view may be stale (the caller reports it as a target), and a primary send that throws is reported to the detector as `failed: true`, which is the row that surfaces it (`bash_write_primary_resync`, `opaque_mutation_head_moved`). Neither is a dropped failure: the first arms the delivery, the second is a classification the caller reads.",
+	}, // :193, :207
 	"clients/dispatch/dispatcher.ts": {
 		silent: 7,
-		identities: "fc89485966eea956",
+		identities: "0cbf028fed5fa5bf",
 		reason: PRE_RULE,
 	}, // :316, :331, :337, :1102, :1807, :1815, :2039
 	"clients/dispatch/facts/file-content.ts": {
@@ -551,11 +559,6 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		identities: "d8fb5fd4d9ec3e87",
 		reason: PRE_RULE,
 	}, // :49, :103
-	"clients/ephemeral-root.ts": {
-		silent: 1,
-		identities: "e6a61419909e565c",
-		reason: PRE_RULE,
-	}, // :43
 	"clients/event-loop-hold.ts": {
 		silent: 2,
 		identities: "255f028624add8ac",
@@ -572,20 +575,20 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :55
 	"clients/file-mutation-queue.ts": {
-		silent: 2,
-		identities: "c27b672b48b38606",
+		silent: 1,
+		identities: "ff8063b5aa2abd0d",
 		reason: PRE_RULE,
-	}, // :104, :141
+	}, // :103
 	"clients/file-time.ts": {
-		silent: 2,
-		identities: "cef7af043e4732be",
+		silent: 1,
+		identities: "addabcaec0339b4f",
 		reason: PRE_RULE,
-	}, // :148, :202
+	}, // :168 (2 -> 1, #5120: the write lock's swallow went with withLock)
 	"clients/file-utils.ts": {
-		silent: 11,
-		identities: "282279822595e8b0",
+		silent: 10,
+		identities: "6ae9ab1bab948b4e",
 		reason: PRE_RULE,
-	}, // :141, :161, :179, :183, :186, :228, :299, :725, :1085, :1366, :1397
+	}, // :339, :359, :377, :381, :384, :511, :939, :1399, :1686, :1717 (#4689 batch 8: dataDirCanonicalRoot's realpath-probe catch is gone with the probe; the adoption's handlers declare their none)
 	"clients/fix-run-restore.ts": {
 		silent: 10,
 		identities: "24b4689d533166d4",
@@ -618,7 +621,7 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 	}, // :47, :57, :73, :117, :152, :192, :215, :243, :282, :310
 	"clients/git-guard.ts": {
 		silent: 3,
-		identities: "20ed3070a07a59a4",
+		identities: "019c17dcf7d22fe6",
 		reason: PRE_RULE,
 	}, // :69, :908, :1432
 	"clients/git-tracked-ignore.ts": {
@@ -627,10 +630,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :108, :205
 	"clients/gitleaks-client.ts": {
-		silent: 9,
-		identities: "a84c4542ebcd6944",
+		silent: 7,
+		identities: "b7d8104671a0bad6",
 		reason: PRE_RULE,
-	}, // :158, :269, :287, :301, :323, :461, :470, :525, :592
+	}, // :156, :267, :285, :299, :321, :489, :556
 	"clients/govulncheck-client.ts": {
 		silent: 5,
 		identities: "e7742f12d2580226",
@@ -662,10 +665,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :63, :176
 	"clients/installer/index.ts": {
-		silent: 60,
-		identities: "b2e5789ab5826d04",
+		silent: 56,
+		identities: "c9c8202f747f0522",
 		reason: PRE_RULE,
-	}, // :155, :192, :197, :207, :218, :231, :288, :2163, :2470, :2557, :2576, :2710, :2722, :2748, :3083, :3123, :3158, :3170, :3292, :3315, :3337, :3507, :3603, :3671, :3699, :3788, :3866, :3874, :3989, :4549, :4602, :4793, :4833, :5306, :5341, :5494, :5511, :5536, :5567, :5570, :5576, :5592, :5629, :5632, :5717, :5804, :5905, :5912, :6104, :6127, :6185, :6195, :6199, :6232, :6296, :6332, :6369, :6487, :6646, :6716
+	}, // :171, :208, :213, :223, :234, :247, :304, :2271, :2600, :2684, :2819, :2831, :2857, :3197, :3238, :3273, :3285, :3407, :3430, :3452, :3622, :3724, :3792, :3826, :3966, :3974, :4642, :4695, :4886, :4926, :5410
 	"clients/installer/managed-tool-refresh.ts": {
 		silent: 4,
 		identities: "dbbc0961e686ccc4",
@@ -762,10 +765,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :483, :777, :767, :818, :1034, :1369, :1466, :1782
 	"clients/lsp/client.ts": {
-		silent: 35,
-		identities: "6d005aad696ad153",
+		silent: 34,
+		identities: "bf780f9a41c81ff1",
 		reason: PRE_RULE,
-	}, // :1477, :1535, :1598, :1605, :1693, :3090, :3343, :3736, :3829, :3853, :3899, :4526, :4715, :4893, :5097, :5270, :5337, :5351, :5454, :5504, :5638, :5659, :5781, :5791, :5880, :5946, :6067, :7189, :7192, :7206, :7268, :7548, :7560, :7569, :7583
+	}, // :1559, :1617, :1680, :1687, :1775, :3444, :3712, :4105, :4198, :4222, :4268, :4957, :5150, :5350, :5575, :5748, :5815, :5829, :5932, :5982, :6116, :6137, :6259, :6269, :6358, :6431, :6573, :7718, :7721, :7735, :7821, :8104, :8116, :8125, :8139
 	"clients/lsp/config.ts": {
 		silent: 1,
 		identities: "2d7a194222ea5fe3",
@@ -787,25 +790,27 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :537, :619, :634, :684, :712
 	"clients/lsp/edits.ts": {
-		silent: 3,
-		identities: "09a1a8f35510f0a5",
+		silent: 2,
+		identities: "fe66130669c23fb1",
 		reason: PRE_RULE,
-	}, // :1023, :1055, :1103
+	}, // :1248, :1280
+	// 42, re-pinned (#3734 r3): the willRenameFiles catch in `renameFile`
+	// (:7890) now returns its own failed flag; no handler added or removed.
 	"clients/lsp/index.ts": {
 		silent: 42,
-		identities: "ed45c04b6c34030f",
+		identities: "375f1ae9e0f9bc6e",
 		reason: SHARP_DID_SAVE,
-	}, // :235, :352, :381, :1157, :1757, :2014, :2312, :2346, :2582, :2735, :2839, :3555, :3615, :3649, :4082, :4646, :4896, :5025, :5088, :5099, :5145, :5234, :5259, :5284, :5569, :5632, :5983, :6007, :6172, :6249, :6268, :7781, :8348, :8580, :8648, :8770, :8864, :8924, :9142, :9269, :9642, :9693
+	}, // :239, :356, :385, :1161, :1761, :2018, :2316, :2350, :2586, :2759, :2878, :3607, :3667, :3701, :4134, :4713, :4963, :5092, :5155, :5166, :5212, :5301, :5326, :5351, :5645, :5708, :6063, :6087, :6252, :6329, :6348, :7890, :8475, :8707, :8775, :8897, :8991, :9051, :9288, :9415, :9788, :9839
 	"clients/lsp/jvm-runtime.ts": {
 		silent: 1,
 		identities: "53f0ed4e5a760b9e",
 		reason: PRE_RULE,
 	}, // :65
 	"clients/lsp/launch.ts": {
-		silent: 11,
-		identities: "679b905d4af5e7db",
+		silent: 9,
+		identities: "eca31a5fa3dd4517",
 		reason: PRE_RULE,
-	}, // :97, :195, :294, :359, :392, :649, :655, :881, :1110, :1121, :1132
+	}, // :105, :295, :406, :753, :759, :1012, :1237, :1248, :1259
 	"clients/lsp/lombok.ts": {
 		silent: 6,
 		identities: "a076d98b1826881f",
@@ -817,10 +822,14 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :57, :79
 	"clients/lsp/server.ts": {
-		silent: 28,
-		identities: "8d1137f64482cd05",
+		silent: 30,
+		// 28 -> 30 (#4914): `findEffectTsgoLsp` answers `undefined` for an absent or
+		// unreadable `@effect/tsgo` manifest and skips a missing bin candidate, the
+		// same shape as `findNativeTypeScriptLsp`'s probe; either way the launch
+		// falls back to the native `tsc`, whose own session-start line names it.
+		identities: "b84df3748a14a0b7",
 		reason: PRE_RULE,
-	}, // :185, :335, :759, :790, :1019, :1219, :1352, :1484, :1673, :1754, :1776, :2086, :2165, :2180, :2194, :2211, :2229, :2261, :2288, :2301, :2379, :2391, :2412, :2433, :2625, :2633, :2663, :3201
+	}, // :223, :377, :890, :921, :1150, :1350, :1483, :1615, :1806, :1953, :1975, :2306, :2385, :2400, :2414, :2431, :2449, :2481, :2508, :2521, :2601, :2613, :2634, :2659, :2700, :2714, :2928, :2936, :2966, :3610
 	"clients/lsp/service-singleton.ts": {
 		silent: 1,
 		identities: "f88b642322d541aa",
@@ -872,10 +881,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :77, :387
 	"clients/metrics-history.ts": {
-		silent: 2,
-		identities: "b02d9c45b1a0e889",
+		silent: 1,
+		identities: "27637aebe860adac",
 		reason: PRE_RULE,
-	}, // :95, :119
+	}, // :112
 	"clients/module-report-lsp.ts": {
 		silent: 3,
 		identities: "2482911206cf896e",
@@ -923,29 +932,29 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 	}, // :291, :328, :387
 	"clients/out-of-band-changes.ts": {
 		silent: 3,
-		identities: "7d466b1252af9e30",
+		identities: "f6a8dcd9fdd0254e",
 		reason: SHARP_INSTALL_STAMP,
-	}, // :129, :140, :189
+	}, // :184, :220, :334
 	"clients/package-manager.ts": {
 		silent: 2,
 		identities: "56b6f18636fed761",
 		reason: PRE_RULE,
 	}, // :113, :468
 	"clients/partial-edit-apply.ts": {
-		silent: 3,
-		identities: "9457f6c639682a54",
+		silent: 1,
+		identities: "cf08efebeaedf178",
 		reason: PRE_RULE,
-	}, // :304, :457, :477
+	}, // :277 (3 -> 1, #5120: the partial-apply writer and its catches are gone)
 	"clients/path-birth.ts": {
 		silent: 1,
 		identities: "b47f07ef1f3c61f0",
 		reason: PRE_RULE,
 	}, // :97
 	"clients/path-utils.ts": {
-		silent: 9,
-		identities: "9bb4a21080715db3",
+		silent: 8,
+		identities: "a67f7f2c5485dc04",
 		reason: PRE_RULE,
-	}, // :286, :297, :303, :316, :410, :433, :702, :1215, :1471
+	}, // :300, :311, :317, :468, :491, :760, :1283, :1539 (9 -> 8, #4689: the identity walk's catch is a `none:` line)
 	"clients/performance-report.ts": {
 		silent: 3,
 		identities: "9285fe879a302231",
@@ -1020,7 +1029,7 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		silent: 2,
 		identities: "dcac541cf34d63cd",
 		reason: PRE_RULE,
-	}, // :84, :336
+	}, // :86, :338
 	"clients/quiet-window.ts": {
 		silent: 2,
 		identities: "2c704faa2d7cb264",
@@ -1102,25 +1111,25 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :1027, :1085, :1531, :2909
 	"clients/runtime-session.ts": {
-		silent: 25,
-		identities: "a7ef9ab6e86045e5",
+		silent: 24,
+		identities: "8e72ef4e0c693497",
 		reason: PRE_RULE,
-	}, // :385, :755, :803, :810, :896, :923, :971, :1005, :1007, :1032, :1062, :1195, :1246, :1389, :1986, :2560, :2592, :2695, :2766, :2771, :2837, :3025, :3355, :3369, :3442
+	}, // :403, :648, :901, :949, :956, :1042, :1069, :1146, :1181, :1183, :1208, :1238, :1371, :1422, :1592, :2189, :2782, :2814, :2922, :2999, :3004, :3414, :3428, :3501
 	"clients/runtime-tool-call.ts": {
-		silent: 14,
-		identities: "b84fa260556085b3",
+		silent: 13,
+		identities: "b762cfa28254b8b0",
 		reason: `${PRE_RULE} Fork #25 retains three opaque-replacement probes whose failures become explicit preflight blocking results; runtime-tool-call.test.ts covers refusal and receipt creation.`,
-	}, // :286, :461, :485, :799, :960, :966, :1133, :1356, :1705, :1813, :1906
+	},
 	"clients/runtime-tool-result.ts": {
-		silent: 12,
-		identities: "6048a226db485dea",
+		silent: 9,
+		identities: "b34b5e082d0b70b8",
 		reason: SHARP_TOOL_RESULT,
-	}, // :266, :280, :410, :860, :955, :1150, :1602, :2152, :2385, :2819, :3397, :3621
+	}, // :399, :919, :1014, :1209, :1661, :2495, :2929, :3507, :3731
 	"clients/runtime-turn.ts": {
 		silent: 20,
-		identities: "4baf397dfa7d293d",
+		identities: "d3c52ebe36413a9f",
 		reason: PRE_RULE,
-	}, // :393, :413, :438, :689, :738, :750, :817, :1043, :3319, :3325, :3331, :4697, :4524, :4645, :4678, :4899, :5032, :5352, :5393, :5648
+	}, // :393, :413, :438, :696, :761, :773, :840, :1066, :3342, :3348, :3354, :4720, :4547, :4668, :4701, :4922, :5055, :5375, :5416, :5671
 	"clients/safe-spawn.ts": {
 		silent: 20,
 		identities: "796ea328bac05569",
@@ -1152,10 +1161,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :171, :579, :608, :904, :1108
 	"clients/sgconfig.ts": {
-		silent: 9,
-		identities: "e709eb6e68b73320",
+		silent: 8,
+		identities: "8fd40026fc0c11bb",
 		reason: PRE_RULE,
-	}, // :61, :144, :176, :212, :405, :424, :447, :476, :480
+	}, // :136, :168, :204, :397, :416, :439, :468, :472
 	"clients/single-flight.ts": {
 		silent: 1,
 		identities: "9b712a522f01e05f",
@@ -1177,10 +1186,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :48, :73
 	"clients/test-runner-client.ts": {
-		silent: 16,
-		identities: "06aea9d4bef19d77",
+		silent: 14,
+		identities: "5966330aef56c708",
 		reason: PRE_RULE,
-	}, // :325, :734, :749, :1046, :1096, :1112, :1156, :1185, :1230, :1334, :1535, :1914, :1991, :2233, :3368, :3377
+	}, // :331, :1048, :1098, :1114, :1158, :1188, :1233, :1337, :1538, :1917, :1994, :2236, :3372, :3381
 	"clients/test-runner-delivery.ts": {
 		silent: 2,
 		identities: "f4ada83f93d3b6b9",
@@ -1232,10 +1241,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :848
 	"clients/trivy-client.ts": {
-		silent: 8,
-		identities: "184de0f9f29457b3",
+		silent: 6,
+		identities: "7437ffe9ed1a72cd",
 		reason: PRE_RULE,
-	}, // :165, :186, :220, :403, :412, :442, :496, :539
+	}, // :163, :184, :218, :407, :461, :504
 	"clients/tui-fit.ts": {
 		silent: 1,
 		identities: "bdb9736abc0aae9d",
@@ -1278,9 +1287,9 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 	}, // :196, :204, :228, :333, :572
 	"index.ts": {
 		silent: 49,
-		identities: "f18d77c651d657a6",
+		identities: "b48916790863d67b",
 		reason: SHARP_HOST,
-	}, // :502, :653, :759, :763, :1061, :1084, :1390, :1540, :1697, :1716, :1725, :1768, :1835, :2079, :2090, :2123, :2174, :2204, :2310, :2362, :2452, :2480, :2552, :2653, :2665, :2722, :2728, :2850, :2874, :2941, :3103, :3190, :3316, :3348, :3424, :3597, :3618, :3695, :3800, :3833, :3920, :3957, :3972, :3999, :4034, :4045, :4363, :4370, :4588
+	}, // :522, :673, :779, :783, :1118, :1141, :1454, :1604, :1761, :1780, :1789, :1832, :1899, :2143, :2154, :2187, :2238, :2268, :2401, :2453, :2543, :2571, :2644, :2745, :2757, :2814, :2820, :2946, :2970, :3047, :3222, :3270, :3369, :3495, :3527, :3603, :3777, :3854, :3959, :3992, :4079, :4116, :4131, :4158, :4193, :4204, :4537, :4544, :4877
 	"mcp/analyze-cli.ts": {
 		silent: 1,
 		identities: "e823b8d7883207bc",
@@ -1327,20 +1336,24 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :110, :188, :222, :337, :387, :412
 	"tools/lens-diagnostics.ts": {
-		silent: 7,
-		identities: "0939abd4809b0410",
+		// 7 -> 6 (#5041): the `paths` cap guard's try/catch is gone, because the
+		// shared reader refuses an over-cap list before the scope is built.
+		silent: 6,
+		identities: "58466145d579efae",
 		reason: PRE_RULE,
-	}, // :254, :678, :879, :939, :1391, :1471, :2162
+	}, // :276, :980, :1040, :1495, :1555, :2269
 	"tools/lsp-diagnostics.ts": {
 		silent: 10,
 		identities: "2e5c32f96dcee285",
 		reason: PRE_RULE,
 	}, // :371, :405, :628, :861, :1026, :1084, :1184, :1405, :1452, :2477
 	"tools/lsp-navigation.ts": {
-		silent: 8,
-		identities: "7d261d33eecee18f",
-		reason: PRE_RULE,
-	}, // :529, :739, :757, :1200, :1569, :1676, :1710, :1898
+		silent: 9,
+		identities: "0ea45645359d3e6d",
+		reason:
+			PRE_RULE +
+			"; #5211 re-admits the same eight handlers after the terminal tool catch switches from instanceof to the cross-evaluation timeout brand; every arm of that catch still calls finalize, and the real service-route timeout witness plus ordinary-error cases prove delivery. The other seven inherited handlers retain the pre-rule admission. #5214 F4 admits one definition-timeout recovery catch: successful recovery is disclosed in the tool note, while misses and thrown fallbacks rethrow the original deadline to finalize; the real-child hit/miss/double-timeout witnesses prove both delivery outcomes.",
+	}, // :591, :801, :819, :1280, :1697, :1804, :1838, :2024
 	"tools/lsp-structured-output.ts": {
 		silent: 3,
 		identities: "0460d5b535aef4a2",
@@ -1375,9 +1388,17 @@ const BASELINE: Readonly<Record<string, Admission>> = {
  * the every-path rule (#4603 review F1) reclassified 20 conditional records and
  * 7 conditional rethrows as `silent`, and reading `.then(ok, onRejected)` made
  * 25 more silent sites visible, so the merged population is 1,188 (1,143 under
- * the old rule on the same tree). It moves only downward from here.
+ * the old rule on the same tree). #4530 routed the installer's raw starts,
+ * the launcher's PATH walk and metrics-history's git probe through the spawn
+ * seam, and the merged tree's population is 1,175. Folding gitleaks's and trivy's
+ * report-scan bodies onto `SecurityScanClient.runReportScan` removed four
+ * silent handlers and spent one `none:` line in the one copy, so it is 1,171.
+ * The PATH walk moved out of the installer into `clients/command-path.ts` with
+ * its one handler spent on a `none:` line (#5119), so it is 1,170.
+ * It moves only downward from here.
  */
-const PINNED_TOTAL = 1190;
+// Fork receipt and Windows rejection handlers remain admitted above.
+const PINNED_TOTAL = 1165;
 
 interface Census {
 	byFile: Map<string, CatchSite[]>;
@@ -1389,7 +1410,7 @@ interface Census {
 	scannedFiles: number;
 }
 
-function scanShippedTrees(): Census {
+async function scanShippedTrees(): Promise<Census> {
 	const files = [
 		...SHIPPED_TREES.flatMap((dir) =>
 			listSourceFiles(path.join(REPO_ROOT, dir), { skipTests: true }),
@@ -1423,11 +1444,19 @@ function scanShippedTrees(): Census {
 				census.byFile.set(rel, sites);
 			}
 		}
+		// #4736: turn the event loop between files. `@ast-grep/napi` frees a
+		// dropped tree's native arena from a finalizer that only runs once the
+		// loop turns, so the synchronous walk held every one of the ~530 parsed
+		// trees at once (1,902 MB peak RSS against 44 MB of V8 heap, 4% under
+		// the #3058 budget). One turn per file brings the peak to ~340 MB with
+		// the same finding list (the same fix `vi-mock-export-sweep.test.ts`
+		// and `flake-shape-scan.ts` took, #3565).
+		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 	return census;
 }
 
-const census = scanShippedTrees();
+const census = await scanShippedTrees();
 const printPins = process.env.PI_LENS_PRINT_PINS === "1";
 
 function sortedByFile<T>(entries: Iterable<[string, T]>): Array<[string, T]> {
@@ -1562,72 +1591,126 @@ function admitted(count = 1): Admission {
 const ADMITTED: Admission = admitted();
 
 describe("silent-catch sweep", () => {
-	it("scans the shipped trees", () => {
-		assertNonEmptyScan("silent-catch sweep", census.scannedFiles, 300);
+	it(
+		"scans the shipped trees",
+		() => {
+			assertNonEmptyScan("silent-catch sweep", census.scannedFiles, 300);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	// Recurrence (#4736): the walk parsed ~530 files in one synchronous loop, so
+	// `@ast-grep/napi` kept every native tree until the file ended and the
+	// worker peaked at 1,902 MB, 4% under the 2,048 MB budget (#3058); +0.34% of
+	// source (#4713) crossed it and redded Unit shard 2/5. With the loop turned
+	// per file the peak is ~340 MB. This ceiling is the issue's acceptance bar
+	// and sits 1,000 MB above the fixed peak, below the first red, so growth
+	// of the source cannot walk the sweep back to the budget unseen.
+	// The ceiling check belongs to the peak-RSS seam, which enforces on linux
+	// only (darwin's `ru_maxrss` is bytes): this case asks it instead of
+	// dividing `maxRSS` itself.
+	it("holds the walk's peak RSS under 1,600 MB (#4736)", () => {
+		expect(() =>
+			reportPeakRss({
+				file: "tests/config/silent-catch-sweep.test.ts",
+				peakRssMb: currentPeakRssMb(),
+				heapUsedMb: 0,
+				externalMb: 0,
+				write: () => {},
+				ceilingMb: 1600,
+			}),
+		).not.toThrow();
 	});
 
-	it("pins existing unresolved delegations and refuses every new one", () => {
-		expect(
-			census.unclassified.map(({ file, site }) => `${file}:${site.identity}`),
-		).toEqual([
-			// Pre-#4596 delegation sites, formerly silent: reject/release is
-			// supplied by another owner. Exact identities admit no new site.
-			"clients/file-mutation-queue.ts:02b17661",
-			"clients/file-mutation-queue.ts:1e574bad",
-			"clients/lsp/index.ts:5c031860",
-			"clients/mcp/session.ts:b686230d",
-			"clients/runtime-tool-result.ts:ed3d6e88",
-			"clients/runtime-tool-result.ts:6e0f90a7",
-			"clients/runtime-tool-result.ts:ed3d6e88",
-		]);
-	});
+	it(
+		"pins existing unresolved delegations and refuses every new one",
+		() => {
+			expect(
+				census.unclassified.map(({ file, site }) => `${file}:${site.identity}`),
+			).toEqual([
+				// Pre-#4596 delegation sites, formerly silent: reject/release is
+				// supplied by another owner. Exact identities admit no new site.
+				"clients/file-mutation-queue.ts:02b17661",
+				"clients/file-mutation-queue.ts:1e574bad",
+				"clients/lsp/index.ts:5c031860",
+				"clients/mcp/session.ts:b686230d",
+				"clients/runtime-tool-result.ts:ed3d6e88",
+				"clients/runtime-tool-result.ts:6e0f90a7",
+				"clients/runtime-tool-result.ts:ed3d6e88",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("derives the verdicts this sweep claims to distinguish", () => {
-		// Floors, not constants: the point is that every detector still finds a
-		// population, so a broken seam regex, rethrow reader or `none:` reader
-		// reds here instead of quietly reclassifying the tree.
-		assertNonEmptyScan("recorded handlers", census.recorded, 100);
-		assertNonEmptyScan("rethrow-only handlers", census.rethrows, 1);
-		assertNonEmptyScan("declared-none handlers", census.declaredNone, 1);
-	});
+	it(
+		"derives the verdicts this sweep claims to distinguish",
+		() => {
+			// Floors, not constants: the point is that every detector still finds a
+			// population, so a broken seam regex, rethrow reader or `none:` reader
+			// reds here instead of quietly reclassifying the tree.
+			assertNonEmptyScan("recorded handlers", census.recorded, 100);
+			assertNonEmptyScan("rethrow-only handlers", census.rethrows, 1);
+			assertNonEmptyScan("declared-none handlers", census.declaredNone, 1);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("admits no silent handler outside the pinned population", () => {
-		const audit = auditSilentCatches(census);
-		expect({ unlisted: audit.unlisted, mismatched: audit.mismatched }).toEqual({
-			unlisted: [],
-			mismatched: [],
-		});
-	});
+	it(
+		"admits no silent handler outside the pinned population",
+		() => {
+			const audit = auditSilentCatches(census);
+			expect({
+				unlisted: audit.unlisted,
+				mismatched: audit.mismatched,
+			}).toEqual({
+				unlisted: [],
+				mismatched: [],
+			});
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("keeps every pinned row alive and every admission reasoned", () => {
-		const audit = auditSilentCatches(census);
-		expect({ dead: audit.dead, unreasoned: audit.unreasoned }).toEqual({
-			dead: [],
-			unreasoned: [],
-		});
-	});
+	it(
+		"keeps every pinned row alive and every admission reasoned",
+		() => {
+			const audit = auditSilentCatches(census);
+			expect({ dead: audit.dead, unreasoned: audit.unreasoned }).toEqual({
+				dead: [],
+				unreasoned: [],
+			});
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("holds the pinned total, which only shrinks", () => {
-		// A row deleted while another grew keeps the per-file check honest only if
-		// the total is also pinned: this is the one number a reviewer reads.
-		expect(auditSilentCatches(census).overTotal).toBe(false);
-		expect(census.byFile.size).toBe(Object.keys(BASELINE).length);
-	});
+	it(
+		"holds the pinned total, which only shrinks",
+		() => {
+			// A row deleted while another grew keeps the per-file check honest only if
+			// the total is also pinned: this is the one number a reviewer reads.
+			expect(auditSilentCatches(census).overTotal).toBe(false);
+			expect(census.byFile.size).toBe(Object.keys(BASELINE).length);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("prints the census a future round re-derives", () => {
-		const report = {
-			scannedFiles: census.scannedFiles,
-			recorded: census.recorded,
-			rethrows: census.rethrows,
-			declaredNone: census.declaredNone,
-			silent: census.silent,
-			files: census.byFile.size,
-			unclassified: census.unclassified.length,
-		};
-		if (printPins)
-			console.log(`${JSON.stringify(report)}\n${pins(census).join("\n")}`);
-		expect(report.silent).toBeLessThanOrEqual(PINNED_TOTAL);
-	});
+	it(
+		"prints the census a future round re-derives",
+		() => {
+			const report = {
+				scannedFiles: census.scannedFiles,
+				recorded: census.recorded,
+				rethrows: census.rethrows,
+				declaredNone: census.declaredNone,
+				silent: census.silent,
+				files: census.byFile.size,
+				unclassified: census.unclassified.length,
+			};
+			if (printPins)
+				console.log(`${JSON.stringify(report)}\n${pins(census).join("\n")}`);
+			expect(report.silent).toBeLessThanOrEqual(PINNED_TOTAL);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 
 /** One case per branch of {@link auditSilentCatches}, each planting its own

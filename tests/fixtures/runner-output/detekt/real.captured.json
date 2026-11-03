@@ -1,0 +1,50 @@
+{
+	"provenance": {
+		"runner": "detekt",
+		"tool": "detekt",
+		"version": "1.23.8",
+		"command": "detekt --input __WORKSPACE__/Bad.kt --config __WORKSPACE__/detekt.yml",
+		"argv": [
+			"--input",
+			"__WORKSPACE__/Bad.kt",
+			"--config",
+			"__WORKSPACE__/detekt.yml"
+		],
+		"versionArgv": [
+			"--version"
+		],
+		"workspace": "tests/fixtures/tool-smoke/detekt",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-20"
+	},
+	"availability": [
+		{
+			"command": "detekt",
+			"argv": [
+				"--version"
+			],
+			"version": "1.23.8",
+			"exitCode": 0,
+			"stdout": "1.23.8\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/detekt",
+		"file": "Bad.kt",
+		"argv": [
+			"--input",
+			"__WORKSPACE__/Bad.kt",
+			"--config",
+			"__WORKSPACE__/detekt.yml"
+		],
+		"version": "1.23.8",
+		"exitCode": 0,
+		"stdout": ".\n\n1 kotlin file was analyzed.\nComplexity Report:\n\t- 4 lines of code (loc)\n\t- 3 source lines of code (sloc)\n\t- 2 logical lines of code (lloc)\n\t- 0 comment lines of code (cloc)\n\t- 1 cyclomatic complexity (mcc)\n\t- 0 cognitive complexity\n\t- 0 number of total code smells\n\t- 0% comment source ratio\n\t- 500 mcc per 1,000 lloc\n\t- 0 code smells per 1,000 lloc\n\nProject Statistics:\n\t- number of properties: 0\n\t- number of functions: 1\n\t- number of classes: 0\n\t- number of packages: 1\n\t- number of kt files: 1\n\n",
+		"stderr": ""
+	},
+	"file": "Bad.kt",
+	"exitCode": 2,
+	"stdout": ".\n\n1 kotlin file was analyzed.\n__WORKSPACE__/Bad.kt:2:5: This comment contains 'TODO:' that has been defined as forbidden. [ForbiddenComment]\n\n__WORKSPACE__/Bad.kt - 10min debt\n\t\u001b[33mForbiddenComment - [This comment contains 'TODO:' that has been defined as forbidden.] at __WORKSPACE__/Bad.kt:2:5\u001b[0m\n\nOverall debt: 10min\n\nstyle - 10min debt\n\t\u001b[33mForbiddenComment - [This comment contains 'TODO:' that has been defined as forbidden.] at __WORKSPACE__/Bad.kt:2:5\u001b[0m\n\nOverall debt: 10min\n\nComplexity Report:\n\t- 5 lines of code (loc)\n\t- 3 source lines of code (sloc)\n\t- 2 logical lines of code (lloc)\n\t- 1 comment lines of code (cloc)\n\t- 1 cyclomatic complexity (mcc)\n\t- 0 cognitive complexity\n\t- 1 number of total code smells\n\t- 33% comment source ratio\n\t- 500 mcc per 1,000 lloc\n\t- 500 code smells per 1,000 lloc\n\nProject Statistics:\n\t- number of properties: 0\n\t- number of functions: 1\n\t- number of classes: 0\n\t- number of packages: 1\n\t- number of kt files: 1\n\nAnalysis failed with 1 weighted issues.\n",
+	"stderr": ""
+}

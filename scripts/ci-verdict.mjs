@@ -210,7 +210,11 @@ import {
 	stripAnsi,
 	stripLineTimestamps,
 } from "./lib/ci-failure-classifier.mjs";
-import { githubHeaders } from "./lib/github-rest.mjs";
+import {
+	githubHeaders,
+	parseOwnerRepoFromGitRemote,
+} from "./lib/github-rest.mjs";
+import { jobCapEntries, runtimeCapLines } from "./lib/ci-runtime-cap.mjs";
 import { parseVitestSummary } from "./lib/vitest-summary.mjs";
 import {
 	CHANGES_CHECK,
@@ -226,6 +230,7 @@ import {
 	resolveTriggerAdvisoryNames,
 	shardAggregateName,
 } from "./lib/ci-checks.mjs";
+import { isBot } from "./update-contributors.mjs";
 
 import { findStickyCommentId } from "./lib/mutation-pr-comment.mjs";
 import { STICKY_MARKER } from "./lib/mutation-report-render.mjs";
@@ -477,7 +482,7 @@ function deferredStateFor(gate) {
 		};
 	return {
 		deferredState: "NOT RUN",
-		deferredWhy: `the heavy gate concluded ${gate.conclusion} (a lint.yml required check was red or unfinished at its deadline)`,
+		deferredWhy: `the heavy gate concluded ${gate.conclusion} (a required check it polls was red or unfinished at its deadline)`,
 	};
 }
 
@@ -528,7 +533,11 @@ function headShaOf(payload, fallback) {
  * @param {{ check_runs?: object[] }} payload
  * @param {{ suiteEvents: Map<number|string, string>, supersededSuites: Map<number|string, number|string> }} headRuns
  */
-function annotateTriggerEvents(payload, { suiteEvents, supersededSuites }) {
+function annotateTriggerEvents(
+	payload,
+	{ suiteEvents, supersededSuites },
+	botAuthored = false,
+) {
 	return {
 		...payload,
 		check_runs: (payload?.check_runs ?? []).map((run) => {
@@ -538,6 +547,12 @@ function annotateTriggerEvents(payload, { suiteEvents, supersededSuites }) {
 			return {
 				...run,
 				...(event === undefined ? {} : { workflow_event: event }),
+				// #5062: a bot-opened PR starts no pull_request run, so its dispatch
+				// runs ARE its CI (docs/ci-bot-pr-checks.md). Only the dispatch
+				// event flips; a schedule or workflow_run row stays advisory.
+				...(botAuthored && event === "workflow_dispatch"
+					? { dispatch_is_pr_ci: true }
+					: {}),
 				...(newerRun === undefined ? {} : { superseded_by_run: newerRun }),
 			};
 		}),
@@ -1021,100 +1036,10 @@ export function formatRerunHint(row) {
 
 // ---------------------------------------------------------------------------
 // #3920 item 3: a required job's recent runtime against its `timeout-minutes`.
-//
-// The TLA+ shard cap was found only when pull requests started timing out
-// (623-881 s against a 720 s cap), and #4672 then showed the other half: a
-// 735 s shard `cancelled` at its own timeout reddens a REQUIRED check with no
-// violation. Nothing compared a job's runtime to its cap, so the cap sat at the
-// measured maximum and nobody could see it coming.
-//
-// This is a non-gating REPORT, never a verdict: it prints one line per job whose
-// last completed run reached `RUNTIME_CAP_WARN_RATIO` of its own cap, and it can
-// never change this script's exit code. It is printed from the check-runs this
-// run already fetched (each row carries `started_at`/`completed_at`), so it
-// costs no extra API call and no network access of its own. A MATRIX shard is
-// its own subject: `TLA+ models (shard 4/4)` warns on its own even while the
-// `TLA+ models` aggregate is momentarily fine, which is exactly the shard that
-// was cancelled.
-//
-// The caps come from the workflow YAML itself -- ONE source, no second table
-// that can drift from the file the runner enforces. `${{ matrix.shard }}` and
-// `${{ strategy.job-total }}` in a job's `name:` are expanded to patterns so a
-// check-run's real name still resolves to its job's cap.
+// The rule (ratio, name matcher, cap entries, the report lines) lives in
+// `scripts/lib/ci-runtime-cap.mjs`, beside the nightly p90-over-window mode of
+// the same rule (#4691); this file only reads the caps off the checkout.
 // ---------------------------------------------------------------------------
-
-/** Warn at 70% of the cap: the headroom the repo's own size rule (#3123)
- * assumes, and what surfaces a shard "running at the cap" before it lands. */
-export const RUNTIME_CAP_WARN_RATIO = 0.7;
-
-/** Most runtime lines one report prints; the rest are counted (#3166 shape 10:
- * a bound on a human-facing surface discloses its truncation). */
-export const MAX_RUNTIME_CAP_LINES = 12;
-
-/**
- * A workflow job's `name:` (or its id, which GitHub uses when `name:` is
- * absent) as a RegExp that matches the EXPANDED check-run name. Matrix and
- * job-total placeholders expand; any other expression admits any token, so an
- * unrecognised placeholder still matches its job rather than silently dropping
- * the job from the report.
- *
- * `escapeRegExp` is the ONE runtime copy (`clients/string-utils.ts`, #2558),
- * passed in rather than imported: that file is build output, and this script
- * must load in a checkout that never ran `npm run build` (#4680 r4 F1).
- * `readJobTimeCaps` loads it lazily beside the YAML parser, the other compiled
- * file this report needs, so an unbuilt checkout loses this report alone.
- *
- * @param {string} jobName
- * @param {(text: string) => string} escapeRegExp
- * @returns {RegExp}
- */
-export function checkNamePattern(jobName, escapeRegExp) {
-	// Split on the placeholders FIRST and escape only the literal chunks: a
-	// name is escaped after expansion would leave `matrix\.shard` behind, and
-	// an expansion pattern escaped with the rest would stop being a pattern.
-	const raw = String(jobName);
-	const placeholder = /\$\{\{\s*([^}]*?)\s*\}\}/g;
-	const parts = [];
-	let previous = 0;
-	for (const match of raw.matchAll(placeholder)) {
-		parts.push(escapeRegExp(raw.slice(previous, match.index)));
-		// `strategy.job-total` is always a count; everything else (a matrix leg,
-		// an env value this reader cannot resolve) admits any one token, so an
-		// unrecognised placeholder matches its own job instead of dropping it.
-		parts.push(match[1] === "strategy.job-total" ? "[0-9]+" : "[^()\\s]+");
-		previous = match.index + match[0].length;
-	}
-	parts.push(escapeRegExp(raw.slice(previous)));
-	return new RegExp(`^${parts.join("")}$`);
-}
-
-/**
- * The cap entries of one parsed workflow document.
- *
- * @param {object} doc a `yaml.load` of a workflow file
- * @param {string} file the workflow's path, for the printed line
- * @param {(text: string) => string} escapeRegExp see `checkNamePattern`
- * @returns {Array<{ file: string, jobId: string, name: string, capMinutes: number, pattern: RegExp }>}
- */
-export function jobCapEntries(doc, file, escapeRegExp) {
-	const jobs = doc?.jobs;
-	if (!jobs || typeof jobs !== "object") return [];
-	const entries = [];
-	for (const [jobId, job] of Object.entries(jobs)) {
-		if (!job || typeof job !== "object") continue;
-		const cap = Number(job["timeout-minutes"]);
-		if (!Number.isFinite(cap) || cap <= 0) continue;
-		const name = typeof job.name === "string" && job.name ? job.name : jobId;
-		entries.push({
-			file,
-			jobId,
-			name,
-			capMinutes: cap,
-			pattern: checkNamePattern(name, escapeRegExp),
-		});
-	}
-	return entries;
-}
 
 /**
  * The caps of every workflow file under `<root>/.github/workflows`, parsed from
@@ -1142,96 +1067,6 @@ export async function readJobTimeCaps(root) {
 		);
 	}
 	return entries;
-}
-
-/** Seconds a completed check-run took, or null when GitHub omitted either end. */
-function checkRunSeconds(run) {
-	const start = Date.parse(String(run?.started_at ?? ""));
-	const end = Date.parse(String(run?.completed_at ?? ""));
-	if (!Number.isFinite(start) || !Number.isFinite(end) || end < start)
-		return null;
-	return Math.round((end - start) / 1000);
-}
-
-/**
- * The report lines: one per check-run at or above the ratio of its job's cap,
- * heaviest ratio first, with a counted remainder past the print bound. A job
- * whose name matches no cap entry, or whose run has no duration, is simply not
- * reported (it is not a finding, and this report never gates).
- *
- * @param {{ checkRuns: object[], caps: Array<{ name: string, capMinutes: number, pattern: RegExp }>, requiredChecks?: string[], ratio?: number, limit?: number }} args
- * @returns {string[]}
- */
-export function runtimeCapLines({
-	checkRuns,
-	caps,
-	requiredChecks = REQUIRED_CHECKS,
-	ratio = RUNTIME_CAP_WARN_RATIO,
-	limit = MAX_RUNTIME_CAP_LINES,
-}) {
-	const payload = Array.isArray(checkRuns) ? checkRuns : [];
-	const latest = resolveLatestByName(payload);
-	const required = new Set(requiredChecks);
-	// The same #4090 resolution the verdict applies: a nightly lane's check-run
-	// attaches to whatever head it ran on, so its name is not a gate on THIS
-	// commit. Without it the marker labelled seven schedule-only jobs
-	// `(gating)` while `computeVerdict` scored the same names `gating: false`
-	// (V5a).
-	const triggerAdvisoryNames = resolveTriggerAdvisoryNames(payload);
-	const measured = [];
-	for (const [name, run] of latest) {
-		const entry = caps.find((candidate) => candidate.pattern.test(name));
-		if (!entry) continue;
-		const seconds = checkRunSeconds(run);
-		if (seconds === null) continue;
-		const capSeconds = entry.capMinutes * 60;
-		const used = seconds / capSeconds;
-		measured.push({
-			name,
-			seconds,
-			capSeconds,
-			used,
-			jobId: entry.jobId,
-			file: entry.file,
-			// A row is gating when branch protection requires its name -- the
-			// live read's list, else `REQUIRED_CHECKS` -- or when the name is
-			// neither on the advisory allowlist nor a schedule-only lane. The
-			// printed line reads it, and `computeVerdict` answers the same
-			// question through the same owner, so the two markers cannot
-			// disagree again (V5a).
-			gating: isGatingCheckName(name, {
-				required,
-				triggerAdvisoryNames,
-			}),
-		});
-	}
-	// A matrix shard is its own subject: the aggregate's row measures seconds of
-	// `echo`, and the shard that gets cancelled is the one worth naming.
-	const over = measured
-		.filter((row) => row.used >= ratio)
-		.sort(
-			(left, right) =>
-				right.used - left.used || left.name.localeCompare(right.name),
-		);
-	if (over.length === 0) {
-		return [
-			`Runtime vs cap: no job is at ${Math.round(ratio * 100)}% of its timeout (${measured.length} job(s) measured)`,
-		];
-	}
-	const printed = over.slice(0, limit).map((row) => {
-		const percent = Math.round(row.used * 100);
-		const verdict =
-			row.used >= 1
-				? "at or over its cap -- a slower runner turns finished work into `cancelled` (#4672)"
-				: `within ${Math.round((1 - ratio) * 100)}% of its cap`;
-		return `Runtime vs cap: ${row.name} ${row.seconds}s of ${row.capSeconds}s (${percent}%) -- ${verdict} [${row.file} job \`${row.jobId}\`]${row.gating ? " (gating)" : " (advisory)"}`;
-	});
-	const hidden = over.length - printed.length;
-	if (hidden > 0)
-		printed.push(
-			`Runtime vs cap: +${hidden} more job(s) at or above ${Math.round(ratio * 100)}% of their cap, not printed`,
-		);
-	return printed;
 }
 
 /**
@@ -1477,19 +1312,26 @@ export function resolveHeadSha(
 ) {
 	if (isPrNumber(target)) {
 		const raw = ghExec(
-			["pr", "view", String(target), "--json", "headRefOid,mergeable"],
+			["pr", "view", String(target), "--json", "headRefOid,mergeable,author"],
 			{ timeoutMs },
 		);
 		try {
 			const parsed = JSON.parse(raw);
-			return { sha: parsed.headRefOid, mergeable: parsed.mergeable ?? null };
+			return {
+				sha: parsed.headRefOid,
+				mergeable: parsed.mergeable ?? null,
+				botAuthored: isBot(
+					String(parsed.author?.login ?? ""),
+					parsed.author?.is_bot === true,
+				),
+			};
 		} catch (error) {
 			throw new Error(
 				`could not parse the PR view JSON for ${target}: ${error instanceof Error ? error.message : error}`,
 			);
 		}
 	}
-	return { sha: String(target).trim(), mergeable: null };
+	return { sha: String(target).trim(), mergeable: null, botAuthored: false };
 }
 
 export function resolveClassification(
@@ -2428,20 +2270,7 @@ export function readMutationLine({
 export const TRANSPORT_GH = "gh";
 export const TRANSPORT_REST = "rest";
 
-/**
- * Parses `owner/repo` out of a `git remote get-url origin` value -- both the
- * SSH (`git@github.com:owner/repo.git`) and HTTPS
- * (`https://github.com/owner/repo.git`) forms this repo's own clones use.
- * `gh repo view` resolves the current repository the same way (from the
- * checkout's remote), so this is the REST transport's equivalent when `gh`
- * itself cannot be asked to do it.
- */
-export function parseOwnerRepoFromGitRemote(remoteUrl) {
-	const match = /github\.com[:/]{1,2}([^/\s]+)\/([^/\s.]+?)(?:\.git)?\/?$/.exec(
-		String(remoteUrl ?? "").trim(),
-	);
-	return match ? `${match[1]}/${match[2]}` : null;
-}
+export { parseOwnerRepoFromGitRemote };
 
 /**
  * REST equivalent of `resolveRepository` (#3497): `gh repo view` has no REST
@@ -2576,7 +2405,11 @@ export function mapRestMergeableState(pullRequest) {
  * the single `gh pr view` call it replaces. */
 export async function restResolveHeadSha(repository, target, options = {}) {
 	if (!isPrNumber(target))
-		return { sha: String(target).trim(), mergeable: null };
+		return {
+			sha: String(target).trim(),
+			mergeable: null,
+			botAuthored: false,
+		};
 	const pullRequest = await restGet(
 		`repos/${repository}/pulls/${target}`,
 		options,
@@ -2584,6 +2417,10 @@ export async function restResolveHeadSha(repository, target, options = {}) {
 	return {
 		sha: pullRequest?.head?.sha,
 		mergeable: mapRestMergeableState(pullRequest),
+		botAuthored: isBot(
+			String(pullRequest?.user?.login ?? ""),
+			pullRequest?.user?.type === "Bot",
+		),
 	};
 }
 
@@ -3441,7 +3278,7 @@ export async function run({
 				: await retryStartup((remainingMs) =>
 						resolveRepository(ghExec, resolveGhTimeoutMs(remainingMs)),
 					);
-		const { sha, mergeable, classification } =
+		const { sha, mergeable, classification, botAuthored } =
 			transport === TRANSPORT_REST
 				? {
 						...(await retryStartup((remainingMs) =>
@@ -3617,7 +3454,7 @@ export async function run({
 										resolveGhTimeoutMs(remainingMs),
 										false,
 									);
-						lastPayload = annotateTriggerEvents(raw, headRuns);
+						lastPayload = annotateTriggerEvents(raw, headRuns, botAuthored);
 					} catch (error) {
 						readError = firstLine(error);
 					}

@@ -12,7 +12,7 @@
  * sweep for it found these three producers that bypass that seam entirely — a
  * forked analyze worker, the unref'd one-shot collector (which is what
  * `safe-spawn.ts` itself depends on, so it can never route through it) and the
- * installer's interpreter user-base probes.
+ * installer's interpreter user-base probes (on the spawn seam since #4530).
  *
  * `node:child_process` is mocked for the same reason
  * `safe-spawn-default-output-cap.test.ts` mocks it: "the child wrote enough to
@@ -189,20 +189,25 @@ describe("spawnCollectStdoutResult output bound (#3383)", () => {
 });
 
 describe("userBaseProbeResult (#3383)", () => {
-	it("resolves empty and records the trip when an interpreter floods the probe", () => {
-		const sink = createBoundedOutputSink(10);
-		sink.append("/home/u/.local");
-		expect(userBaseProbeResult("python3", 0, sink)).toBe("");
-		const row = ledgerRow("spawn-output-cap-truncated");
-		expect(row?.count).toBe(1);
-		expect(row?.latestReasons[0]?.subject).toBe("user-base-probe:python3");
+	// #4530 moved both user-base probes onto the spawn seam, which bounds the
+	// output and records the cap trip itself; what stays here is the verdict:
+	// a truncated answer is a different path, never a prefix to trust.
+	it("resolves empty when the seam truncated the probe's output", () => {
+		expect(
+			userBaseProbeResult({
+				status: 0,
+				stdout: "/home/u/.local",
+				outputTruncated: true,
+			}),
+		).toBe("");
 	});
 
-	it("returns the trimmed path from a healthy probe", () => {
-		const sink = createBoundedOutputSink();
-		sink.append("/home/u/.local\n");
-		expect(userBaseProbeResult("python3", 0, sink)).toBe("/home/u/.local");
-		expect(userBaseProbeResult("python3", 1, sink)).toBe("");
-		expect(ledgerRow("spawn-output-cap-truncated")).toBeUndefined();
+	it("returns the trimmed path from a healthy probe, empty on a failed one", () => {
+		expect(userBaseProbeResult({ status: 0, stdout: "/home/u/.local\n" })).toBe(
+			"/home/u/.local",
+		);
+		expect(userBaseProbeResult({ status: 1, stdout: "/home/u/.local\n" })).toBe(
+			"",
+		);
 	});
 });

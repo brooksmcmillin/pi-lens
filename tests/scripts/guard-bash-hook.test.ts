@@ -3,7 +3,7 @@
 // actually invokes); an in-process call to the exported classify functions
 // cannot see a drift in that contract. Admitted in vitest.config.ts's
 // wallClockBudgetInclude. The transcript harness also pins a bounded
-// end-to-end budget for its 1,122 real hook processes. The scoped-pkill
+// end-to-end budget for its sampled real hook processes. The scoped-pkill
 // cases (#3663 CI round) also spawn real `git` to build a linked-worktree
 // fixture, because F6's allow depends on a real linked worktree.
 //
@@ -20,11 +20,11 @@
 // Only that wiring needs a child. The verdict-only table rows (the deny and
 // allow lists, the #3778 hook-bypass rows, the #3988 path-argument rows) call
 // the exported classifyPayload through hookVerdict() under the env the child
-// would get; the spawn cases (the pipe-safe ci-verdict message, the tmpWrite
-// exit-2/exit-0 witness, malformed JSON, the large-payload drain, the broken
-// stderr and the transcript corpus) pin the stdin, exit-code and stderr wiring
-// those rows skip.
-import { spawnSync } from "node:child_process";
+// would get, and so does every transcript-corpus row; the spawn cases (the
+// pipe-safe ci-verdict message, the tmpWrite exit-2/exit-0 witness, malformed
+// JSON, the large-payload drain, the broken stderr and the corpus's denies plus
+// every 50th row) pin the stdin, exit-code and stderr wiring those rows skip.
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	closeSync,
@@ -40,7 +40,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	classifySegment,
@@ -80,9 +80,19 @@ const PAYLOAD_CWD = "/home/dev/pi-lens-guard-bash-fixed-cwd";
 // happens to have PI_LENS_HOME set (probe hygiene: this repo's own worktree
 // convention sets it for ad-hoc probes), and a positive (PI_LENS_HOME
 // ambient) case sets it back deliberately.
-const BASE_ENV: NodeJS.ProcessEnv = Object.fromEntries(
-	Object.entries(process.env).filter(([key]) => key !== "PI_LENS_HOME"),
-);
+//
+// HOME is pinned to a synthetic path off /tmp for the same reason as PAYLOAD_CWD
+// (#4789 review F1). The vitest worker's own HOME is a scratch directory under
+// `os.tmpdir()` (tests/support/vitest-setup.ts), and on every host whose TMPDIR
+// is `/tmp` (GitHub runners, most shells) a `~` then expands under /tmp, where
+// the guard's own `tmpCheckout` rule denies the `~`-destination allow-list rows.
+// A row that needs another HOME overrides it, as `{ ...BASE_ENV, HOME: x }` does.
+const BASE_ENV: NodeJS.ProcessEnv = {
+	...Object.fromEntries(
+		Object.entries(process.env).filter(([key]) => key !== "PI_LENS_HOME"),
+	),
+	HOME: "/home/dev/guard-bash-hook-base-home",
+};
 
 function runHook(
 	command: string,
@@ -101,6 +111,60 @@ function runHook(
 		encoding: "utf8",
 		env,
 	});
+}
+
+/**
+ * runHook's result for many commands at once: the same PreToolUse payload and
+ * the same child, spawned `concurrency` at a time (#3801; the transcript corpus
+ * spawned 1122 children one after another while the wall-clock lane leaves the
+ * other cores idle). Results come back in input order, so a caller's offense
+ * list is as deterministic as the serial loop's.
+ */
+async function runHooksConcurrently(
+	commands: readonly string[],
+	env: NodeJS.ProcessEnv,
+	concurrency: number,
+): Promise<Array<{ status: number | null; stderr: string }>> {
+	const results = new Array<{ status: number | null; stderr: string }>(
+		commands.length,
+	);
+	let next = 0;
+	const one = (command: string) =>
+		new Promise<{ status: number | null; stderr: string }>(
+			(resolveRun, rejectRun) => {
+				const child = spawn(process.execPath, [HOOK], {
+					env,
+					stdio: ["pipe", "ignore", "pipe"],
+				});
+				let stderr = "";
+				child.stderr.setEncoding("utf8");
+				child.stderr.on("data", (chunk: string) => {
+					stderr += chunk;
+				});
+				child.on("error", rejectRun);
+				child.on("close", (status) => resolveRun({ status, stderr }));
+				child.stdin.on("error", rejectRun);
+				child.stdin.end(
+					JSON.stringify({
+						session_id: "test",
+						cwd: PAYLOAD_CWD,
+						permission_mode: "default",
+						hook_event_name: "PreToolUse",
+						tool_name: "Bash",
+						tool_input: { command },
+					}),
+				);
+			},
+		);
+	await Promise.all(
+		Array.from({ length: concurrency }, async () => {
+			while (next < commands.length) {
+				const at = next++;
+				results[at] = await one(commands[at]);
+			}
+		}),
+	);
+	return results;
 }
 
 /**
@@ -213,7 +277,6 @@ const DENY_CASES: Array<[command: string, ruleNeedle: string]> = [
 	["git rebase --continue", "rebase"],
 	["git rebase --skip", "rebase"],
 	["git stash", "stash"],
-	["git stash list", "stash"],
 	["git stash pop", "stash"],
 	["git stash apply", "stash"],
 	["git stash drop", "stash"],
@@ -432,6 +495,12 @@ const ALLOW_CASES: string[] = [
 	"node scripts/pr-worktree.mjs open 9001 --head --name review-1",
 	"node scripts/pr-worktree.mjs open 9001 --merge",
 	"node scripts/pr-worktree.mjs close /home/dev/Desktop/pi-lens-worktrees/review-1",
+	// #5111: the one worktree-removal helper the refusals name.
+	// a process substitution AFTER the subcommand is classified normally
+	"git diff <(true) <(true)",
+	"git -C . diff --no-index <(echo a) <(echo b)",
+	"node scripts/worktree-remove.mjs /home/dev/wt/lane-1",
+	"node scripts/worktree-remove.mjs /home/dev/wt/lane-1 --force",
 	"npx vitest run tests/clients/foo.test.ts",
 	"npm test",
 	"npm run build",
@@ -497,7 +566,8 @@ const ALLOW_CASES: string[] = [
 	"cat <<EOF\n$(echo x\n$(git stash)\nEOF",
 	// #3026: the COMPLIANT shapes of the tmpdirCollision rule. TMPDIR aimed
 	// at its own directory, with PI_LENS_HOME still pinned at .probe-home
-	// exactly as AGENTS.md "Probe hygiene" prescribes.
+	// exactly as docs/invariants/paths-os.md "Paths, data, and operating systems"
+	// prescribes.
 	"PI_LENS_HOME=$PWD/.probe-home TMPDIR=$PWD/.tmp-disk npx vitest run tests/config",
 	"export TMPDIR=/home/dev/.cache/lane-tmp\nnpx vitest run tests/config",
 	// TMPDIR untouched -- the harness keeps the real one on purpose.
@@ -817,8 +887,10 @@ describe("scripts/hooks/guard-bash.mjs -- git worktree remove node_modules symli
 			const result = runHook(`git worktree remove ${tree}`);
 			expect(result.status).toBe(2);
 			expect(result.stderr.toLowerCase()).toContain("worktree");
-			// The note names the fix (acceptance #1).
-			expect(result.stderr).toContain(`rm <tree>/node_modules`);
+			// The note names the fix (acceptance #1; the one helper, #5111).
+			expect(result.stderr).toContain(
+				"node scripts/worktree-remove.mjs <path>",
+			);
 		} finally {
 			rmSync(tree, { recursive: true, force: true });
 			rmSync(shared, { recursive: true, force: true });
@@ -834,7 +906,9 @@ describe("scripts/hooks/guard-bash.mjs -- git worktree remove node_modules symli
 		try {
 			const result = runHook(`git worktree remove ${tree}`);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("rm <tree>/node_modules");
+			expect(result.stderr).toContain(
+				"node scripts/worktree-remove.mjs <path>",
+			);
 		} finally {
 			rmSync(tree, { recursive: true, force: true });
 			rmSync(shared, { recursive: true, force: true });
@@ -2055,6 +2129,11 @@ describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () =>
 		// symlinked tree to the kernel and `away/wt` (absent) lexically (#3997 H3).
 		mkdirSync(join(home, "away"));
 		symlinkSync(join("..", "scratch", "wt"), join(home, "away", "lnk"));
+		// HOME/rootlink and HOME/scratch/rl -> /: a symlinked parent whose
+		// physical place differs from its spelling, for destinations that do not
+		// exist yet (#4060 item 2). /usr is off /tmp and /tmp is on it, on every host.
+		symlinkSync("/", join(home, "rootlink"));
+		symlinkSync("/", join(scratch, "rl"));
 	});
 
 	afterAll(() => {
@@ -2507,6 +2586,191 @@ describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () =>
 		expectRule(row),
 	);
 
+	// -- #4060 item 1: `cd -P` resolves its target physically ---------------
+	// Measured with bash 5: the LAST of -L/-P in the options wins, flags may be
+	// clustered, and `-e` does not change the mode. `cd away/lnk/..` prints
+	// HOME/away (logical); `cd -P away/lnk/..` prints HOME/scratch.
+	const CD_PHYSICAL_ROWS: PathRow[] = [
+		{
+			label: "cd -P through a symlink, then ..",
+			command: "cd -P away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "cd -LP (the last flag wins)",
+			command: "cd -LP away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "cd -L -P (the last flag wins)",
+			command: "cd -L -P away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "cd -Pe (-e does not change the mode)",
+			command: "cd -Pe away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "cd -P -- (the option terminator)",
+			command: "cd -P -- away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "cd -P to the link, then a plain cd ..",
+			command: "cd -P away/lnk && cd .. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "a logical cd to the link, then cd -P ..",
+			command: "cd away/lnk && cd -P .. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			// The physical cwd is the shared install itself and no longer names the
+			// link, so only the logical reading of the same `cd` still denies this.
+			label: "cd -P into a linked node_modules, then rm -rf *",
+			command: "cd -P node_modules && rm -rf *",
+			cwd: "@W@",
+			rule: "linkedNodeModulesDelete",
+		},
+		{
+			label: "cd -PL stays logical (the last flag wins)",
+			command: "cd -PL away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "cd -P -L stays logical (the last flag wins)",
+			command: "cd -P -L away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "cd -L stays logical",
+			command: "cd -L away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: null,
+		},
+	];
+
+	it.each(CD_PHYSICAL_ROWS)("cd mode (#4060 item 1): $label", (row) =>
+		expectRule(row),
+	);
+
+	// -- #4060 item 2: a destination that does not exist yet ----------------
+	// `realpath` fails on the missing leaf, so the resolver resolves the nearest
+	// existing ancestor physically and appends the missing tail. `rootlink` is a
+	// symlink to `/`: the same spelling lands under /usr (allow) and under /tmp
+	// (deny), and the fixture root itself sits under /tmp on a host whose TMPDIR
+	// is /tmp, so each direction is the red on one kind of host.
+	const MISSING_LEAF_ROWS: PathRow[] = [
+		{
+			label: "worktree add below a symlink to /, landing under /tmp",
+			command: "git worktree add rootlink/tmp/pi-lens-4060-new",
+			cwd: "@HOME@",
+			rule: "tmpCheckout",
+		},
+		{
+			label: "worktree add below a symlink to /, landing under /usr",
+			command: "git worktree add rootlink/usr/pi-lens-4060-new",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "worktree add two missing levels below a symlink to /, under /tmp",
+			command: "git worktree add rootlink/tmp/pi-lens-4060-a/b/new",
+			cwd: "@HOME@",
+			rule: "tmpCheckout",
+		},
+		{
+			// F4 (PR #4935 review): both readings of the /tmp row above deny on a
+			// host whose TMPDIR is /tmp (HOME is then under /tmp lexically too), so
+			// it never tested the walk there. This one differs by host kind: the
+			// kernel puts it under /usr (allow), the spelling under HOME.
+			label:
+				"worktree add two missing levels below a symlink to /, landing under /usr",
+			command: "git worktree add rootlink/usr/pi-lens-4060-a/b/new",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "clone below a symlink to /, landing under /tmp",
+			command: "git clone r rootlink/tmp/pi-lens-4060-new",
+			cwd: "@HOME@",
+			rule: "tmpCheckout",
+		},
+		{
+			label: "clone below a symlink to /, landing under /usr",
+			command: "git clone r rootlink/usr/pi-lens-4060-new",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "mktemp -d template below a symlink to /, landing under /tmp",
+			command: "mktemp -d rootlink/tmp/x.XXXXXX",
+			cwd: "@HOME@",
+			rule: "tmpCheckout",
+		},
+		{
+			label: "mktemp -d template below a symlink to /, landing under /usr",
+			command: "mktemp -d rootlink/usr/x.XXXXXX",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label:
+				"mktemp -d template with a missing directory below a symlink to /, under /tmp",
+			command: "mktemp -d rootlink/tmp/pi-lens-4060-gone/x.XXXXXX",
+			cwd: "@HOME@",
+			rule: "tmpCheckout",
+		},
+		{
+			label: "git -C a symlink to /, then a missing /tmp destination",
+			command: "git -C rootlink/tmp worktree add pi-lens-4060-new",
+			cwd: "@HOME@",
+			rule: "tmpCheckout",
+		},
+		{
+			// The `..` after `lnk` is the kernel's, so the walk starts from the raw
+			// spelling: collapsing it first names HOME/away/rl/usr/…, which holds
+			// no symlink to follow.
+			label: "a symlink, then .., then a symlink to / (the raw spelling walks)",
+			command: "git worktree add away/lnk/../rl/usr/pi-lens-4060-new",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "a symlink, then .., then a symlink to /, landing under /tmp",
+			command: "git worktree add away/lnk/../rl/tmp/pi-lens-4060-new",
+			cwd: "@HOME@",
+			rule: "tmpCheckout",
+		},
+	];
+
+	it.each(MISSING_LEAF_ROWS)("missing leaf (#4060 item 2): $label", (row) =>
+		expectRule(row),
+	);
+
+	// lane: Linux unit shards. /proc/self/root is the hook process's own root, so
+	// the spelling is off /tmp lexically and on it physically whatever TMPDIR is.
+	it.skipIf(process.platform !== "linux").each([
+		["worktree add", "git worktree add /proc/self/root/tmp/pi-lens-4060-new"],
+		["clone", "git clone r /proc/self/root/tmp/pi-lens-4060-new"],
+		["mktemp -d", "mktemp -d /proc/self/root/tmp/x.XXXXXX"],
+	])(
+		"missing leaf below /proc/self/root/tmp (#4060 item 2): %s",
+		(_name, command) =>
+			expectRule({ label: command, command, rule: "tmpCheckout" }),
+	);
+
 	// -- the other path-taking rules go through the SAME resolver ------------
 	// tmpCheckout (#3526): worktree add, clone, mktemp -d, plus `cd`/`-C`.
 	// An unresolvable variable stays a documented fail-OPEN there: it is a
@@ -2641,6 +2905,143 @@ describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () =>
 				expect(result.status).toBe(2);
 			},
 		);
+
+		// #4057: bash expands node's file word from the shell's own variables
+		// before an inline prefix applies, as it does git's (#3997), while node
+		// reads PI_LENS_HOME from its own environment, prefix included. Measured
+		// on /bin/bash 3.2: with R=a in the shell, `R=b PI_LENS_HOME=/h node
+		// $R/dist/x.js` ran a's script, and the script saw PI_LENS_HOME=/h. Each
+		// row sets the hook's ambient value itself and runs the real hook.
+		it.each([
+			{
+				label: "an inline HOME= does not move ~ out of this repository",
+				command: "HOME=@OTHER@ node ~/clients/probe.mjs",
+				ambient: { HOME: "@REPO@" },
+				rule: "probe",
+			},
+			{
+				label: "an inline HOME= does not move ~ into this repository",
+				command: "HOME=@REPO@ node ~/clients/probe.mjs",
+				ambient: { HOME: "@OTHER@" },
+				rule: null,
+			},
+			{
+				label:
+					"an inline VAR= does not move a $VAR file out of this repository",
+				command: "LANE_4057=@OTHER@ node $LANE_4057/dist/cli.js",
+				ambient: { LANE_4057: "@REPO@" },
+				rule: "probe",
+			},
+			{
+				label: "an inline VAR= does not move a $VAR file into this repository",
+				command: "LANE_4057=@REPO@ node $LANE_4057/dist/cli.js",
+				ambient: { LANE_4057: "@OTHER@" },
+				rule: null,
+			},
+			{
+				label: "an inline PI_LENS_HOME= still pins the probe node runs",
+				command:
+					"PI_LENS_HOME=/x/.probe-home LANE_4057=@OTHER@ node $LANE_4057/clients/probe.mjs",
+				ambient: { LANE_4057: "@REPO@" },
+				rule: null,
+			},
+		] as Array<{
+			label: string;
+			command: string;
+			ambient: Record<string, string>;
+			rule: DenyRule | null;
+		}>)("$label (#4057)", ({ command, ambient, rule }) => {
+			const fill = (text: string) =>
+				text.replaceAll("@REPO@", repoRoot).replaceAll("@OTHER@", otherRepo);
+			const result = runHook(
+				fill(command),
+				{
+					...BASE_ENV,
+					...Object.fromEntries(
+						Object.entries(ambient).map(([key, value]) => [key, fill(value)]),
+					),
+				},
+				foreignDir,
+			);
+			expect(result.stderr).toBe(
+				rule === null ? "" : `${RULE_MESSAGES[rule]}\n`,
+			);
+			expect(result.status).toBe(rule === null ? 0 : 2);
+		});
+
+		// #4057 accepted residual: neither the shell nor the hook's env has
+		// LANE_4057, so bash expands `$LANE_4057` to the empty string and node
+		// runs `/clients/probe.mjs`. expandShellWord leaves an unknown `$NAME` in
+		// place, and loadsPiLensRuntime resolves that leftover under this
+		// repository, so the hook denies, as master does for the same word with no
+		// prefix. Master allowed the prefixed form only by expanding the prefix.
+		it.each([
+			{
+				label: "an inline VAR= does not resolve an unknown $VAR file word",
+				command:
+					"LANE_4057=/home/dev/guard-bash-4057-lane node $LANE_4057/clients/probe.mjs",
+			},
+			{
+				label: "an unknown $VAR file word with no prefix",
+				command: "node $LANE_4057/clients/probe.mjs",
+			},
+		])("$label reads as relative to this repository (#4057)", ({ command }) => {
+			const result = runHook(
+				command,
+				Object.fromEntries(
+					Object.entries(BASE_ENV).filter(([key]) => key !== "LANE_4057"),
+				),
+				repoRoot,
+			);
+			expect(result.stderr).toBe(`${RULE_MESSAGES.probe}\n`);
+			expect(result.status).toBe(2);
+		});
+
+		// Recurrence (#4826 review r1 F1): an inline `S=` prefix used to cover
+		// `$S` after an absolute head only because the prefix was expanded into
+		// the word. The shell has no S, so bash hands node `<repo>/clients/…` and
+		// the file loads. The word has two readings, as written and with the
+		// references it cannot resolve removed; either one loading this
+		// repository's runtime denies.
+		it.each([
+			{
+				label: "an unset $S after ${PWD}, S only in the prefix",
+				command: "S= node ${PWD}$S/clients/probe.mjs",
+				rule: "probe" as DenyRule | null,
+			},
+			{
+				label: "an unset $S after ${PWD} with no prefix",
+				command: "node ${PWD}$S/clients/probe.mjs",
+				rule: "probe" as DenyRule | null,
+			},
+			{
+				label: "an unset $S after a resolved $R",
+				command: "R=@REPO@; S= node $R$S/dist/x.js",
+				rule: "probe" as DenyRule | null,
+			},
+			{
+				label: "a ${S:-} after ${PWD}",
+				command: "node ${PWD}${S:-}/clients/probe.mjs",
+				rule: "probe" as DenyRule | null,
+			},
+			{
+				label: "an unset $S after ${PWD} for a file outside clients/ and dist/",
+				command: "S= node ${PWD}$S/scripts/x.mjs",
+				rule: null,
+			},
+		])("$label (#4057)", ({ command, rule }) => {
+			const result = runHook(
+				command.replaceAll("@REPO@", repoRoot),
+				Object.fromEntries(
+					Object.entries(BASE_ENV).filter(([key]) => key !== "S"),
+				),
+				repoRoot,
+			);
+			expect(result.stderr).toBe(
+				rule === null ? "" : `${RULE_MESSAGES[rule]}\n`,
+			);
+			expect(result.status).toBe(rule === null ? 0 : 2);
+		});
 	});
 });
 
@@ -2733,6 +3134,391 @@ describe("scripts/hooks/guard-bash.mjs -- substitution next to a rule word (#399
 	});
 });
 
+// #4060 item 3: two spans the lexer closed in the wrong place, so `git stash`
+// ran with the hook reading it as quoted text or as part of a substitution.
+// Every DENY row was measured against bash 5 with a fake `git` that touches a
+// marker: each one really runs `git stash`, except the `echo case x in` row,
+// which only pins that the span closes at its own paren (the hook denies it
+// under the empty reading of the substitution, as it denies `git $(:) stash`).
+//   (a) a case pattern's `)` closed a `$( … )` body at the first pattern;
+//   (b) `$'\''` (ANSI-C quoting, where `\'` is an escaped quote) read as a
+//       closed quote followed by an open one, in a body and at top level.
+describe("scripts/hooks/guard-bash.mjs -- case patterns and ANSI-C quotes (#4060)", () => {
+	it.each([
+		["a case pattern in a substitution", "git $(case x in x) : ;; esac) stash"],
+		["a leading-paren pattern", "git $(case x in (x) : ;; esac) stash"],
+		["an alternation pattern", "git $(case x in y|x) : ;; esac) stash"],
+		["the ;& terminator", "git $(case x in x) : ;& y) : ;; esac) stash"],
+		["esac after a plain ;", "git $(case x in x) : ; esac) stash"],
+		["newline-separated clauses", "git $(case x in\nx) :\n;;\nesac) stash"],
+		[
+			"a nested case",
+			"git $(case x in x) case y in y) : ;; esac ;; esac) stash",
+		],
+		[
+			"a substitution as the subject",
+			"git $(case $(echo x) in x) : ;; esac) stash",
+		],
+		["case after then", "git $(if :; then case x in x) : ;; esac; fi) stash"],
+		["case after a ;", "git $(: ; case x in x) : ;; esac) stash"],
+		[
+			"an ANSI-C quote in a case body",
+			"git $(case x in x) echo $'\\'' ;; esac) stash",
+		],
+		["an ANSI-C \\' in a substitution", "$(: $'\\'' ) git stash"],
+		[
+			"an ANSI-C \\' that must not swallow the closing paren",
+			"git $(: $'\\'') stash",
+		],
+		["an ANSI-C \\' at top level", "echo $'\\'' ; git stash"],
+		["an ANSI-C \\' mid-word", "echo $'a\\'b' && git stash"],
+		[
+			"a `case x in` argument whose paren must still close the substitution",
+			"git $(echo case x in) stash",
+		],
+	] as Array<[string, string]>)("denies %s", (_name, command) => {
+		const result = runHook(command);
+		expect(result.stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+		expect(result.status).toBe(2);
+	});
+
+	it.each([
+		["a case in a substitution", "echo $(case x in x) echo hi ;; esac)"],
+		[
+			"a case in a quoted substitution",
+			'git commit -m "$(case x in x) echo hi ;; esac)"',
+		],
+		["an ANSI-C \\' then a harmless command", "echo $'\\'' ; echo ok"],
+		["an ANSI-C \\\\ closes at the quote", "echo $'\\\\' ; echo ok"],
+		["a `case` argument is not a case clause", "echo $(echo case x in)"],
+	])("allows %s", (_name, command) => {
+		const result = runHook(command);
+		expect(result.stderr).toBe("");
+		expect(result.status).toBe(0);
+	});
+
+	it("keeps `$'` inside double quotes literal: the next command still runs", () => {
+		const result = runHook(`echo "$'" ; git stash`);
+		expect(result.stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+		expect(result.status).toBe(2);
+	});
+});
+
+// #4060 round 2 (PR #4935 review F3): `physicalPath` puts a missing leaf where
+// the kernel does, so where /tmp is a symlink (macOS: /tmp -> private/tmp) the
+// destination `/tmp/new` resolves to `/private/tmp/new`, which a literal-/tmp
+// comparison misses. Master kept the lexical `/tmp/new` and denied it; head
+// allowed it, and no lane runs this suite on macOS. The hook is copied with its
+// one `TMP_ROOT` literal re-pointed at a fixture root that is a symlink, which
+// is the macOS shape on any host, and imported in process like `findDeny`'s
+// other callers here (a spawned copy would be a new real-process-spawn hit).
+describe("scripts/hooks/guard-bash.mjs -- tmpCheckout and tmpWrite where the tmp root is a symlink (#4060 r2, r3, r4)", () => {
+	type HookModule = typeof import("../../scripts/hooks/guard-bash.mjs");
+	let root: string;
+	let mod: HookModule;
+	// Roots whose `claude-<uid>` entry is itself a symlink (r4, PR #4935
+	// CodeRabbit GjnV): to the physical tmp root, above it, and to a sibling.
+	const harnessLinks = {
+		self: ".",
+		above: "..",
+		sibling: "sib",
+	} as const;
+	const linkedRoots = new Map<keyof typeof harnessLinks, string>();
+	const linkedMods = new Map<keyof typeof harnessLinks, HookModule>();
+	const roots: string[] = [];
+
+	// The hook is copied with its one `TMP_ROOT` literal re-pointed at
+	// `<dir>/tmp`, a symlink to `private/tmp`, and imported in process.
+	async function loadRooted(
+		linkTarget?: string,
+	): Promise<{ dir: string; hook: HookModule }> {
+		const dir = realpathSync(
+			mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-macroot-")),
+		);
+		roots.push(dir);
+		mkdirSync(join(dir, "private", "tmp", "sib"), { recursive: true });
+		symlinkSync(join("private", "tmp"), join(dir, "tmp"));
+		if (linkTarget !== undefined && typeof process.getuid === "function")
+			symlinkSync(
+				linkTarget,
+				join(dir, "private", "tmp", `claude-${process.getuid()}`),
+			);
+		const source = readFileSync(HOOK, "utf8");
+		const literal = 'const TMP_ROOT = "/tmp";';
+		// Guards the re-point itself: a renamed constant would make every row
+		// below test the real /tmp instead of the fixture.
+		expect(source.split(literal)).toHaveLength(2);
+		const copy = join(dir, "guard-bash-macroot.mjs");
+		writeFileSync(
+			copy,
+			source.replace(
+				literal,
+				`const TMP_ROOT = ${JSON.stringify(join(dir, "tmp"))};`,
+			),
+		);
+		return {
+			dir,
+			hook: (await import(pathToFileURL(copy).href)) as HookModule,
+		};
+	}
+
+	beforeAll(async () => {
+		const main = await loadRooted();
+		root = main.dir;
+		mod = main.hook;
+		mkdirSync(join(root, "elsewhere"));
+		mkdirSync(join(root, "private", "other"), { recursive: true });
+		for (const [name, target] of Object.entries(harnessLinks)) {
+			const key = name as keyof typeof harnessLinks;
+			const linked = await loadRooted(target);
+			linkedRoots.set(key, linked.dir);
+			linkedMods.set(key, linked.hook);
+		}
+	});
+
+	afterAll(() => {
+		for (const dir of roots) rmSync(dir, { recursive: true, force: true });
+	});
+
+	function verdict(command: string): string | null {
+		return mod.findDeny(command, PAYLOAD_CWD);
+	}
+
+	it.each([
+		["a missing leaf", "git worktree add @R@/tmp/pi-lens-4060-new"],
+		["two missing levels", "git worktree add @R@/tmp/pi-lens-4060-a/b/new"],
+		["a clone", "git clone r @R@/tmp/pi-lens-4060-new"],
+		["an existing mktemp directory", "mktemp -d @R@/tmp/x.XXXXXX"],
+		["a missing mktemp directory", "mktemp -d @R@/tmp/gone/x.XXXXXX"],
+	])("denies %s below the symlinked root", (_name, template) => {
+		expect(verdict(template.replaceAll("@R@", root))).toBe("tmpCheckout");
+	});
+
+	// #4060 round 3 (PR #4935 verify F7): `tmpWrite` asked the same root
+	// question with the literal spelling only, so a redirect, `mkdir`, `touch`
+	// or `cp` target below a symlinked /tmp lost its master denial (master kept
+	// the lexical `/tmp/new` for a missing leaf; `physicalPath` now returns
+	// `/private/tmp/new`).
+	it.each([
+		["a redirect to a missing leaf", "echo x > @R@/tmp/new.txt"],
+		["an append two levels down", "echo x >> @R@/tmp/a/b.txt"],
+		["a mkdir", "mkdir @R@/tmp/new"],
+		["a touch", "touch @R@/tmp/new"],
+		["a cp target", "cp a @R@/tmp/new.txt"],
+	])("denies %s below the symlinked root as tmpWrite", (_name, template) => {
+		expect(verdict(template.replaceAll("@R@", root))).toBe("tmpWrite");
+	});
+
+	// The harness's own `/tmp/claude-<uid>` stays exempt (there is no uid, and
+	// so no harness directory, on Windows).
+	it.skipIf(typeof process.getuid !== "function").each([
+		[
+			"a redirect into the harness directory",
+			"echo x > @R@/tmp/claude-@U@/new",
+		],
+		["a mkdir in the harness directory", "mkdir @R@/tmp/claude-@U@/sub"],
+	])("allows %s", (_name, template) => {
+		const uid = String(process.getuid?.());
+		expect(
+			verdict(template.replaceAll("@R@", root).replaceAll("@U@", uid)),
+		).toBeNull();
+	});
+
+	it("allows a redirect outside the symlinked root", () => {
+		expect(verdict(`echo x > ${root}/elsewhere/new`)).toBeNull();
+	});
+
+	// #4060 round 4 (PR #4935 CodeRabbit GjnV, a regression of round 3): the
+	// harness exemption must name the directory `claude-<uid>` directly below
+	// the PHYSICAL tmp root. When that entry is a symlink to the tmp root, to
+	// a directory above it, or to a sibling, exempting wherever it resolves
+	// let `echo x > /tmp/new` (or every write under the sibling) through,
+	// while master denied it.
+	it.skipIf(typeof process.getuid !== "function").each([
+		["the tmp root", "self", "echo x > @R@/tmp/new"],
+		["the tmp root, at a nested leaf", "self", "mkdir @R@/tmp/a/b"],
+		["a directory above the tmp root", "above", "echo x > @R@/tmp/new"],
+		["a sibling directory", "sibling", "echo x > @R@/tmp/sib/new"],
+		[
+			"a sibling directory, by the link",
+			"sibling",
+			"echo x > @R@/tmp/claude-@U@/new",
+		],
+	] as const)(
+		"denies a write when the harness directory is a symlink to %s",
+		(_name, key, template) => {
+			const dir = linkedRoots.get(key) as string;
+			const hook = linkedMods.get(key) as HookModule;
+			const command = template
+				.replaceAll("@R@", dir)
+				.replaceAll("@U@", String(process.getuid?.()));
+			expect(hook.findDeny(command, PAYLOAD_CWD)).toBe("tmpWrite");
+		},
+	);
+
+	it.each([
+		["a sibling of the symlinked root", "git worktree add @R@/elsewhere/new"],
+		[
+			"the root's target spelled by its own name",
+			"git worktree add @R@/private/other/new",
+		],
+	])("allows %s", (_name, template) => {
+		expect(verdict(template.replaceAll("@R@", root))).toBeNull();
+	});
+});
+
+// #4060 round 2 (PR #4935 review F1/F2): where a `case` clause may open inside
+// a `$( … )` body is decided by the lexer's own command-position state, never
+// by the text before the word. Each deny row below was measured against bash
+// 5.3.9 with a fake `git` that records its argv: every one runs `git stash`.
+// The first group is F1, the regression the retained-text regex introduced: a
+// keyword used as an ARGUMENT (`: do`) or a word that merely ENDS in one
+// (`-do`, `x.do`, `a=if`) opened a phantom clause, so the real `)` that closes
+// the substitution was read as a pattern's `)` and `stash` fell inside the
+// substitution, leaving `git ⟨mark⟩` outside (master denied all of them).
+describe("scripts/hooks/guard-bash.mjs -- case clauses open only at a command position (#4060 r2)", () => {
+	it.each([
+		"git $(: do case x in x) stash",
+		"git $(: then case x in x) stash",
+		"git $(: else case x in x) stash",
+		"git $(: elif case x in x) stash",
+		"git $(: if case x in x) stash",
+		"git $(: while case x in x) stash",
+		"git $(: until case x in x) stash",
+		"git $(: -do case x in x) stash",
+		"git $(: --do case x in x) stash",
+		"git $(: x.do case x in x) stash",
+		"git $(: x/then case x in x) stash",
+		"git $(: a:do case x in x) stash",
+		"git $(: a=if case x in x) stash",
+		"git $(x=1 case x in x) stash",
+		"git $(: <(:) case x in x) stash",
+		"git $(: 2>&1 case x in x) stash",
+		"git $(: -else case x in x) stash",
+		"git $(: x.elif case x in x) stash",
+		"git $(: -while case x in x) stash",
+		"git $(: x/until case x in x) stash",
+	])(
+		"an argument or word tail shaped like a keyword opens no clause: %s",
+		(command) => {
+			expect(hookVerdict(command).stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+		},
+	);
+
+	// F2: `!` and `time` (with `-p` / `--`) are reserved-word prefixes the
+	// grammar accepts before a compound command, so `case` after them is at a
+	// command position and the pattern's `)` must not close the substitution.
+	it.each([
+		"git $(! case x in x) : ;; esac) stash",
+		"git $(! ! case x in x) : ;; esac) stash",
+		"git $(time case x in x) : ;; esac) stash",
+		"git $(time -p case x in x) : ;; esac) stash",
+		"git $(time -p -- case x in x) : ;; esac) stash",
+		"git $(time ! case x in x) : ;; esac) stash",
+		"git $(! time case x in x) : ;; esac) stash",
+		"git $(: && ! case x in x) : ;; esac) stash",
+	])(
+		"a reserved-word prefix before case is a command position: %s",
+		(command) => {
+			expect(hookVerdict(command).stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+		},
+	);
+
+	// Positions bash does open a clause at (each measured to run `git stash`).
+	it.each([
+		"git $({ case x in x) : ;; esac; }) stash",
+		"git $(if case x in x) : ;; esac; then :; fi) stash",
+		"git $(until case x in x) : ;; esac; do break; done) stash",
+		"git $(if :; then :; elif case x in x) : ;; esac; then :; fi) stash",
+		"git $(if :; then :; else case x in x) : ;; esac; fi) stash",
+		"git $(: |case x in x) : ;; esac) stash",
+		"git $(: &case x in x) : ;; esac) stash",
+		"git $(f() case x in x) : ;; esac; f) stash",
+		"git $( (case x in x) : ;; esac) ) stash",
+		"git $(case x in x) case y in y) : ;; esac ;; esac) stash",
+		"git $(case x in x) : ;; esac;case y in y) : ;; esac) stash",
+		"git $(case x in x) : ;;esac) stash",
+		"git $(case x in(x) : ;; esac) stash",
+		"git $([[ ( case ) ]] ; case x in x) : ;; esac) stash",
+		"git $([[ a && case ]] ; case x in x) : ;; esac) stash",
+		"git $([[ ( case == in ) ]]) stash",
+		"git $(:; \\\ncase x in x) : ;; esac) stash",
+		"git $(case x in a|esac) : ;; esac) stash",
+		"git $(case x in esac) stash",
+		"git $(echo >&2 case x in x) stash",
+		"git $(echo &>/dev/null case x in x) stash",
+		"git $(case x in x) echo esac ;; y) : ;; esac) stash",
+		"git $(case in in x) : ;; esac) stash",
+		"git $(case esac in x) : ;; esac) stash",
+		"git $(case x in in) : ;; esac) stash",
+		"git $(case x in x) : ;; (y) : ;; esac) stash",
+		"git $(case x in x) (echo) ;; esac) stash",
+		"git $(case x in x) : ;; *) : ;; esac) stash",
+		"git $(for i in a; do case x in x) : ;; esac; done) stash",
+		"git $(for ((i=0;i<1;i++)) ; do case x in x) : ;; esac; break; done) stash",
+	])(
+		"a clause opened at a command position keeps its pattern paren: %s",
+		(command) => {
+			expect(hookVerdict(command).stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+		},
+	);
+
+	// #4060 round 3 (PR #4935 verify F6): a `#` comment between the clauses is
+	// skipped, never read as a pattern word. Round 2's word branch ran before
+	// the comment branch, so `esac` after a comment arrived at a `pattern`
+	// frame and the `)` after it closed a pattern instead of the substitution:
+	// `stash` fell inside the substitution and the command was ALLOWED while
+	// bash 5.3.9 runs `git stash` (round 1 and master denied the first two).
+	it.each([
+		"git $(case x in\n# note\nesac) stash",
+		"git $(case x in x) : ;;\n# note\nesac) stash",
+		"git $(case x in x) : ;; # note\n esac) stash",
+		"git $(case x in # note\nesac) stash",
+		"git $(case x in\n# note\nx) : ;; esac) stash",
+		"git $(case x in x) : ;;\n# a\n# b\nesac) stash",
+	])("a comment inside a case body is skipped: %s", (command) => {
+		expect(hookVerdict(command).stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+	});
+
+	// `#` that does not start a comment keeps its old reading: inside a word
+	// (`a#b`) and as `$#`.
+	it.each([
+		"git $(: a#b case x in x) stash",
+		"git $(echo $# ; case x in x) : ;; esac) stash",
+		"git $(case x in a#b) : ;; esac) stash",
+	])("a `#` that is not a comment starts no comment: %s", (command) => {
+		expect(hookVerdict(command).stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+	});
+
+	it("allows a commented case clause whose body is harmless", () => {
+		expect(
+			hookVerdict("git $(case x in\n# note\nx) : ;; esac) status").status,
+		).toBe(0);
+	});
+
+	// `case` in a position the lexer does not model fails CLOSED: the hook
+	// cannot tell whether bash opens a clause there, so it cannot tell where the
+	// substitution ends. `for ((…)) do case`, `coproc [NAME] case` and
+	// `function f case` really run `git stash` in bash 5.3.9; `$((case))` is
+	// arithmetic, and `case(` is a syntax error either way.
+	it.each([
+		"git $(for ((i=0;i<1;i++)) do case x in x) : ;; esac; done) stash",
+		"git $(coproc case x in x) : ;; esac) stash",
+		"git $(coproc NAME case x in x) : ;; esac) stash",
+		"git $(function f case x in x) : ;; esac; f) stash",
+		"git $(for i do case x in x) : ;; esac; break; done) stash",
+		"git $(select i do case x in x) : ;; esac; break; done) stash",
+		"git $((case x in x) : ;; esac)) stash",
+		"git $(: && ((case == x)) ; : in) stash",
+		"git $(((case x in x) : ;; esac) )) stash",
+		"git $(case(x) in x) : ;; esac) stash",
+	])("an unmodelled grammar position fails closed: %s", (command) => {
+		expect(hookVerdict(command).stderr).toBe(
+			`${RULE_MESSAGES.unscannableCase}\n`,
+		);
+	});
+});
+
 describe("scripts/hooks/guard-bash.mjs -- ambient PI_LENS_HOME (#2699)", () => {
 	it("allows an unpinned-looking node probe when PI_LENS_HOME is only in process.env, not the command text", () => {
 		const result = runHook("node -e \"require('./clients/foo.js')\"", {
@@ -2744,35 +3530,34 @@ describe("scripts/hooks/guard-bash.mjs -- ambient PI_LENS_HOME (#2699)", () => {
 });
 
 describe(`scripts/hooks/guard-bash.mjs -- transcript corpus ${TRANSCRIPT_CORPUS_DATE} (#2705)`, () => {
+	// A synthetic HOME that is never created, like PAYLOAD_CWD: the hook only
+	// resolves `~` against it. A mkdtemp under os.tmpdir() is /tmp when TMPDIR
+	// is unset or /tmp, which turned the corpus's `~/...` writes into /tmp
+	// writes (#4348 review r1: 5 rows flipped).
+	const corpusHome = "/home/dev/pi-lens-guard-bash-corpus-home";
+	const corpusEnv = {
+		...BASE_ENV,
+		HOME: corpusHome,
+		PI_LENS_HOME: join(corpusHome, ".pi-lens"),
+		PILENS_DATA_DIR: join(corpusHome, "data"),
+		PI_LENS_INSTALL_LOG: join(corpusHome, "logs", "install.log"),
+	};
+	// The fixture was captured as uid 1000: its 655 harness-scratch writes name
+	// /tmp/claude-1000/. The exemption is the RUNNER's own uid, so the hook sees
+	// the runner's directory; the hash and the EXPECTED_* sets stay keyed on the
+	// original row (#4348 review r1: a CI uid != 1000 gave `expected 313 to be
+	// 66`).
+	const asRunner = (command: string) =>
+		command.replaceAll(
+			"/tmp/claude-1000",
+			`/tmp/claude-${process.getuid?.() ?? 1000}`,
+		);
+
 	it("keeps the transcript corpus at zero non-rule denies", () => {
-		// A synthetic HOME that is never created, like PAYLOAD_CWD: the hook only
-		// resolves `~` against it. A mkdtemp under os.tmpdir() is /tmp when TMPDIR
-		// is unset or /tmp, which turned the corpus's `~/...` writes into /tmp
-		// writes (#4348 review r1: 5 rows flipped).
-		const corpusHome = "/home/dev/pi-lens-guard-bash-corpus-home";
-		const corpusEnv = {
-			...BASE_ENV,
-			HOME: corpusHome,
-			PI_LENS_HOME: join(corpusHome, ".pi-lens"),
-			PILENS_DATA_DIR: join(corpusHome, "data"),
-			PI_LENS_INSTALL_LOG: join(corpusHome, "logs", "install.log"),
-		};
-		const started = performance.now();
 		const offenses: string[] = [];
 		let actualDenies = 0;
 		for (const { command } of TRANSCRIPT_CORPUS) {
-			// The fixture was captured as uid 1000: its 655 harness-scratch
-			// writes name /tmp/claude-1000/. The exemption is the RUNNER's own
-			// uid, so the hook sees the runner's directory; the hash and the
-			// EXPECTED_* sets stay keyed on the original row (#4348 review r1:
-			// a CI uid != 1000 gave `expected 313 to be 66`).
-			const result = runHook(
-				command.replaceAll(
-					"/tmp/claude-1000",
-					`/tmp/claude-${process.getuid?.() ?? 1000}`,
-				),
-				corpusEnv,
-			);
+			const result = hookVerdict(asRunner(command), corpusEnv);
 			const hash = commandHash(command);
 			const expectedDeny = EXPECTED_TRANSCRIPT_DENIES.has(hash);
 			const expectedAllow = EXPECTED_TRANSCRIPT_ALLOWS.has(hash);
@@ -2791,14 +3576,60 @@ describe(`scripts/hooks/guard-bash.mjs -- transcript corpus ${TRANSCRIPT_CORPUS_
 				offenses.push(`unexpected stderr: ${command}`);
 		}
 
+		expect(actualDenies).toBe(EXPECTED_TRANSCRIPT_DENIES.size);
+		expect(offenses).toEqual([]);
+	});
+
+	// The real hook for every row. The classifier pass above skips the child's
+	// stdin, exit-code and stderr wiring, so a deny that only the hook adds (a
+	// non-rule deny from run() on one row) is caught here and nowhere else.
+	// Recurrence: the 88-row sample this loop replaced let a hook-only deny on
+	// an unsampled row pass (#4729 review r1 F1). The in-process verdict rides
+	// beside each spawn, since it costs no process.
+	it("keeps every transcript row's real hook verdict at zero non-rule denies", async () => {
+		const offenses: string[] = [];
+		const mismatches: string[] = [];
+		let actualDenies = 0;
+		const started = performance.now();
+		// #3801: four children at a time; the verdicts below are read in corpus
+		// order, so the offense and mismatch lists keep their serial order.
+		const children = await runHooksConcurrently(
+			TRANSCRIPT_CORPUS.map(({ command }) => asRunner(command)),
+			corpusEnv,
+			4,
+		);
+		for (const [index, { command }] of TRANSCRIPT_CORPUS.entries()) {
+			const child = children[index];
+			const verdict = hookVerdict(asRunner(command), corpusEnv);
+			if (child.status !== verdict.status || child.stderr !== verdict.stderr)
+				mismatches.push(
+					`child ${child.status} vs classifier ${verdict.status}: ${command}`,
+				);
+			const hash = commandHash(command);
+			const expectedDeny = EXPECTED_TRANSCRIPT_DENIES.has(hash);
+			const expectedAllow = EXPECTED_TRANSCRIPT_ALLOWS.has(hash);
+			if (child.status === 2) actualDenies++;
+
+			if (expectedDeny) {
+				if (child.status !== 2)
+					offenses.push(`expected deny was allowed: ${command}`);
+				continue;
+			}
+			if (expectedAllow && child.status !== 0)
+				offenses.push(`expected allow was denied: ${command}`);
+			else if (!expectedAllow && child.status !== 0)
+				offenses.push(`non-rule deny (${child.status}): ${command}`);
+			else if (child.stderr !== "")
+				offenses.push(`unexpected stderr: ${command}`);
+		}
 		const elapsedMs = performance.now() - started;
 		console.log(
-			`guard-bash transcript corpus: ${TRANSCRIPT_CORPUS.length} rows, ` +
-				`${actualDenies} expected denies, ${Math.round(elapsedMs)}ms`,
+			`guard-bash transcript corpus: ${TRANSCRIPT_CORPUS.length} rows through the real hook, ${actualDenies} expected denies, ${Math.round(elapsedMs)}ms`,
 		);
 		expect(elapsedMs).toBeLessThan(180_000);
 		expect(actualDenies).toBe(EXPECTED_TRANSCRIPT_DENIES.size);
 		expect(offenses).toEqual([]);
+		expect(mismatches).toEqual([]);
 	}, 180_000);
 });
 
@@ -4054,6 +4885,457 @@ describe("scripts/hooks/guard-bash.mjs -- checkout/scratch directory under /tmp 
 		expect(offTmp.status).toBe(0);
 	});
 
+	// #4057: mktemp has two TMPDIRs. A word the agent typed (a template, a
+	// `-p` or `--tmpdir=` value, a `~`) is expanded by bash from the shell's own
+	// variables before the inline prefix applies, as git's words are (#3997).
+	// GNU mktemp's own default directory (no template, `-t`, bare `--tmpdir`) is
+	// read from mktemp's environment, so the prefix moves it. The rule models
+	// GNU coreutils mktemp as #3526 measured it (9.4); this change did not re-run
+	// GNU mktemp. Measured on macOS 26.5 (/bin/bash 3.2.57, BSD mktemp from
+	// shell_cmds-329, whose man page lists `-p tmpdir, --tmpdir[=tmpdir]`) with
+	// TMPDIR=a in the shell: `TMPDIR=b mktemp -d $TMPDIR/x.XXXXXX`, `-p $TMPDIR
+	// x.XXXXXX` and `--tmpdir=$TMPDIR x.XXXXXX` landed in a, bare `--tmpdir
+	// x.XXXXXX` landed in b, and no template and `-t` landed in the per-user
+	// temp directory, in neither, so only the GNU model backs those two rows.
+	// Each row sets the hook's ambient TMPDIR (or HOME) itself, so the runner's
+	// own value never decides it, and names only absent directories, which the
+	// hook judges as spelled on every platform.
+	describe("an inline TMPDIR= moves only mktemp's own default (#4057)", () => {
+		const AMBIENT_TMP = "/tmp/guard-bash-4057-ambient";
+		const AMBIENT_OFF = "/home/dev/guard-bash-4057-ambient";
+		const INLINE_TMP = "/tmp/guard-bash-4057-inline";
+		const INLINE_OFF = "/home/dev/guard-bash-4057-inline";
+		// Recurrence (#4826 review r1 F2): the gate admitted a closed list of
+		// spellings that can expand to nothing and was widened twice; each of
+		// these is a parameter expansion bash makes empty for an unset D and the
+		// list missed. Any reference the hook cannot resolve takes both readings.
+		const EMPTY_SPELLINGS = [
+			"${D:-}",
+			"${D-}",
+			"${D%x}",
+			"${D#x}",
+			"${D:+x}",
+			"${D:0:0}",
+			"${D:-${E}}",
+		];
+		// mktemp's own /tmp fallback lands in /tmp itself, which exists. On macOS
+		// /tmp resolves to /private/tmp; the tmpCheckout rules compare against
+		// both spellings of the root (#4060 r2), so the rows deny there too.
+		const TMP_FALLBACK_RULE: DenyRule = "tmpCheckout";
+		const ROWS: Array<{
+			label: string;
+			command: string;
+			ambient: Record<string, string>;
+			rule: DenyRule | null;
+		}> = [
+			{
+				label: "a $TMPDIR/ template follows the shell's TMPDIR under /tmp",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d $TMPDIR/x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a $TMPDIR/ template follows the shell's TMPDIR off /tmp",
+				command: `TMPDIR=${INLINE_TMP} mktemp -d $TMPDIR/x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: null,
+			},
+			{
+				label: "a -p $TMPDIR value follows the shell's TMPDIR under /tmp",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d -p $TMPDIR x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label:
+					"a bundled -dp $TMPDIR value follows the shell's TMPDIR off /tmp",
+				command: `TMPDIR=${INLINE_TMP} mktemp -dp "$TMPDIR" x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: null,
+			},
+			{
+				label: "a --tmpdir=$TMPDIR value follows the shell's TMPDIR under /tmp",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d --tmpdir=$TMPDIR x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a --tmpdir=$TMPDIR value follows the shell's TMPDIR off /tmp",
+				command: `TMPDIR=${INLINE_TMP} mktemp -d --tmpdir=$TMPDIR x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: null,
+			},
+			{
+				label: "a ~/ template follows the shell's HOME under /tmp",
+				command: "HOME=/home/dev/guard-bash-4057-home mktemp -d ~/x.XXXXXX",
+				ambient: { HOME: "/tmp/guard-bash-4057-home" },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a ~/ template follows the shell's HOME off /tmp",
+				command: "HOME=/tmp/guard-bash-4057-home mktemp -d ~/x.XXXXXX",
+				ambient: { HOME: "/home/dev/guard-bash-4057-home" },
+				rule: null,
+			},
+			{
+				// The shell has no T, so bash hands mktemp `//x.XXXXXX`.
+				label: "a variable only the prefix sets stays unexpanded in a template",
+				command: "T=tmp/guard-bash-4057 mktemp -d /$T/x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: null,
+			},
+			{
+				label: "an earlier export is the shell's TMPDIR for a typed word",
+				command: `export TMPDIR=/tmp/guard-bash-4057-exported; TMPDIR=${INLINE_OFF} mktemp -d $TMPDIR/x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			// Accepted residual: TMPDIR is unset in the shell and in the hook's env.
+			// Bash expands a typed `$TMPDIR` to the empty string, so mktemp gets
+			// `/guard-bash-4057-unset/…`, but the hook reads lookupShellVariable's
+			// `/tmp` default, as git's words do. The prefix is not consulted. The
+			// absent subdirectory keeps macOS's /tmp symlink out of the verdict.
+			{
+				label: "an unset shell TMPDIR in a template reads the /tmp default",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d $TMPDIR/guard-bash-4057-unset/x.XXXXXX`,
+				ambient: {},
+				rule: "tmpCheckout",
+			},
+			{
+				label: "an unset shell TMPDIR in a -p value reads the /tmp default",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d -p $TMPDIR/guard-bash-4057-unset x.XXXXXX`,
+				ambient: {},
+				rule: "tmpCheckout",
+			},
+			// A `-p`/`--tmpdir=` value or a template that is one variable the shell
+			// does not have expands to nothing. GNU mktemp reads an empty `-p ''` or
+			// `--tmpdir=` as its own `$TMPDIR`, else /tmp (coreutils mktemp.c), and a
+			// vanished template leaves none, which defaults there too. The prefix's
+			// `D` never reaches the word. The ambient TMPDIR is an absent directory,
+			// so macOS's /tmp symlink stays out of the verdict.
+			{
+				label: "-p $D, D only in the prefix: mktemp's TMPDIR under /tmp",
+				command: "D=/tmp/guard-bash-4057-lane mktemp -d -p $D x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: '-p "$D", D only in the prefix: mktemp\'s TMPDIR under /tmp',
+				command: 'D=/tmp/guard-bash-4057-lane mktemp -d -p "$D" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "-p ${D}, D only in the prefix: mktemp's TMPDIR under /tmp",
+				command: "D=/tmp/guard-bash-4057-lane mktemp -d -p ${D} x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "--tmpdir=$D, D only in the prefix: mktemp's TMPDIR under /tmp",
+				command: "D=/tmp/guard-bash-4057-lane mktemp -d --tmpdir=$D x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label:
+					"a $D template, D only in the prefix: mktemp's TMPDIR under /tmp",
+				command: "D=/tmp/guard-bash-4057-lane mktemp -d $D",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: 'an empty-assigned -p "$D" reads mktemp\'s TMPDIR under /tmp',
+				command: 'D=; mktemp -d -p "$D" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "-p \"$D\" follows mktemp's TMPDIR off /tmp, not the prefix's D",
+				command: 'D=/tmp/guard-bash-4057-lane mktemp -d -p "$D" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: null,
+			},
+			{
+				label: '-p "$D" with D unset reads the prefix\'s TMPDIR under /tmp',
+				command: `TMPDIR=${INLINE_TMP} mktemp -d -p "$D" x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			// The same holds for any word made only of references the hook cannot
+			// resolve and bash can expand to empty: a positional parameter (the
+			// hook's command has none), `$*`, `$!` before any background job, and a
+			// concatenation of unset variables. `$0` is always set, and a resolved
+			// part keeps the word non-empty, so neither gets the empty reading.
+			{
+				label: '-p "$1", no parameters: mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d -p "$1" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: '-p "${1}", no parameters: mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d -p "${1}" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: '-p "$*", no parameters: mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d -p "$*" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: '-p "$!", no background job: mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d -p "$!" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "--tmpdir=$D$E, both unset: mktemp's TMPDIR under /tmp",
+				command: "mktemp -d --tmpdir=$D$E x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a $D$E template, both unset: mktemp's TMPDIR under /tmp",
+				command: "mktemp -d $D$E",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: '-p "$0" is never empty: it stays relative to the cwd',
+				command: 'mktemp -d -p "$0" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: null,
+			},
+			{
+				label: '-p "$X$D" with X off /tmp is never empty',
+				command: 'X=/home/dev/guard-bash-4057-x; mktemp -d -p "$X$D" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: null,
+			},
+			// Recurrence (#4826 review r1 F1): moving the typed words off the prefix
+			// env removed the only cover for an absolute head followed by a variable
+			// the shell lacks. `S` is unset in the shell, so bash hands mktemp
+			// `/tmp/…` and the directory lands under /tmp; the prefix's S is never
+			// read. The unprefixed spelling was already allowed on master.
+			{
+				label: "a /tmp$S template, S only in the prefix, lands under /tmp",
+				command: "S= mktemp -d /tmp$S/guard-bash-4057-f1/x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a /tmp$S template with no prefix lands under /tmp",
+				command: "mktemp -d /tmp$S/guard-bash-4057-f1/x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "-p /tmp$S, S only in the prefix, lands under /tmp",
+				command: "S= mktemp -d -p /tmp$S/guard-bash-4057-f1 x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "--tmpdir=/tmp$S, S only in the prefix, lands under /tmp",
+				command: "S= mktemp -d --tmpdir=/tmp$S/guard-bash-4057-f1 x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a /home$S template stays off /tmp",
+				command: "S= mktemp -d /home$S/dev/guard-bash-4057-f1/x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: null,
+			},
+			// Recurrence (#4826 review r1 F2): see EMPTY_SPELLINGS. Quotes are gone
+			// by the time the hook reads the word, so the quoted spelling stands for
+			// the unquoted one too.
+			...EMPTY_SPELLINGS.flatMap((spelling) => [
+				{
+					label: `-p "${spelling}" reads mktemp's TMPDIR under /tmp`,
+					command: `mktemp -d -p "${spelling}" x.XXXXXX`,
+					ambient: { TMPDIR: AMBIENT_TMP },
+					rule: "tmpCheckout" as DenyRule | null,
+				},
+				{
+					label: `-p "${spelling}" follows mktemp's TMPDIR off /tmp`,
+					command: `mktemp -d -p "${spelling}" x.XXXXXX`,
+					ambient: { TMPDIR: AMBIENT_OFF },
+					rule: null as DenyRule | null,
+				},
+			]),
+			{
+				label: '--tmpdir="${D-}" reads mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d --tmpdir="${D-}" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: 'a "${D-}" template reads mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d "${D-}"',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label:
+					'a quoted backtick -p "`true`" reads mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d -p "`true`" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			// Parser-hostile words: an unterminated or unparseable reference is a
+			// reference the hook cannot resolve, so it neither throws nor allows.
+			{
+				label: "-p '${' (unterminated brace) reads mktemp's TMPDIR under /tmp",
+				command: "mktemp -d -p '${' x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label:
+					"-p '$((1+1' (unterminated arithmetic) reads mktemp's TMPDIR under /tmp",
+				command: "mktemp -d -p '$((1+1' x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: '-p "${!D}" (indirection) reads mktemp\'s TMPDIR under /tmp',
+				command: 'mktemp -d -p "${!D}" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label:
+					"-p ~nosuch (unresolvable ~user) reads mktemp's TMPDIR under /tmp",
+				command: "mktemp -d -p ~guardbash4057nosuch x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a lone backtick in a -p value reads mktemp's TMPDIR under /tmp",
+				command: "mktemp -d -p '`' x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: "tmpCheckout",
+			},
+			// GNU mktemp reads TMPDIR only when it is set and non-empty, else
+			// /tmp (coreutils mktemp.c: `env && *env`), so an empty TMPDIR in
+			// mktemp's own env, from the prefix or the ambient env, is /tmp for its
+			// default directory (TMP_FALLBACK_RULE).
+			{
+				label: "an empty TMPDIR= with no template falls back to /tmp",
+				command: "TMPDIR= mktemp -d",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: TMP_FALLBACK_RULE,
+			},
+			{
+				label: "an empty TMPDIR= with -t falls back to /tmp",
+				command: "TMPDIR= mktemp -d -t x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: TMP_FALLBACK_RULE,
+			},
+			{
+				label: "an empty TMPDIR= with bare --tmpdir falls back to /tmp",
+				command: "TMPDIR= mktemp -d --tmpdir x.XXXXXX",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: TMP_FALLBACK_RULE,
+			},
+			{
+				label: 'an empty TMPDIR= with -p "" falls back to /tmp',
+				command: 'TMPDIR= mktemp -d -p "" x.XXXXXX',
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: TMP_FALLBACK_RULE,
+			},
+			{
+				label: "an empty TMPDIR (ambient) with no template falls back to /tmp",
+				command: "mktemp -d",
+				ambient: { TMPDIR: "" },
+				rule: TMP_FALLBACK_RULE,
+			},
+			{
+				label: "an empty TMPDIR from TMPDIR=$X, X unset, falls back to /tmp",
+				command: "TMPDIR=$X mktemp -d",
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: TMP_FALLBACK_RULE,
+			},
+			{
+				label:
+					"an empty TMPDIR (ambient) with bare --tmpdir falls back to /tmp",
+				command: "mktemp -d --tmpdir x.XXXXXX",
+				ambient: { TMPDIR: "" },
+				rule: TMP_FALLBACK_RULE,
+			},
+			{
+				label:
+					"a non-empty prefix over an empty TMPDIR (ambient) follows the prefix",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d`,
+				ambient: { TMPDIR: "" },
+				rule: null,
+			},
+			{
+				label: "no template lands in the prefix's TMPDIR under /tmp",
+				command: `TMPDIR=${INLINE_TMP} mktemp -d`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "no template lands in the prefix's TMPDIR off /tmp",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d`,
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: null,
+			},
+			{
+				label: "-t lands in the prefix's TMPDIR under /tmp",
+				command: `TMPDIR=${INLINE_TMP} mktemp -d -t x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "-t lands in the prefix's TMPDIR off /tmp",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d -t x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: null,
+			},
+			{
+				label: "a bundled -dt lands in the prefix's TMPDIR under /tmp",
+				command: `TMPDIR=${INLINE_TMP} mktemp -dt x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "a bundled -dt lands in the prefix's TMPDIR off /tmp",
+				command: `TMPDIR=${INLINE_OFF} mktemp -dt x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: null,
+			},
+			{
+				label: "bare --tmpdir lands in the prefix's TMPDIR under /tmp",
+				command: `TMPDIR=${INLINE_TMP} mktemp -d --tmpdir x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_OFF },
+				rule: "tmpCheckout",
+			},
+			{
+				label: "bare --tmpdir lands in the prefix's TMPDIR off /tmp",
+				command: `TMPDIR=${INLINE_OFF} mktemp -d --tmpdir x.XXXXXX`,
+				ambient: { TMPDIR: AMBIENT_TMP },
+				rule: null,
+			},
+		];
+
+		it.each(ROWS)("$label", ({ command, ambient, rule }) => {
+			const result = runHook(command, {
+				...NO_AMBIENT_TMPDIR_ENV,
+				...ambient,
+			});
+			expect(result.stderr).toBe(
+				rule === null ? "" : `${RULE_MESSAGES[rule]}\n`,
+			);
+			expect(result.status).toBe(rule === null ? 0 : 2);
+		});
+	});
+
 	it("a /tmp string inside a comment, a heredoc body, or echo text never trips the rule -- this rule reads argv WORDS, not raw text", () => {
 		expect(
 			findDeny(
@@ -4088,12 +5370,15 @@ describe("scripts/hooks/guard-bash.mjs -- checkout/scratch directory under /tmp 
 			expect(
 				findDeny('W=".claude/worktrees/a"; git worktree add "$W"', PAYLOAD_CWD),
 			).toBeNull();
+			// hookVerdict, not findDeny: `~` expands from the HOME of the env it is
+			// given (BASE_ENV's off-/tmp one), not from the worker's pinned HOME.
 			expect(
-				findDeny(
+				hookVerdict(
 					"S=~/.local/share/pi-lens-orchestrator/tmp; W=$S/wt; git worktree add $W",
+					BASE_ENV,
 					PAYLOAD_CWD,
-				),
-			).toBeNull();
+				).status,
+			).toBe(0);
 		});
 
 		it("does not hang on a self-referential chain, and stays allowed (the cap breaks the loop, leaving unresolved $A as literal text)", () => {
@@ -4161,30 +5446,28 @@ describe("scripts/hooks/guard-bash.mjs -- checkout/scratch directory under /tmp 
 	describe("~ (HOME) expansion (review S1)", () => {
 		it("expands ~/… to a real HOME even when cwd is itself under /tmp", () => {
 			const underTmpCwd = "/tmp/some-review-worktree";
-			expect(
-				findDeny(
-					"git worktree add ~/.cache/pi-lens-orchestrator/worktrees/agent-x",
-					underTmpCwd,
-				),
-			).toBeNull();
-			expect(
-				findDeny(
-					"git worktree add ~/.local/share/pi-lens-orchestrator/tmp/lane-1",
-					underTmpCwd,
-				),
-			).toBeNull();
-			expect(
-				findDeny("git worktree add ~/.plegma/work/sub-1", underTmpCwd),
-			).toBeNull();
+			// hookVerdict, not findDeny: the classifier reads `~` from the env it
+			// is given, and the worker's own HOME is a scratch dir under /tmp
+			// whenever TMPDIR is /tmp (#4789 review F1).
+			for (const command of [
+				"git worktree add ~/.cache/pi-lens-orchestrator/worktrees/agent-x",
+				"git worktree add ~/.local/share/pi-lens-orchestrator/tmp/lane-1",
+				"git worktree add ~/.plegma/work/sub-1",
+			])
+				expect(
+					hookVerdict(command, BASE_ENV, underTmpCwd).status,
+					command,
+				).toBe(0);
 		});
 
 		it("expands ~ picked up MID-CHAIN through variable indirection", () => {
 			expect(
-				findDeny(
+				hookVerdict(
 					"S=~/.local/share/pi-lens-orchestrator/tmp; W=$S/wt; git worktree add $W",
+					BASE_ENV,
 					"/tmp/some-review-worktree",
-				),
-			).toBeNull();
+				).status,
+			).toBe(0);
 		});
 
 		it("bare ~ alone expands too, even when cwd is itself under /tmp", () => {
@@ -4194,8 +5477,9 @@ describe("scripts/hooks/guard-bash.mjs -- checkout/scratch directory under /tmp 
 			// cwd, the same way the `~/…` cases above do, so the assertion
 			// actually depends on the bare-`~` branch running.
 			expect(
-				findDeny("git worktree add ~", "/tmp/some-review-worktree"),
-			).toBeNull();
+				hookVerdict("git worktree add ~", BASE_ENV, "/tmp/some-review-worktree")
+					.status,
+			).toBe(0);
 		});
 	});
 });
@@ -5408,5 +6692,164 @@ describe("scripts/hooks/guard-bash.mjs -- writes under /tmp (#4348)", () => {
 		"echo a > ${TMPDIR:-/tmp}/x",
 	])("limit: %j is not judged", (command) => {
 		expect(deny(command)).toBeNull();
+	});
+});
+
+// #5111: `git stash` is an ADMIT list, not a deny list. Recurrence: 41 of 43
+// stash refusals in 14 days of transcripts (#3995 slice B) were the read-only
+// `git stash list`. Only `list` and `show` (with read-only flags and, for
+// `show`, one `stash@{N}`) pass; every other form, including a spelling the
+// scan cannot classify, stays denied (principles: gates fail closed).
+const STASH_ADMITTED: string[] = [
+	"git stash list",
+	"git stash show",
+	"git stash list --oneline",
+	"git stash list --stat",
+	"git stash list --format=%gd:%s",
+	'git stash list --pretty="%gd %s"',
+	"git stash show --stat",
+	"git stash show -p",
+	"git stash show --name-only stash@{1}",
+	"git stash show stash@{0}",
+	"git stash show 2",
+	"git -C /home/dev/wt stash list",
+	"git -C /home/dev/a -C b stash show",
+	"git -C ~/wt stash list",
+	"git -C ../wt-1.2_x@y stash show",
+	"git stash list | head -5",
+	"git stash list 2>&1",
+	"git stash list 2>/dev/null",
+	"git stash show -p >/dev/null 2>&1",
+	"git stash list --format=%gd; git status",
+	"git stash list && git status",
+	"cd /home/dev/wt && git stash list",
+	"git stash 'list'",
+	'git "stash" list',
+];
+
+const STASH_STILL_DENIED: string[] = [
+	// every writing subcommand, and the bare form (= push)
+	"git stash",
+	"git stash push",
+	"git stash push -m list",
+	"git stash save wip",
+	"git stash pop",
+	"git stash apply",
+	"git stash drop",
+	"git stash clear",
+	"git stash create",
+	"git stash store abc123",
+	"git stash branch newbranch",
+	"git stash -u",
+	"git stash -m list",
+	"git stash --include-untracked",
+	// spellings of list/show git does not take as the subcommand
+	"git stash li",
+	"git stash LIST",
+	"git stash list-all",
+	// extra operands and flags outside the admitted set
+	"git stash list drop",
+	"git stash list stash@{0}",
+	"git stash list --output=/home/dev/x",
+	"git stash list -- drop",
+	"git stash show drop",
+	"git stash show -p drop",
+	"git stash show stash@{0} drop",
+	"git stash show stash@{0} stash@{1}",
+	"git stash show --ext-diff",
+	"git stash show --output=/home/dev/x",
+	"git stash show --format=$X",
+	"git stash show --format=$(echo %gd)",
+	"git stash list --format='%gd' '--output=/home/dev/x'",
+	"git stash list > /home/dev/out",
+	"git stash list 2>/home/dev/out",
+	"git stash list >/dev/nullx",
+	"git stash list >>/dev/null",
+	"git stash 2>&1 list",
+	// global options before the subcommand (-c config, aliases, git-dir)
+	"git -c core.pager=sh stash list",
+	"git -c alias.stash=push stash list",
+	"git --git-dir=/home/dev/g stash list",
+	"git --no-pager stash list",
+	"git --exec-path=/home/dev/x stash show",
+	"git -C /home/dev/wt -c user.name=a stash list",
+	// PR #5115 Greptile G1: the -C VALUE is part of the words bash hands git, so
+	// a value the scan cannot read as one plain path is a refusal (bash runs
+	// `git -C . stash save stash list` for the first row).
+	'git -C $(printf ". stash save") stash list',
+	"git -C `echo .` stash list",
+	'git -C "$X" stash list',
+	"git -C $X stash list",
+	"git -C ${X} stash list",
+	"git -C '. stash save' stash list",
+	"git -C a\\ b stash list",
+	"git -C {.,.} stash list",
+	"git -C * stash list",
+	"git -C ? stash list",
+	"git -C [a] stash list",
+	"git -C -c stash list",
+	"git -c a=$(echo x) stash list",
+	// PR #5115 verify r4: the lexer splits a segment at `<(`/`>(`, so the words
+	// after a process substitution before the subcommand are never classified
+	// (bash runs `git -C /dev/fd/63 stash drop`). A git segment that ends
+	// before its subcommand on a dangling `<`/`>` is refused.
+	"git -C <(true) stash drop",
+	"git -C >(true) stash drop",
+	"git <(true) stash drop",
+	"git -C . <(true) stash pop",
+	// env, inline or exported earlier in the command
+	"FOO=1 git stash list",
+	"GIT_EXTERNAL_DIFF=/home/dev/x git stash show -p",
+	"export GIT_PAGER=sh; git stash list",
+	"env GIT_PAGER=sh git stash list",
+	// substitutions and expansions the scan cannot resolve
+	"git stash $(echo drop)",
+	"git stash `echo drop`",
+	'git stash "$(echo drop)"',
+	"git stash $(:) list",
+	"git stash list $(echo drop)",
+	"git stash list `echo drop`",
+	"git stash list $X",
+	"git stash $X",
+	"git stash {list,drop}",
+	"git stash l*",
+	"git stash show $'\\x64rop'",
+	// quoted spellings that resolve to something else
+	'git "stash" drop',
+	"git stash 'drop'",
+	'git stash "pu""sh"',
+	'git stash "list drop"',
+	// a writing stash chained after an admitted one
+	"git stash list && git stash drop",
+	"git stash list; git stash pop",
+	"git stash list | git stash apply",
+	"echo $(git stash drop)",
+];
+
+describe("scripts/hooks/guard-bash.mjs -- stash admit list (#5111)", () => {
+	it.each(STASH_ADMITTED)("admits %j", (command) => {
+		const result = hookVerdict(command);
+		expect(result.stderr).toBe("");
+		expect(result.status).toBe(0);
+	});
+
+	it.each(STASH_STILL_DENIED)("still denies %j", (command) => {
+		const result = hookVerdict(command);
+		expect(result.stderr).toBe(`${RULE_MESSAGES.stash}\n`);
+		expect(result.status).toBe(2);
+	});
+
+	// #5111: every worktree-remove refusal names the helper, so an agent no
+	// longer answers with an `rm` and a retry (215 refusals in 14 days).
+	it.each(["worktreeSymlink", "worktreeUnresolved", "worktreeForce"] as const)(
+		"%s refusal names scripts/worktree-remove.mjs",
+		(rule) => {
+			expect(RULE_MESSAGES[rule]).toContain("scripts/worktree-remove.mjs");
+		},
+	);
+
+	it("names the admitted read-only forms in the refusal", () => {
+		expect(RULE_MESSAGES.stash).toContain("git stash list");
+		expect(RULE_MESSAGES.stash).toContain("git stash show");
 	});
 });

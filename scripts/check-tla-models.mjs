@@ -97,6 +97,69 @@ export function classifyTlcOutput(output) {
 	return { status: "error", detail: errorLine?.trim() ?? "no verdict" };
 }
 
+/**
+ * TLC's distinct-state count from its statistics line
+ * (`N states generated, M distinct states found, K states left on queue.`),
+ * or null when the run printed none, such as a parse error (#4714). A missing
+ * count is no count, never zero: the ratchet then reports rather than fails.
+ */
+export function parseDistinctStates(output) {
+	const match =
+		/^\s*[\d,]+ states generated, ([\d,]+) distinct states found/m.exec(
+			String(output),
+		);
+	return match ? Number(match[1].replace(/,/g, "")) : null;
+}
+
+/**
+ * How far a config's distinct-state count may grow past its recorded count
+ * before the checker fails it (#4714). Recurrence: #3836, where three processes
+ * at MaxGen=5 and Rounds=2 reached 30.8M distinct states and never finished.
+ */
+export const STATE_COUNT_FACTOR = 2;
+
+/**
+ * The runs whose distinct-state count exceeds the recorded count by more than
+ * `factor`. A run with no count, or a config with no recorded count, is not a
+ * jump here (see `unrecordedStateCounts`).
+ *
+ * @param {Array<{ id: string, distinctStates: number | null }>} outcomes
+ * @param {Record<string, number>} states the recorded counts, by `modelCostId`
+ * @param {number} [factor]
+ */
+export function stateCountJumps(outcomes, states, factor = STATE_COUNT_FACTOR) {
+	const jumps = [];
+	for (const outcome of outcomes) {
+		const recorded = states[outcome.id];
+		if (!Number.isInteger(recorded) || outcome.distinctStates == null) continue;
+		if (outcome.distinctStates > recorded * factor)
+			jumps.push({
+				id: outcome.id,
+				recorded,
+				observed: outcome.distinctStates,
+			});
+	}
+	return jumps;
+}
+
+/** The message for one `stateCountJumps` entry: its config, old and new count. */
+export function formatStateJump(
+	{ id, recorded, observed },
+	factor = STATE_COUNT_FACTOR,
+) {
+	return `STATE-COUNT JUMP ${id}: old count ${recorded} distinct states (recorded in ${MODEL_COSTS_FILE}), new count ${observed} distinct states, more than ${factor}x the recorded count. If the growth is intended, re-record the count: regenerate from a shard log that prints it (scripts/gen-tla-model-costs.mjs), or raise the count in ${MODEL_COSTS_FILE} in the same PR with the reason`;
+}
+
+/** The configs that ran with a count but have no recorded count yet. */
+export function unrecordedStateCounts(outcomes, states) {
+	return outcomes
+		.filter(
+			(outcome) =>
+				outcome.distinctStates != null && !Number.isInteger(states[outcome.id]),
+		)
+		.map((outcome) => outcome.id);
+}
+
 export function verdictMatches(expected, actual) {
 	if (expected.status !== actual.status) return false;
 	return (
@@ -159,7 +222,7 @@ export const MODEL_COSTS_FILE = "scripts/tla-model-costs.json";
 
 /**
  * @param {string} root repository root
- * @returns {{ files: Record<string, number>, max: number }}
+ * @returns {{ files: Record<string, number>, max: number, states: Record<string, number> }}
  */
 export function loadModelCosts(root) {
 	const file = path.join(root, MODEL_COSTS_FILE);
@@ -196,7 +259,19 @@ export function loadModelCosts(root) {
 		throw new Error(
 			`TLA+ model costs at ${file} price no config above 0 s; regenerate with scripts/gen-tla-model-costs.mjs (a config with no row costs the table max, so a table whose max is 0 sends every config to shard 1)`,
 		);
-	return { files, max };
+	// `states` is the #4714 distinct-state count per config. A table written
+	// before it has no key at all, and that is a valid table with no counts.
+	const states = parsed.states ?? {};
+	if (typeof states !== "object" || Array.isArray(states))
+		throw new Error(
+			`TLA+ model costs at ${file} have a "states" that is not an object`,
+		);
+	for (const [id, count] of Object.entries(states))
+		if (!Number.isInteger(count) || count < 0)
+			throw new Error(
+				`TLA+ model costs at ${file}: states["${id}"] is not a non-negative integer`,
+			);
+	return { files, max, states };
 }
 
 /**
@@ -206,7 +281,7 @@ export function loadModelCosts(root) {
  * separator is not: keyed by hand, `<root>`-relative paths carry `\` on a
  * Windows runner, every lookup misses, and a miss costs the table's MAXIMUM --
  * so all configs become equal-cost and the balance this shard prints reads a
- * flat 1.00x by construction (AGENTS.md "Windows path shapes" 1 and 2; the
+ * flat 1.00x by construction (docs/pi-lens-reviewer.md "Windows path shapes"; the
  * #4356 recurrence: a host-default separator reddening the Windows lane).
  * `pathImpl` is injectable so a posix lane can prove the win32 shape
  * (AGENTS.md shape 35) instead of trusting it.
@@ -523,7 +598,7 @@ function sha256(file) {
 	return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-async function ensureJar(jarArg, root) {
+export async function ensureJar(jarArg, root) {
 	const jar = resolveJarPath(jarArg, root);
 	if (!fs.existsSync(jar)) {
 		if (jarArg) throw new Error(`--jar ${jarArg} does not exist`);
@@ -656,7 +731,11 @@ function runTlc(jar, config, module) {
 		});
 		child.on("close", () => {
 			fs.rmSync(metadir, { recursive: true, force: true });
-			resolve(classifyTlcOutput(`${stdout}\n${stderr}`));
+			const output = `${stdout}\n${stderr}`;
+			resolve({
+				...classifyTlcOutput(output),
+				distinctStates: parseDistinctStates(output),
+			});
 		});
 	});
 }
@@ -701,6 +780,9 @@ async function main() {
 	// across ALL shards -- the balance is otherwise invisible until a shard
 	// loses its race against `timeout-minutes` and reports `cancelled`.
 	const shardCosts = resolveShardCosts(argv, root);
+	// #4714: the recorded distinct-state counts gate the run whether or not it
+	// is sharded, so the table is read (and refused when malformed) up front.
+	const { states: recordedStates } = loadModelCosts(root);
 
 	const availableParallelism =
 		typeof os.availableParallelism === "function"
@@ -723,20 +805,45 @@ async function main() {
 		const header = parseModelHeader(fs.readFileSync(config, "utf8"));
 		if (header.error) {
 			console.log(`FAIL ${name}: ${header.error}`);
-			return { name, id, dir: path.dirname(name), ok: false, seconds: 0 };
+			return {
+				name,
+				id,
+				dir: path.dirname(name),
+				ok: false,
+				seconds: 0,
+				distinctStates: null,
+			};
 		}
 		const started = Date.now();
 		const actual = await runTlc(jar, config, header.module);
 		const seconds = (Date.now() - started) / 1000;
 		const ok = verdictMatches(header.expect, actual);
+		const distinct =
+			actual.distinctStates == null
+				? ""
+				: `, ${actual.distinctStates} distinct states`;
 		console.log(
-			`${ok ? "ok  " : "FAIL"} ${name}: expected ${describeVerdict(header.expect)}, got ${describeVerdict(actual)} (${seconds.toFixed(1)}s)`,
+			`${ok ? "ok  " : "FAIL"} ${name}: expected ${describeVerdict(header.expect)}, got ${describeVerdict(actual)} (${seconds.toFixed(1)}s${distinct})`,
 		);
-		return { name, id, dir: path.dirname(name), ok, seconds };
+		return {
+			name,
+			id,
+			dir: path.dirname(name),
+			ok,
+			seconds,
+			distinctStates: actual.distinctStates ?? null,
+		};
 	});
 	const wallSeconds = (Date.now() - wallStarted) / 1000;
 
 	const failures = outcomes.filter((outcome) => !outcome.ok).length;
+	const jumps = stateCountJumps(outcomes, recordedStates);
+	for (const jump of jumps) console.log(formatStateJump(jump));
+	const unrecorded = unrecordedStateCounts(outcomes, recordedStates);
+	if (unrecorded.length > 0)
+		console.log(
+			`${unrecorded.length} config(s) ran with no recorded distinct-state count in ${MODEL_COSTS_FILE}; their counts are reported above and do not fail the run (regenerate with scripts/gen-tla-model-costs.mjs to record them)`,
+		);
 	const perDir = new Map();
 	for (const outcome of outcomes) {
 		const totals = perDir.get(outcome.dir) ?? { seconds: 0, count: 0 };
@@ -770,6 +877,12 @@ async function main() {
 
 	if (failures > 0) {
 		console.log(`${failures} of ${configs.length} models did not match.`);
+		process.exitCode = 1;
+	}
+	if (jumps.length > 0) {
+		console.log(
+			`${jumps.length} model(s) grew past their recorded distinct-state count by more than ${STATE_COUNT_FACTOR}x.`,
+		);
 		process.exitCode = 1;
 	}
 }

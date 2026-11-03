@@ -114,7 +114,10 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 			contents: "read",
 			issues: "write",
 		});
+		// #5062: `actions: write` is the dispatch of ci.yml and lint.yml on the bot
+		// branches (docs/ci-bot-pr-checks.md); nothing else holds it.
 		expect(workflow.jobs?.[PRS_JOB]?.permissions).toEqual({
+			actions: "write",
 			contents: "write",
 			"pull-requests": "write",
 		});
@@ -153,7 +156,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		);
 	});
 
-	it("reads all six gating layers' step outcomes via the smoke job's outputs, by expression (not hardcoded literals)", () => {
+	it("reads all nine gating layers' step outcomes via the smoke job's outputs, by expression (not hardcoded literals)", () => {
 		const env = notifyStep.env ?? {};
 		expect(env.TOOL_LAYER_OUTCOME).toBe(
 			"${{ needs.tool-smoke.outputs.tool_layer }}",
@@ -163,6 +166,14 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		);
 		expect(env.LSP_GATE_OUTCOME).toBe(
 			"${{ needs.tool-smoke.outputs.lsp_gate }}",
+		);
+		// #1712: the live cascade layer. Without this pair a cascade red filed as
+		// "(outside the tracked layers)" with no log (the #2723 shape).
+		expect(env.LSP_CASCADE_OUTCOME).toBe(
+			"${{ needs.tool-smoke.outputs.lsp_cascade }}",
+		);
+		expect(env.LSP_CASCADE_LOG).toBe(
+			"${{ runner.temp }}/tool-smoke-lsp-cascade.log",
 		);
 		expect(env.LENS_FULL_OUTCOME).toBe(
 			"${{ needs.tool-smoke.outputs.lens_full }}",
@@ -180,6 +191,15 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		expect(env.EVALUATED_FLOOR_LOG).toBe(
 			"${{ runner.temp }}/tool-smoke-evaluated-floor.log",
 		);
+		// #3405/#4999: the eighth gating step, the LSP save verdict. Without this
+		// pair a red save-verdict night filed as "(outside the tracked layers)"
+		// with no log — the #2723 shape this file exists to prevent, one step over.
+		expect(env.SAVE_VERDICT_OUTCOME).toBe(
+			"${{ needs.tool-smoke.outputs.save_verdict }}",
+		);
+		expect(env.SAVE_VERDICT_LOG).toBe(
+			"${{ runner.temp }}/tool-smoke-save-verdict.log",
+		);
 	});
 
 	// Recurrence: an output wired to the wrong step id reads "" in the notifier,
@@ -189,10 +209,12 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 			"tool_layer",
 			"lsp_handshake",
 			"lsp_gate",
+			"lsp_cascade",
 			"lens_full",
 			"format_layer",
 			"resolution_layer",
 			"evaluated_floor",
+			"save_verdict",
 		]) {
 			expect(smokeJob.outputs?.[id]).toBe(`\${{ steps.${id}.outcome }}`);
 		}
@@ -204,6 +226,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		expect(findStep(workflow, "LSP diagnostics clean-gate").id).toBe(
 			"lsp_gate",
 		);
+		expect(findStep(workflow, "LSP cascade layer").id).toBe("lsp_cascade");
 		expect(findStep(workflow, "lens_diagnostics mode=full row").id).toBe(
 			"lens_full",
 		);
@@ -212,6 +235,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		expect(findStep(workflow, "LSP evaluated floor").id).toBe(
 			"evaluated_floor",
 		);
+		expect(findStep(workflow, "LSP save verdict").id).toBe("save_verdict");
 	});
 
 	// #2723 review F3: disambiguates "the job failed before the six
@@ -242,6 +266,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 			"Tool layer",
 			"LSP handshake layer",
 			"LSP diagnostics clean-gate",
+			"LSP cascade layer",
 			"lens_diagnostics mode=full row",
 			"Format layer",
 			"Resolution layer",
@@ -335,7 +360,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		expect(mutatedJob.if).toBeUndefined();
 	});
 
-	// Mutation-proof, the OTHER direction (AGENTS.md "mutate both ways"):
+	// Mutation-proof, the OTHER direction (docs/engineering-principles.md "Mutation output is quoted, not ticked"):
 	// swapping `always()` for `success()` (GitHub's own implicit default when
 	// no `if:` is given -- functionally identical to #2723's actual bug)
 	// must fail this file's own gate assertion just as surely as deleting
@@ -397,10 +422,12 @@ describe("each gating layer step's pipe keeps set -o pipefail (#2723 review F4)"
 		"Tool layer",
 		"LSP handshake layer",
 		"LSP diagnostics clean-gate",
+		"LSP cascade layer",
 		"lens_diagnostics mode=full row",
 		"Format layer",
 		"Resolution layer",
 		"LSP evaluated floor",
+		"LSP save verdict",
 	];
 
 	it.each(LAYER_STEP_NAMES)("%s's run script sets pipefail", (name) => {
@@ -491,9 +518,12 @@ describe("each layer's tee log filename matches the notify step's *_LOG env (#27
 		["Tool layer", "TOOL_LAYER_LOG"],
 		["LSP handshake layer", "LSP_HANDSHAKE_LOG"],
 		["LSP diagnostics clean-gate", "LSP_GATE_LOG"],
+		["LSP cascade layer", "LSP_CASCADE_LOG"],
 		["lens_diagnostics mode=full row", "LENS_FULL_LOG"],
 		["Format layer", "FORMAT_LAYER_LOG"],
 		["Resolution layer", "RESOLUTION_LAYER_LOG"],
+		// #3405/#4999: the eighth tracked layer, same hand-maintained pair.
+		["LSP save verdict", "SAVE_VERDICT_LOG"],
 	])("%s's tee target matches env.%s", (stepName, envVar) => {
 		const step = findStep(workflow, stepName);
 		const fromTee = teeLogFilename(step.run as string);

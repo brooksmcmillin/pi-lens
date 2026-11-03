@@ -1,5 +1,5 @@
 import path from "node:path";
-import { pathsEqual } from "../../path-utils.js";
+import { pathsEqual, toPosix } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
@@ -29,7 +29,7 @@ type ActionlintIssue = {
 };
 
 export function isGitHubWorkflowFile(filePath: string): boolean {
-	const normalized = filePath.replace(/\\/g, "/");
+	const normalized = toPosix(filePath);
 	return /(^|\/)\.github\/workflows\/[^/]+\.ya?ml$/i.test(normalized);
 }
 

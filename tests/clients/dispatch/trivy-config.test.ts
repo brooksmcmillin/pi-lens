@@ -31,17 +31,13 @@ describe("trivy-config appliesTo", () => {
 
 // ── Terraform files skip the yaml/k8s content gate ─────────────────────────────
 
-const {
-	safeSpawnAsync,
-	isTrivyEnabled,
-	resolveSeverityFloor,
-	incrementDegradationCount,
-} = vi.hoisted(() => ({
-	safeSpawnAsync: vi.fn(),
-	isTrivyEnabled: vi.fn(),
-	resolveSeverityFloor: vi.fn(),
-	incrementDegradationCount: vi.fn(),
-}));
+const { safeSpawnAsync, isTrivyEnabled, resolveSeverityFloor } = vi.hoisted(
+	() => ({
+		safeSpawnAsync: vi.fn(),
+		isTrivyEnabled: vi.fn(),
+		resolveSeverityFloor: vi.fn(),
+	}),
+);
 
 vi.mock("../../../clients/safe-spawn.js", () => ({
 	safeSpawnAsync,
@@ -50,13 +46,6 @@ vi.mock("../../../clients/safe-spawn.js", () => ({
 vi.mock("../../../clients/trivy-client.js", () => ({
 	isTrivyEnabled,
 	resolveSeverityFloor,
-}));
-
-vi.mock("../../../clients/degradation-ledger.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../../clients/degradation-ledger.js")
-	>()),
-	incrementDegradationCount,
 }));
 
 vi.mock(
@@ -93,7 +82,6 @@ describe("trivy-config run() — terraform pass-through", () => {
 		safeSpawnAsync.mockReset();
 		isTrivyEnabled.mockReset();
 		resolveSeverityFloor.mockReset();
-		incrementDegradationCount.mockReset();
 		isTrivyEnabled.mockReturnValue(true);
 		resolveSeverityFloor.mockReturnValue(["HIGH", "CRITICAL"]);
 	});
@@ -122,6 +110,24 @@ describe("trivy-config run() — terraform pass-through", () => {
 		expect(result.status).toBe("succeeded");
 	});
 
+	// Recurrence (#5042): an opt-in runner left off returned a bare skip, which
+	// a denied sibling's coverage notice reads as a failed tool.
+	it("states a not-enabled skip, and spawns nothing, while trivy is not opted in", async () => {
+		isTrivyEnabled.mockReturnValue(false);
+
+		const runner = (
+			await import("../../../clients/dispatch/runners/trivy-config.js")
+		).default;
+
+		const result = await runner.run(
+			createCtx("terraform", tfFile, tfCwd) as never,
+		);
+
+		expect(result.status).toBe("skipped");
+		expect(result.skipReason).toBe("not-enabled");
+		expect(safeSpawnAsync).not.toHaveBeenCalled();
+	});
+
 	// `trivy config` gets no `--exit-code`, so it exits 0 whenever it
 	// completed (findings included). A nonzero exit is therefore always a
 	// real error, regardless of stdout content — an empty-output-ONLY guard
@@ -144,6 +150,54 @@ describe("trivy-config run() — terraform pass-through", () => {
 
 		expect(result.status).toBe("skipped");
 		expect(result.diagnostics).toEqual([]);
+		// #4130: trivy completed abnormally (it rejected its policy bundle).
+		expect(result.skipFault).toBe("rejected-invocation");
+	});
+
+	// #4130: a trivy that was killed before it exited names a different fault
+	// than one that exited nonzero.
+	it("names a signal death as did-not-run", async () => {
+		safeSpawnAsync.mockResolvedValue({
+			status: null,
+			signal: "SIGKILL",
+			stdout: "",
+			stderr: "",
+		});
+
+		const runner = (
+			await import("../../../clients/dispatch/runners/trivy-config.js")
+		).default;
+
+		const result = await runner.run(
+			createCtx("terraform", tfFile, tfCwd) as never,
+		);
+
+		expect(result.status).toBe("skipped");
+		expect(result.skipFault).toBe("did-not-run");
+	});
+
+	// RECURRENCE THIS PREVENTS: #4130 round 2 (PR #4971 thread on trivy-config).
+	// A launch failure resolves with a negative errno status and an `error`
+	// (ENOENT is -2 on Linux), so a `status === null || signal` test named it
+	// `rejected-invocation`. The shared classifier names it `did-not-run`.
+	it("names a failed launch with a numeric errno status as did-not-run", async () => {
+		safeSpawnAsync.mockResolvedValue({
+			status: -2,
+			error: new Error("spawn trivy ENOENT"),
+			stdout: "",
+			stderr: "",
+		});
+
+		const runner = (
+			await import("../../../clients/dispatch/runners/trivy-config.js")
+		).default;
+
+		const result = await runner.run(
+			createCtx("terraform", tfFile, tfCwd) as never,
+		);
+
+		expect(result.status).toBe("skipped");
+		expect(result.skipFault).toBe("did-not-run");
 	});
 
 	// #1757 F3: a rejected flag (e.g. the `--no-progress` bug that shipped in
@@ -184,12 +238,18 @@ describe("trivy-config run() — terraform pass-through", () => {
 		expect(result.status).not.toBe("succeeded");
 		expect(result.diagnostics).toEqual([]);
 
-		expect(incrementDegradationCount).toHaveBeenCalledTimes(1);
-		const record = incrementDegradationCount.mock.calls[0][0];
-		expect(record.kind).toBe("runner-empty-result");
-		expect(record.subject).toBe(tfFile);
-		expect(record.reason).toContain("trivy config");
-		expect(record.reason).toContain("1");
+		// The runner wrote to the ledger loaded after this case's
+		// `vi.resetModules()`, so it is read back through the same registry.
+		const { getDegradationSummary } =
+			await import("../../../clients/degradation-ledger.js");
+		const group = getDegradationSummary().find(
+			(row) => row.kind === "runner-empty-result",
+		);
+		expect(group?.count).toBe(1);
+		const record = group?.latestReasons[0];
+		expect(record?.subject).toBe(tfFile);
+		expect(record?.reason).toContain("trivy config");
+		expect(record?.reason).toMatch(/\bexited 1\b/);
 	});
 });
 

@@ -33,6 +33,7 @@ import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 
 import { EventEmitter } from "node:events";
 import { waitFor } from "./interleaving-kit.js";
+import { endMockSessions } from "../support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "../support/pi-mock.js";
 import { makeSessionStartEvent } from "../support/host-event-factory.js";
 
@@ -155,7 +156,7 @@ describe("machine-global writers route through PI_LENS_HOME, never the real home
 //      spawns such a child never touches the registry itself and is outside
 //      this walk's population — `tests/clients/instance-registry-race.test.ts`).
 //
-// Both scans run over comment-and-string-blanked text (AGENTS.md "Detectors
+// Both scans run over comment-and-string-blanked text (docs/engineering-principles.md "Detectors
 // match code, not prose") — this docblock's own mentions of every symbol
 // above must never be read as a hit.
 
@@ -1210,11 +1211,14 @@ describe("transitive session_start backstop isolation", () => {
 
 	beforeEach(clearOwnBackstopStamps);
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.clearAllTimers();
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
+		// #5146: end the session on real timers and the worker's own home, before
+		// its lifecycle state resets.
+		await endMockSessions();
 		_resetSessionLifecycleForTests();
 	});
 

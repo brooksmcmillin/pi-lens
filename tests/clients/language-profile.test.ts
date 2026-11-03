@@ -77,6 +77,27 @@ describe("language-profile roots", () => {
 		expect(root).toBe(pkg);
 	});
 
+	it("keeps the workspace for a file whose nearest marker lies outside it", () => {
+		// RECURRENCE GUARDED: the clamp's containment test moved from a
+		// `path.relative` to `isUnderDir` (#4689 r2) and survived a mutation
+		// that deleted it: no cell put the nearest marker outside the
+		// workspace, where a sibling project would claim the file's config and
+		// runner scope.
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const workspace = path.join(tmp, "repo");
+		const sibling = path.join(tmp, "sibling");
+		const file = path.join(sibling, "tool.py");
+
+		fs.mkdirSync(workspace, { recursive: true });
+		fs.mkdirSync(sibling, { recursive: true });
+		fs.writeFileSync(path.join(sibling, "pyproject.toml"), "[tool.ruff]\n");
+		fs.writeFileSync(file, "print('ok')\n");
+
+		expect(resolveLanguageRootForFile(file, workspace)).toBe(workspace);
+	});
+
 	it("resolves a java file to a nested Kotlin-DSL Gradle module (#2870)", () => {
 		// Both java marker tables listed only the Groovy `build.gradle`, so a
 		// `.java` file in a `build.gradle.kts` module resolved to the workspace

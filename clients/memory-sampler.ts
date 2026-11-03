@@ -49,6 +49,8 @@ import {
 import { getDispatchCascadeCacheStats } from "./dispatch/integration.js";
 import { getLspDocumentTextRetentionSnapshot } from "./lsp/client.js";
 import type { PersistWorkerHeapStatistics } from "./persist-worker-stats.js";
+import { getLspIdleEvictMs } from "./lsp/client-registry.js";
+import { sessionCell } from "./session-scope.js";
 
 /** Every N turns, emit one `memory_sample` latency.log line (#1123 item 2). */
 export const MEMORY_SAMPLE_TURN_INTERVAL = 10;
@@ -98,11 +100,59 @@ export const HEAP_GROWTH_TIGHTEN_RATIO = 1.2;
 
 let _lastSampledHeapUsedBytes = 0;
 let _tightenThroughTurn = 0;
+/**
+ * #1332: epoch ms of a session's turn end not yet matched by that session's
+ * turn start. One process-global slot let a coexisting session consume
+ * another's marker (AGENTS.md shape 72); #4965 keeps it in a cell on the
+ * session's scope, so each session owns its own and it ends with the scope (a
+ * new primary's `session_start` begins a fresh scope, so no reset clears it,
+ * and a live secondary's marker is not the primary's to clear).
+ */
+const MEMORY_TURN_END_CELL = "memory-turn-end";
+
+interface MemoryTurnEndCell {
+	endedAt: number | undefined;
+}
 
 /** Clear the rising-edge cadence state. Called on primary session_start. */
 export function resetMemorySamplerCadence(): void {
 	_lastSampledHeapUsedBytes = 0;
 	_tightenThroughTurn = 0;
+}
+
+/**
+ * #1332: record that a session's turn ended at `now` (epoch ms). Called at
+ * turn_end. `sessionKey` is the session's lookup key (`sessionLookupKey`); a
+ * session with no live scope keeps no marker.
+ */
+export function recordMemoryTurnEnd(sessionKey: string, now: number): void {
+	const cell = sessionCell<MemoryTurnEndCell>(
+		sessionKey,
+		MEMORY_TURN_END_CELL,
+		() => ({ endedAt: undefined }),
+	);
+	if (cell) cell.endedAt = now;
+}
+
+/**
+ * #1332 (post-idle heap reading): called once per turn start. Returns the idle
+ * gap in ms when the turn start is the session's first after its own turn end
+ * and that gap is strictly greater than `windowMs` (the TS idle-evict window),
+ * otherwise null. Consumes only that session's pending turn end, so at most one
+ * idle sample is taken per idle period, however many turns start after it, and
+ * another session's turn never reads it.
+ */
+export function takeMemoryIdleGapMs(
+	sessionKey: string,
+	now: number,
+	windowMs: number = getLspIdleEvictMs(),
+): number | null {
+	const cell = sessionCell<MemoryTurnEndCell>(sessionKey, MEMORY_TURN_END_CELL);
+	const endedAt = cell?.endedAt;
+	if (cell) cell.endedAt = undefined;
+	if (endedAt === undefined) return null;
+	const gap = now - endedAt;
+	return gap > windowMs ? gap : null;
 }
 
 /** PURE: >20% heap growth between two sampled readings warrants tightening. */

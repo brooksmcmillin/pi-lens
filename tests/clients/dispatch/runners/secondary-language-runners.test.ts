@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { hasUsableResult } from "../../../../clients/dispatch/types.js";
 import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
@@ -117,6 +118,7 @@ async function dispatchOutcome(
 		registry.register(runner);
 		let observedStatus: string | undefined;
 		let observedSemantic: string | undefined;
+		let observedSkipFault: string | undefined;
 		let observedDiagnostics: Array<{ id?: string; semantic?: string }> = [];
 		const result = await dispatchForFile(
 			createDispatchContext(
@@ -130,12 +132,14 @@ async function dispatchOutcome(
 			(_runnerId, runnerResult) => {
 				observedStatus = runnerResult.status;
 				observedSemantic = runnerResult.semantic;
+				observedSkipFault = runnerResult.skipFault;
 				observedDiagnostics = runnerResult.diagnostics;
 			},
 		);
 		return {
 			status: observedStatus,
 			semantic: observedSemantic,
+			skipFault: observedSkipFault,
 			diagnostics: observedDiagnostics,
 			output: result.output,
 			ledger: getDegradationSummary(),
@@ -271,6 +275,8 @@ describe("secondary language fallback runners", () => {
 		expect(observed.status).toBe("skipped");
 		expect(observed.output).toContain("not a clean result");
 		expect(observed.ledger[0]?.latestReasons[0]?.reason).toContain("SIGTERM");
+		// #4130: the signal death reaches the delivery sink as a named fault.
+		expect(observed.skipFault).toBe("did-not-run");
 	});
 
 	it("falls back to flutter analyze when dart is unavailable", async () => {
@@ -330,6 +336,8 @@ describe("secondary language fallback runners", () => {
 		expect(observed.status).toBe("skipped");
 		expect(observed.output).toContain("not a clean result");
 		expect(observed.ledger[0]?.latestReasons[0]?.reason).toContain("no output");
+		// #4130: a failed run that said nothing is a fault, not an absent tool.
+		expect(observed.skipFault).toBe("did-not-run");
 	});
 
 	it("guards actual dart unavailability through dispatch (#1816)", async () => {
@@ -344,6 +352,252 @@ describe("secondary language fallback runners", () => {
 		expect(observed.output).toContain("not a clean result");
 		expect(observed.spawnCalls).toBe(0);
 		expect(observed.ledger).toEqual([]);
+		// #4130: nothing was invoked, so an absent tool stays a plain skip.
+		expect(observed.skipFault).toBeUndefined();
+	});
+
+	// RECURRENCE THIS PREVENTS: #4130 item 3. zig-check and gleam-check turned a
+	// spawn that failed with no output into a bare skip, which the smoke
+	// classifier read as "tool absent". The tool resolved and was invoked, so
+	// the skip names the fault.
+	it.each([
+		["zig-check", "zig", "src/main.zig", "pub fn main() void {}\n"],
+		["gleam-check", "gleam", "src/app.gleam", "pub fn main() { 1 }\n"],
+	] as const)(
+		"%s names a spawn failure on its skip (#4130)",
+		async (id, kind, file, source) => {
+			const env = setupTestEnvironment(`pi-lens-${id}-spawn-fault-`);
+			try {
+				const filePath = path.join(env.tmpDir, file);
+				fs.mkdirSync(path.dirname(filePath), { recursive: true });
+				fs.writeFileSync(filePath, source);
+				safeSpawnAsync.mockResolvedValue({
+					error: new Error("Process timed out after 30000ms"),
+					status: null,
+					stdout: "",
+					stderr: "",
+				});
+				const runner = (
+					await import(`../../../../clients/dispatch/runners/${id}.js`)
+				).default;
+
+				const result = await runner.run(
+					createCtx(kind, filePath, env.tmpDir) as never,
+				);
+				expect(result.status).toBe("skipped");
+				expect(result.skipFault).toBe("did-not-run");
+
+				// The same runner with no tool installed invokes nothing: plain skip.
+				safeSpawnAsync.mockClear();
+				mockRunnerHelpers(() => false);
+				vi.resetModules();
+				const absent = await (
+					await import(`../../../../clients/dispatch/runners/${id}.js`)
+				).default.run(createCtx(kind, filePath, env.tmpDir) as never);
+				expect(absent.status).toBe("skipped");
+				expect(absent.skipFault).toBeUndefined();
+				expect(safeSpawnAsync).not.toHaveBeenCalled();
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	// RECURRENCE THIS PREVENTS: #4130 item 3, same shape as the zig/gleam rows
+	// above. pyright and prisma-validate resolved their tool, the spawn failed,
+	// and the bare skip read as "tool absent" to the smoke classifier.
+	it.each([
+		["pyright", "python", "app.py", "x = 1\n"],
+		["prisma-validate", "prisma", "schema.prisma", "model A { id Int @id }\n"],
+	] as const)(
+		"%s names a spawn failure on its skip (#4130)",
+		async (id, kind, file, source) => {
+			const env = setupTestEnvironment(`pi-lens-${id}-spawn-fault-`);
+			try {
+				const filePath = path.join(env.tmpDir, file);
+				fs.writeFileSync(filePath, source);
+				safeSpawnAsync.mockResolvedValue({
+					error: new Error("Process timed out after 60000ms"),
+					status: null,
+					stdout: "",
+					stderr: "",
+				});
+				const runner = (
+					await import(`../../../../clients/dispatch/runners/${id}.js`)
+				).default;
+
+				const result = await runner.run(
+					makeRunnerCtx(filePath, env.tmpDir, {
+						kind,
+						pi: { getFlag: (name: string) => name === "no-lsp" },
+					} as never) as never,
+				);
+				expect(safeSpawnAsync).toHaveBeenCalled();
+				expect(result.status).toBe("skipped");
+				expect(result.skipFault).toBe("did-not-run");
+			} finally {
+				env.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	// RECURRENCE THIS PREVENTS: #4130 round 2 (PR #4971 threads on gleam-check and
+	// prisma-validate). The spawn guard only caught a cut-short run with NO
+	// output at all; a run killed after it printed something reached the parser,
+	// and gleam reported it `succeeded` (nothing parsed, status null) or
+	// `blocking_diagnostics` (something parsed), prisma reported an unmarked
+	// skip or `blocking_diagnostics`. Smoke then rendered a broken tool as
+	// pass or skip.
+	describe("a cut-short run that printed something is a fault (#4130)", () => {
+		const gleamFinding = (filePath: string) =>
+			[
+				"error: Type mismatch",
+				`  ┌─ ${filePath}:1:8`,
+				"  │",
+				"1 │ pub fn main() { 1 }",
+				"  │        ^ expected Int",
+			].join("\n");
+
+		async function runGleam(
+			spawn: SpawnShape,
+			render: (filePath: string) => string,
+		) {
+			const env = setupTestEnvironment("pi-lens-gleam-cut-short-");
+			try {
+				const filePath = path.join(env.tmpDir, "src", "app.gleam");
+				fs.mkdirSync(path.dirname(filePath), { recursive: true });
+				fs.writeFileSync(filePath, "pub fn main() { 1 }\n");
+				safeSpawnAsync.mockResolvedValue({
+					...spawn,
+					stderr: render(filePath),
+				});
+				const runner = (
+					await import("../../../../clients/dispatch/runners/gleam-check.js")
+				).default;
+				return await runner.run(
+					createCtx("gleam", filePath, env.tmpDir) as never,
+				);
+			} finally {
+				env.cleanup();
+			}
+		}
+
+		it("gleam keeps the findings it printed before a timeout, as a fault", async () => {
+			const result = await runGleam(
+				{
+					error: new Error("Process timed out after 30000ms"),
+					status: null,
+					stdout: "",
+					stderr: "",
+				},
+				gleamFinding,
+			);
+			expect(result.status).toBe("failed");
+			expect(result.failureKind).toBe("did-not-run");
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0]?.message).toContain("Type mismatch");
+			expect(hasUsableResult(result)).toBe(false);
+		});
+
+		it("gleam never reads a killed run with only progress output as clean", async () => {
+			const result = await runGleam(
+				{
+					error: new Error("Process timed out after 30000ms"),
+					status: null,
+					stdout: "",
+					stderr: "",
+				},
+				() => "   Compiling demo",
+			);
+			expect(result.status).toBe("skipped");
+			expect(result.skipFault).toBe("did-not-run");
+		});
+
+		it("gleam keeps a completed run's findings as ordinary findings", async () => {
+			const result = await runGleam(
+				{ error: null, status: 1, stdout: "", stderr: "" },
+				gleamFinding,
+			);
+			expect(result.status).toBe("failed");
+			expect(result.failureKind).toBe("blocking_diagnostics");
+			expect(result.skipFault).toBeUndefined();
+			expect(hasUsableResult(result)).toBe(true);
+		});
+
+		async function runPrisma(spawn: SpawnShape) {
+			const env = setupTestEnvironment("pi-lens-prisma-cut-short-");
+			try {
+				const filePath = path.join(env.tmpDir, "schema.prisma");
+				fs.writeFileSync(filePath, "model A { id Int @id }\n");
+				safeSpawnAsync.mockResolvedValue(spawn);
+				const runner = (
+					await import("../../../../clients/dispatch/runners/prisma-validate.js")
+				).default;
+				return await runner.run(
+					makeRunnerCtx(filePath, env.tmpDir, {
+						kind: "prisma",
+						pi: { getFlag: (name: string) => name === "no-lsp" },
+					} as never) as never,
+				);
+			} finally {
+				env.cleanup();
+			}
+		}
+
+		it("prisma faults a killed run whose partial output has no diagnostics", async () => {
+			const result = await runPrisma({
+				error: null,
+				status: null,
+				signal: "SIGKILL",
+				stdout: "Prisma schema loaded from schema.prisma",
+				stderr: "",
+			});
+			expect(result.status).toBe("skipped");
+			expect(result.skipFault).toBe("did-not-run");
+		});
+
+		it("prisma never counts a killed run's non-validation output as findings", async () => {
+			// npm's E404 (`npx --no prisma` with nothing to run) parses to a
+			// "finding" for any text; only prisma's own report may be kept.
+			const result = await runPrisma({
+				error: null,
+				status: null,
+				signal: "SIGKILL",
+				stdout: "",
+				stderr: "npm error code E404",
+			});
+			expect(result.status).toBe("skipped");
+			expect(result.skipFault).toBe("did-not-run");
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		it("prisma keeps a killed run's validation findings, as a fault", async () => {
+			const result = await runPrisma({
+				error: null,
+				status: null,
+				signal: "SIGKILL",
+				stdout: "",
+				stderr:
+					"Error: Prisma schema validation - (get-config wasm)\nValidation Error Count: 1\nschema.prisma:1",
+			});
+			expect(result.status).toBe("failed");
+			expect(result.failureKind).toBe("did-not-run");
+			expect(result.diagnostics).toHaveLength(1);
+			expect(hasUsableResult(result)).toBe(false);
+		});
+
+		it("prisma leaves a completed run with nothing parsed as the existing plain skip", async () => {
+			// The residual `skipWhenParsedNothing` family (PR body), unchanged here.
+			const result = await runPrisma({
+				error: null,
+				status: 1,
+				stdout: "Prisma schema loaded from schema.prisma",
+				stderr: "",
+			});
+			expect(result.status).toBe("skipped");
+			expect(result.skipFault).toBeUndefined();
+		});
 	});
 
 	it("surfaces a warning when zig exits non-zero without structured diagnostics", async () => {
@@ -404,7 +658,7 @@ describe("secondary language fallback runners", () => {
 		}
 	});
 
-	it("surfaces a blocking diagnostic when gleam exits non-zero without structured output", async () => {
+	it("surfaces a runner-fault warning, never a blocker, when gleam exits non-zero without structured output (#4130)", async () => {
 		const env = setupTestEnvironment("pi-lens-gleam-runner-");
 		try {
 			const filePath = path.join(env.tmpDir, "src", "app.gleam");
@@ -427,9 +681,61 @@ describe("secondary language fallback runners", () => {
 			);
 
 			expect(result.status).toBe("failed");
-			expect(result.semantic).toBe("blocking");
+			expect(result.failureKind).toBe("unconfirmed_output");
+			expect(result.semantic).toBe("warning");
 			expect(result.diagnostics[0]?.message).toContain("gleam check failed");
+			expect(result.diagnostics[0]).toMatchObject({
+				runnerFault: true,
+				semantic: "warning",
+			});
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #4130, through the commit gate's absorb path: a settled collect-later
+	// gleam fault never enters the blocker map (#3814). The runtime chain loads
+	// inside the case because the mocked spawn module is not initialized when
+	// static imports run.
+	it("keeps a gleam runner fault out of the blocker map when it settles as a collect-later answer (#4130)", async () => {
+		const env = setupTestEnvironment("pi-lens-gleam-fault-blocker-");
+		const pendingStore =
+			await import("../../../../clients/dispatch/pending-runner-findings.js");
+		try {
+			const filePath = path.join(env.tmpDir, "src", "app.gleam");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "pub fn main() { Nil }\n");
+			safeSpawnAsync.mockResolvedValue({
+				error: null,
+				status: 1,
+				stdout: "",
+				stderr: "gleam check failed unexpectedly",
+			});
+			const runner = (
+				await import("../../../../clients/dispatch/runners/gleam-check.js")
+			).default;
+			const result = await runner.run(
+				createCtx("gleam", filePath, env.tmpDir) as never,
+			);
+			const { absorbSettledRunnerBlockers } =
+				await import("../../../../clients/deferred-runner-blockers.js");
+			const { RuntimeCoordinator } =
+				await import("../../../../clients/runtime-coordinator.js");
+			const runtime = new RuntimeCoordinator();
+			pendingStore.deferRunnerFindings({
+				filePath,
+				cwd: env.tmpDir,
+				projectRoot: env.tmpDir,
+				runnerId: "gleam-check",
+				markedAtMs: Date.now() + 60_000,
+				promise: Promise.resolve(result),
+			});
+			await pendingStore.settlePendingRunnerFindingsForTests();
+
+			expect(absorbSettledRunnerBlockers(runtime, env.tmpDir).recorded).toBe(0);
+			expect(runtime.getInlineBlockerDiagnostics(filePath) ?? []).toEqual([]);
+		} finally {
+			pendingStore.resetPendingRunnerFindings();
 			env.cleanup();
 		}
 	});

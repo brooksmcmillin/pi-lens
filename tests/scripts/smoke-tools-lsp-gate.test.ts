@@ -8,6 +8,7 @@ import {
 	LSP_FIXTURES,
 	runCreatedModuleWitness,
 	runLspGate,
+	runVenvInstallWitness,
 } from "../../scripts/smoke-tools.mjs";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
@@ -252,6 +253,105 @@ describe("smoke-tools --lsp-gate census admission (#3309)", () => {
 	});
 });
 
+// #3405: a save-triggered server (Expert) answers the cold call with 0 and a
+// later call with the finding. The rung polls the same handler to a deadline;
+// these cases script the handler's answers (the language server is the process
+// boundary) and drive the real runLspGate.
+describe("smoke-tools --lsp-gate readiness rung (#3405)", () => {
+	const READINESS = { deadlineMs: 400, intervalMs: 2 };
+	const finding = {
+		details: { totalDiagnostics: 1, primaryDiagnosticsCount: 1 },
+	};
+	const silent = {
+		details: { totalDiagnostics: 0, primaryDiagnosticsCount: 0 },
+	};
+
+	it("passes a server that answers 0 on the cold call and the finding on a later one", async () => {
+		let call = 0;
+		const execute = vi.fn(async () => (++call < 3 ? silent : finding));
+		const { output } = await runGateWithCensus("pass", execute, {
+			lspGateReadiness: READINESS,
+		});
+
+		expect(output).toContain("✓  typescript");
+		expect(output).toContain("answered on call 3");
+		expect(execute).toHaveBeenCalledTimes(3);
+	});
+
+	it("reds a server that never publishes, naming that it stayed unanswered", async () => {
+		const execute = vi.fn(async () => silent);
+		const { output } = await runGateWithCensus("pass", execute, {
+			lspGateReadiness: READINESS,
+		});
+
+		expect(output).toContain("✗  typescript");
+		expect(output).toContain("still unanswered");
+		// a deadline, not one retry: the cold call plus several polls
+		expect(execute.mock.calls.length).toBeGreaterThan(2);
+	});
+
+	it("does not poll a fixture that declares no readiness rung", async () => {
+		const execute = vi.fn(async () => silent);
+		const { output } = await runGateWithCensus("pass", execute);
+
+		expect(output).toContain("✗  typescript");
+		// the plain verdict, not a harness error from entering the rung without one
+		expect(output).toContain("lsp_diagnostics returned 0 diagnostic(s)");
+		expect(output).not.toContain("lsp_diagnostics error");
+		expect(execute).toHaveBeenCalledOnce();
+	});
+
+	// #3405 review r1 F2: the rung's entry is "the cold call FAILED", not "did
+	// not pass". An unavailable server answered nothing to wait for; polling it
+	// would burn the whole deadline (150 s for Expert) and could turn a skip
+	// into a pass. Neutering the entry to `!== "pass"` makes this red.
+	it("does not poll a cold call that answered unavailable", async () => {
+		const execute = vi.fn(async () => ({
+			details: { unavailable: "probe server unavailable" },
+		}));
+		const { output } = await runGateWithCensus("pass", execute, {
+			lspGateReadiness: READINESS,
+		});
+
+		expect(execute).toHaveBeenCalledOnce();
+		expect(output).toContain("⚠  typescript");
+		expect(output).not.toContain("unanswered");
+		expect(output).not.toContain("after the cold call");
+	});
+
+	// #3405 review r1 F4: a cold call that ran and produced no finding is a
+	// recorded red. A later poll that answers unavailable (the server crashed
+	// while its project was booting) must not turn that red into a skip, which
+	// exits 0 on a mixed population.
+	it("keeps the cold hard failure when a later poll answers unavailable", async () => {
+		let call = 0;
+		const execute = vi.fn(async () =>
+			++call === 1
+				? silent
+				: { details: { unavailable: "probe server unavailable" } },
+		);
+		const { output } = await runGateWithCensus("pass", execute, {
+			lspGateReadiness: READINESS,
+		});
+
+		// pollUntil probes once before it reads the clock, so the first
+		// unavailable answer is always delivered; how many follow is wall-clock
+		// and is not asserted (review r2 F7).
+		expect(execute.mock.calls.length).toBeGreaterThan(1);
+		expect(output).toContain("✗  typescript");
+		expect(output).not.toContain("⚠  typescript");
+		expect(output).toContain("lsp_diagnostics returned 0 diagnostic(s)");
+		expect(output).toContain("still unanswered");
+	});
+
+	it("does not poll once the cold call already passed", async () => {
+		const execute = vi.fn(async () => finding);
+		await runGateWithCensus("pass", execute, { lspGateReadiness: READINESS });
+
+		expect(execute).toHaveBeenCalledOnce();
+	});
+});
+
 // #4320/#4346: the witness's verdicts, through its real entry with a scripted
 // language-server answer (the server is the process boundary; the nightly
 // runs it against pyright). A witness that cannot red, or that passes when the
@@ -372,11 +472,20 @@ describe("smoke-tools created-module witness (#4320/#4346)", () => {
 				adoptProjectTrustFromContext: vi.fn(),
 				getLSPService: () => makeLspServiceDouble(),
 				createdModulePoll: { deadlineMs: 30, intervalMs: 2 },
+				lookForOutOfBandChanges: vi.fn(async () => undefined),
 			},
 		});
 
 		expect(output.join("\n")).toContain("LSP created-module witness");
-		expect(failures).toBe(2);
+		// Every witness row stays red: the scripted server reports every import
+		// missing. 6 = 2 created-module rows (`runCreatedModuleWitness`: pi
+		// write, outside pi-lens) + 3 born-after-start config rows
+		// (`runBornAfterStartConfigWitness`: config file, root marker, root
+		// marker with no ancestor marker, added by #4532's gap 14) + 1
+		// lockfile-less venv install row (`runVenvInstallWitness`, #4532 gap 3).
+		expect(output.join("\n")).toContain("born after start (config file)");
+		expect(output.join("\n")).toContain("venv install (no lockfile)");
+		expect(failures).toBe(6);
 	});
 
 	// Recurrence: the one-call witness red-flaked locally (2 of 5 pyright runs
@@ -462,5 +571,118 @@ describe("smoke-tools created-module witness (#4320/#4346)", () => {
 			expect.stringContaining("precondition"),
 			expect.stringContaining("precondition"),
 		]);
+	});
+});
+
+// #4532 gap 3: the lockfile-less venv install phase's verdicts, through its real
+// entry. The scripted server answers from what is actually on disk, so a pass
+// requires the package to be IN site-packages — not a flag the witness set.
+describe("smoke-tools venv install witness (#4532 gap 3)", () => {
+	const python = LSP_FIXTURES.find(
+		(fixture) =>
+			(fixture as { venvInstall?: unknown }).venvInstall !== undefined,
+	);
+
+	// A short deadline keeps a red case fast; the phase's real one is 20 s.
+	const POLL = { deadlineMs: 400, intervalMs: 2 };
+
+	async function witness(
+		reportsMissing: (call: number, installed: boolean) => boolean,
+		poll: { deadlineMs?: number; intervalMs?: number } = POLL,
+		errorAfterInstall = false,
+	) {
+		const workspace = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-venv-witness-"),
+		);
+		tempHomes.push(workspace);
+		const calls: Array<{ installed: boolean }> = [];
+		const execute = vi.fn(async (_id: string, params: { path: string }) => {
+			const source = fs.readFileSync(params.path, "utf8");
+			const name = /import (\w+)/.exec(source)?.[1] ?? "";
+			const installed = fs.existsSync(
+				path.join(
+					path.dirname(params.path),
+					".venv",
+					"lib",
+					"python3.12",
+					"site-packages",
+					name,
+				),
+			);
+			calls.push({ installed });
+			if (errorAfterInstall && installed) {
+				// What the handler answers when its server is not there: an error
+				// result whose text reports no diagnostic at all.
+				return {
+					content: [{ text: "LSP service not available." }],
+					isError: true,
+				};
+			}
+			const missing = reportsMissing(calls.length, installed);
+			return {
+				content: [
+					{ text: missing ? `Import "${name}" could not be resolved` : "ok" },
+				],
+			};
+		});
+		const rows = await runVenvInstallWitness(python, {
+			workspace,
+			execute,
+			...poll,
+		});
+		return { rows, calls, workspace };
+	}
+
+	it("passes when the installed package clears the importer", async () => {
+		const { rows, calls } = await witness((_call, installed) => !installed);
+		expect(rows.map((row) => row.state)).toEqual(["pass"]);
+		expect(rows[0].detail).toContain("cleared on call");
+		// The pass rides the package really being inside site-packages.
+		expect(calls.at(-1)?.installed).toBe(true);
+	});
+
+	it("reds when the importer still reports the package after the install", async () => {
+		const { rows, calls } = await witness(() => true);
+		expect(rows.map((row) => row.state)).toEqual(["fail"]);
+		expect(rows[0].detail).toContain("still reports");
+		// The install DID happen: the red is the product's, not the fixture's.
+		expect(calls.at(-1)?.installed).toBe(true);
+	});
+
+	it("does not install when the importer never reported the package", async () => {
+		const { rows, calls } = await witness(() => false);
+		expect(rows.map((row) => row.state)).toEqual(["fail"]);
+		expect(rows[0].detail).toContain("precondition");
+		expect(calls.every((call) => !call.installed)).toBe(true);
+	});
+
+	it("reds when the answer after the install is an error result", async () => {
+		// Recurrence (review 5009): the phase read only the answer's text, so an
+		// `isError` result such as "LSP service not available." matched neither
+		// the inconclusive marker nor the missing-import check and the poll
+		// accepted it as cleared on its first call — a green row with no
+		// diagnostic answer behind it.
+		const { rows, calls } = await witness(() => true, POLL, true);
+		expect(rows.map((row) => row.state)).toEqual(["fail"]);
+		expect(rows[0].detail).toContain("still reports");
+		// The install DID happen, and every answer after it was an error.
+		expect(calls.at(-1)?.installed).toBe(true);
+	});
+
+	it("reports a red row when the fixture carries no venvInstall", async () => {
+		// Recurrence (review 5009): the phase dereferenced `fx.venvInstall` before
+		// its try, so a fixture without the flag rejected out of the helper
+		// instead of becoming a smoke row the gate can count.
+		const workspace = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-venv-witness-"),
+		);
+		tempHomes.push(workspace);
+		const rows = await runVenvInstallWitness(undefined, {
+			workspace,
+			execute: vi.fn(),
+			...POLL,
+		});
+		expect(rows.map((row) => row.state)).toEqual(["fail"]);
+		expect(rows[0].detail).toContain("witness error");
 	});
 });

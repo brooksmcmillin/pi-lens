@@ -345,6 +345,29 @@ export function scratchEnv(
 	scratchRoot: string,
 	extra?: Record<string, string>,
 ): NodeJS.ProcessEnv;
+export function classifyLspWarmLog(text: string): ProbeReport;
+export const LSP_WARM_RESOLVED: string;
+export function awaitWarmLog(
+	readLog: () => string,
+	opts?: { capMs?: number; intervalMs?: number; sinceIso?: string },
+): Promise<string>;
+export interface RpcCapture {
+	ok: boolean;
+	reason?: string;
+	commands?: unknown[];
+	extensionLog?: string;
+	logError?: string;
+	sinceIso?: string;
+	[key: string]: unknown;
+}
+export function captureGetCommands(opts: {
+	piBin: string;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+	timeoutMs?: number;
+	awaitWarm?: boolean;
+	warmWaitMs?: number;
+}): Promise<RpcCapture>;
 
 /** Every variable `scratchEnv` pins inside the scratch root. */
 export const PINNED_ENV_KEYS: readonly string[];

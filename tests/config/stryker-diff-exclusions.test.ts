@@ -8,6 +8,7 @@ import {
 	relativePosix,
 } from "../support/sweep-kit.js";
 import { mutationLaneExclusion } from "../../scripts/lib/stryker-diff.mjs";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const REGISTRY_PATH = path.join(
@@ -32,25 +33,29 @@ function liveMarkers(): string[] {
 }
 
 describe("mutation-lane exclusion registry", () => {
-	it("keeps live markers and checked reasons in lockstep", () => {
-		// Recurrence (#3625 F2): a marker or stale registry row could silently
-		// change the mutation population without a reviewable governance failure.
-		const markers = liveMarkers();
-		const audit = auditRegistry({
-			sweepName: "mutation-lane exclusion markers",
-			flagged: markers,
-			registered: [],
-			exemptions: Object.fromEntries(
-				Object.entries(REGISTRY).map(([file, entry]) => [
-					file,
-					entry.reason ?? "",
-				]),
-			),
-			scannedCount: markers.length,
-			minScanned: 1,
-		});
-		expect(audit.problems, audit.problems.join("\n")).toEqual([]);
-	});
+	it(
+		"keeps live markers and checked reasons in lockstep",
+		() => {
+			// Recurrence (#3625 F2): a marker or stale registry row could silently
+			// change the mutation population without a reviewable governance failure.
+			const markers = liveMarkers();
+			const audit = auditRegistry({
+				sweepName: "mutation-lane exclusion markers",
+				flagged: markers,
+				registered: [],
+				exemptions: Object.fromEntries(
+					Object.entries(REGISTRY).map(([file, entry]) => [
+						file,
+						entry.reason ?? "",
+					]),
+				),
+				scannedCount: markers.length,
+				minScanned: 1,
+			});
+			expect(audit.problems, audit.problems.join("\n")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("crosses a real registry row through the selector seam", () => {
 		const file = "tests/mcp/server.smoke.test.ts";

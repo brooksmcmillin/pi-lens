@@ -993,13 +993,43 @@
 			]
 		},
 		"lsp-diagnostics-freshness": {
+			"pins": {
+				"PendingGuard": {
+					"value": "TRUE",
+					"test": "tests/clients/lsp/pending-receipt-wait-4782.test.ts",
+					"title": "does not return the stored answer at once while a later receipt is pending",
+					"also": [
+						{
+							"test": "tests/clients/lsp/pending-receipt-wait-4782.test.ts",
+							"title": "does not settle on the stored answer when a later receipt arrives inside the quiet window"
+						}
+					]
+				},
+				"Resend": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
+					"title": "checks a dependent against its rewritten dependency when the primary re-checks dependents only after the drain reply (push diagnostics)",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"DependencyFix",
+								"DependencyMutAnswerGuardNoClear",
+								"DependencyMutDropAnswerBlind",
+								"DependencyMutRetainSlotBlind"
+							],
+							"reason": "The phase as it runs for a server not declared to re-check unchanged bytes: the re-send is gated on resendRecheck (\"sends a dependent once when its primary is not declared to re-check unchanged bytes\" pins that branch). These configs check the read's guards against an in-order republish on a drained phase, where no re-send is sent."
+						}
+					}
+				}
+			},
 			"notCodeChoice": [
 				{
 					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
 					"constants": [
 						"SkippedWait",
 						"Preserve",
-						"MaxPubs"
+						"MaxPubs",
+						"MaxClears"
 					]
 				},
 				{
@@ -1007,7 +1037,10 @@
 					"constants": [
 						"VersionedServer",
 						"AsyncServer",
-						"ReplyFirst"
+						"ReplyFirst",
+						"Republish",
+						"Versioned",
+						"Drain"
 					]
 				},
 				{
@@ -1210,17 +1243,17 @@
 				},
 				"WritesPrimaryFirst": {
 					"value": "TRUE",
-					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
 					"title": "checks a dependent the command rewrote against its rewritten dependency"
 				},
 				"DispatchWaitsPhase": {
 					"value": "TRUE",
-					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
 					"title": "checks a dependent against its rewritten dependency when the primary phase outlasts the read-only bound (%s diagnostics)"
 				},
 				"RequireOrderedDrain": {
 					"value": "TRUE",
-					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
 					"title": "records undrained when %s replies overtake queued changes"
 				},
 				"ContentGate": {
@@ -1714,8 +1747,8 @@
 					"title": "runs the shared teardown once when the last session to leave is a secondary",
 					"also": [
 						{
-							"test": "tests/index-4554-last-member-teardown.test.ts",
-							"title": "runs the shared teardown when the primary is the last session to leave"
+							"test": "tests/index-4632-s5-session-identity.test.ts",
+							"title": "releases the primary registration when the primary is the last session to leave"
 						}
 					]
 				},
@@ -1723,6 +1756,86 @@
 					"value": "FALSE",
 					"test": "tests/index-4554-last-member-teardown.test.ts",
 					"title": "r6 a superseded primary's delayed shutdown never tears down its replacement"
+				},
+				"ProcessWideLast": {
+					"value": "TRUE",
+					"test": "tests/index-4704-sibling-teardown.test.ts",
+					"title": "releases the primary registration but keeps the sibling's root and the LSP service when the primary leaves first",
+					"also": [
+						{
+							"test": "tests/index-4704-sibling-teardown.test.ts",
+							"title": "releases the entry, the registration and the LSP service once the sibling leaves last"
+						}
+					]
+				},
+				"StaleMemberHolds": {
+					"value": "FALSE",
+					"test": "tests/index-4704-sibling-teardown.test.ts",
+					"title": "counts each sibling pi disposed without a shutdown, and none of them as live"
+				},
+				"SplitRelease": {
+					"value": "TRUE",
+					"test": "tests/index-4704-sibling-teardown.test.ts",
+					"title": "admits a /resume into another root as primary while the sibling is live",
+					"also": [
+						{
+							"test": "tests/index-4704-sibling-teardown.test.ts",
+							"title": "releases the primary registration but keeps the sibling's root and the LSP service when the primary leaves first"
+						}
+					]
+				},
+				"StartKeepsLiveFleet": {
+					"value": "TRUE",
+					"test": "tests/index-4554-last-member-teardown.test.ts",
+					"title": "keeps the LSP fleet at a full start while another session in the process is live"
+				},
+				"UnbindAtLeave": {
+					"value": "TRUE",
+					"test": "tests/index-4554-last-member-teardown.test.ts",
+					"title": "unbinds a sibling that leaves before the primary at its own leave",
+					"also": [
+						{
+							"test": "tests/index-4554-last-member-teardown.test.ts",
+							"title": "unbinds a primary that leaves before its sibling at its own leave"
+						}
+					]
+				},
+				"DisposalUnbinds": {
+					"value": "TRUE",
+					"test": "tests/index-4704-sibling-teardown.test.ts",
+					"title": "ends the scope of each subagent pi disposed without a shutdown at the next session start",
+					"also": [
+						{
+							"test": "tests/index-4554-last-member-teardown.test.ts",
+							"title": "unbinds a member pi disposed beside a live sibling at the next start"
+						}
+					]
+				},
+				"SweepAtStart": {
+					"value": "TRUE",
+					"test": "tests/index-4704-sibling-teardown.test.ts",
+					"title": "ends the scope of each subagent pi disposed without a shutdown at the next session start",
+					"also": [
+						{
+							"test": "tests/index-4554-last-member-teardown.test.ts",
+							"title": "unbinds a member pi disposed beside a live sibling at the next start"
+						}
+					]
+				},
+				"PrimaryClaims": {
+					"value": "TRUE",
+					"test": "tests/index-4751-newsession-turn-end-scope.test.ts",
+					"title": "delivers the new session's turn-end findings for its own write and records its section under its id"
+				},
+				"ClaimEmpty": {
+					"value": "TRUE",
+					"test": "tests/clients/turn-state-primary-claim.test.ts",
+					"title": "takes an empty ownerless worklist, so a no-turn secondary's leave cannot strand the primary's next write"
+				},
+				"SecondaryClaims": {
+					"value": "FALSE",
+					"test": "tests/index-4751-newsession-turn-end-scope.test.ts",
+					"title": "keeps the primary's worklist when a subagent runs a turn inside the primary's writing turn"
 				}
 			},
 			"notCodeChoice": [
@@ -1733,7 +1846,8 @@
 						"Writers",
 						"FileLess",
 						"MaxSteps",
-						"MaxTurns"
+						"MaxTurns",
+						"WithSubagent"
 					]
 				},
 				{

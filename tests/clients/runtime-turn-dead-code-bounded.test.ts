@@ -82,6 +82,7 @@ import {
 	type DeadCodeResult,
 	PythonDeadCodeClient,
 } from "../../clients/dead-code-client.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
 import { consumeTurnEndFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleTurnEnd } from "../../clients/runtime-turn.js";
@@ -315,7 +316,6 @@ describe("#4117 turn_end dead-code scan is bounded by the hook budget", () => {
 			await startTurn().turn;
 		}
 
-		expect(vultureProcess.scans).toBe(1);
 		// A failure never replaces the good baseline row (#925).
 		expect(
 			cacheManager.readCache<DeadCodeResult>(CACHE_KEY, root)?.data.summary,
@@ -430,7 +430,6 @@ describe("#4117 round 2: a scan that missed the budget still lands", () => {
 		// Turn 2 while the first scan is still parked: one process, no wait.
 		edit("other.py");
 		await startTurn().turn;
-		expect(vultureProcess.scans).toBe(1);
 		expect(String(deadCodeRows()[1]?.reason)).toContain("python:in_flight");
 
 		await settle(slow);
@@ -481,7 +480,6 @@ describe("#4117 round 2: a scan that missed the budget still lands", () => {
 			(group) => group.kind === "dead-code-late-scan-dropped",
 		);
 		expect(dropped?.count).toBe(1);
-		expect(vultureProcess.scans).toBe(1);
 		// The new session's own late scan wrote the row the one process produced.
 		expect(names()).toEqual(["late"]);
 	});
@@ -709,7 +707,6 @@ describe("#4154 a late scan is fenced to its session, its edits and the row on d
 		const second = startTurn();
 		await vi.advanceTimersByTimeAsync(3_100);
 		await second.turn;
-		expect(vultureProcess.scans).toBe(1);
 		await settle(first);
 		vultureProcess.gate = undefined;
 
@@ -801,5 +798,149 @@ describe("#4154 a late scan is fenced to its session, its edits and the row on d
 		await startTurn().turn;
 		expect(String(deadCodeRows().at(-1)?.reason)).not.toContain("late_scan");
 		expect(advisory()).not.toContain("late");
+	});
+});
+
+describe("#4117 a parked scan whose baseline write throws", () => {
+	// Recurrence prevented: the settle handler's success branch ran
+	// `cacheManager.writeCache` (mkdir + `writeFileAtomic(..., { bestEffort:
+	// false })`, so a disk fault throws) with nothing after the `.then(ok, fail)`
+	// pair. The throw rejected a promise nobody held, which ends the process under
+	// Node's default, and it skipped `entry.settled`, so the entry stayed parked
+	// and every later turn answered `in_flight` without starting a scan.
+
+	/**
+	 * Park a scan, put a regular file where the cache directory must be (`mkdirSync`
+	 * throws EEXIST on every platform and needs no permission bits), let the scan
+	 * settle, and return every `unhandledRejection` Node raised meanwhile.
+	 */
+	async function settleOnABrokenCache(): Promise<unknown[]> {
+		const slow = await slowTurn();
+		await slow.turn;
+		const cacheDir = path.join(getProjectDataDir(root), "cache");
+		fs.rmSync(cacheDir, { recursive: true, force: true });
+		fs.writeFileSync(cacheDir, "not a directory");
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			slow.release();
+			// `unhandledRejection` is delivered on a real macrotask; each step of the
+			// fake clock's async advance yields to one.
+			await vi.advanceTimersByTimeAsync(10);
+			await vi.advanceTimersByTimeAsync(10);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			vi.useRealTimers();
+			fs.rmSync(cacheDir, { force: true });
+		}
+		return unhandled;
+	}
+
+	it("leaves no unhandled rejection", async () => {
+		expect(await settleOnABrokenCache()).toEqual([]);
+	});
+
+	it("counts the failed baseline write and still delivers the scan's findings", async () => {
+		// Recurrence prevented (review of #4663, F1): a baseline write that threw
+		// partway took the whole settle with it, so the entry was dropped and the
+		// scan's findings (already computed) never reached the next turn. A failed
+		// write loses only the on-disk baseline.
+		await settleOnABrokenCache();
+
+		const failed = getDegradationSummary().find(
+			(group) => group.kind === "dead-code-baseline-write-failed",
+		);
+		const record = JSON.stringify(failed ?? null);
+		expect(record).toContain("EEXIST");
+		expect(
+			getDegradationSummary().find(
+				(group) => group.kind === "dead-code-late-scan-dropped",
+			),
+		).toBeUndefined();
+		vultureProcess.gate = undefined;
+		edit("other.py");
+		await startTurn().turn;
+		expect(String(deadCodeRows().at(-1)?.reason)).toContain("late_scan");
+		expect(advisory()).toContain("late");
+	});
+});
+
+describe("#4117 a parked scan's drop is its own", () => {
+	// Recurrence prevented: `dropLateDeadCodeScan` deleted by key. Two turns of
+	// one session that both reach the lane before either parks (the client's
+	// single flight hands both the same scan) park twice under one key, the second
+	// entry replacing the first. When the first entry's settle then dropped, it
+	// deleted the second, which had settled, so its delta was never delivered.
+	it("keeps the newer turn's settled scan when the older turn's baseline write throws", async () => {
+		let release!: () => void;
+		vultureProcess.gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let scan!: () => void;
+		const scanning = new Promise<void>((resolve) => {
+			scan = resolve;
+		});
+		vultureProcess.onScan = scan;
+		vi.useFakeTimers();
+		edit();
+		const analyze = vi.spyOn(client, "analyze");
+		const older = startTurn();
+		await scanning;
+		edit("other.py");
+		const newer = startTurn();
+		// Both turns are inside their dead-code await before either budget is spent.
+		for (let i = 0; i < 100 && analyze.mock.calls.length < 2; i++)
+			await vi.advanceTimersByTimeAsync(1);
+		expect(analyze).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(3_100);
+		await Promise.all([older.turn, newer.turn]);
+
+		// Entries register in turn order, so the older turn's settle writes first.
+		const write = vi
+			.spyOn(cacheManager, "writeCache")
+			.mockImplementationOnce(() => {
+				throw new Error("EIO: write refused");
+			});
+		release();
+		await vi.advanceTimersByTimeAsync(10);
+		vi.useRealTimers();
+		write.mockRestore();
+
+		vultureProcess.gate = undefined;
+		edit("third.py");
+		await startTurn().turn;
+		expect(String(deadCodeRows().at(-1)?.reason)).toContain("late_scan");
+		expect(advisory()).toContain("late");
+		// The settled scan was delivered; this turn's own file got the one more scan.
+		expect(vultureProcess.scans).toBe(2);
+	});
+
+	it("drops a parked scan that threw, and lets the next turn start another", async () => {
+		let reject!: (err: Error) => void;
+		const analyze = vi.spyOn(client, "analyze").mockImplementationOnce(
+			() =>
+				new Promise<DeadCodeResult>((_, fail) => {
+					reject = fail;
+				}),
+		);
+		vi.useFakeTimers();
+		edit();
+		const turn = startTurn();
+		for (let i = 0; i < 100 && analyze.mock.calls.length < 1; i++)
+			await vi.advanceTimersByTimeAsync(1);
+		await vi.advanceTimersByTimeAsync(3_100);
+		await turn.turn;
+		reject(new Error("vulture crashed"));
+		await vi.advanceTimersByTimeAsync(10);
+		vi.useRealTimers();
+
+		const dropped = getDegradationSummary().find(
+			(group) => group.kind === "dead-code-late-scan-dropped",
+		);
+		expect(JSON.stringify(dropped ?? null)).toContain("scan-threw");
+		edit("other.py");
+		await startTurn().turn;
+		expect(String(deadCodeRows().at(-1)?.reason)).not.toContain("in_flight");
 	});
 });

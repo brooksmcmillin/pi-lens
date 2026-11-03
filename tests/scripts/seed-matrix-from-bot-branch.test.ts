@@ -250,17 +250,35 @@ describe("#3401 the nightly clock with an unmerged bot PR", () => {
 		return working;
 	}
 
-	it("expires the cell after N elapsed days although no bot PR ever merged", () => {
-		const after = run(FIRST_PUBLISH_EXPIRY_DAYS, true);
-		expect(vueFirstPublish(after)).toBe("unknown");
+	const streak = (text: string) =>
+		parseRefreshState(text)["missed-probe"]?.vue?.["first-publish"];
+
+	it("carries the missed-probe streak across nights although no bot PR ever merged (#4512)", () => {
+		// Recurrence: without the seed each night restarts from master's doc, so a
+		// cell the probe keeps missing never reaches the second consecutive miss
+		// that raises it, and its `stale` date slides forward every night.
+		const nights = FIRST_PUBLISH_EXPIRY_DAYS;
+		const after = run(nights, true);
+		expect(vueFirstPublish(after)).toBe("direct");
+		expect(streak(after)).toEqual({
+			since: day(0),
+			last: day(nights),
+			misses: nights + 1,
+		});
 	});
 
-	it("never expires it when every night starts from master's doc (the r1 defect)", () => {
-		const after = run(FIRST_PUBLISH_EXPIRY_DAYS + 10, false);
+	it("restarts the streak every night when each night starts from master's doc (the r1 defect)", () => {
+		const nights = FIRST_PUBLISH_EXPIRY_DAYS + 10;
+		const after = run(nights, false);
 		expect(vueFirstPublish(after)).toBe("direct");
 		// Each night restarted the clock at its own date.
 		expect(parseRefreshState(after)["first-publish"]?.vue).toEqual({
-			firstMissed: day(FIRST_PUBLISH_EXPIRY_DAYS + 10),
+			firstMissed: day(nights),
+		});
+		expect(streak(after)).toEqual({
+			since: day(nights),
+			last: day(nights),
+			misses: 1,
 		});
 	});
 });

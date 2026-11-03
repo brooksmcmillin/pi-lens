@@ -15,11 +15,6 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 describe("runWorkspaceDiagnostics sweep bracket on the real wire (#2332)", () => {
 	let root: string;
 	let file: string;
@@ -28,6 +23,9 @@ describe("runWorkspaceDiagnostics sweep bracket on the real wire (#2332)", () =>
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-2332-"));
 		fs.mkdirSync(path.join(root, ".pi-lens"));

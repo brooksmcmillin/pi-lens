@@ -52,10 +52,6 @@ export interface ProjectReportOptions {
 	 * subsystems; never expands scope or triggers scans. The project-level
 	 * analogue of module_report's `focus`-ranked recommendedReads. */
 	focus?: string;
-	/** Rendering instruction only (mirrors module_report's `view`): "compact"
-	 * signals the caller to use `renderCompactProjectReport` instead of JSON.
-	 * The computed data is identical either way. */
-	view?: "compact";
 }
 
 interface ProjectReportTrust {
@@ -179,7 +175,6 @@ export interface ProjectReport {
 		 * one field that always distinguishes attempts; compare it, not `when`. */
 		buildId?: number;
 	};
-	view?: "compact";
 	trust?: ProjectReportTrust;
 	hubs?: ProjectReportHub[];
 	entryPoints?: ProjectReportEntryPoint[];
@@ -812,7 +807,6 @@ export async function projectReport(
 ): Promise<ProjectReport> {
 	const limit = clampLimit(options?.limit);
 	const focusTerms = normalizeFocus(options?.focus);
-	const view = options?.view;
 
 	const {
 		getCachedReviewGraph,
@@ -850,7 +844,6 @@ export async function projectReport(
 					"or set PI_LENS_REVIEW_GRAPH_MAX_FILES; for CI/cron, run " +
 					"npx pi-lens build-graph after configuring the cap",
 				...(lastBuildAttempt ? { lastBuildAttempt } : {}),
-				...(view ? { view } : {}),
 			};
 		}
 		const previousAttempt = getLastReviewGraphBuildAttempt(cwd);
@@ -890,7 +883,6 @@ export async function projectReport(
 					: "No review graph cached for this workspace yet — a build was kicked off in the background; retry this call shortly."
 				: `${cause}A build is already running for this workspace; retry this call shortly.`,
 			...(lastBuildAttempt ? { lastBuildAttempt } : {}),
-			...(view ? { view } : {}),
 		};
 	}
 
@@ -926,7 +918,6 @@ export async function projectReport(
 	return {
 		available: true,
 		...(lastBuildAttempt ? { lastBuildAttempt } : {}),
-		...(view ? { view } : {}),
 		trust,
 		hubs,
 		entryPoints,
@@ -936,87 +927,207 @@ export async function projectReport(
 	};
 }
 
-// --- compact (line-oriented text) rendering -------------------------------------
+// --- default text cell (#5150 R2) -------------------------------------------------
+// The default `project_report` rendering. The cell is a total function of the
+// artifact: every field the JSON payload carries is rendered in its own
+// section, except the per-item `suggestedNext` navigation hints — which repeat
+// their item's file path beside the constant tool `module_report`, so the item
+// line itself is the hint. They stay named in the trailing UNRENDERED row, and
+// the strict census in tests/clients/project-report-text.test.ts reds on any
+// runtime leaf outside that set.
+//
+// Staleness owns the trailing STALENESS block (per #5159: never inline in
+// another section, never mutated into a JSON payload — the MCP handler passes
+// this text through untouched and the JSON hatch carries staleness inside the
+// document's own trust notes). TRUST renders the remaining notes inline.
+//
+// View vocabulary (deliberately smaller than #5137's preset matrix): the
+// report has one projection, so `view` is a plain string — `"json"` returns
+// the full JSON document, anything else (absent, "default", unknown) returns
+// this text.
+export function renderTextProjectReport(report: ProjectReport): string {
+	if (!report.available) {
+		const lines = [
+			`project_report — unavailable${report.hint ? `: ${report.hint}` : ""}`,
+		];
+		lines.push(...renderLastBuildLines(report));
+		lines.push(renderUnrenderedLine(report));
+		return lines.join("\n");
+	}
+	const t = report.trust!;
+	const lines: string[] = [
+		`project_report — ${t.filesCovered}/${t.filesTotal} files (${fmtPct(t.coverage)} coverage), built ${t.graphBuiltAt}`,
+		"TRUST:",
+		`  built: ${t.graphBuiltAt}`,
+		`  coverage: ${t.filesCovered}/${t.filesTotal} (${fmtPct(t.coverage)})`,
+	];
+	if (t.resolution.sampleSize > 0) {
+		lines.push(
+			`  resolution: exact ${fmtPct(t.resolution.exact)}, ` +
+				`import ${fmtPct(t.resolution.import)}, ` +
+				`receiver-type ${fmtPct(t.resolution.receiverType)}, ` +
+				`name-only ${fmtPct(t.resolution.nameOnly)} ` +
+				`(${t.resolution.sampleSize} tagged edges)`,
+		);
+	} else {
+		lines.push("  resolution: no resolution-tagged edges yet");
+	}
+	const stalenessNotes = stalenessNotesOf(t);
+	for (const note of t.notes) {
+		if (stalenessNotes.has(note)) continue;
+		lines.push(`  note: ${note}`);
+	}
+	lines.push("HUBS:");
+	if (report.hubs!.length === 0) {
+		lines.push("  (none found)");
+	} else {
+		for (const h of report.hubs!) {
+			const role = h.role ? ` — ${h.role}` : "";
+			lines.push(
+				`  - ${h.file}${role}; ${h.fanIn} importer(s), blast radius ${h.blastRadius}`,
+			);
+		}
+	}
+	lines.push("ENTRY POINTS:");
+	if (report.entryPoints!.length === 0) {
+		lines.push("  (none found)");
+	} else {
+		for (const e of report.entryPoints!) {
+			lines.push(`  - ${e.file}; fan-out ${e.fanOut}`);
+		}
+	}
+	const s = report.subsystems!;
+	lines.push("SUBSYSTEMS:", "  DIRECTORIES:");
+	if (s.directories.length === 0) {
+		lines.push("    (none)");
+	} else {
+		for (const dir of s.directories) lines.push(`    - ${dir}`);
+	}
+	lines.push("  EDGES:");
+	if (s.edges.length === 0) {
+		lines.push("    (none)");
+	} else {
+		for (const edge of s.edges) {
+			lines.push(`    - ${edge.from} -> ${edge.to} (${edge.count} edge(s))`);
+		}
+	}
+	lines.push("  CYCLES:");
+	if (s.cycles.length === 0) {
+		lines.push("    (none)");
+	} else {
+		for (const c of s.cycles) {
+			lines.push(`    - ${c.dirs.join(" <-> ")} (${c.edgeCount} edges)`);
+		}
+	}
+	lines.push("  LAYERING VIOLATIONS:");
+	if (s.violations.length === 0) {
+		lines.push("    (none)");
+	} else {
+		for (const v of s.violations) {
+			lines.push(
+				`    - ${v.from} -> ${v.to} (${v.count} edge(s), ` +
+					`against ${v.to} -> ${v.from} ${v.dominantCount} edge(s))`,
+			);
+		}
+	}
+	lines.push("RISK HOTSPOTS:");
+	if (report.riskHotspots!.length === 0) {
+		lines.push("  (none found)");
+	} else {
+		for (const r of report.riskHotspots!) {
+			lines.push(
+				`  - ${r.file}; fan-in ${r.fanIn} x max complexity ` +
+					`${r.maxComplexity} = ${r.score}`,
+			);
+		}
+	}
+	lines.push("DEAD WEIGHT:", `  disclaimer: ${report.deadWeight!.disclaimer}`);
+	if (report.deadWeight!.files.length === 0) {
+		lines.push("  (none found)");
+	} else {
+		for (const d of report.deadWeight!.files) lines.push(`  - ${d.file}`);
+	}
+	lines.push(...renderLastBuildLines(report));
+	if (stalenessNotes.size > 0) {
+		lines.push("STALENESS:");
+		for (const note of stalenessNotes) lines.push(`  - ${note}`);
+	}
+	lines.push(renderUnrenderedLine(report));
+	return lines.join("\n");
+}
+
+/** Notes owned by the trailing STALENESS block: the age sentence computeTrust
+ * emits when `trust.stale`, and the revision-drift sentence from #1961
+ * (recomputed from the same producer, so its wording cannot drift from the
+ * note). Membership is re-derived from the same producers (same file) rather
+ * than tagged at creation, so a future note cannot silently join or leave
+ * the block. */
+function stalenessNotesOf(trust: ProjectReportTrust): Set<string> {
+	const owned = new Set<string>();
+	for (const note of trust.notes) {
+		if (/^Graph is stale: built \d+m ago\./.test(note)) owned.add(note);
+	}
+	if (trust.revisionDrift)
+		owned.add(formatReviewGraphRevisionDriftNote(trust.revisionDrift));
+	return owned;
+}
+
+function renderLastBuildLines(report: ProjectReport): string[] {
+	const lines = ["LAST BUILD:"];
+	const attempt = report.lastBuildAttempt;
+	if (!attempt) {
+		lines.push("  no build attempt recorded");
+		return lines;
+	}
+	const reason = attempt.reason ? ` — ${attempt.reason}` : "";
+	const buildId =
+		attempt.buildId !== undefined ? ` (build ${attempt.buildId})` : "";
+	lines.push(`  ${attempt.outcome} ${attempt.when}${reason}${buildId}`);
+	return lines;
+}
+
+/** The declared row: every runtime leaf the sections above intentionally do
+ * not name. Tokens are short names the census expands against runtime leaves
+ * (a `suggestedNext.<field>` suffix); the parenthetical carries the reason.
+ * Empty set renders as an explicit `none` so the row itself is the totality
+ * proof rather than its absence. */
+function renderUnrenderedLine(report: ProjectReport): string {
+	const tokens: string[] = [];
+	const leaves: string[] = [];
+	collectLeafPaths(report, "report", leaves);
+	if (leaves.some((leaf) => leaf.endsWith(".suggestedNext.tool")))
+		tokens.push("suggestedNext.tool");
+	if (leaves.some((leaf) => leaf.endsWith(".suggestedNext.path")))
+		tokens.push("suggestedNext.path");
+	if (tokens.length === 0)
+		return "UNRENDERED: none — every artifact field is rendered above";
+	return (
+		`UNRENDERED: ${tokens.join(", ")} (per-item module_report navigation ` +
+		`hints repeat their item's file path)`
+	);
+}
+
+/** Every runtime leaf path of `value` (`[]` for array elements), prefixed.
+ * Exported so the text cell's leaf census (tests/clients/project-report-text.
+ * test.ts) walks the same traversal the UNRENDERED row uses — one owner for
+ * the shape (#83) instead of a hand-copied twin in the test. */
+export function collectLeafPaths(
+	value: unknown,
+	prefix: string,
+	out: string[],
+): void {
+	if (Array.isArray(value)) {
+		for (const v of value) collectLeafPaths(v, `${prefix}[]`, out);
+		return;
+	}
+	if (value !== null && typeof value === "object") {
+		for (const [k, v] of Object.entries(value))
+			collectLeafPaths(v, prefix ? `${prefix}.${k}` : k, out);
+		return;
+	}
+	out.push(prefix);
+}
 
 function fmtPct(n: number): string {
 	return `${Math.round(n * 100)}%`;
-}
-
-/**
- * Render a ProjectReport as line-oriented text (mirrors
- * renderCompactModuleReport's convention) — cheapest option, one line per
- * ranked item instead of a repeated-keys JSON object.
- */
-export function renderCompactProjectReport(report: ProjectReport): string {
-	if (!report.available) {
-		return `project_report — unavailable${report.hint ? `: ${report.hint}` : ""}`;
-	}
-	const lines: string[] = [];
-	// #919: an available graph whose persist failed serves this process fine
-	// but leaves the NEXT session cold — compact view must say so, not only
-	// the JSON view.
-	if (report.lastBuildAttempt?.reason) {
-		lines.push(`! build: ${report.lastBuildAttempt.reason}`);
-	}
-	const t = report.trust;
-	if (t) {
-		lines.push(
-			`TRUST: built ${t.graphBuiltAt} — ${t.filesCovered}/${t.filesTotal} files (${fmtPct(t.coverage)} coverage)` +
-				(t.resolution.sampleSize > 0
-					? ` — resolution: exact ${fmtPct(t.resolution.exact)}, import ${fmtPct(t.resolution.import)}, receiver-type ${fmtPct(t.resolution.receiverType)}, name-only ${fmtPct(t.resolution.nameOnly)}`
-					: " — no resolution-tagged edges yet"),
-		);
-		for (const note of t.notes) lines.push(`  ! ${note}`);
-	}
-	if (report.hubs?.length) {
-		lines.push("HUBS:");
-		for (const h of report.hubs) {
-			const role = h.role ? ` — ${h.role}` : "";
-			lines.push(
-				`  ${h.file}${role}; ${h.fanIn} importer(s), blastRadius ${h.blastRadius}`,
-			);
-		}
-	}
-	if (report.entryPoints?.length) {
-		lines.push("ENTRY POINTS:");
-		for (const e of report.entryPoints) {
-			lines.push(`  ${e.file}; fan-out ${e.fanOut}`);
-		}
-	}
-	if (report.subsystems) {
-		const s = report.subsystems;
-		lines.push(
-			`SUBSYSTEMS: ${s.directories.length} directories, ${s.edges.length} cross-dir edge group(s)`,
-		);
-		if (s.cycles.length > 0) {
-			lines.push("  CYCLES:");
-			for (const c of s.cycles) {
-				lines.push(`    ${c.dirs.join(" <-> ")} (${c.edgeCount} edges)`);
-			}
-		}
-		if (s.violations.length > 0) {
-			lines.push("  LAYERING VIOLATIONS:");
-			for (const v of s.violations) {
-				lines.push(
-					`    ${v.from} -> ${v.to} (${v.count} edge(s), against the dominant ${v.to} -> ${v.from} direction, ${v.dominantCount} edge(s))`,
-				);
-			}
-		}
-	}
-	if (report.riskHotspots?.length) {
-		lines.push("RISK HOTSPOTS:");
-		for (const r of report.riskHotspots) {
-			lines.push(
-				`  ${r.file}; fan-in ${r.fanIn} × max complexity ${r.maxComplexity} = ${r.score}`,
-			);
-		}
-	}
-	if (report.deadWeight) {
-		lines.push(`DEAD WEIGHT (${report.deadWeight.disclaimer}):`);
-		for (const d of report.deadWeight.files) {
-			lines.push(`  ${d.file}`);
-		}
-		if (report.deadWeight.files.length === 0) lines.push("  (none found)");
-	}
-	return lines.join("\n");
 }

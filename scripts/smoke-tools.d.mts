@@ -45,6 +45,13 @@ export interface LspFixture {
 	expectedReason?: string;
 	expectedTool?: string;
 	tools?: string[];
+	/**
+	 * The registry server id this fixture's file routes to, when it is not the
+	 * fixture's own `lang` (`typst` → `tinymist`, `jedi` → `python-jedi`). Set
+	 * for scripts that key a row by SERVER id rather than by fixture lang; the
+	 * harness itself never reads it (it resolves the live servers from the file).
+	 */
+	serverId?: string;
 	/** Auxiliary (diagnostic-only) servers attached alongside the primary. */
 	auxiliaryServerIds?: string[];
 	auxiliarySourceMatch?: string;
@@ -57,6 +64,9 @@ export interface LspFixture {
 	/** Why this gate-eligible fixture cannot opt in (#3217). Mutually exclusive
 	 *  with `lspGate`; the reason is asserted, not just the key's presence. */
 	lspGateExempt?: string;
+	/** #3405: a server that publishes only after its project is active. A gated
+	 *  fixture whose cold call finds nothing is polled to this deadline. */
+	lspGateReadiness?: { deadlineMs: number; intervalMs: number };
 	expectDiagnosticCode?: string;
 	/** The one fixture the nightly `lens_diagnostics mode=full` row drives
 	 *  (#2780), mirroring `lspGate`. */
@@ -64,6 +74,12 @@ export interface LspFixture {
 	/** #4320/#4346: the created-module witness the clean gate runs on this
 	 *  fixture once its server is up (`runCreatedModuleWitness`). */
 	createdModuleWitness?: CreatedModuleWitness;
+	/** #4521/#4532: the config-file and root-marker phases the clean gate runs
+	 *  on this fixture once its server is up (`runBornAfterStartConfigWitness`). */
+	bornAfterStartConfig?: BornAfterStartConfigWitness;
+	/** #4532 gap 3: the lockfile-less venv install phase the clean gate runs on
+	 *  this fixture once its server is up (`runVenvInstallWitness`). */
+	venvInstall?: VenvInstallWitness;
 	lombokJar?: boolean;
 	expectNoMessageMatch?: string;
 	/** A diagnostic message that MUST arrive. The lane's default verdict passes
@@ -170,6 +186,39 @@ export interface CreatedModuleWitness {
 	moduleText: string;
 	reportsMissing: (text: string, name: string) => boolean;
 }
+/** What configures the server, created after it started (#4521, #4532). */
+export interface BornAfterStartConfigWitness extends CreatedModuleWitness {
+	/** Directory under the importer's root that holds the module. */
+	moduleDir: string;
+	/** The server's config file name and its text (puts `moduleDir` on the search path). */
+	configFile: string;
+	configText: string;
+	/** A marker the workspace itself holds, so a subdirectory shares its client. */
+	ancestorMarker: string;
+	/** A file whose presence makes a subdirectory a project root of its own. */
+	rootMarker: string;
+}
+/** A package installed into a project `.venv` that keeps no lockfile (#4532 gap 3). */
+export interface VenvInstallWitness {
+	ext: string;
+	importerText: (name: string) => string;
+	/** The installed package's own module text. */
+	packageText: string;
+	reportsMissing: (text: string, name: string) => boolean;
+	/** The server's config file that points it at the venv, written before the
+	 *  first call (a config born after start is the separate gap 12 case). */
+	configFile: string;
+	configText: string;
+	/** `site-packages` path segments under the importer's root. */
+	sitePackages: string[];
+	/** A file whose presence makes the witness directory a project root. */
+	rootMarker: string;
+}
+/** Call `probe` until it returns true or `deadlineMs` passes (the phases' poll). */
+export function pollUntil(
+	probe: () => Promise<boolean>,
+	options: { deadlineMs: number; intervalMs: number },
+): Promise<{ ok: boolean; polls: number; elapsedMs: number }>;
 /** The born-after-start phase's deadline and poll interval (#4521). */
 export const BORN_AFTER_START_DEADLINE_MS: number;
 export const BORN_AFTER_START_POLL_MS: number;
@@ -188,11 +237,49 @@ export function runCreatedModuleWitness(
 		intervalMs?: number;
 	},
 ): Promise<SmokeRow[]>;
+/** Create the server's config file, and a root marker, once the server
+ *  reports the importer's missing import; one row per case (#4521, #4532).
+ *  `look` is the out-of-band look pi runs at every `tool_call`; `clientRoots`
+ *  is read into each row's detail so a pass also names the live client roots
+ *  (#4532 gap 14). */
+export function runBornAfterStartConfigWitness(
+	fixture: LspFixture | undefined,
+	options: {
+		workspace: string;
+		execute: (...args: never[]) => Promise<unknown>;
+		look: (root: string) => Promise<unknown>;
+		clientRoots?: () => string[];
+		deadlineMs?: number;
+		intervalMs?: number;
+	},
+): Promise<SmokeRow[]>;
+/** Install a package into the fixture's lockfile-less `.venv` once the server
+ *  reports the importer's missing import; one row, failing while the importer
+ *  still reports it at the deadline (#4532 gap 3). */
+export function runVenvInstallWitness(
+	fixture: LspFixture | undefined,
+	options: {
+		workspace: string;
+		execute: (...args: never[]) => Promise<unknown>;
+		/** Poll deadline and interval; the defaults are the BORN_AFTER_START_* constants. */
+		deadlineMs?: number;
+		intervalMs?: number;
+	},
+): Promise<SmokeRow[]>;
 /** Run the production LSP clean-gate layer, optionally with test seams. */
 export function runLspGate(options?: {
 	langs?: string[];
 	install?: boolean;
 	verbose?: boolean;
+	deps?: unknown;
+}): Promise<number>;
+/** Run the nightly live cascade layer (#1712), optionally with test seams. */
+export function runLspCascade(options?: {
+	langs?: string[];
+	install?: boolean;
+	verbose?: boolean;
+	timesOut?: string | null;
+	minPass?: number | null;
 	deps?: unknown;
 }): Promise<number>;
 /** The fixtures the nightly `lens_diagnostics mode=full` row drives (#2780). */
@@ -213,7 +300,7 @@ export function runLensFull(options?: {
 export interface SmokeRow {
 	lang?: string;
 	runner?: string;
-	state: "pass" | "fail" | "skip" | "setup-failed";
+	state: "pass" | "fail" | "skip" | "known-defect" | "setup-failed";
 	detail?: string;
 	diags?: number;
 }

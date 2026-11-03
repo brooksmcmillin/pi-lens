@@ -1,0 +1,518 @@
+{
+  "source": "Synthetic recording shaped like gh api repos/{o}/{r}/actions/runs/{id}/jobs for ci.yml (runs) and lint.yml (lintRuns), plus the branch-protection contexts (required); durations are chosen so each job sits at a stated fraction of its timeout-minutes cap. No Install test (macos-latest) row is recorded on purpose: a required context with no samples must be reported, not skipped silently (#4691).",
+  "runs": [
+    {
+      "id": 1000,
+      "created_at": "2026-10-18T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "Lint & type-check",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:06:40Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 1/2)",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:15:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 2/2)",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:16:40Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:00:12Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests Windows",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:25:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Changelog fragment (fast-fail)",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:00:05Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 1/4)",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:08:20Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 2/4)",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:15:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:00:10Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (ubuntu-latest)",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:00:45Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (windows-latest)",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:02:50Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 1001,
+      "created_at": "2026-10-19T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "Lint & type-check",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:07:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 1/2)",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:16:40Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 2/2)",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:17:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:00:12Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests Windows",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:25:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Changelog fragment (fast-fail)",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:00:05Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 1/4)",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:08:21Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 2/4)",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:15:50Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:00:10Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (ubuntu-latest)",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:00:44Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (windows-latest)",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:02:56Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 1002,
+      "created_at": "2026-10-20T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "Lint & type-check",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:07:20Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 1/2)",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:18:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 2/2)",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:18:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:00:13Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests Windows",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:25:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Changelog fragment (fast-fail)",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:00:06Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 1/4)",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:08:22Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 2/4)",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:16:40Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:00:11Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (ubuntu-latest)",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:00:46Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (windows-latest)",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:02:56Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 1003,
+      "created_at": "2026-10-21T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "Lint & type-check",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:07:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 1/2)",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:18:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 2/2)",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:18:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:00:12Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests Windows",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:25:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Changelog fragment (fast-fail)",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:00:05Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 1/4)",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:08:23Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 2/4)",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:16:40Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:00:10Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (ubuntu-latest)",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:00:45Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (windows-latest)",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:02:55Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 1004,
+      "created_at": "2026-10-22T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "Lint & type-check",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:07:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 1/2)",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:18:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests (shard 2/2)",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:18:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:00:12Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Unit tests Windows",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:25:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Changelog fragment (fast-fail)",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:00:05Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 1/4)",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:08:24Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models (shard 2/4)",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:16:40Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "TLA+ models",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:00:10Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (ubuntu-latest)",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:00:45Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "Install test (windows-latest)",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:02:56Z",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "lintRuns": [
+    {
+      "id": 2000,
+      "created_at": "2026-10-18T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "knip",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:01:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "oxfmt format check",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:00:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "actionlint",
+          "started_at": "2026-10-18T10:00:00Z",
+          "completed_at": "2026-10-18T10:00:20Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 2001,
+      "created_at": "2026-10-19T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "knip",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:01:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "oxfmt format check",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:00:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "actionlint",
+          "started_at": "2026-10-19T10:00:00Z",
+          "completed_at": "2026-10-19T10:00:20Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 2002,
+      "created_at": "2026-10-20T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "knip",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:01:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "oxfmt format check",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:00:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "actionlint",
+          "started_at": "2026-10-20T10:00:00Z",
+          "completed_at": "2026-10-20T10:00:20Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 2003,
+      "created_at": "2026-10-21T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "knip",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:01:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "oxfmt format check",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:00:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "actionlint",
+          "started_at": "2026-10-21T10:00:00Z",
+          "completed_at": "2026-10-21T10:00:20Z",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 2004,
+      "created_at": "2026-10-22T10:00:00Z",
+      "head_branch": "master",
+      "event": "push",
+      "jobs": [
+        {
+          "name": "knip",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:01:00Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "oxfmt format check",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:00:30Z",
+          "conclusion": "success"
+        },
+        {
+          "name": "actionlint",
+          "started_at": "2026-10-22T10:00:00Z",
+          "completed_at": "2026-10-22T10:00:20Z",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ],
+  "required": [
+    "Lint & type-check",
+    "Unit tests",
+    "Install test (ubuntu-latest)",
+    "Install test (windows-latest)",
+    "Install test (macos-latest)",
+    "knip",
+    "oxfmt format check",
+    "TLA+ models",
+    "Unit tests Windows"
+  ]
+}

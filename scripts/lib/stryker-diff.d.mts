@@ -91,6 +91,24 @@ export declare function sampleRangesDeterministically(
 	limit: number,
 	seed: string,
 ): { selected: string[]; sampled: boolean };
+export type MutantFit = {
+	selected: string[];
+	mutants: number | null;
+	passes: number;
+	exceedsAllowance: boolean;
+	unverified: boolean;
+};
+export declare function fitSampleToMutantAllowance(args: {
+	patterns: string[];
+	startCount: number;
+	allowedMutants: number;
+	seed: string;
+	countMutants: (selection: string[]) => number | null;
+}): MutantFit;
+export declare function describeSampledMutants(
+	fit: MutantFit,
+	allowedMutants: number,
+): string;
 export declare function extractSnippet(
 	sourceLines: string[],
 	location:
@@ -140,6 +158,11 @@ export declare function planResample(args: {
 	seed: string;
 	attemptsSoFar: number;
 	maxAttempts: number;
+	sample?: (
+		patterns: string[],
+		limit: number,
+		seed: string,
+	) => { selected: string[] };
 }): { retry: false } | { retry: true; patterns: string[] };
 export declare function augmentAndSummarize(
 	strykerReport: { files?: Record<string, { mutants?: any[] }> },

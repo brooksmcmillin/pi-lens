@@ -31,11 +31,7 @@ import { waitFor } from "./interleaving-kit.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 let dir: string;
-
-vi.mock("../../clients/file-utils.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/file-utils.js")>()),
-	getGlobalPiLensDir: () => dir,
-}));
+let previousHome: string | undefined;
 
 const ROOT_A = "/repo/session-1";
 const ROOT_B = "/repo/session-2";
@@ -103,6 +99,9 @@ async function expectSessionTwoRegistersAlone(): Promise<void> {
 // Shared by both describes below: a fresh registry dir and module graph per case.
 beforeEach(async () => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-instreg-"));
+	// `PI_LENS_HOME` is the knob the registry's data and log resolvers read.
+	previousHome = process.env.PI_LENS_HOME;
+	process.env.PI_LENS_HOME = dir;
 	vi.resetModules();
 	registry = await import("../../clients/instance-registry.js");
 	ledger = await import("../../clients/degradation-ledger.js");
@@ -112,8 +111,11 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	peerReleases();
 	// The tail is a process singleton: settle it here so nothing queued by
-	// one case lands in the next case's directory.
+	// one case lands in the next case's directory. A queued mutation resolves
+	// the registry path when it runs, so the pin stays until the drain ends.
 	await registry._settleRegistryMutationsForTests();
+	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+	else process.env.PI_LENS_HOME = previousHome;
 	removeTempDirSync(dir);
 });
 

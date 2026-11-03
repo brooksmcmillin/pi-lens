@@ -115,7 +115,7 @@ describe("ci-test-diff failure extraction", () => {
 
 	it("returns 0 for unchanged, 1 for NEW, and 2 for invalid job logs", () => {
 		const scratch = fs.mkdtempSync(
-			path.join(process.env.TMPDIR ?? os.tmpdir(), "ci-test-diff-"),
+			path.join(os.tmpdir(), "pi-lens-ci-test-diff-"),
 		);
 		const gh = path.join(scratch, "gh");
 		const fixtureDir = path.resolve("tests/fixtures/ci-test-diff");

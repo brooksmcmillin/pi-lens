@@ -21,11 +21,6 @@ import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.j
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -154,8 +149,11 @@ async function touchWith(
 }
 
 describe("#3405 — touchFile forwards the caller's save declaration", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});
@@ -174,6 +172,36 @@ describe("#3405 — touchFile forwards the caller's save declaration", () => {
 		// would fall back to, so the service states the answer explicitly.
 		const call = await touchWith({});
 		expect(call?.[5]).toBe(false);
+	});
+});
+
+/**
+ * #2066 round 3: the same seam, a second forwarded value. `touchFile`
+ * fingerprints every touch's bytes for its owned document `#3480` (debounce
+ * fingerprints, sibling announcements) before any client is asked to push them;
+ * passing that digest on is what stops the send from walking the document for a
+ * second sha256 of the same bytes.
+ */
+describe("#2066 — touchFile forwards the fingerprint it computed for these bytes", () => {
+	beforeEach(async () => {
+		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
+		getServersForFileWithConfig.mockReset();
+		createLSPClient.mockReset();
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("hands notify.open the #1095 fingerprint of the content it is pushing", async () => {
+		const call = await touchWith({});
+		// The eighth argument. Pinned against the caller's own content, so a
+		// missing forward reads `undefined` and a fingerprint of some other bytes
+		// reads a different digest.
+		expect(call?.[1]).toBe("const x = 1;\n");
+		expect(call?.[7]).toBe(hashDiagnosticContent("const x = 1;\n"));
 	});
 });
 
@@ -225,8 +253,11 @@ async function touchSameBytes(
  * bytes, left the query inconclusive.
  */
 describe("#3405 — a save is not debounced away with the push it rides on", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});

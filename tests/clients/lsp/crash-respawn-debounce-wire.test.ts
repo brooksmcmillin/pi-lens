@@ -25,19 +25,16 @@ import { LSPService } from "../../../clients/lsp/index.js";
 import type { LSPProcess } from "../../../clients/lsp/launch.js";
 import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import { removeTempDirSync } from "../test-utils.js";
+import { _setServersForFileForTests } from "../../../clients/lsp/config.js";
 
 const { getServersForFileWithConfig } = vi.hoisted(() => ({
 	getServersForFileWithConfig: vi.fn(),
-}));
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 
 describe("#3501 — real-wire crash between two same-content touches", () => {
 	let tmp: string;
 	beforeEach(() => {
+		_setServersForFileForTests(getServersForFileWithConfig);
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-crash-wire-"));
 		// Generous: the fixed path is answered by B's publish, not by this budget.
 		process.env.PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS = "5000";

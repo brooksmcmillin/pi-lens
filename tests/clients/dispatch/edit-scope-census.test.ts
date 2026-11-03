@@ -107,6 +107,7 @@ const CLASSIFICATION: Readonly<Record<string, Classification>> = {
 	ktlint: LINTER,
 	lsp: SEMANTIC,
 	"lsp/ast-grep": GATED,
+	"lsp/fallow": SCANNER,
 	"lsp/opengrep": SCANNER,
 	"lsp/typos": SCANNER,
 	"lsp/zizmor": SCANNER,

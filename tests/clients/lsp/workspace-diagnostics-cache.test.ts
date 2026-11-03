@@ -859,6 +859,9 @@ describe("dependency-index availability persisted on the entry (#1793)", () => {
 
 	it("emits a bounded record when a dep-index-cold refusal fires", async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		const logLatency = vi.fn();
 		vi.doMock("../../../clients/latency-logger.js", async (importOriginal) => ({
 			...(await importOriginal<Record<string, unknown>>()),
@@ -900,6 +903,9 @@ describe("dependency-index availability persisted on the entry (#1793)", () => {
 		expect(records[0].metadata.depIndexColdRefusals).toBe(1);
 		vi.doUnmock("../../../clients/latency-logger.js");
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 	});
 
 	// #1793 review F3 (Probe D shape): both `record()` call sites
@@ -1109,6 +1115,9 @@ describe("per-file dependency-index coverage in isEntryFresh (#1814)", () => {
 	// case, not just the whole-session-absent one.
 	it("counts a per-file-uncovered refusal in the same depIndexColdRefusals telemetry as a whole-session refusal", async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		const logLatency = vi.fn();
 		vi.doMock("../../../clients/latency-logger.js", async (importOriginal) => ({
 			...(await importOriginal<Record<string, unknown>>()),
@@ -1152,6 +1161,9 @@ describe("per-file dependency-index coverage in isEntryFresh (#1814)", () => {
 		expect(records[0].metadata.depIndexColdRefusals).toBe(1);
 		vi.doUnmock("../../../clients/latency-logger.js");
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 	});
 });
 
@@ -1165,16 +1177,12 @@ const { getServersForFileWithConfig, createLSPClient } = vi.hoisted(() => ({
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
 }));
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal()),
 	createLSPClient,
 }));
 
+import { _setServersForFileForTests } from "../../../clients/lsp/config.js";
 import { LSPService } from "../../../clients/lsp/index.js";
 
 function makeTsServer(root: string, id = "typescript", extension = ".ts") {
@@ -1228,8 +1236,14 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		await Promise.all(services.splice(0).map((service) => service.shutdown()));
 	};
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		// Two module instances are live in this describe: the dynamic import
+		// below (fresh after the reset) and the static `LSPService` above.
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
+		_setServersForFileForTests(getServersForFileWithConfig);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmpSweep = setupTestEnvironment("pi-lens-lsp-sweep-cache-").tmpDir;

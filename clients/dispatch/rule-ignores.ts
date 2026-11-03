@@ -11,12 +11,18 @@
  * file is filtered by the CLI and unfiltered over LSP. So every pi-lens path
  * that delivers ast-grep's LSP diagnostics has to apply the carve-out itself;
  * the runner-side matcher below is what it applies.
+ *
+ * This matcher is for a RULE'S OWN `ignores:` globs, which mirror
+ * `ast-grep scan`. A user's `rules.<id>.ignorePaths` is not matched here: it is
+ * a gitignore line list, like the `ignore` field, and
+ * `clients/dispatch/rule-policy.ts` (`ruleIgnoredForPath`) evaluates it with
+ * `isIgnoredByGitignoreLines` (#5029).
  */
 
 import * as path from "node:path";
 import { minimatch } from "../deps/minimatch.js";
 import { buildEffectiveAstGrepCatalog } from "./ast-grep-catalog.js";
-import { isWindowsPath, toPosix } from "../path-utils.js";
+import { isWindowsPath, relativeInside, toPosix } from "../path-utils.js";
 
 /**
  * True when `filePath` is carved out of a rule by one of its glob `patterns`.
@@ -36,16 +42,12 @@ export function isRuleIgnoredForPath(
 	if (!patterns || patterns.length === 0) return false;
 	const pathApi =
 		isWindowsPath(root) || isWindowsPath(filePath) ? path.win32 : path.posix;
-	const relative = pathApi.relative(root, filePath);
-	const outsideRoot =
-		relative !== "" &&
-		(relative === ".." ||
-			relative.startsWith(`..${pathApi.sep}`) ||
-			pathApi.isAbsolute(relative));
+	const relative = relativeInside(root, filePath, pathApi);
+	const outsideRoot = relative === undefined;
 	const displayPath = toPosix(outsideRoot ? filePath : relative);
 	return patterns.some(
 		(pattern) =>
-			(!outsideRoot || !pattern.replaceAll("\\", "/").endsWith("/**")) &&
+			(!outsideRoot || !toPosix(pattern).endsWith("/**")) &&
 			minimatch(displayPath, pattern, { dot: true }),
 	);
 }

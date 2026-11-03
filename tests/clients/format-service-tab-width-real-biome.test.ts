@@ -75,7 +75,9 @@ function writeBiomeProject(root: string): void {
 async function formatThroughService(filePath: string): Promise<void> {
 	const service = new FormatService("format-tab-width", true);
 	service.recordRead(filePath);
-	const summary = await service.formatFile(filePath);
+	const summary = await service.formatFile(filePath, {
+		sessionRoot: fs.realpathSync(path.dirname(filePath)),
+	});
 	expect(summary.formatters).toEqual([
 		expect.objectContaining({ name: "biome", success: true }),
 	]);

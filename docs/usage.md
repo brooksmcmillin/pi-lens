@@ -109,7 +109,12 @@ pi --no-delta            # Disable delta mode (show all diagnostics, not just ne
 pi --lens-guard          # Block git commit/push when unresolved blockers exist (experimental)
 pi --lens-checkout-guard # Decline git commands that rewrite the working tree while another live pi-lens session shares this dirty checkout (experimental)
 pi --no-opengrep         # Disable the Opengrep security scanner (default-on auxiliary LSP)
+pi --no-ast-grep         # Disable the ast-grep auxiliary LSP server (default-on)
+pi --no-zizmor           # Disable the zizmor auxiliary LSP server (default-on)
+pi --no-typos            # Disable the typos auxiliary LSP server (default-on)
+pi --lens-spotbugs       # Run SpotBugs on Java and Kotlin files (opt-in; needs a Java build descriptor and compiled classes)
 pi --no-read-guard       # Disable the read-before-edit behavior monitor
+pi --lens-retain-injections # Re-send injected findings unchanged in later requests, for exact-prefix (local) prompt caches
 pi --lens-turn-summary   # Persist a per-turn summary of diagnostics, autofixes, and autoformats
 pi --lens-compact-tool-line   # Render tool results as one compact, theme-aware line (closes #1327)
 pi --lens-compact-lsp-status  # Collapse the footer LSP status to one state glyph instead of the server names (refs #3099)
@@ -117,6 +122,7 @@ pi --lens-hide-lsp-status     # Publish no pi-lens-lsp footer status at all, so 
 pi --lens-compact-widget      # Render the widget as one summary line (languages + totals, LSP↑ chip while servers spawn) with no file rows or blocker details (refs #3959)
 pi --no-lazy-tools       # Keep every pi-lens tool active instead of activating the situational ones on demand
 pi --lens-turn-end-madge # Run the madge circular-dependency check at every turn end, not just at session start
+pi --lens-fallow         # Run fallow-lsp beside the TypeScript server on JS/TS files (advisory unused-code, duplication and cycle findings; opt-in)
 pi --no-knip             # Disable the knip session-start analyzer
 pi --no-jscpd            # Disable the jscpd session-start analyzer
 pi --no-madge            # Disable the madge session-start analyzer

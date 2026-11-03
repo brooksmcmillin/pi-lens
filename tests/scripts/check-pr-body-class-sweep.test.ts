@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
 	lintClassSweep,
 	lintLocalPrBody,
+	lintPrBody,
 } from "../../scripts/check-pr-body.mjs";
 
 // #4273: a `## Class sweep` names the defect shape, quotes the search that
@@ -79,6 +80,30 @@ describe("Class sweep shape and search (#4273)", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	// #4717 F1, class-wide: the reviewed head (and master, by measurement)
+	// accepted a `## Class sweep` hidden inside an HTML comment, because the
+	// heading scan read the fence-blanked body only. GitHub renders no section
+	// for it, so the requirement and the section lint now read the
+	// comment-blanked body as the reader sees it.
+	it("does not read a Class sweep an HTML comment hides", () => {
+		const hidden = [
+			"## Summary",
+			"The section is hidden.",
+			"",
+			"<!--",
+			"## Class sweep",
+			"Defect shape: x. Search: `rg x`. Verdict: none.",
+			"-->",
+			"",
+			"## Observability",
+			"Recorded.",
+		].join("\n");
+		expect(lintClassSweep(hidden)).toEqual([]);
+		expect(lintPrBody(hidden, { workingTree: true }).errors).toContainEqual(
+			expect.stringContaining('missing "## Class sweep"'),
+		);
 	});
 
 	// F1: the template sanctions "a per-member line (an arrow or a coverage

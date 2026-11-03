@@ -75,6 +75,39 @@ describe("nested ignore freshness clock (#2071)", () => {
 		}
 	});
 
+	it("drops subtree verdicts under a directory whose name begins with two dots", () => {
+		// RECURRENCE GUARDED (#4861 F2): `dropVerdictsUnder` read a relative path
+		// that begins with `..` as outside the subtree, so a memoized verdict for
+		// `package/..foo/x.log` survived the rebuild that superseded its rules.
+		const env = setupTestEnvironment("pi-lens-2071-dotdot-drop-");
+		try {
+			const nested = path.join(env.tmpDir, "package");
+			const odd = path.join(nested, "..foo");
+			fs.mkdirSync(odd, { recursive: true });
+			fs.writeFileSync(path.join(env.tmpDir, ".gitignore"), "*.log\n");
+			const ignorePath = path.join(nested, ".gitignore");
+			fs.writeFileSync(ignorePath, "placeholder-keep\n");
+			const memoized = path.join(odd, "x.log");
+			const walked = path.join(odd, "y.log");
+
+			vi.useFakeTimers();
+			const start = Date.now();
+			const matcher = getProjectIgnoreMatcher(env.tmpDir);
+			expect(matcher.isIgnored(memoized)).toBe(true);
+
+			fs.writeFileSync(ignorePath, "!*.log\n");
+			vi.setSystemTime(start + PROJECT_IGNORE_FRESHNESS_CADENCE_MS + 1);
+
+			// This fresh path rebuilds the drifted directory. That rebuild must take
+			// the superseded verdict under `..foo` with it.
+			matcher.isIgnored(walked);
+
+			expect(matcher.isIgnored(memoized)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("stats a nested ignore source once per cadence window, not once per file", () => {
 		const env = setupTestEnvironment("pi-lens-2071-bounded-cost-");
 		try {

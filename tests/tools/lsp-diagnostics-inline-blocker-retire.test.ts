@@ -26,29 +26,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMapKey } from "../../clients/path-utils.js";
+import type { Diagnostic } from "../../clients/dispatch/types.js";
+import { formatDiagnostics } from "../../clients/dispatch/utils/format-utils.js";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import { installLspService } from "../support/lsp-service-seam.js";
+import { _setServersForFileForTests } from "../../clients/lsp/config.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-
-vi.mock("../../clients/lsp/config.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/config.js")
-	>("../../clients/lsp/config.js");
-	return {
-		...actual,
-		getServersForFileWithConfig: (filePath: string) =>
-			getServersForFileWithConfig(filePath),
-		getServerInitOverride: () => undefined,
-		primaryServerId: (filePath: string) =>
-			(
-				getServersForFileWithConfig(filePath) as
-					| Array<{ id: string; role?: string }>
-					| undefined
-			)?.find((server) => server.role !== "auxiliary")?.id,
-	};
-});
 
 vi.mock("../../clients/lsp/client.js", async () => {
 	const actual = await vi.importActual<
@@ -73,13 +59,6 @@ vi.mock("../../clients/widget-state.js", async () => {
 });
 
 let service: unknown;
-vi.mock("../../clients/lsp/capabilities.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/capabilities.js")
-	>("../../clients/lsp/capabilities.js");
-	return { ...actual, getLSPService: () => service };
-});
-
 function makeServer(
 	id: string,
 	root: string,
@@ -246,7 +225,7 @@ async function runTool(
 
 async function freshService(): Promise<void> {
 	const { LSPService } = await import("../../clients/lsp/index.js");
-	service = new LSPService();
+	service = installLspService(new LSPService());
 }
 
 describe("#1561 lsp_diagnostics retires a stale inline blocker", () => {
@@ -257,6 +236,7 @@ describe("#1561 lsp_diagnostics retires a stale inline blocker", () => {
 	>;
 
 	beforeEach(async () => {
+		_setServersForFileForTests(getServersForFileWithConfig);
 		const { RuntimeCoordinator } =
 			await import("../../clients/runtime-coordinator.js");
 		getServersForFileWithConfig.mockReset();
@@ -345,11 +325,12 @@ describe("#1561 lsp_diagnostics retires a stale inline blocker", () => {
 		expect(runtime.gitGuardHasBlockers).toBe(true);
 	});
 
-	it("F1: partial source coverage is not coverage", async () => {
+	it("F1: an explicit partial coverage with no structured rows is not coverage", async () => {
 		const file = path.join(tmp, "README.md");
 		arrangeCleanMarkdown(file, "ast-grep");
-		// Two sources; the check covers one of them. `every` is the right
-		// quantifier here, not `some`.
+		// Two sources; the check covers one of them, and the record carries no
+		// structured diagnostics, so there is no honest per-source split to make.
+		// A legacy/hand-authored record must fail closed, as before (#4990).
 		runtime.recordInlineBlockers(file, "🔴 STOP", 1, ["lsp", "eslint"]);
 
 		await runTool(
@@ -362,6 +343,60 @@ describe("#1561 lsp_diagnostics retires a stale inline blocker", () => {
 		expect(retires).toHaveLength(1);
 		expect([...retires[0].coveredSources].sort()).toEqual(["ast-grep", "lsp"]);
 		expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+	});
+
+	it("#4990 gap 1: a partial clean retires the source rows it covered, and keeps the rest", async () => {
+		const file = path.join(tmp, "README.md");
+		arrangeCleanMarkdown(file);
+		// The live incident's shape: the record holds a language-server row and a
+		// row from another tool. The primary check disproves the former; it never
+		// consulted the latter, so only the former leaves.
+		const diagnostics: Diagnostic[] = [
+			{
+				id: "lsp:1",
+				message: "Cannot find name 'setCached'.",
+				filePath: file,
+				line: 1,
+				severity: "error",
+				semantic: "blocking",
+				tool: "lsp",
+				rule: "typescript:2304",
+			},
+			{
+				id: "oxlint:1",
+				message: "no-eval is banned",
+				filePath: file,
+				line: 1,
+				severity: "error",
+				semantic: "blocking",
+				tool: "oxlint",
+				rule: "no-eval",
+			},
+		];
+		runtime.recordInlineBlockers(
+			file,
+			formatDiagnostics(diagnostics, "blocking").trim(),
+			1,
+			["lsp", "oxlint"],
+			[1],
+			undefined,
+			diagnostics,
+		);
+
+		await runTool(
+			{ path: file, severity: "error", serverScope: "primary", waitMs: 10_000 },
+			tmp,
+			runtime,
+			retires,
+		);
+
+		expect(retires).toHaveLength(1);
+		expect(retires[0].coveredSources).toEqual(["lsp"]);
+		const snapshot = runtime.getInlineBlockersSnapshot();
+		expect(snapshot).toHaveLength(1);
+		expect(snapshot[0]?.sources).toEqual(["oxlint"]);
+		expect(snapshot[0]?.summary).not.toContain("setCached");
+		expect(snapshot[0]?.summary).toContain("no-eval is banned");
 	});
 
 	it("F1: an all-scope check DOES retire an auxiliary-origin blocker it consulted", async () => {

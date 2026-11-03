@@ -72,7 +72,7 @@ describe("classify-ci-failure.mjs CLI (#2668 review F2 -- real child process, re
 		tmpDir = mkdtempSync(join(tmpdir(), "pi-lens-classify-cli-test-"));
 		callLogPath = join(tmpDir, "calls.ndjson");
 		writeFileSync(callLogPath, "");
-		// Probe hygiene (AGENTS.md): this script touches no pi-lens runtime
+		// Probe hygiene (docs/invariants/paths-os.md "Paths, data, and operating systems"): this script touches no pi-lens runtime
 		// state today, but an ad-hoc child-process invocation outside vitest's
 		// own test-mode gate is exactly the shape that has previously written
 		// into the real ~/.pi-lens by accident, so pin homes defensively.

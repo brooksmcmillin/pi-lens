@@ -1,8 +1,12 @@
+// lane: windows-vitest — #4638 F5's jedi spawn fixtures take the host's venv
+// shape (`.venv/Scripts/python.exe` on Windows), so only that lane exercises
+// the Scripts branch the runner branches on.
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { removeTempDirSync } from "../test-utils.js";
+import { MTIME_DRIFT_TOLERANCE_MS } from "../../../clients/freshness.js";
+import { removeTempDirSync, setupTestEnvironment } from "../test-utils.js";
 
 const toolNotFound = (message = "ENOENT: command not found") =>
 	Object.assign(new Error(message), { kind: "tool-not-found" as const });
@@ -33,15 +37,6 @@ vi.mock("../../../clients/lsp/launch.js", () => ({
 	admitProjectSuppliedTsserver: (tsserverPath: string) => tsserverPath,
 }));
 
-// Suppress sync disk I/O from logLatency — prevents timeout under full-suite load
-vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
-	...(await importActual<
-		typeof import("../../../clients/latency-logger.js")
-	>()),
-	logLatency: vi.fn(),
-	resetLatencyLog: vi.fn(),
-}));
-
 vi.mock("../../../clients/sessionstart-logger.js", () => ({
 	logSessionStart,
 }));
@@ -49,6 +44,20 @@ vi.mock("../../../clients/sessionstart-logger.js", () => ({
 const dirs: string[] = [];
 
 const IS_WIN = process.platform === "win32";
+
+/**
+ * Stamp every directory under `root` (and `root`) in 2023, so the root memo's
+ * first walk sees records older than the racy window and stores them (#4756).
+ * Fresh fixture directories are racy by design: without this pin the first
+ * resolution is never memoized and a case named for the memo exercises only
+ * the walk, so a serve path forced to answer "fresh" would stay green.
+ */
+function pinTreeOld(root: string): void {
+	const OLD_SECONDS = 1_700_000_000;
+	for (const entry of fs.readdirSync(root, { withFileTypes: true }))
+		if (entry.isDirectory()) pinTreeOld(path.join(root, entry.name));
+	fs.utimesSync(root, OLD_SECONDS, OLD_SECONDS);
+}
 
 /**
  * Build a fake managed tools tree for the classic TypeScript fallback (#1436):
@@ -138,6 +147,31 @@ beforeEach(async () => {
 	const trust = await import("../../../clients/project-trust.js");
 	trust.setProjectTrustState("trusted");
 });
+
+/**
+ * #4638 review (F5): the venv shape the HOST uses. POSIX puts the interpreter at
+ * `.venv/bin/python`; Windows at `.venv/Scripts/python.exe`, and only that shape
+ * exercises the runner's Windows branch, so the Windows lane must collect this
+ * file (see the WINDOWS_LANE_ADMISSIONS row for it).
+ */
+function venvBinDir(root: string): string {
+	return path.join(
+		root,
+		".venv",
+		process.platform === "win32" ? "Scripts" : "bin",
+	);
+}
+
+function venvPython(binDir: string): string {
+	return path.join(
+		binDir,
+		process.platform === "win32" ? "python.exe" : "python",
+	);
+}
+
+function venvTool(binDir: string, name: string): string {
+	return path.join(binDir, process.platform === "win32" ? `${name}.exe` : name);
+}
 
 describe("lsp server policy", () => {
 	it("every built-in server has a spawn function", async () => {
@@ -555,6 +589,10 @@ describe("lsp server policy", () => {
 		fs.mkdirSync(src, { recursive: true });
 		fs.writeFileSync(path.join(tmp, "package.json"), "{}");
 		fs.writeFileSync(file, "");
+		// Stamped long before the walk, or the walk would refuse to memoize it
+		// (#4756) and there would be no freshness read to wedge.
+		for (const dir of [src, tmp])
+			fs.utimesSync(dir, 1_700_000_000, 1_700_000_000);
 
 		const resolver = NearestRoot(["package.json"], undefined, tmp);
 		expect(await resolver(file)).toBe(tmp);
@@ -622,6 +660,28 @@ describe("lsp server policy", () => {
 		expect(await resolver(file)).toBeUndefined();
 	});
 
+	// #4854: an Xcode project has no Package.swift; sourcekit-lsp reads its build
+	// settings from the buildServer.json at the project root (xcode-build-server).
+	// Rooting at the file's directory instead made every cross-file type unknown.
+	it("roots a Swift file at the nearest buildServer.json when there is no Package.swift", async () => {
+		const { SwiftServer } = await import("../../../clients/lsp/server.js");
+		const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-root-bsp-"));
+		dirs.push(ws);
+
+		const feature = path.join(ws, "App", "Features", "Home");
+		const main = path.join(feature, "HomeView.swift");
+		fs.mkdirSync(feature, { recursive: true });
+		fs.writeFileSync(path.join(ws, "buildServer.json"), "{}\n");
+		fs.writeFileSync(main, "print(1)\n");
+
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(ws);
+		try {
+			await expect(SwiftServer.root(main)).resolves.toBe(ws);
+		} finally {
+			cwdSpy.mockRestore();
+		}
+	});
+
 	// #3412: `swift package init` inside a subdirectory of a resolved root. The
 	// nearer marker must win on the next call, for the file that triggered the
 	// first resolution AND for every other file in the same directory (the memo
@@ -638,6 +698,7 @@ describe("lsp server policy", () => {
 		fs.writeFileSync(path.join(ws, "Package.swift"), "// tools\n");
 		fs.writeFileSync(main, "print(1)\n");
 		fs.writeFileSync(other, "print(2)\n");
+		pinTreeOld(ws);
 
 		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(ws);
 		try {
@@ -667,6 +728,8 @@ describe("lsp server policy", () => {
 		fs.writeFileSync(path.join(feature, "Package.swift"), "// nested\n");
 		fs.writeFileSync(main, "print(1)\n");
 
+		pinTreeOld(ws);
+
 		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(ws);
 		try {
 			await expect(SwiftServer.root(main)).resolves.toBe(feature);
@@ -674,6 +737,125 @@ describe("lsp server policy", () => {
 			await expect(SwiftServer.root(main)).resolves.toBe(ws);
 		} finally {
 			cwdSpy.mockRestore();
+		}
+	});
+
+	// #4756: the memo compares a directory's mtime for EQUALITY, and a directory
+	// whose last change was stamped moments before the walk can take a second
+	// change in the SAME timestamp tick (Windows system time advances in 10-16 ms
+	// steps; FAT/HFS+ in 1-2 s). That change leaves the mtime unchanged, so
+	// "unchanged" proves nothing about it. Both directions missed on the Windows
+	// runner (a removed marker stayed memoized; a nearer `.git` did not move the
+	// root). These cases manufacture the tick the way the M-3421-01 case does:
+	// pin every probed directory to one instant, freeze the clock one millisecond
+	// after it (the walk is "inside the tick"), plant, and restore the instant.
+	// A record stamped that close to the walk must not be memoized at all.
+	const SAME_TICK_MS = 1_700_000_000_000;
+	const pinTick = (...pinned: string[]) => {
+		for (const dir of pinned)
+			fs.utimesSync(dir, SAME_TICK_MS / 1000, SAME_TICK_MS / 1000);
+	};
+	const restoreTick = (...pinned: string[]) => {
+		pinTick(...pinned);
+		for (const dir of pinned)
+			expect(fs.statSync(dir).mtimeMs, `${dir} keeps the pinned tick`).toBe(
+				SAME_TICK_MS,
+			);
+	};
+
+	it("re-resolves a marker removed inside the walk's own timestamp tick (#4756)", async () => {
+		const { SwiftServer } = await import("../../../clients/lsp/server.js");
+		const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-root-tickrm-"));
+		dirs.push(ws);
+
+		const sources = path.join(ws, "Sources");
+		const feature = path.join(sources, "Feature");
+		const main = path.join(feature, "main.swift");
+		fs.mkdirSync(feature, { recursive: true });
+		fs.writeFileSync(path.join(ws, "Package.swift"), "// tools\n");
+		fs.writeFileSync(path.join(feature, "Package.swift"), "// nested\n");
+		fs.writeFileSync(main, "print(1)\n");
+		pinTick(feature, sources, ws);
+
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(ws);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(SAME_TICK_MS + 1);
+		try {
+			await expect(SwiftServer.root(main)).resolves.toBe(feature);
+			fs.rmSync(path.join(feature, "Package.swift"));
+			restoreTick(feature);
+			await expect(SwiftServer.root(main)).resolves.toBe(ws);
+		} finally {
+			vi.useRealTimers();
+			cwdSpy.mockRestore();
+		}
+	});
+
+	it("moves to a marker created inside the walk's own timestamp tick (#4756)", async () => {
+		const { SwiftServer } = await import("../../../clients/lsp/server.js");
+		const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-root-tickadd-"));
+		dirs.push(ws);
+
+		const sources = path.join(ws, "Sources");
+		const feature = path.join(sources, "Feature");
+		const main = path.join(feature, "main.swift");
+		fs.mkdirSync(feature, { recursive: true });
+		fs.writeFileSync(path.join(ws, "Package.swift"), "// tools\n");
+		fs.writeFileSync(main, "print(1)\n");
+		pinTick(feature, sources, ws);
+
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(ws);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(SAME_TICK_MS + 1);
+		try {
+			await expect(SwiftServer.root(main)).resolves.toBe(ws);
+			fs.writeFileSync(path.join(feature, "Package.swift"), "// nested\n");
+			restoreTick(feature);
+			await expect(SwiftServer.root(main)).resolves.toBe(feature);
+		} finally {
+			vi.useRealTimers();
+			cwdSpy.mockRestore();
+		}
+	});
+
+	// The other side of the same rule, pinned in both directions so the guard
+	// cannot drift into "never memoize" (#3412's perf contract) or "memoize
+	// everything" (this issue): a record older than the tick tolerance IS served
+	// even when a later change leaves its mtime alone — that residual is the one
+	// the freshness cadence bounds — and a record inside the tolerance is not.
+	it.each([
+		{
+			label: "a record exactly one tolerance old is memoized",
+			ageMs: MTIME_DRIFT_TOLERANCE_MS,
+			memoized: true,
+		},
+		{
+			label: "a record one millisecond inside the tolerance is not memoized",
+			ageMs: MTIME_DRIFT_TOLERANCE_MS - 1,
+			memoized: false,
+		},
+	])("$label (#4756)", async ({ ageMs, memoized }) => {
+		const { NearestRoot } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-root-age-"));
+		dirs.push(tmp);
+
+		const src = path.join(tmp, "src");
+		const file = path.join(src, "a.ts");
+		fs.mkdirSync(src, { recursive: true });
+		fs.writeFileSync(path.join(tmp, "package.json"), "{}");
+		fs.writeFileSync(file, "");
+		pinTick(src, tmp);
+
+		const resolver = NearestRoot(["package.json"], undefined, tmp);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(SAME_TICK_MS + ageMs);
+		try {
+			expect(await resolver(file)).toBe(tmp);
+			fs.writeFileSync(path.join(src, "package.json"), "{}");
+			restoreTick(src);
+			expect(await resolver(file)).toBe(memoized ? tmp : src);
+		} finally {
+			vi.useRealTimers();
 		}
 	});
 
@@ -709,15 +891,19 @@ describe("lsp server policy", () => {
 			fs.mkdirSync(path.dirname(file), { recursive: true });
 			fs.writeFileSync(file, "");
 			materialize(ws, pattern);
+			pinTreeOld(ws);
 
 			const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(ws);
 			try {
 				const first = await server.root(file);
+				// The directory mtimes ride the failure text: an equal pair across the
+				// plant names the memo's mtime key (#4756) as the cause without a rerun.
+				const before = fs.statSync(nested).mtimeMs;
 				materialize(nested, pattern);
 				const second = await server.root(file);
 				if (first !== ws || second !== nested) {
 					stale.push(
-						`${server.id} [${pattern}] first=${first} second=${second}`,
+						`${server.id} [${pattern}] first=${first} second=${second} dirMtime=${before}->${fs.statSync(nested).mtimeMs}`,
 					);
 				}
 			} finally {
@@ -725,7 +911,11 @@ describe("lsp server policy", () => {
 			}
 		}
 		expect(stale).toEqual([]);
-	});
+		// Budget (#4638 r4 F1): this cell makes 40+ temp trees, so on the Windows
+		// runner its cost is filesystem-bound. CI "Unit tests Windows"
+		// measured 396-794 ms on five earlier heads of this PR and 5333 ms on the
+		// next (job 119786141033), against the lane's 5000 ms default. Locally it is ~60 ms.
+	}, 30_000);
 
 	// #3412: a marker that carries a path segment (`prisma/schema.prisma`) is
 	// probed inside a SUBDIRECTORY of the walked directory, so creating it bumps
@@ -761,6 +951,7 @@ describe("lsp server policy", () => {
 			// the marker into it later leaves the walked directory's own mtime alone.
 			const subdir = path.join(nested, ...relative.slice(0, -1));
 			fs.mkdirSync(subdir, { recursive: true });
+			pinTreeOld(ws);
 
 			const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(ws);
 			try {
@@ -1665,6 +1856,71 @@ describe("lsp server policy", () => {
 		}
 	});
 
+	// #4758 recurrence: the project's interpreter and the open-files mode sat
+	// top level in the blob, where pyright never reads them; it pulls the
+	// `python` and `python.analysis` sections and was answered `{}`. Resolved
+	// through the same function the client's `workspace/configuration` handler
+	// calls, so the key's SECTION is what is asserted, not its mere presence.
+	it("hands pyright its interpreter under the python section it pulls (#4758)", async () => {
+		const { PythonServer } = await import("../../../clients/lsp/server.js");
+		const { resolveConfigurationSection } =
+			await import("../../../clients/lsp/client.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pyright-4758-"));
+		dirs.push(tmp);
+
+		const binDir = path.join(
+			tmp,
+			".venv",
+			process.platform === "win32" ? "Scripts" : "bin",
+		);
+		const pythonPath = path.join(
+			binDir,
+			process.platform === "win32" ? "python.exe" : "python",
+		);
+		const pyrightPath = path.join(
+			binDir,
+			process.platform === "win32"
+				? "pyright-langserver.exe"
+				: "pyright-langserver",
+		);
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.writeFileSync(pythonPath, "#!/usr/bin/env python\n");
+		fs.writeFileSync(pyrightPath, "#!/usr/bin/env python\n");
+		vi.stubEnv("VIRTUAL_ENV", undefined);
+		vi.stubEnv("CONDA_PREFIX", undefined);
+		vi.stubEnv("UV_PROJECT_ENVIRONMENT", undefined);
+
+		launchLSP.mockImplementation(async (command: string) => {
+			if (command === pyrightPath) {
+				return {
+					process: { killed: false } as never,
+					stdin: {} as never,
+					stdout: {} as never,
+					stderr: {} as never,
+					pid: 5682,
+				};
+			}
+			throw toolNotFound(`unexpected command: ${command}`);
+		});
+
+		try {
+			const spawned = await PythonServer.spawn(tmp, { allowInstall: false });
+
+			expect(spawned).toBeDefined();
+			expect(
+				resolveConfigurationSection(spawned?.initialization, "python"),
+			).toEqual({
+				pythonPath,
+				analysis: { diagnosticMode: "openFilesOnly" },
+			});
+			expect(
+				resolveConfigurationSection(spawned?.initialization, "python.analysis"),
+			).toEqual({ diagnosticMode: "openFilesOnly" });
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
 	it("prefers a locally-found pyright over ty (opt-in fallback never wins when pyright is available)", async () => {
 		const { PythonServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
@@ -2034,6 +2290,328 @@ describe("lsp server policy", () => {
 		}
 	});
 
+	it("PythonJediServer launches from the project's own venv before the managed install (#4638)", async () => {
+		const { PythonJediServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-jedi-project-env-"),
+		);
+		dirs.push(tmp);
+		const binDir = venvBinDir(tmp);
+		const jediPath = venvTool(binDir, "jedi-language-server");
+		const pythonPath = venvPython(binDir);
+		fs.mkdirSync(binDir, { recursive: true });
+		for (const executable of [jediPath, pythonPath]) {
+			fs.writeFileSync(executable, "#!/usr/bin/env bash\nexit 0\n");
+			fs.chmodSync(executable, 0o755);
+		}
+		fs.writeFileSync(
+			path.join(tmp, "pyproject.toml"),
+			'[project]\nname = "demo"\nrequires-python = ">=3.14"\n',
+		);
+
+		// Self-contained (#4638, #4589): the project tier needs trust and an
+		// ambient Python environment would outrank it, so the case states both
+		// through the harness seams and restores them.
+		const { setProjectTrustState } =
+			await import("../../../clients/project-trust.js");
+		setProjectTrustState("trusted");
+		vi.stubEnv("VIRTUAL_ENV", undefined);
+		vi.stubEnv("CONDA_PREFIX", undefined);
+		vi.stubEnv("UV_PROJECT_ENVIRONMENT", undefined);
+
+		launchLSP.mockClear();
+		launchLSP.mockResolvedValue({
+			process: { killed: false } as never,
+			stdin: {} as never,
+			stdout: {} as never,
+			stderr: {} as never,
+			pid: 2222,
+		});
+
+		try {
+			const spawned = await PythonJediServer.spawn(tmp);
+
+			expect(spawned?.initialization).toMatchObject({
+				workspace: { environmentPath: pythonPath },
+			});
+			expect(launchLSP).toHaveBeenCalledTimes(1);
+			const [command, , options] = launchLSP.mock.calls[0] as [
+				string,
+				string[],
+				{ cwd?: string; env?: NodeJS.ProcessEnv },
+			];
+			expect(command).toBe(jediPath);
+			expect(options.cwd).toBe(tmp);
+			expect(options.env?.VIRTUAL_ENV).toBe(path.join(tmp, ".venv"));
+			expect(String(options.env?.PATH).split(path.delimiter)[0]).toBe(binDir);
+			expect(ensureTool).not.toHaveBeenCalled();
+		} finally {
+			vi.unstubAllEnvs();
+			setProjectTrustState("trusted");
+		}
+	});
+
+	it("falls through to the PATH tier once every project candidate fails (#4638 review)", async () => {
+		const { PythonJediServer } = await import("../../../clients/lsp/server.js");
+		const { setProjectTrustState } =
+			await import("../../../clients/project-trust.js");
+		const { getDegradationSummary, resetDegradationLedger } =
+			await import("../../../clients/degradation-ledger.js");
+		const { detectPythonEnvironment, pythonEnvironmentToolCandidates } =
+			await import("../../../clients/python-environment.js");
+		const { setPlatform } = await import("../../support/platform-stub.js");
+
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-jedi-launch-throw-"),
+		);
+		dirs.push(tmp);
+
+		const realPlatform = process.platform;
+		// Lane-independent (#4638 Windows leg): the Windows ladder — `.exe`,
+		// `.cmd`, then the plain shim — is exercised on every host, so a macOS or
+		// Linux run fails too if the fallback stops falling through after the
+		// project tier throws. Each spelling is a different binary, so re-entering
+		// the same venv ladder is intended; the fallback begins after the LAST one.
+		setPlatform("win32");
+		try {
+			// The ambient channels outrank the project `.venv`, so they are stubbed
+			// BEFORE the first detection: a developer shell with an active
+			// `VIRTUAL_ENV` must not decide this case (#4638 r3 N8).
+			vi.stubEnv("VIRTUAL_ENV", undefined);
+			vi.stubEnv("CONDA_PREFIX", undefined);
+			vi.stubEnv("UV_PROJECT_ENVIRONMENT", undefined);
+			const binDir = venvBinDir(tmp);
+			fs.mkdirSync(binDir, { recursive: true });
+			for (const name of ["jedi-language-server", "python"]) {
+				const target = venvTool(binDir, name);
+				fs.writeFileSync(target, "#!/usr/bin/env bash\nexit 0\n");
+				fs.chmodSync(target, 0o755);
+			}
+
+			const environment = await detectPythonEnvironment(tmp);
+			expect(environment?.source).toBe("project-dot-venv");
+			const projectCandidates = pythonEnvironmentToolCandidates(
+				environment,
+				"jedi-language-server",
+			);
+			expect(projectCandidates).toHaveLength(3);
+			// A real install writes every shim of the ladder.
+			for (const candidate of projectCandidates) {
+				fs.writeFileSync(candidate, "#!/usr/bin/env bash\nexit 0\n");
+				fs.chmodSync(candidate, 0o755);
+			}
+
+			setProjectTrustState("trusted");
+			resetDegradationLedger();
+			launchLSP.mockClear();
+			// Every project candidate fails with something that is not "tool not
+			// found"; `resolveAndLaunch` then re-raises the runtime failure, which
+			// must not end the attempt.
+			for (const _candidate of projectCandidates) {
+				launchLSP.mockRejectedValueOnce(
+					new Error("project interpreter is unusable"),
+				);
+			}
+			launchLSP.mockResolvedValueOnce({
+				process: { killed: false } as never,
+				stdin: {} as never,
+				stdout: {} as never,
+				stderr: {} as never,
+				pid: 4444,
+			});
+
+			const spawned = await PythonJediServer.spawn(tmp);
+
+			expect(spawned).toBeDefined();
+			const commands = launchLSP.mock.calls.map((call) => call[0]);
+			// Derived from the production ladder, never hard-coded: the project
+			// candidates in order, then the managed/PATH tier's bare command.
+			expect(commands.slice(0, projectCandidates.length)).toEqual(
+				projectCandidates,
+			);
+			expect(commands[projectCandidates.length]).toBe("jedi-language-server");
+			expect(getDegradationSummary().map((entry) => entry.kind)).toContain(
+				"python-project-launch-failed",
+			);
+		} finally {
+			setPlatform(realPlatform);
+			vi.unstubAllEnvs();
+			setProjectTrustState("trusted");
+		}
+	});
+
+	it("the fallback cannot resolve the failed project binary through PATH (#4638 r3 N5)", async () => {
+		// Recurrence: the fallback reused the venv-augmented environment, so its
+		// bare `jedi-language-server` resolved the SAME executable-but-failing shim
+		// the project tier had just thrown on, `spawn` rejected, and a working host
+		// copy later on PATH was never tried.
+		const { PythonJediServer } = await import("../../../clients/lsp/server.js");
+		const { setProjectTrustState } =
+			await import("../../../clients/project-trust.js");
+		const { detectPythonEnvironment, pythonEnvironmentToolCandidates } =
+			await import("../../../clients/python-environment.js");
+
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-jedi-broken-shim-"),
+		);
+		dirs.push(tmp);
+		const binDir = venvBinDir(tmp);
+		fs.mkdirSync(binDir, { recursive: true });
+		for (const name of ["jedi-language-server", "python"]) {
+			fs.writeFileSync(venvTool(binDir, name), "#!/usr/bin/env bash\nexit 0\n");
+			fs.chmodSync(venvTool(binDir, name), 0o755);
+		}
+		const hostBin = path.join(tmp, "host-bin");
+		fs.mkdirSync(hostBin, { recursive: true });
+		const hostShim = venvTool(hostBin, "jedi-language-server");
+		fs.writeFileSync(hostShim, "#!/usr/bin/env bash\nexit 0\n");
+		fs.chmodSync(hostShim, 0o755);
+
+		setProjectTrustState("trusted");
+		vi.stubEnv("VIRTUAL_ENV", undefined);
+		vi.stubEnv("CONDA_PREFIX", undefined);
+		vi.stubEnv("UV_PROJECT_ENVIRONMENT", undefined);
+		const environment = await detectPythonEnvironment(tmp);
+		const projectCandidates = pythonEnvironmentToolCandidates(
+			environment,
+			"jedi-language-server",
+		);
+		getToolEnvironment.mockResolvedValueOnce({ PATH: hostBin });
+		launchLSP.mockClear();
+		for (const _candidate of projectCandidates) {
+			launchLSP.mockRejectedValueOnce(
+				new Error("jedi-language-server exited immediately with code 127"),
+			);
+		}
+		launchLSP.mockResolvedValueOnce({
+			process: { killed: false } as never,
+			stdin: {} as never,
+			stdout: {} as never,
+			stderr: {} as never,
+			pid: 5555,
+		});
+
+		try {
+			const spawned = await PythonJediServer.spawn(tmp);
+
+			expect(spawned).toBeDefined();
+			const [command, , options] = launchLSP.mock.calls.at(-1) as [
+				string,
+				string[],
+				{ env?: NodeJS.ProcessEnv },
+			];
+			expect(command).toBe("jedi-language-server");
+			const entries = String(options.env?.PATH).split(path.delimiter);
+			expect(entries).not.toContain(binDir);
+			expect(options.env?.VIRTUAL_ENV).toBeUndefined();
+			// `launchLSP` resolves a bare command by the first executable of that
+			// name along `env.PATH`; walk the fallback's PATH the same way.
+			const firstOnPath = entries
+				.map((entry) => venvTool(entry, command))
+				.find((candidate) => fs.existsSync(candidate));
+			expect(firstOnPath).toBe(hostShim);
+		} finally {
+			vi.unstubAllEnvs();
+			setProjectTrustState("trusted");
+		}
+	});
+
+	it("PythonJediServer falls back to the managed install when the project venv is untrusted (#4638)", async () => {
+		const { PythonJediServer } = await import("../../../clients/lsp/server.js");
+		const { setProjectTrustState } =
+			await import("../../../clients/project-trust.js");
+		const { detectPythonTargetVersion } =
+			await import("../../../clients/python-environment.js");
+		const { getDegradationSummary, resetDegradationLedger } =
+			await import("../../../clients/degradation-ledger.js");
+
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-jedi-untrusted-"),
+		);
+		dirs.push(tmp);
+		const binDir = venvBinDir(tmp);
+		fs.mkdirSync(binDir, { recursive: true });
+		for (const name of ["jedi-language-server", "python"]) {
+			fs.writeFileSync(venvTool(binDir, name), "#!/usr/bin/env bash\nexit 0\n");
+			fs.chmodSync(venvTool(binDir, name), 0o755);
+		}
+		fs.writeFileSync(
+			path.join(tmp, "pyproject.toml"),
+			'[project]\nname = "demo"\nrequires-python = ">=3.14"\n',
+		);
+
+		vi.stubEnv("VIRTUAL_ENV", undefined);
+		vi.stubEnv("CONDA_PREFIX", undefined);
+		vi.stubEnv("UV_PROJECT_ENVIRONMENT", undefined);
+
+		resetDegradationLedger();
+		setProjectTrustState("unknown");
+		launchLSP.mockClear();
+		launchLSP.mockResolvedValue({
+			process: { killed: false } as never,
+			stdin: {} as never,
+			stdout: {} as never,
+			stderr: {} as never,
+			pid: 3333,
+		});
+
+		try {
+			const spawned = await PythonJediServer.spawn(tmp);
+
+			expect(spawned).toBeDefined();
+			const [command, , options] = launchLSP.mock.calls[0] as [
+				string,
+				string[],
+				{ cwd?: string; env?: NodeJS.ProcessEnv },
+			];
+			expect(command).toBe("jedi-language-server");
+			expect(options.env?.VIRTUAL_ENV).toBeUndefined();
+			expect(getDegradationSummary().map((entry) => entry.kind)).toContain(
+				"trust-refusal",
+			);
+			// The declaration is read independently of trust, so the compile drop
+			// still applies to a project whose interpreter pi-lens refuses.
+			await expect(
+				detectPythonTargetVersion(path.join(tmp, "app.py"), path.dirname(tmp)),
+			).resolves.toMatchObject({ major: 3, minor: 14 });
+		} finally {
+			vi.unstubAllEnvs();
+			setProjectTrustState("trusted");
+		}
+	});
+
+	it("pythonEnvironmentToolCandidates offers the Windows shim order without a platform skip (#4638)", async () => {
+		const { pythonEnvironmentToolCandidates } =
+			await import("../../../clients/python-environment.js");
+		const { withPlatform } = await import("../../support/platform-stub.js");
+
+		const root = path.join("/fixture", ".venv");
+		const binDir = path.join(root, "Scripts");
+		// `withPlatform` captures the real platform BEFORE stubbing, so the stub
+		// cannot leak `win32` into a later case in the same worker.
+		withPlatform("win32", () => {
+			expect(
+				pythonEnvironmentToolCandidates(
+					{
+						root,
+						binDir,
+						pythonPath: path.join(binDir, "python.exe"),
+						source: "project-dot-venv" as const,
+					},
+					"jedi-language-server",
+				),
+			).toEqual([
+				path.join(binDir, "jedi-language-server.exe"),
+				path.join(binDir, "jedi-language-server.cmd"),
+				path.join(binDir, "jedi-language-server"),
+			]);
+		});
+		// A bare environment offers nothing: the bare command stays the fallback.
+		expect(
+			pythonEnvironmentToolCandidates(undefined, "jedi-language-server"),
+		).toEqual([]);
+	});
+
 	describe("rust-analyzer force-reinstall", () => {
 		const MANAGED =
 			process.platform === "win32"
@@ -2204,6 +2782,36 @@ describe("monorepo root hoisting (#1671)", () => {
 		expect(roots[0]).toBe(tmp);
 	});
 
+	// #2556 RECURRENCE GUARDED: the member test read `path.relative(parent,
+	// child).startsWith("..")`, so a workspace member directory named `..crate`
+	// (inside the workspace) was read as outside it and kept a root of its own.
+	// #4993 review: the fixture carries `setupTestEnvironment`'s shared `.git`
+	// marker, so it is its own project root and root discovery cannot adopt a
+	// marker above the tmp root (AGENTS.md shape 73).
+	it("RustServer.root hoists a member directory with a ..-prefixed name (#2556)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const env = setupTestEnvironment("pi-lens-cargo-dots-");
+		try {
+			const tmp = env.tmpDir;
+			fs.writeFileSync(
+				path.join(tmp, "Cargo.toml"),
+				'[workspace]\nmembers = ["..crate"]\n',
+			);
+			const crateDir = path.join(tmp, "..crate");
+			fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+			fs.writeFileSync(
+				path.join(crateDir, "Cargo.toml"),
+				'[package]\nname = "dots"\n',
+			);
+			const file = path.join(crateDir, "src", "lib.rs");
+			fs.writeFileSync(file, "pub fn x() {}\n");
+
+			await expect(RustServer.root(file)).resolves.toBe(tmp);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("records a capped member glob through the Cargo consumer", async () => {
 		const { RustServer } = await import("../../../clients/lsp/server.js");
 		const { getDegradationSummary } =
@@ -2237,7 +2845,13 @@ describe("monorepo root hoisting (#1671)", () => {
 				}),
 			]),
 		);
-	});
+		// Budget (#4638 r4 F1): the fixture nests 708 directories, and creating
+		// and walking a path that deep is filesystem-bound on the Windows runner.
+		// CI "Unit tests Windows" measured 1058, 1552, 2160, 2591 and 11405 ms on
+		// five earlier heads of this PR (the 11405 ms head predates every r3
+		// change) and 7475 ms on the next, against the lane's 5000 ms default. Locally
+		// it is ~100 ms.
+	}, 30_000);
 
 	it("RustServer.root hoists to the workspace root even when Cargo.toml opens with a UTF-8 BOM (#2498/#2520 round 2, F4)", async () => {
 		const { RustServer } = await import("../../../clients/lsp/server.js");

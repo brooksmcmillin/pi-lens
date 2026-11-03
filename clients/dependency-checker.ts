@@ -16,7 +16,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { mapWithConcurrency } from "./map-with-concurrency.js";
 import { findNodeToolBinary } from "./package-manager.js";
-import { isFullyQualified } from "./path-utils.js";
+import { isFullyQualified, isUnderDir } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { compareOrdinal } from "./string-utils.js";
 import { getIsolatedNpxSpawnOptions } from "./tool-probe.js";
@@ -237,12 +237,6 @@ const MADGE_STATS_TARGET_CAP = 12;
  */
 const MADGE_STATS_TARGET_MIN_DURATION_MS = 100;
 
-/** Is `target` inside `dir`? */
-function isWithin(dir: string, target: string): boolean {
-	const rel = path.relative(dir, target);
-	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
-}
-
 /**
  * Classify a resolved madge command for `MadgeCommandKind`. Both resolution
  * steps feed this: `findNodeToolBinary` walks up to the project's
@@ -255,8 +249,8 @@ function classifyMadgeKind(
 	projectRoot: string,
 ): MadgeCommandKind {
 	if (!isFullyQualified(resolved)) return "path";
-	if (isWithin(managedToolsDir, resolved)) return "managed";
-	if (isWithin(projectRoot, resolved)) return "local";
+	if (isUnderDir(resolved, managedToolsDir)) return "managed";
+	if (isUnderDir(resolved, projectRoot)) return "local";
 	return "global";
 }
 

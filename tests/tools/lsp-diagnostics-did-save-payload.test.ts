@@ -34,11 +34,6 @@ import { removeTempDirSync } from "../clients/test-utils.js";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -65,8 +60,11 @@ function makeFakeProcess() {
 describe("#3405 M3406-1 — didSave payload from the explicit lsp_diagnostics query", () => {
 	let tmpDir: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-did-save-size-"));

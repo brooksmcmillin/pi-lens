@@ -6,36 +6,28 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { _resetWarmAttachForTests } from "../../clients/warm-attach.js";
+import {
+	clearWidgetState,
+	getFileDiagnostics,
+} from "../../clients/widget-state.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
-
-const mocked = vi.hoisted(() => ({
-	service: null as unknown,
-}));
-
-vi.mock("../../clients/warm-attach.js", () => ({
-	isWarmAttached: () => false,
-	tryWarmAttachedDiagnostics: vi.fn(),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/capabilities.js")
-	>("../../clients/lsp/capabilities.js");
-	return { ...actual, getLSPService: () => mocked.service };
-});
+import { installLspService } from "../support/lsp-service-seam.js";
 
 vi.mock("../../clients/lsp/wait-policy/index.js", () => ({
 	classifyCascadeWaitTier: () => "waits",
 }));
 
-const reconcileScanDiagnosticsMock = vi.fn().mockReturnValue(true);
-
-vi.mock("../../clients/widget-state.js", () => ({
-	reconcileScanDiagnostics: (...args: unknown[]) =>
-		reconcileScanDiagnosticsMock(...args),
-}));
+beforeEach(() => {
+	_resetWarmAttachForTests();
+	clearWidgetState();
+});
+afterEach(() => {
+	_resetWarmAttachForTests();
+	clearWidgetState();
+});
 
 import { createLspDiagnosticsTool } from "../../tools/lsp-diagnostics.js";
 
@@ -74,9 +66,8 @@ function makeService() {
 describe("lsp_diagnostics — inferred-project demotion (#1645 F3)", () => {
 	let cwd: string;
 
-	beforeEach(() => {
-		reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
-		mocked.service = makeService();
+	beforeEach(async () => {
+		installLspService(makeService());
 		cwd = fs.realpathSync(
 			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lspdiag-inferred-")),
 		);
@@ -95,10 +86,8 @@ describe("lsp_diagnostics — inferred-project demotion (#1645 F3)", () => {
 				{ cwd },
 			)) as unknown as { content: Array<{ text: string }> };
 
-			expect(reconcileScanDiagnosticsMock).toHaveBeenCalled();
-			const written = reconcileScanDiagnosticsMock.mock.calls.at(-1)?.[1] as
-				| Array<{ severity: string; semantic: string; message: string }>
-				| undefined;
+			const written = getFileDiagnostics(file);
+			expect(written).toBeDefined();
 			expect(written?.length).toBeGreaterThan(0);
 			// The store must not receive a blocker for a file no tsconfig owns.
 			expect(written?.every((d) => d.semantic !== "blocking")).toBe(true);

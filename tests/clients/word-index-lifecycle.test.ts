@@ -13,7 +13,7 @@ import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	loadProjectSnapshot,
 	PROJECT_SNAPSHOT_VERSION,
@@ -40,24 +40,19 @@ import {
 	acquireWarmWordIndex,
 } from "../../clients/mcp/analyze.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { matchingCloseIndex } from "../support/sweep-kit.js";
 
 // Same LSP stub as runtime-session.test.ts / runtime-session-warm.test.ts: the
 // dominant-language auto-warm (#203) must not spawn a real language server
 // against a throwaway temp dir.
 const mockTouchFile = vi.fn(async () => undefined);
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(() =>
-		makeLspServiceDouble({
-			supportsLSP: () => false,
-			touchFile: mockTouchFile,
-		}),
-	),
-}));
+beforeEach(async () => {
+	await installLspServiceDouble({
+		supportsLSP: () => false,
+		touchFile: mockTouchFile,
+	});
+});
 
 const deferredRuntimeSnapshotSave = vi.hoisted(() => ({
 	delayCall: undefined as number | undefined,

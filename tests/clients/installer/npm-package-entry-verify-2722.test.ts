@@ -52,6 +52,7 @@ import {
 	verifyNpmPackageEntry,
 	verifyToolBinary,
 } from "../../../clients/installer/index.js";
+import { writeStandIn } from "../../support/path-probe-stub.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 /** The literal #208 rescues on — see `isLspTransportRequiredError`. */
@@ -69,23 +70,6 @@ afterEach(() => {
 	removeTempDirSync(root);
 	resetDegradationLedger();
 });
-
-/** `<root>/node_modules/.bin/<name>`, as an executable POSIX/Windows shim. */
-function writeShim(name: string, body: string): string {
-	const binDir = path.join(root, "node_modules", ".bin");
-	fs.mkdirSync(binDir, { recursive: true });
-	const isWin = process.platform === "win32";
-	const file = path.join(binDir, isWin ? `${name}.cmd` : name);
-	if (isWin) {
-		fs.writeFileSync(file, `@echo off\r\n${body}\r\n`, "utf8");
-	} else {
-		fs.writeFileSync(file, `#!/bin/sh\n${body}\n`, {
-			encoding: "utf8",
-			mode: 0o755,
-		});
-	}
-	return file;
-}
 
 describe("inconclusive verification keeps its non-verdict (#2722)", () => {
 	// lane: ubuntu (the authoritative Unit tests lane) and every other POSIX dev
@@ -112,7 +96,8 @@ describe("inconclusive verification keeps its non-verdict (#2722)", () => {
 				].join("\n"),
 				"utf8",
 			);
-			const bin = writeShim(
+			const bin = writeStandIn(
+				path.join(root, "node_modules", ".bin"),
 				"buried-marker-lsp",
 				`exec "${process.execPath}" "${dump}"`,
 			);
@@ -162,7 +147,8 @@ describe("inconclusive verification keeps its non-verdict (#2722)", () => {
 		// rather than "the matcher did not match": a server that exits nonzero
 		// with everything it had to say already in hand IS broken, and must keep
 		// taking the cleanup branch.
-		const bin = writeShim(
+		const bin = writeStandIn(
+			path.join(root, "node_modules", ".bin"),
 			"honestly-broken-lsp",
 			process.platform === "win32" ? "exit /b 3" : "exit 3",
 		);
@@ -253,7 +239,8 @@ describe.each(ENTRY_FIXTURES)(
 			// The shim RECORDS being executed. Verification must never run it, so
 			// the absence of this file is the spawn-free proof — no spy, no mock.
 			spawnMarker = path.join(root, `${fixture.shim}.spawned`);
-			bin = writeShim(
+			bin = writeStandIn(
+				path.join(root, "node_modules", ".bin"),
 				fixture.shim,
 				process.platform === "win32"
 					? `type nul > "${spawnMarker}"`

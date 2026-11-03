@@ -1,0 +1,3 @@
+{
+	"tools": { "ast_grep_replace": { "enabled": false } }
+}

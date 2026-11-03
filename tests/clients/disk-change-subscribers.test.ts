@@ -31,15 +31,23 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import {
+	BASH_RECOVERY_DRIFT_SOURCE,
+	BASH_WRITE_SOURCE,
+	ensureDiskChangeSubscribers,
+	LSP_CONSUMER,
+	type HeldDocumentsAnswer,
+} from "../../clients/disk-change-subscribers.js";
+import {
 	type DiskChange,
 	DISK_CHANGE_MAX_RECORDED_PATHS,
+	DISK_CHANGE_ORIGINS,
+	publishDiskChange,
 	subscribeDiskChange,
 } from "../../clients/disk-changes.js";
 import {
 	getLSPService,
 	resetLSPService,
 } from "../../clients/lsp/capabilities.js";
-import { configureLspServiceLifecycle } from "../../clients/lsp/service-singleton.js";
 import {
 	resetWorkspaceDiagnosticsCacheSession,
 	workspaceFileCreatedAtFor,
@@ -47,7 +55,7 @@ import {
 import { lookForOutOfBandChanges } from "../../clients/out-of-band-changes.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 interface ServiceCalls {
 	restartRoots: string[];
@@ -77,7 +85,7 @@ function recordPublishes(): DiskChange[] {
 	return seen;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-disk-change-subs-"));
 	fs.mkdirSync(path.join(tmp, "src"), { recursive: true });
 	runtime = new RuntimeCoordinator();
@@ -87,8 +95,7 @@ beforeEach(() => {
 	calls = { restartRoots: [], notified: [] };
 	// Drop the previous case's service, then install this case's recorder
 	// through the same lifecycle seam the host uses.
-	resetLSPService();
-	const service = makeLspServiceDouble({
+	await installLspServiceDouble({
 		restartPrimaryClientsUnder: async (root: string) => {
 			calls.restartRoots.push(root);
 			return [`primary:${root}`];
@@ -99,11 +106,8 @@ beforeEach(() => {
 			calls.notified.push(...events);
 		},
 	});
-	configureLspServiceLifecycle<Record<string, unknown>>({
-		create: () => service,
-		beforeReset: () => undefined,
-		destroy: async () => undefined,
-	});
+	// The look reads the LIVE service through `peekLSPService`, so the double has
+	// to exist before it runs — the same eager call the hand-rolled install made.
 	getLSPService();
 });
 
@@ -201,4 +205,225 @@ describe("one look that holds an install and declaration changes", () => {
 		expect(calls.restartRoots).toEqual([]);
 		expect(calls.notified).toEqual([{ filePath: declaration, type: 2 }]);
 	});
+});
+
+/**
+ * #4742 / #4535 slice 3b. Recurrence: the held-document phase resynced only
+ * what a server held, so a module changed on disk that no server had open
+ * (pyright had read it for an importer) kept its old bytes for the server's
+ * life. The service is the host boundary here: a recorder of what the
+ * subscriber asked it to do, in order. Everything above it is real (the
+ * publisher, the subscriber, the disk, the degradation ledger).
+ */
+describe("the LSP consumer sends a publish's unheld paths as watched-files events (#4742)", () => {
+	let order: string[];
+	let held: string[];
+	let notifyThrows: boolean;
+	let resynced: string[][];
+	let announced: string[];
+
+	beforeEach(async () => {
+		order = [];
+		held = [];
+		notifyThrows = false;
+		resynced = [];
+		announced = [];
+		await installLspServiceDouble({
+			getOpenDocumentPaths: () => held,
+			getTrackedContent: () => undefined,
+			notifyOutOfBandFileChanges: (
+				events: ReadonlyArray<{ filePath: string; type: number }>,
+			) => {
+				order.push("notify");
+				if (notifyThrows) throw new Error("service refused the events");
+				calls.notified.push(...events);
+			},
+			announceCreatedFiles: (paths: readonly string[]) => {
+				order.push("announce");
+				announced.push(...paths);
+			},
+			resyncHeldPrimaries: async (paths: readonly string[]) => {
+				order.push("primary");
+				return { sent: paths.length, drained: true };
+			},
+			resyncGitChangedFiles: async (paths: readonly string[]) => {
+				resynced.push([...paths]);
+				return new Map();
+			},
+		});
+		getLSPService();
+		ensureDiskChangeSubscribers();
+	});
+
+	function write(name: string, content: string): string {
+		const filePath = path.join(tmp, "src", name);
+		fs.writeFileSync(filePath, content);
+		return normalizeMapKey(filePath);
+	}
+
+	async function publish(
+		origin: DiskChange["origin"],
+		sources: string[],
+		paths: readonly string[] | "unknown",
+	): Promise<HeldDocumentsAnswer> {
+		const { results } = await publishDiskChange(
+			{ root: tmp, origin, sources, paths },
+			undefined,
+		);
+		return results.get(LSP_CONSUMER) as HeldDocumentsAnswer;
+	}
+
+	it("sends a head-move's unheld path as Changed and a gone one as Deleted, before the held document's send", async () => {
+		const unheld = write("unheld.py", "X = 1\n");
+		const gone = normalizeMapKey(path.join(tmp, "src", "gone.py"));
+		const heldPath = write("held.py", "Y = 1\n");
+		held = [heldPath];
+
+		const answer = await publish(
+			"head-move",
+			["head-move"],
+			[unheld, gone, heldPath],
+		);
+
+		expect(calls.notified).toEqual([
+			{ filePath: unheld, type: 2 },
+			{ filePath: gone, type: 3 },
+		]);
+		expect(answer.unheld).toBe(2);
+		// A path born inside the move needs Created, not Changed (review r1 F2):
+		// the unheld paths are offered to the clients' Created decision, the
+		// held one is not.
+		expect(announced).toEqual([unheld, gone]);
+		// The held path is a document, not an event; the events precede its
+		// send so the primary phase's drain probe covers them.
+		expect(answer.primary).toBe(1);
+		expect(order).toEqual(["notify", "announce", "primary"]);
+	});
+
+	it("sends a bash write's unheld path, and sends none for the recovered-drift follow-up", async () => {
+		const unheld = write("written.py", "X = 2\n");
+
+		const write1 = await publish(
+			"bash-recovery",
+			[BASH_WRITE_SOURCE],
+			[unheld],
+		);
+		const drift = await publish(
+			"bash-recovery",
+			[BASH_RECOVERY_DRIFT_SOURCE],
+			[unheld],
+		);
+
+		expect(calls.notified).toEqual([{ filePath: unheld, type: 2 }]);
+		expect(announced).toEqual([unheld]);
+		expect(write1.unheld).toBe(1);
+		// The follow-up carries the same population: a second event would be the
+		// same bytes sent twice.
+		expect(drift.unheld).toBe(0);
+		expect(resynced).toEqual([[unheld]]);
+	});
+
+	it("sends a settled sweep's unheld path as Changed", async () => {
+		const unheld = write("swept.py", "X = 4\n");
+
+		const answer = await publish("settled-sweep", ["settled-sweep"], [unheld]);
+
+		expect(calls.notified).toEqual([{ filePath: unheld, type: 2 }]);
+		expect(announced).toEqual([unheld]);
+		expect(answer.unheld).toBe(1);
+	});
+
+	it("names no path for an unenumerable publish, and still resyncs the held set", async () => {
+		const heldPath = write("held.py", "Y = 2\n");
+		held = [heldPath];
+
+		const answer = await publish("head-move", ["head-move"], "unknown");
+
+		expect(calls.notified).toEqual([]);
+		expect(announced).toEqual([]);
+		expect(answer.unheld).toBe(0);
+		expect(answer.primary).toBe(1);
+		// Nothing was attempted, so nothing failed: a guard that let "unknown"
+		// through would be caught by the notify step and leave only this record.
+		expect(
+			getDegradationSummary().filter(
+				(group) => group.kind === "disk-change-unheld-notify-failed",
+			),
+		).toEqual([]);
+	});
+
+	it("records a refused send once per root and still runs the held-document phase", async () => {
+		const unheld = write("unheld.py", "X = 3\n");
+		const heldPath = write("held.py", "Y = 3\n");
+		held = [heldPath];
+		notifyThrows = true;
+
+		const first = await publish("head-move", ["head-move"], [unheld, heldPath]);
+		const second = await publish(
+			"head-move",
+			["head-move"],
+			[unheld, heldPath],
+		);
+
+		expect(first.unheld).toBe(0);
+		expect(first.primary).toBe(1);
+		expect(first.failed).toBe(false);
+		expect(second.primary).toBe(1);
+		const rows = getDegradationSummary().filter(
+			(group) => group.kind === "disk-change-unheld-notify-failed",
+		);
+		expect(rows).toHaveLength(1);
+	});
+});
+
+describe("the diagnostics cache hears every detector", () => {
+	// Recurrence: slice 2 filtered to `out-of-band` inside the handler, so a
+	// HEAD move, a bash-recovered rewrite and a settled-sweep drift refused only
+	// the entries whose own file moved, and the cached finding of an unchanged
+	// importer kept serving.
+	it.each(DISK_CHANGE_ORIGINS)(
+		"refuses the entries that depend on a path a %s publish names",
+		async (origin) => {
+			ensureDiskChangeSubscribers();
+			const changed = path.join(tmp, "src", "changed.ts");
+			const key = normalizeMapKey(changed);
+			const pathRefusedAt = () =>
+				workspaceFileCreatedAtFor(
+					() => false,
+					() => true,
+					(creation) => creation.path === key,
+				);
+			expect(pathRefusedAt()).toBe(0);
+
+			const { change } = await publishDiskChange({
+				root: tmp,
+				origin,
+				paths: [changed],
+			});
+
+			expect(change.paths).toEqual([key]);
+			expect(pathRefusedAt()).toBe(change.at);
+		},
+	);
+
+	it.each(DISK_CHANGE_ORIGINS)(
+		"refuses every entry scanned before a %s publish it could not enumerate",
+		async (origin) => {
+			ensureDiskChangeSubscribers();
+			const clock = () =>
+				workspaceFileCreatedAtFor(
+					() => false,
+					() => false,
+				);
+			expect(clock()).toBe(0);
+
+			const { change } = await publishDiskChange({
+				root: tmp,
+				origin,
+				paths: "unknown",
+			});
+
+			expect(clock()).toBe(change.at);
+		},
+	);
 });

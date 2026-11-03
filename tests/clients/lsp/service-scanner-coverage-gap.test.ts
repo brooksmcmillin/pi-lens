@@ -21,10 +21,13 @@
  *     `"partial"` and names the scanner, not `"confirmed"`.
  */
 
+import { mkdirSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { pinFixtureHome } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -35,11 +38,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 		typeof import("../../../clients/latency-logger.js")
 	>()),
 	logLatency,
-}));
-
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 
 vi.mock("../../../clients/lsp/client.js", () => ({
@@ -243,9 +241,12 @@ async function touchAll(
 }
 
 describe("#1459 — sweep fan-out must not black out a scanner silently", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -274,9 +275,8 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const files = ["a.ts", "b.ts", "c.ts", "d.ts"].map((f) => `${ROOT}/${f}`);
@@ -482,6 +482,171 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 		);
 	});
 
+	// #4956 F5: an opt-in scanner (fallow) is a gap only for the door that names
+	// it. The per-edit door names it when the operator turned it on, so its open
+	// breaker must still read `"partial"`; the all-server door never admits it,
+	// so the same breaker is no gap there. Recurrence: round 3 listed every
+	// unattached auxiliary of an all-server touch, which walked fallow's root
+	// per file and named a scanner that door would never have started.
+	it("an opt-in scanner's open breaker is a gap only for the door that names it", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const primary = makeClient("typescript", 0, [
+			makeDiagnostic("primary finding"),
+		]);
+		getServersForFileWithConfig.mockReturnValue([
+			makeServer("typescript"),
+			makeServer("fallow", "auxiliary"),
+		]);
+		createLSPClient.mockResolvedValue(primary);
+		(
+			service as unknown as { state: { broken: Map<string, number> } }
+		).state.broken.set(`fallow:${normalizeMapKey(ROOT)}`, Date.now() + 15_000);
+
+		const touch = async (options: Record<string, unknown>) => {
+			const pending = service.touchFile(`${ROOT}/a.ts`, "content", {
+				diagnostics: "document",
+				collectDiagnostics: true,
+				source: "cascade",
+				...options,
+			});
+			await vi.advanceTimersByTimeAsync(NOTIFY_BUDGET_MS * 20);
+			return (await pending) as
+				| { confirmation?: string; unconfirmedServerIds?: string[] }
+				| undefined;
+		};
+
+		const named = await touch({
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["fallow"],
+		});
+		expect(named?.confirmation).toBe("partial");
+		expect(named?.unconfirmedServerIds).toEqual(["fallow"]);
+
+		const unnamed = await touch({ clientScope: "all" });
+		expect(unnamed?.confirmation).toBe("confirmed");
+		expect(unnamed?.unconfirmedServerIds ?? []).toEqual([]);
+	});
+
+	/**
+	 * #4956 r6. Recurrence: `getDiagnostics` answered a read that acquired no
+	 * client with the file's stored rows minus `excludeServerIds` only, so a
+	 * fallow row the named per-edit door stored came back from a read that never
+	 * names fallow (the same read with a live client overwrites the store from
+	 * its own clients and never returns it). Turning fallow off puts nothing in
+	 * `excludeServerIds`, so the stale finding outlived the switch. The fallback
+	 * admits only rows of this read's candidates; a default-on scanner's stale
+	 * row (the positive control) still comes back.
+	 */
+	it("a read that acquires no client returns the stored rows of its candidates only", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		getServersForFileWithConfig.mockReturnValue([
+			makeServer("typescript"),
+			makeServer("typos", "auxiliary"),
+			makeServer("fallow", "auxiliary"),
+		]);
+		createLSPClient.mockImplementation(async (args: { serverId: string }) =>
+			makeClient(args.serverId, 0, [
+				makeDiagnostic(`${args.serverId} finding`),
+			]),
+		);
+		const pending = service.touchFile(`${ROOT}/a.ts`, "content", {
+			diagnostics: "document",
+			collectDiagnostics: true,
+			source: "lsp_sync",
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["typos", "fallow"],
+		});
+		await vi.advanceTimersByTimeAsync(NOTIFY_BUDGET_MS * 20);
+		const touched = (await pending) as { confirmation?: string } | undefined;
+		expect(touched?.confirmation).toBe("confirmed");
+		// Precondition: the named per-edit door stored the fallow row.
+		expect(
+			service
+				.getLastKnownDiagnostics(`${ROOT}/a.ts`)
+				?.map((d) => d.message)
+				.sort(),
+		).toEqual(["fallow finding", "typescript finding", "typos finding"]);
+
+		// A stored row that names its server only through `source` is attributed
+		// the same way (the #4323 contract for a row with no `serverId`). It is
+		// the only fallow row left, so only the source can identify it.
+		const stored = service.getLastKnownDiagnostics(`${ROOT}/a.ts`) ?? [];
+		stored.splice(
+			0,
+			stored.length,
+			...stored.filter((d) => d.serverId !== "fallow"),
+			{ ...makeDiagnostic("source-only fallow finding"), source: "fallow" },
+		);
+
+		// Every server is now down: the read acquires nothing and serves the store.
+		(
+			service as unknown as { state: { clients: Map<string, unknown> } }
+		).state.clients.clear();
+		createLSPClient.mockRejectedValue(new Error("server down"));
+		const read = await service.getDiagnostics(`${ROOT}/a.ts`, "document");
+		expect(read.map((d) => d.message).sort()).toEqual([
+			"typescript finding",
+			"typos finding",
+		]);
+	});
+
+	// #4760 / #4769 review F2: the root-policy door. A scanner declined because
+	// its root is `$HOME` never spawned, so the touch that skipped it must read
+	// `"partial"` and name it, never `"confirmed"`: the #1459 false-clean shape
+	// with a policy cause instead of a breaker. Pins both lines that deliver it,
+	// the `unconfirmedServerIds` union and the gap-record condition.
+	it("a scanner declined by its root policy makes the touch partial, not confirmed", async () => {
+		// A file in `~/testdata` whose scanner root is `$HOME` itself (the
+		// `FileDirRoot` walk-up past an excluded directory): the policy declines
+		// it on the ROOT, though the file's own directory is below `$HOME`, and
+		// only the primary spawns.
+		const { home, restore } = pinFixtureHome("coverage-gap-root-policy");
+		try {
+			const file = path.join(home, "testdata", "a.ts");
+			mkdirSync(path.dirname(file), { recursive: true });
+			writeFileSync(file, "content");
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+
+			const primary = makeClient("typescript", 0, [
+				makeDiagnostic("primary finding"),
+			]);
+			getServersForFileWithConfig.mockReturnValue([
+				makeServer("typescript", undefined, { root: async () => home }),
+				makeServer("opengrep", "auxiliary", {
+					looseFileRoot: "decline",
+					root: async () => home,
+				}),
+			]);
+			createLSPClient.mockResolvedValue(primary);
+
+			const pending = service.touchFile(file, "content", {
+				clientScope: "all",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				source: "cascade",
+			});
+			await vi.advanceTimersByTimeAsync(NOTIFY_BUDGET_MS * 20);
+			const result = (await pending) as
+				| { confirmation?: string; unconfirmedServerIds?: string[] }
+				| undefined;
+
+			expect(createLSPClient).toHaveBeenCalledTimes(1);
+			expect(result?.confirmation).toBe("partial");
+			expect(result?.unconfirmedServerIds).toEqual(["opengrep"]);
+			const gapRows = rowsFor("lsp_scanner_coverage_gap");
+			expect(gapRows).toHaveLength(1);
+			expect(gapRows[0]?.metadata).toMatchObject({
+				policySkippedServerIds: ["opengrep"],
+			});
+			expect(gapRows[0]?.metadata).not.toHaveProperty("brokenSkippedServerIds");
+		} finally {
+			restore();
+		}
+	});
+
 	// #1533 makes the "still confirmed" half load-bearing on this scope too: `"all"`
 	// now derives auxiliary coverage evidence from post-wait state, so a scanner that
 	// publishes for every file must keep every touch unqualified. This is the
@@ -509,9 +674,8 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const files = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"].map(
@@ -695,9 +859,8 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 						makeServer("opengrep", "auxiliary"),
 					],
 		);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		void service.touchFile(`${ROOT}/a.ts`, "one", {
@@ -763,9 +926,8 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 						makeServer("opengrep", "auxiliary"),
 					],
 		);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		void service.touchFile(`${ROOT}/a.ts`, "one", {
@@ -857,9 +1019,8 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const touchOptions = {
@@ -909,9 +1070,8 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const files = ["a.ts", "b.ts"].map((f) => `${ROOT}/${f}`);
@@ -967,9 +1127,8 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? auxWithBinding : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? auxWithBinding : primary,
 		);
 
 		const touchOptions = {
@@ -1035,6 +1194,9 @@ describe("#1586 — deferred-door coverage is judged at merge time", () => {
 	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		(
 			await import("../../../clients/lsp/spawn-history.js")
 		)._clearSuccessfulLspSpawnHistoryForTests();
@@ -1147,9 +1309,8 @@ describe("#1586 — deferred-door coverage is judged at merge time", () => {
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const touchOptions = {
@@ -1293,9 +1454,8 @@ describe("#1586 — deferred-door coverage is judged at merge time", () => {
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const touchOptions = {
@@ -1395,9 +1555,8 @@ describe("#1586 — deferred-door coverage is judged at merge time", () => {
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const touch = service.touchFile(FILE, CONTENT, {
@@ -1441,9 +1600,8 @@ describe("#1586 — deferred-door coverage is judged at merge time", () => {
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const touchOptions = {
@@ -1556,9 +1714,12 @@ describe("#1586 review round (FIND-1) — publication lands between the aux wait
 	const FILE = `${ROOT}/a.ts`;
 	const CONTENT = "const value = 1;";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -1598,9 +1759,8 @@ describe("#1586 review round (FIND-1) — publication lands between the aux wait
 			makeServer("typescript"),
 			makeServer("opengrep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "opengrep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "opengrep" ? aux : primary,
 		);
 
 		const touch = service.touchFile(FILE, CONTENT, {

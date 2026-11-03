@@ -16,7 +16,12 @@ import {
 } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/capabilities.js";
 import { configDisabledAuxiliaryLspServerIds } from "./dispatch/auxiliary-lsp.js";
-import { isUnderDir, normalizeMapKey } from "./path-utils.js";
+import {
+	isUnderDir,
+	normalizeMapKey,
+	realpathOrResolve,
+	toPosix,
+} from "./path-utils.js";
 import {
 	bounded,
 	combineAbortSignals,
@@ -295,7 +300,7 @@ function legacyActionableWarningId(args: {
 	message: string;
 	line?: number;
 }): string {
-	const rel = path.relative(args.cwd, args.filePath).replace(/\\/g, "/");
+	const rel = toPosix(path.relative(args.cwd, args.filePath));
 	const legacyRelativeFile =
 		rel && !rel.startsWith("..") ? rel : normalizeMapKey(args.filePath);
 	const parts = [
@@ -2242,11 +2247,13 @@ export async function applyConservativeActionableWarningFixes(args: {
 				}
 				// #3541: and it covers only the file this fix read; an edit that
 				// also writes another file would apply there at the server's
-				// positions unchecked. A path not on disk throws here, and the fix
-				// is skipped as apply_failed.
-				const target = fs.realpathSync.native(warning.filePath);
+				// positions unchecked. Files are compared by path identity (#4689), so
+				// a link to this file is not a second file and a second file not on
+				// disk is still one (multi_file_edit, not a failed fix). This file
+				// gone from disk fails in `applyWorkspaceEdit` and is apply_failed.
+				const target = realpathOrResolve(warning.filePath);
 				const writesOtherFile = workspaceEditDiskPaths(edit).some(
-					(diskPath) => fs.realpathSync.native(diskPath) !== target,
+					(diskPath) => realpathOrResolve(diskPath) !== target,
 				);
 				if (writesOtherFile) {
 					summary.skipped.push({ id: warning.id, reason: "multi_file_edit" });

@@ -14,7 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	buildMemorySample,
 	collectMemorySampleSubsystems,
@@ -24,9 +24,11 @@ import {
 	isRapidHeapGrowth,
 	MEMORY_SAMPLE_TURN_INTERVAL,
 	recordMemorySampleOutcome,
+	recordMemoryTurnEnd,
 	resetMemorySamplerCadence,
 	shouldEmitMemorySample,
 	shouldEmitMemorySampleAdaptive,
+	takeMemoryIdleGapMs,
 	toMemoryProcessUsage,
 } from "../../clients/memory-sampler.js";
 import {
@@ -34,7 +36,9 @@ import {
 	getReviewGraphWorkspaceCacheSnapshot,
 } from "../../clients/review-graph/builder.js";
 import { getDispatchCascadeCacheStats } from "../../clients/dispatch/integration.js";
+import { sessionLookupKey } from "../../clients/session-scope.js";
 import type { WordIndex } from "../../clients/word-index.js";
+import { bindSession, retireBoundSessions } from "../support/bound-sessions.js";
 import {
 	WORD_POSTING_LIST_OVERHEAD_BYTES,
 	WordForwardEntry,
@@ -484,5 +488,120 @@ describe("formatMemoryHealthLine (pure)", () => {
 		sample.subsystems.treeSitter = null;
 		const line = formatMemoryHealthLine(sample);
 		expect(line).toContain("tree-sitter cache n/a");
+	});
+});
+
+describe("post-idle sample decision (#1332)", () => {
+	// An explicit window: the decision takes the window as an argument, so the
+	// default (the LSP idle-evict value) is not pinned here.
+	const WINDOW_MS = 300_000;
+	// #4965: the pending turn end is a cell on the session's scope, found by the
+	// session's lookup key; `bindSession` does what index.ts's session_start does.
+	const SESSION = sessionLookupKey("session-a", "primary");
+	beforeEach(() => {
+		resetMemorySamplerCadence();
+		bindSession("session-a", "primary");
+	});
+	afterEach(() => retireBoundSessions());
+
+	it("#1332: no post-idle heap reading existed, so a turn after a gap over the window reports the measured idleMs", () => {
+		recordMemoryTurnEnd(SESSION, 1_000);
+		expect(takeMemoryIdleGapMs(SESSION, 1_000 + WINDOW_MS + 1, WINDOW_MS)).toBe(
+			WINDOW_MS + 1,
+		);
+	});
+
+	it("#1332: a gap at or under the window yields no idle sample (the window is a strict bound)", () => {
+		recordMemoryTurnEnd(SESSION, 1_000);
+		expect(
+			takeMemoryIdleGapMs(SESSION, 1_000 + WINDOW_MS - 1, WINDOW_MS),
+		).toBeNull();
+		recordMemoryTurnEnd(SESSION, 1_000);
+		expect(
+			takeMemoryIdleGapMs(SESSION, 1_000 + WINDOW_MS, WINDOW_MS),
+		).toBeNull();
+	});
+
+	it("#1332: two turn starts after one long gap yield only one idle sample", () => {
+		recordMemoryTurnEnd(SESSION, 0);
+		const longGap = WINDOW_MS * 2;
+		expect(takeMemoryIdleGapMs(SESSION, longGap, WINDOW_MS)).toBe(longGap);
+		// The second turn start has no turn end in between: nothing is pending.
+		expect(takeMemoryIdleGapMs(SESSION, longGap + 5, WINDOW_MS)).toBeNull();
+	});
+
+	it("#1332: no turn end was ever recorded (first turn of a process) yields no idle sample", () => {
+		expect(takeMemoryIdleGapMs(SESSION, WINDOW_MS * 10, WINDOW_MS)).toBeNull();
+	});
+
+	it("#1332: the next turn end re-arms the decision for the next idle period", () => {
+		recordMemoryTurnEnd(SESSION, 0);
+		expect(takeMemoryIdleGapMs(SESSION, WINDOW_MS * 2, WINDOW_MS)).toBe(
+			WINDOW_MS * 2,
+		);
+		const secondEnd = WINDOW_MS * 2 + 10;
+		recordMemoryTurnEnd(SESSION, secondEnd);
+		expect(
+			takeMemoryIdleGapMs(SESSION, secondEnd + WINDOW_MS * 3, WINDOW_MS),
+		).toBe(WINDOW_MS * 3);
+	});
+
+	it("#1332: a new session scope for the same id starts with no pending turn end, so its first turn is never measured against the old one (#4965)", () => {
+		// RECURRENCE GUARDED: shape 72. The marker was a process table the primary's
+		// session_start cleared whole, which also dropped a live secondary's.
+		recordMemoryTurnEnd(SESSION, 0);
+		retireBoundSessions();
+		bindSession("session-a", "primary");
+		expect(takeMemoryIdleGapMs(SESSION, WINDOW_MS * 2, WINDOW_MS)).toBeNull();
+	});
+
+	it("#1332: the primary's reset leaves a live secondary's pending turn end (#4965)", () => {
+		// RECURRENCE GUARDED: resetMemorySamplerCadence cleared the whole process
+		// table, so a subagent running across the primary's /new lost its idle
+		// sample (shape 72).
+		const secondary = sessionLookupKey("subagent-b", "concurrent-secondary");
+		bindSession("subagent-b", "concurrent-secondary");
+		recordMemoryTurnEnd(secondary, 0);
+		resetMemorySamplerCadence();
+		expect(takeMemoryIdleGapMs(secondary, WINDOW_MS * 2, WINDOW_MS)).toBe(
+			WINDOW_MS * 2,
+		);
+	});
+
+	it("#1332: another session's turn start neither consumes nor reports a session's pending turn end", () => {
+		// #4761 review F1 (AGENTS.md shape 72): one process-global slot let a
+		// coexisting session take the primary's marker.
+		bindSession("session-b", "concurrent-secondary");
+		recordMemoryTurnEnd(SESSION, 0);
+		expect(
+			takeMemoryIdleGapMs("session-b", WINDOW_MS * 2, WINDOW_MS),
+		).toBeNull();
+		expect(takeMemoryIdleGapMs(SESSION, WINDOW_MS * 2, WINDOW_MS)).toBe(
+			WINDOW_MS * 2,
+		);
+	});
+
+	it("#1332: a host without session ids keeps one marker per role under the no-session key", () => {
+		// Recurrence: a host whose ctx has no `getSessionId` (getStableSessionId
+		// answers undefined) must still get its post-idle reading, and a secondary
+		// must not read the primary's marker.
+		const primary = sessionLookupKey(undefined, "primary");
+		const secondary = sessionLookupKey(undefined, "concurrent-secondary");
+		bindSession(undefined, "primary");
+		bindSession(undefined, "concurrent-secondary");
+		recordMemoryTurnEnd(primary, 0);
+		expect(takeMemoryIdleGapMs(secondary, WINDOW_MS * 2, WINDOW_MS)).toBeNull();
+		expect(takeMemoryIdleGapMs(primary, WINDOW_MS * 2, WINDOW_MS)).toBe(
+			WINDOW_MS * 2,
+		);
+	});
+
+	it("#1332: a turn end for a session with no live scope keeps no marker (#4965)", () => {
+		// RECURRENCE GUARDED: the resurrection a process table allowed; the cell
+		// must not outlive, or be created without, the session's scope.
+		const ghost = sessionLookupKey("never-started", "primary");
+		recordMemoryTurnEnd(ghost, 0);
+		bindSession("never-started", "primary");
+		expect(takeMemoryIdleGapMs(ghost, WINDOW_MS * 2, WINDOW_MS)).toBeNull();
 	});
 });

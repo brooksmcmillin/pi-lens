@@ -193,6 +193,21 @@ export const CAPTURES = [
 		argv: ["--reporter=json", "Bad.kt"],
 	},
 	{
+		// detekt emits TEXT reports with no severity token (`file:line:col:
+		// message [Rule]`), and its default ruleset is off once a config is
+		// passed, so the smoke workspace's detekt.yml activates one rule.
+		runner: "detekt",
+		tool: "detekt",
+		workspace: smoke("detekt"),
+		file: "Bad.kt",
+		argv: [
+			"--input",
+			"__WORKSPACE__/Bad.kt",
+			"--config",
+			"__WORKSPACE__/detekt.yml",
+		],
+	},
+	{
 		// Needs Ruby on PATH; the gem's launcher is a Ruby script.
 		runner: "rubocop",
 		tool: "rubocop",

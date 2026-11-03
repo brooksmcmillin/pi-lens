@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import {
 	DocumentDriftTracker,
+	DRIFT_CHECK_BATCH,
 	DRIFT_RESYNC_BATCH,
 	DRIFT_TRACK_CAP,
 	driftCheckIntervalMs,
@@ -393,6 +394,94 @@ describe("DocumentDriftTracker (#1783)", () => {
 		await tracker.sweep(deps, { force: true });
 
 		expect(new Set(resynced.map((r) => r.filePath)).size).toBe(total);
+	});
+
+	/**
+	 * #4532 gap 13 round 1b. `held` documents are recorded, then the LAST
+	 * `changed` of them are edited outside the tracker, so a pass whose window
+	 * starts at the cursor origin cannot reach them.
+	 */
+	function heldWithTailChanged(held: number, changed: number) {
+		const files = new Map<string, FakeFile>();
+		const tracker = new DocumentDriftTracker();
+		for (let i = 0; i < held; i++) {
+			const key = k(`/repo/held-${i}.ts`);
+			files.set(key, { content: `v0-${i}\n`, mtimeMs: SYNCED_AT - 10 });
+			tracker.recordSynced(key, `v0-${i}\n`, SYNCED_AT);
+		}
+		for (let i = held - changed; i < held; i++) {
+			const key = k(`/repo/held-${i}.ts`);
+			files.set(key, { content: `v1-${i}\n`, mtimeMs: SYNCED_AT + 5 });
+		}
+		clock = SYNCED_AT + 2_000;
+		return { files, tracker };
+	}
+
+	// Recurrence: round 1 of #4532 gap 13 called a forced pass before the
+	// answer; the pass stated 64 documents and re-pushed 4, so a changed file
+	// past the window (200 held: 2 of 4 reached, 500 held: 1 of 4) stayed stale.
+	it("a full pass checks every held document and re-pushes every changed one", async () => {
+		const { files, tracker } = heldWithTailChanged(500, 8);
+		const { deps, resynced } = makeDeps(files, now);
+
+		const result = await tracker.sweep(deps, { force: true, full: true });
+
+		expect(result.checked).toBe(500);
+		expect(result.resynced).toBe(8);
+		expect(result.deferred).toBe(0);
+		expect(resynced).toHaveLength(8);
+	});
+
+	// Recurrence: the turn-settle sweep must keep its pacing, or a bulk edit
+	// would stall a settle on hundreds of stats and re-pushes (#1783).
+	it("the unforced sweep still checks DRIFT_CHECK_BATCH documents and re-pushes at most DRIFT_RESYNC_BATCH", async () => {
+		const { files, tracker } = heldWithTailChanged(200, 200);
+		const { deps, resynced } = makeDeps(files, now);
+
+		const result = await tracker.sweep(deps);
+
+		expect(result.checked).toBe(DRIFT_CHECK_BATCH);
+		expect(result.resynced).toBe(DRIFT_RESYNC_BATCH);
+		expect(resynced).toHaveLength(DRIFT_RESYNC_BATCH);
+	});
+
+	// Recurrence: resyncGitChangedFiles forces the sweep for git recovery and
+	// depends on its pacing; widening plain `force` would have changed it (#4493).
+	it("a plain forced sweep (git recovery) keeps both caps", async () => {
+		const { files, tracker } = heldWithTailChanged(200, 200);
+		const { deps, resynced } = makeDeps(files, now);
+
+		const result = await tracker.sweep(deps, { force: true });
+
+		expect(result.checked).toBe(DRIFT_CHECK_BATCH);
+		expect(resynced).toHaveLength(DRIFT_RESYNC_BATCH);
+	});
+
+	// Recurrence: a full pass joining an in-flight capped pass returned that
+	// pass's result, which began before the caller's change and stopped at 64.
+	it("a full pass waits for a capped pass in flight instead of joining it", async () => {
+		const { files, tracker } = heldWithTailChanged(200, 8);
+		const { deps, resynced } = makeDeps(files, now);
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const baseStat = deps.stat;
+		let gated = true;
+		deps.stat = async (filePath: string) => {
+			if (gated) await gate;
+			return baseStat(filePath);
+		};
+
+		const capped = tracker.sweep(deps, { force: true });
+		const full = tracker.sweep(deps, { force: true, full: true });
+		gated = false;
+		release();
+		const [cappedResult, fullResult] = await Promise.all([capped, full]);
+
+		expect(cappedResult.checked).toBe(DRIFT_CHECK_BATCH);
+		expect(fullResult.checked).toBe(200);
+		expect(new Set(resynced.map((r) => r.filePath)).size).toBe(8);
 	});
 
 	it("rate-limits: a second pass inside the interval does no work", async () => {

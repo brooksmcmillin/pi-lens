@@ -29,7 +29,11 @@ function errorTextWithHint(raw: string): string {
 	const hint = astGrepRemediationHint(classifyAstGrepError(raw));
 	return hint ? `Error: ${raw}\n\n${hint}` : `Error: ${raw}`;
 }
-import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
+import {
+	defaultedCwdHomeRefusal,
+	readAstGrepLang,
+	readPathsArgument,
+} from "./shared.js";
 
 function lineCount(value: string): number {
 	if (!value) return 0;
@@ -77,40 +81,34 @@ export function createAstGrepReplaceTool(
 				description: "Replacement using meta-variables from pattern",
 			}),
 			lang: Type.String({
-				enum: [...LANGUAGES] as string[],
-				description: "Target language",
+				description: "Language id, e.g. typescript, tsx, python, go.",
 			}),
 			paths: Type.Optional(
 				Type.Array(Type.String(), { description: "Specific files/folders" }),
 			),
 			insideKind: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes inside an ancestor of this AST node kind. Synthesizes a YAML rule.",
+					description: "Ancestor AST node kind filter.",
 				}),
 			),
 			hasKind: Type.Optional(
 				Type.String({
-					description:
-						'Restrict matches to nodes whose immediate child has this AST node kind (ast-grep default stopBy: neighbor). Example: `hasKind: "await_expression"`.',
+					description: "Immediate child AST node kind filter.",
 				}),
 			),
 			hasDescendantKind: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes containing this AST node kind anywhere in their descendants. Explicit recursive form (`stopBy: end`); use this instead of `hasKind` when nesting is not immediate.",
+					description: "Recursive descendant AST node kind filter.",
 				}),
 			),
 			follows: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes that immediately follow a sibling matching this pattern.",
+					description: "Preceding sibling pattern filter.",
 				}),
 			),
 			precedes: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes that immediately precede a sibling matching this pattern.",
+					description: "Following sibling pattern filter.",
 				}),
 			),
 			apply: Type.Optional(
@@ -119,8 +117,7 @@ export function createAstGrepReplaceTool(
 			strictness: Type.Optional(
 				Type.String({
 					enum: ["smart", "relaxed", "ast", "cst", "signature", "template"],
-					description:
-						"Pattern matching strictness. 'smart' (default) ignores comments and whitespace. 'relaxed' also ignores unnamed nodes like punctuation. 'ast' ignores all whitespace.",
+					description: "Match strictness; default smart.",
 				}),
 			),
 		}),
@@ -129,9 +126,15 @@ export function createAstGrepReplaceTool(
 			params: Record<string, unknown>,
 			_signal: AbortSignal,
 			_onUpdate: unknown,
-			ctx: { cwd?: string; resultMaxItems?: number },
+			ctx: {
+				cwd?: string;
+				resultMaxItems?: number;
+				sessionManager?: { getSessionId?: () => string };
+			},
 		) {
 			const lineage = captureLineage?.();
+			// #4943: the calling session owns the deferred pass of the apply.
+			const sessionId = ctx.sessionManager?.getSessionId?.();
 			const startedAt = Date.now();
 			const {
 				pattern,
@@ -157,9 +160,9 @@ export function createAstGrepReplaceTool(
 				follows?: string;
 				precedes?: string;
 			};
-			const lang = ((params as { lang: string }).lang ?? "").replace(
-				/^"|"$/g,
-				"",
+			const { lang, refusal: langError } = readAstGrepLang(
+				(params as { lang?: unknown }).lang,
+				true,
 			);
 			const pathsCount = paths?.length ?? 1;
 			const applyFlag = apply ?? false;
@@ -200,6 +203,30 @@ export function createAstGrepReplaceTool(
 				}
 			}
 
+			if (langError) {
+				logOutcome("error", { errorRaw: langError });
+				return {
+					content: [{ type: "text" as const, text: `Error: ${langError}` }],
+					isError: true,
+					details: {},
+				};
+			}
+			// #5041: replace used to forward `paths` unchecked, so a non-string
+			// entry, a blank entry or an over-cap list reached the CLI as argv.
+			const pathsRead = readPathsArgument(paths, {
+				cwd: ctx.cwd,
+				absent: "cwd",
+			});
+			if (pathsRead.refusal) {
+				logOutcome("error", { errorRaw: pathsRead.refusal });
+				return {
+					content: [
+						{ type: "text" as const, text: `Error: ${pathsRead.refusal}` },
+					],
+					isError: true,
+					details: {},
+				};
+			}
 			if (!(await astGrepClient.ensureAvailable())) {
 				logOutcome("error", { errorRaw: "ast-grep CLI not found" });
 				return {
@@ -213,7 +240,24 @@ export function createAstGrepReplaceTool(
 					details: {},
 				};
 			}
-			const searchPaths = resolveAstGrepPaths(paths, ctx.cwd);
+			// #5039: a write tool needs the home ceiling more than a read tool does.
+			// Decided before any target is resolved, so it covers the dry run and the
+			// apply alike (`apply` only flips a flag on this same dispatch), through
+			// the seam #747/#250's guard became when it was lifted out of
+			// ast_grep_search. It runs AFTER the `paths` reader above: an empty list
+			// (`paths: []`) is the reader's refusal even at home, and only an absent
+			// `paths` reaches this ceiling (keyed on the raw argument, not on
+			// `pathsRead.entries`, which `absent: "cwd"` always fills).
+			const homeRefusal = defaultedCwdHomeRefusal(paths, ctx.cwd);
+			if (homeRefusal) {
+				logOutcome("error", { errorRaw: homeRefusal.reason });
+				return {
+					content: [{ type: "text" as const, text: homeRefusal.text }],
+					isError: true,
+					details: {},
+				};
+			}
+			const searchPaths = pathsRead.entries;
 
 			// Phase 3: structural-intent params → synthesize YAML with fix: field
 			if (
@@ -254,7 +298,7 @@ export function createAstGrepReplaceTool(
 					ruleYaml,
 					searchPaths,
 					applyFlag,
-					{ lineage, toolCallId: _toolCallId },
+					{ lineage, toolCallId: _toolCallId, sessionId },
 				);
 				if (ruleResult.stalePreview) {
 					logOutcome("error", { errorRaw: "stale_preview" });
@@ -306,7 +350,7 @@ export function createAstGrepReplaceTool(
 				lang,
 				searchPaths,
 				applyFlag,
-				{ strictness, lineage, toolCallId: _toolCallId },
+				{ strictness, lineage, toolCallId: _toolCallId, sessionId },
 			);
 
 			if (result.stalePreview) {

@@ -1,10 +1,11 @@
 // Dependency-free coverage-map seam for #3802 rule 2.
 //
 // `scripts/check-pr-body.mjs` runs in the `PR body (advisory)` job, which
-// checks out the repo and runs plain Node with NO `npm install`. Everything
-// this module imports must therefore come from `node:` or the dependency-free
-// `./defect-shapes.mjs` -- `minimatch` and
-// the other glob packages are unavailable on that lane.
+// checks out the repo and runs plain Node with NO `npm install`: the job
+// installs `marked` alone (#4717), the markdown lexer `./defect-shapes.mjs`
+// loads lazily through `./markdown-lexer.mjs`. Everything this module imports
+// must therefore come from `node:` or those two repository modules --
+// `minimatch` and the other glob packages are unavailable on that lane.
 //
 // A PR that changes a file the checked-in `formal/coverage-map.json` maps to
 // model families must also change a `.tla`/`.cfg` under ANY ONE of the row's
@@ -417,14 +418,37 @@ export function validateCoverageMap(map, rootDir = process.cwd()) {
 	return errors;
 }
 
+// Everything of a declaration line that precedes the family token.
+const DECLARATION_PREFIX = "^\\s*(?:[-*+]\\s+)?\\**TLA\\+ unaffected:\\s*";
+
 function bodyNamesFamily(lines, family) {
 	const escaped = family.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	// `(?![\w-])` keeps `read-guard` from matching `read-guard-foo`: the family
 	// must end at a word boundary before its separator dash.
 	const pattern = new RegExp(
-		`^\\s*(?:[-*+]\\s+)?\\**TLA\\+ unaffected:\\s*${escaped}(?![\\w-])\\s*[—–-]\\s*\\S`,
+		`${DECLARATION_PREFIX}${escaped}(?![\\w-])\\s*[—–-]\\s*\\S`,
 	);
 	return lines.some((line) => pattern.test(line));
+}
+
+/**
+ * The text with the family token of each `TLA+ unaffected:` declaration line
+ * removed. A family name is a declared slot of that line, not an Observability
+ * record mention (#3902); the reason after it stays. Only a token that names a
+ * known family (`families`, the map's list) is removed, so a malformed
+ * declaration keeps its token and the #4597 read-back still checks it.
+ */
+export function withoutDeclaredFamilies(text = "", families = []) {
+	const known = new Set(families);
+	const declared = new RegExp(`(${DECLARATION_PREFIX})([\\w-]+)`);
+	return String(text)
+		.split(/\r?\n/)
+		.map((line) =>
+			line.replace(declared, (whole, prefix, token) =>
+				known.has(token) ? prefix : whole,
+			),
+		)
+		.join("\n");
 }
 
 /**

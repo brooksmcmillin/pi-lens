@@ -1607,7 +1607,6 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		// full suite on any doubt and must never gate a merge.
 		"Changed files (advisory)",
 		"PR body (advisory)",
-		"Vale prose lint (advisory)",
 		"OSV scan (advisory)",
 		"jscpd (advisory)",
 		"yamllint (advisory)",
@@ -1619,6 +1618,10 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		// #2697 item 9: the strictness census lane (two scratch tsconfigs) is advisory.
 		"strictness (advisory)",
 		"Targeted tests (advisory)",
+		// #5002: Vale, jscpd, yamllint, typos, taplo, complexity and strictness
+		// are steps of this one advisory job.
+		"Lint (advisory)",
+		"Changed tests shuffled (advisory)",
 		// #4363: the head-against-base latency lane. It is not a required check
 		// and keeps a truthful run conclusion, so only the suffix marks it advisory.
 		"Hot-path latency (advisory)",
@@ -1686,12 +1689,10 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 	it("the reviewer's named gating list is NOT advisory", () => {
 		for (const name of [
 			...EXTERNAL_GATING_NAMES,
-			"Detect lockfile change",
-			"PR title",
+			"PR metadata",
 			"actionlint",
 			"markdownlint",
 			"Dependency boundaries",
-			"Close-keyword syntax",
 			"Changelog fragment (fast-fail)",
 			"Install test (ubuntu-latest)",
 			"Install test (windows-latest)",
@@ -1712,13 +1713,9 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 			...EXTERNAL_ADVISORY_NAMES,
 			"greeting",
 			"PR body (advisory)",
-			"Vale prose lint (advisory)",
 			"OSV scan (advisory)",
 			"oxlint (advisory)",
-			"jscpd (advisory)",
-			"yamllint (advisory)",
-			"typos (advisory)",
-			"taplo (advisory)",
+			"Lint (advisory)",
 		]) {
 			expect(isAdvisoryCheck(name)).toBe(true);
 		}
@@ -1738,17 +1735,10 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		expect(isAdvisoryCheck("oxlint (advisory)")).toBe(true);
 	});
 
-	it("registers the four tool jobs in the explicit advisory allowlist (#2706)", () => {
-		expect([...ADVISORY_CHECKS]).toEqual(
-			expect.arrayContaining([
-				"jscpd (advisory)",
-				"yamllint (advisory)",
-				"typos (advisory)",
-				"taplo (advisory)",
-				"complexity (advisory)",
-				"Targeted tests (advisory)",
-			]),
-		);
+	it("classifies the folded lint job by the suffix, with no allowlist entry (#5002)", () => {
+		expect(ADVISORY_CHECKS.has("Lint (advisory)")).toBe(false);
+		expect(isAdvisoryCheck("Lint (advisory)")).toBe(true);
+		expect(ADVISORY_CHECKS.has("Changed tests shuffled (advisory)")).toBe(true);
 	});
 });
 
@@ -2193,9 +2183,13 @@ describe("resolveHeadSha — mergeable resolution (#2539 round 2, F1)", () => {
 			});
 		};
 		const result = resolveHeadSha("2539", ghExec);
-		expect(result).toEqual({ sha: "c0ffee123456", mergeable: "CONFLICTING" });
+		expect(result).toEqual({
+			sha: "c0ffee123456",
+			mergeable: "CONFLICTING",
+			botAuthored: false,
+		});
 		expect(calls).toEqual([
-			["pr", "view", "2539", "--json", "headRefOid,mergeable"],
+			["pr", "view", "2539", "--json", "headRefOid,mergeable,author"],
 		]);
 	});
 
@@ -2206,6 +2200,7 @@ describe("resolveHeadSha — mergeable resolution (#2539 round 2, F1)", () => {
 		expect(resolveHeadSha("abc1234", ghExec)).toEqual({
 			sha: "abc1234",
 			mergeable: null,
+			botAuthored: false,
 		});
 	});
 
@@ -2228,6 +2223,22 @@ describe("resolveHeadSha — mergeable resolution (#2539 round 2, F1)", () => {
 		};
 		resolveHeadSha("2539", ghExec);
 		expect(calls[0]).toEqual({ timeoutMs: DEFAULT_GH_TIMEOUT_MS });
+	});
+});
+
+describe("resolveHeadSha — bot authorship (#5062)", () => {
+	// Recurrence: a bot-opened PR's checks are all dispatch runs, which #4090
+	// reads as advisory; the verdict needs to know who opened the PR.
+	it.each([
+		["gh is_bot flag", { login: "someone", is_bot: true }, true],
+		["an app login", { login: "app/github-actions", is_bot: false }, true],
+		["a [bot] login", { login: "dependabot[bot]" }, true],
+		["a human", { login: "apmantza", is_bot: false }, false],
+		["a missing author", undefined, false],
+	])("reads %s", (_name, author, expected) => {
+		const ghExec = () =>
+			JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE", author });
+		expect(resolveHeadSha("5066", ghExec).botAuthored).toBe(expected);
 	});
 });
 

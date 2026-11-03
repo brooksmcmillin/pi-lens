@@ -38,9 +38,12 @@ export async function run(ctx) {
 	);
 	const service = getFormatService();
 	const abs = path.join(ctx.ws, FILE);
+	// The service classifies the file's identity against the session root
+	// (#4689), so the workspace is the session here.
+	const options = { sessionRoot: fs.realpathSync(ctx.ws) };
 	// recordRead is the read baseline the external-modification guard needs.
 	service.recordRead(abs);
-	const first = await service.formatFile(abs);
+	const first = await service.formatFile(abs, options);
 	ctx.record("format the file", { summary: first });
 	const ruff = first.formatters.find((f) => f.name === "ruff");
 	ctx.expect(
@@ -55,7 +58,7 @@ export async function run(ctx) {
 		JSON.stringify(ctx.read(FILE)),
 	);
 	service.recordRead(abs);
-	const second = await service.formatFile(abs);
+	const second = await service.formatFile(abs, options);
 	ctx.record("format again", { summary: second });
 	ctx.expect(
 		"a second pass changes nothing",

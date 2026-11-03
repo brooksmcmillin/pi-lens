@@ -53,6 +53,7 @@ import { insertSuppressComment } from "../clients/dispatch/suppress-writer.js";
 import { getMutationBridge } from "../clients/mutation-bridge.js";
 import { normalizeMapKey, resolveHostToolPath } from "../clients/path-utils.js";
 import { resolveLensToolName } from "../clients/tool-config.js";
+import { readFilePath } from "./shared.js";
 import type { LineageHandle } from "../clients/session-scope.js";
 import {
 	getFileDiagnostics,
@@ -245,10 +246,15 @@ export function createLensDiagnosticMarkTool(
 		// which the adapter-aware guard reds on first.
 		promptSnippet: `Use ${resolveLensToolName("lens_diagnostic_mark", "pi") ?? "lens_diagnostic_mark"} to dismiss a false-positive, suppress a won't-fix, defer, or flag a finding to fix later`,
 		parameters: Type.Object({
-			filePath: Type.String({
-				description:
-					"The file the diagnostic was reported on (relative or absolute).",
-			}),
+			path: Type.Optional(
+				Type.String({
+					description:
+						"The file the diagnostic was reported on (relative or absolute).",
+				}),
+			),
+			filePath: Type.Optional(
+				Type.String({ description: "Alias for `path`." }),
+			),
 			line: Type.Number({
 				description: "The 1-based line the diagnostic was reported at.",
 			}),
@@ -283,11 +289,22 @@ export function createLensDiagnosticMarkTool(
 			params: Record<string, unknown>,
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
-			ctx: { cwd?: string },
+			ctx: { cwd?: string; sessionManager?: { getSessionId?: () => string } },
 		) {
 			const lineage = captureLineage?.();
+			// #4943: the calling session owns the deferred pass of a suppress write.
+			const sessionId = ctx.sessionManager?.getSessionId?.();
 			const cwd = ctx.cwd ?? getCwd();
-			const filePathArg = params.filePath;
+			// #5041: `path` is canonical; `filePath` stays accepted (#2418).
+			const fileRead = readFilePath(params);
+			if (fileRead.refusal) {
+				return {
+					content: [{ type: "text" as const, text: fileRead.refusal }],
+					isError: true,
+					details: {},
+				};
+			}
+			const filePathArg = fileRead.path;
 			const line = params.line;
 			const message = params.message;
 			const disposition = params.disposition as Disposition;
@@ -296,7 +313,7 @@ export function createLensDiagnosticMarkTool(
 			const reason = params.reason as string | undefined;
 
 			if (
-				typeof filePathArg !== "string" ||
+				!filePathArg ||
 				typeof line !== "number" ||
 				typeof message !== "string" ||
 				!DISPOSITIONS.includes(disposition as (typeof DISPOSITIONS)[number])
@@ -305,7 +322,7 @@ export function createLensDiagnosticMarkTool(
 					content: [
 						{
 							type: "text" as const,
-							text: "filePath, line, message, and a valid disposition are required.",
+							text: "path, line, message, and a valid disposition are required.",
 						},
 					],
 					isError: true,
@@ -429,6 +446,7 @@ export function createLensDiagnosticMarkTool(
 					consumer: "lens_diagnostic_mark",
 					provenance: "observed",
 					...(lineage && { lineage }),
+					...(sessionId !== undefined && { sessionId }),
 					// #4187 R4-1: this suppress wrote the file its own `tool_call`
 					// checked, so it may advance that file's authorship. Without
 					// the id the guard cannot tell it from a write no call
@@ -441,7 +459,11 @@ export function createLensDiagnosticMarkTool(
 				cwd,
 				{
 					cwd,
-					filePath: absPath,
+					// The tool is the entry point for this path: the widget mirror keys
+					// syntactically (#1020), so it gets the identity the pipeline
+					// recorded the finding under, not the spelling the model typed
+					// (#4689 item 3). The file IO above keeps the spelling.
+					filePath: normalizeMapKey(absPath),
 					tool,
 					rule,
 					message,

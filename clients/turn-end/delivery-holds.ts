@@ -65,6 +65,11 @@ export interface DeliveryHoldPlan {
 	/** Cut parts that will stay pending, known before the message is final. */
 	heldCount: number;
 	/**
+	 * The parts the message delivers under the reach rule, held or not: the
+	 * stamp binds only what these show (#4954 F5).
+	 */
+	reachedParts: readonly ComposedPart[];
+	/**
 	 * Run each hold's callback once. `suppressed` is true when the message is
 	 * not sent because it is identical to the last one delivered: its parts are
 	 * text the agent already holds, so they settle as delivered.
@@ -94,16 +99,18 @@ export function planDeliveryHolds(args: {
 		reached: boolean;
 		keeps: boolean;
 	}> = [];
+	const reachedParts: ComposedPart[] = [];
 	let start = 0;
 	for (const part of args.parts) {
 		const end = start + part.text.length;
+		const whole = end <= args.keptChars;
+		// A part at offset 0 that the cap did not keep whole was cut by the cap
+		// alone, so it could never fit: this delivery is its delivery.
+		const leadsOversized = start === 0;
+		const reached = whole || leadsOversized;
+		if (reached) reachedParts.push(part);
 		const hold = byPart.get(part.raw)?.shift();
 		if (hold) {
-			const whole = end <= args.keptChars;
-			// A part at offset 0 that the cap did not keep whole was cut by the cap
-			// alone, so it could never fit: this delivery is its delivery.
-			const leadsOversized = start === 0;
-			const reached = whole || leadsOversized;
 			settled.push({
 				hold,
 				reached,
@@ -113,6 +120,7 @@ export function planDeliveryHolds(args: {
 		start = end + args.separatorLength;
 	}
 	return {
+		reachedParts,
 		heldCount: settled.reduce(
 			(n, entry) => n + (entry.reached || !entry.keeps ? 0 : 1),
 			0,

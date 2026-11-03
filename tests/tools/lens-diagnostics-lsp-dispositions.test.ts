@@ -72,6 +72,7 @@ function makeService(severity = 2) {
 	}));
 	return {
 		announceCreatedFiles: vi.fn(),
+		sweepDocumentDrift: vi.fn(async () => undefined),
 		touchFile,
 		getDiagnostics: vi.fn(async () => []),
 		getCapabilitySnapshots: vi.fn(async () => []),
@@ -86,6 +87,7 @@ const OTHER_MESSAGE = "Cannot find name 'other'.";
 function makeTwoFindingService(severity = 2, otherSeverity = severity) {
 	return {
 		announceCreatedFiles: vi.fn(),
+		sweepDocumentDrift: vi.fn(async () => undefined),
 		touchFile: vi.fn(async () => ({
 			diags: [
 				{
@@ -834,6 +836,7 @@ describe("lens_diagnostics source=lsp scope=paths / legacy lsp_diagnostics paths
 	function makeBadCallService() {
 		return {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => ({
 				diags: [
 					{

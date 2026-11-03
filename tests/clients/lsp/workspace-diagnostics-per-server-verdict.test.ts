@@ -4,11 +4,6 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../test-utils.js";
 
-const getServersForFileWithConfig = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient: vi.fn(),
 }));
@@ -16,9 +11,8 @@ vi.mock("../../../clients/lsp/client.js", () => ({
 describe("#1549 workspace sweep per-server verdict", () => {
 	let root: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
-		getServersForFileWithConfig.mockReset();
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-sweep-verdict-"));
 	});
 
@@ -27,14 +21,6 @@ describe("#1549 workspace sweep per-server verdict", () => {
 	it("keeps a fast primary finding when one auxiliary is silent and names only that lane", async () => {
 		const filePath = path.join(root, "answer.ts");
 		fs.writeFileSync(filePath, "const answer: string = 42;\n");
-		getServersForFileWithConfig.mockReturnValue([
-			{
-				id: "typescript",
-				name: "typescript",
-				extensions: [".ts"],
-				root: async () => root,
-			},
-		]);
 
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();

@@ -72,6 +72,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scratchHomeEnv } from "./lib/scratch-home-env.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -283,7 +284,7 @@ async function main() {
 	const maskRoot = fs.mkdtempSync(
 		path.join(os.tmpdir(), "pi-lens-smoke-avail-mask-"),
 	);
-	process.env.PI_LENS_HOME = scratch;
+	Object.assign(process.env, scratchHomeEnv(scratch));
 	// Mask every REAL system `gh` (GitHub-hosted runners can ship more than
 	// one on PATH -- see `findAllOnPath`'s doc comment, #1651 round 3), don't
 	// strip PATH down to just the fixture dir -- phase 5 removes the fixture

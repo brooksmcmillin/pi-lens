@@ -173,31 +173,38 @@ describe("#3310 first-publish census", () => {
 			now: "2026-09-20",
 		}).text;
 		const unbacked = unbackedEmptyFirstCells(text, "2026-09-20");
-		expect(unbacked.map((line) => line.split(" ")[0]).sort()).toEqual([
-			"php",
-			"terraform",
-		]);
+		// Was ["php", "terraform"]. terraform's marker is retired (#4615: its
+		// `empty-first` reads came from the workspace-directory row), so its cell
+		// is `direct` and is never a candidate for this rule. Only php, the one
+		// empty-first cell left, is named.
+		expect(unbacked.map((line) => line.split(" ")[0]).sort()).toEqual(["php"]);
 		expect(unbacked.join("\n")).toContain("standing on no measurement");
-		// The cells themselves are NOT expired: they still back their markers.
+		// The cell itself is NOT expired: it still backs its marker.
 		const table = parseTable(text, "| lang | server |")!;
 		const langIdx = table.header.indexOf("lang");
 		const fpIdx = table.header.indexOf("first-publish");
-		for (const lang of ["php", "terraform"]) {
-			const cells = table.rows.find((row) => row[langIdx] === lang)!;
-			expect(cells[fpIdx], lang).toBe("empty-first");
-		}
+		const php = table.rows.find((row) => row[langIdx] === "php")!;
+		expect(php[fpIdx], "php").toBe("empty-first");
 	});
 
 	it("clears the miss stamp when the axis is observed again", () => {
 		// The reverse direction: a live measurement makes the cell back its marker
-		// again, so the census rule stops naming it.
+		// again, so the census rule stops naming it. The stamp sits on php, the one
+		// empty-first cell left after #4615 retired terraform's marker.
 		const real = fs.readFileSync(MATRIX_PATH, "utf8");
-		let text = refreshCapabilityMatrix(real, [], {
+		const first = refreshCapabilityMatrix(real, [], {
 			src: "ci",
 			now: "2026-09-01",
 		}).text;
-		text = refreshCapabilityMatrix(
-			text,
+		const missed = refreshCapabilityMatrix(first, [], {
+			src: "ci",
+			now: "2026-09-20",
+		}).text;
+		expect(unbackedEmptyFirstCells(missed, "2026-09-20")).toEqual([
+			expect.stringContaining("php"),
+		]);
+		const observed = refreshCapabilityMatrix(
+			missed,
 			[
 				{
 					lang: "php",
@@ -208,12 +215,7 @@ describe("#3310 first-publish census", () => {
 			],
 			{ src: "ci", now: "2026-09-20" },
 		).text;
-		expect(unbackedEmptyFirstCells(text, "2026-09-20")).toEqual([
-			expect.stringContaining("terraform"),
-		]);
-		expect(unbackedEmptyFirstCells(text, "2026-09-20").join(" ")).not.toContain(
-			"php",
-		);
+		expect(unbackedEmptyFirstCells(observed, "2026-09-20")).toEqual([]);
 	});
 
 	it("never marks one server both seedFirstPush and emptyFirstPublish", () => {

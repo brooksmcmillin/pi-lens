@@ -44,14 +44,8 @@ import { setHostFileMutationQueueLoader } from "../../clients/file-mutation-queu
 import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
 
 const lsp = vi.hoisted(() => ({ service: undefined as unknown }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => lsp.service,
-}));
-
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
 function gate() {
 	let open!: () => void;
@@ -120,20 +114,22 @@ async function renameWith(
 ): Promise<{ isError?: boolean; text: string }> {
 	const parked = gate();
 	const resume = gate();
-	lsp.service = makeLspServiceDouble({
-		supportsLSP: () => true,
-		hasLSP: async () => true,
-		touchFile: vi.fn(async (file: string, content: string) => {
-			await touch(file, content);
-			return { diags: [] };
+	lsp.service = installLspService(
+		makeLspServiceDouble({
+			supportsLSP: () => true,
+			hasLSP: async () => true,
+			touchFile: vi.fn(async (file: string, content: string) => {
+				await touch(file, content);
+				return { diags: [] };
+			}),
+			getTrackedContent: (file: string) => client.getSentContent?.(file),
+			rename: async () => {
+				parked.open();
+				await resume.p;
+				return edit();
+			},
 		}),
-		getTrackedContent: (file: string) => client.getSentContent?.(file),
-		rename: async () => {
-			parked.open();
-			await resume.p;
-			return edit();
-		},
-	});
+	);
 	const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 	const pending = tool.execute(
 		"rename-3827",

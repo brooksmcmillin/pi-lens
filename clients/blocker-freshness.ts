@@ -38,10 +38,12 @@
  * entries whose `sources` were not all `"lsp"` skipped the check entirely. A
  * tree-sitter verdict about F's own syntax is emphatically invalidated by F's own
  * bytes changing, and no other path could clear it —
- * `retireInlineBlockerOnConfirmedClean` requires `coveredSources` to be a superset
- * of the record's sources, `coveredSourcesForCheck` builds that set from the LSP
- * server registry, and no registered server has id `"tree-sitter"`, so the retire
- * could never fire however many clean checks ran. Live shape: a
+ * `retireInlineBlockerOnConfirmedClean` retires only the rows whose source the
+ * verdict's `coveredSources` covers (per row since #4990; a superset of the
+ * record's sources was required before), `coveredSourcesForCheck` builds that set
+ * from the LSP server registry, and no registered server has id `"tree-sitter"`,
+ * so a tree-sitter row could never retire however many clean checks ran. Live
+ * shape: a
  * `ts-incomplete-assertion` blocker re-served every turn for the rest of a session
  * against a file already proven clean by grep, LSP, and a passing test.
  *
@@ -75,22 +77,31 @@
  * Re-arming: `setInlineBlockerSelfDriftStale` re-derives the verdict every turn
  * and un-demotes a record whose bytes come back, exactly as
  * `setInlineBlockerPastEofStale` does for a transient shrink-then-restore. That
- * is what lets this axis stay OUT of the #1950 delivery cap. The cap retires a
- * record permanently after `DEPENDENCY_DRIFT_MAX_DELIVERIES` stale deliveries,
- * which suits recoverable LSP dependency drift; a self-drift record can carry
- * ast-grep or tree-sitter security provenance, and retiring one because an
- * advisory was shown three times would walk a hardcoded secret out of turn-end
- * rendering with no dispatch to re-raise it. A record that heals on its own
- * needs no bounded-noise retirement.
+ * re-arm covers the shape where the file returns to its recorded bytes (a
+ * checkout, a revert, an editor undo). It does NOT cover the ordinary shape an
+ * agent produces: the file was rewritten to fix the code the finding named and
+ * never returns to the recorded bytes. Such a record cannot heal, so it re-served
+ * dead coordinates on every turn end for the rest of the session (#4990).
+ * `SELF_DRIFT_MAX_DELIVERIES` therefore caps it, on the same count-of-deliveries
+ * rule as #1950's dependency cap; a record that heals before the cap still
+ * un-demotes and is never retired. The cap's ledger reason says a re-run can
+ * still confirm, as #1950's does, so it reads distinctly from #1944's
+ * "retired, unrecoverable". The security-provenance concern that kept this axis
+ * uncapped is answered by the re-arm and by the fact that a fresh dispatch of
+ * the file re-raises a finding that is still there; what the cap stops is the
+ * free re-serve of a verdict the record itself says may be dead.
  *
  * Defect shape 24 is satisfied by composition, not by reusing a string: the new
  * reason has per-writer semantics (re-arm, no cap), and like every sibling gate
  * it never touches a demotion another gate made and never heals one it did not
  * make. The commit gate is unaffected either way. `updateGitGuardStatus` counts
- * `getInlineBlockersSnapshot().length` with no `stale` filter, so a demoted
- * record still gates a commit; `tests/clients/blocker-freshness.test.ts` pins
- * that, because it is what makes widening this sweep to security provenance
- * safe at all.
+ * the unsuppressed records with no `stale` filter, so a demoted record still
+ * gates a commit; `tests/clients/blocker-freshness.test.ts` pins that, because
+ * it is what makes widening this sweep to security provenance safe at all. The
+ * one exception is the agent's own disposition: since #4990 the demoted channel
+ * runs the same policy pass as the live one, so a record whose every finding is
+ * marked is stamped `policySuppressed` (out of the gate, out of the advisory)
+ * like any other fully suppressed record.
  *
  * Resolution boundary (#1631 review F8, narrowed by #4438): `extractForwardImportPaths`
  * parses import and export statements and, since #4438, `import("x")` and
@@ -110,20 +121,22 @@
  * observed (every tool, bash included); a writer pi-lens never sees, and a
  * deletion, leave the blocker as it is (#4476).
  *
- * Delivery cap (#1950). A demoted-but-confirmable entry (`alreadyStale` above)
- * is deliberately NOT retired after its past-EOF sibling's one-delivery rule
- * (#1944, `blocker-past-eof.ts`) — its coordinates are still in bounds, so a
- * fresh dispatch can genuinely confirm or clear it, and retiring on delivery
- * one would discard a recoverable finding. But nothing capped how many times
- * the SAME demoted record re-serves: incident data (#1944's lane sweep) showed
- * 18 `alreadyStale` re-serves in one window, with repeat deliveries carrying
+ * Delivery cap (#1950, widened to the self axis by #4990). A
+ * demoted-but-confirmable entry (`alreadyStale` above) is deliberately NOT
+ * retired after its past-EOF sibling's one-delivery rule (#1944,
+ * `blocker-past-eof.ts`) — its coordinates are still in bounds, so a fresh
+ * dispatch can genuinely confirm or clear it, and retiring on delivery one
+ * would discard a recoverable finding. But nothing capped how many times the
+ * SAME demoted record re-serves: incident data (#1944's lane sweep) showed 18
+ * `alreadyStale` re-serves in one window, with repeat deliveries carrying
  * near-zero information after the first. `runtime-turn.ts` counts each
  * delivery (`InlineBlockerRecord.staleDeliveryCount`) and retires the record
- * via `RuntimeCoordinator.retireDemotedDependencyDriftBlocker` once it reaches
- * `DEPENDENCY_DRIFT_MAX_DELIVERIES` — a count, not a TTL or a session
- * boundary, because "how many times has the agent already been told" is the
- * quantity that actually went to zero information, not "how much time has
- * passed". The ledger reason says "capped, re-run can still confirm" so it
+ * via `RuntimeCoordinator.retireDemotedDriftBlocker` once it reaches the cap
+ * for its own reason — `DEPENDENCY_DRIFT_MAX_DELIVERIES` for the import axis,
+ * `SELF_DRIFT_MAX_DELIVERIES` for the own-file axis. A count, not a TTL or a
+ * session boundary, because "how many times has the agent already been told"
+ * is the quantity that actually went to zero information, not "how much time
+ * has passed". The ledger reason says "capped, re-run can still confirm" so it
  * reads distinctly from #1944's "retired, unrecoverable" — a capped record
  * COULD still resolve a fresh dispatch; it just stopped being handed one for
  * free.
@@ -171,6 +184,19 @@ import { TreeSitterSymbolExtractor } from "./tree-sitter-symbol-extractor.js";
 
 /** See the module doc's "Delivery cap (#1950)" section above. */
 export const DEPENDENCY_DRIFT_MAX_DELIVERIES = 3;
+
+/**
+ * #4990: deliveries a `"self-drift"` demotion may re-serve before
+ * `runtime-turn.ts` retires it, the self axis's sibling of
+ * {@link DEPENDENCY_DRIFT_MAX_DELIVERIES}.
+ *
+ * The self axis is re-arming, so a record whose bytes come back is un-demoted
+ * and never reaches this cap. A record the agent fixed by rewriting the file
+ * does not come back, and re-served dead coordinates on every turn end for the
+ * rest of the session; the cap's ledger reason keeps #1950's distinction
+ * ("capped, a re-run can still confirm") rather than #1944's "unrecoverable".
+ */
+export const SELF_DRIFT_MAX_DELIVERIES = 3;
 
 /**
  * #2982: total bytes the self-drift axis may hash in ONE sweep.
@@ -274,6 +300,12 @@ interface WidgetSweepBlockerEntry {
 export interface BlockerFreshnessOptions {
 	/** Wall-clock baseline override; defaults to `Date.now()`. Test seam only. */
 	now?: number;
+	/**
+	 * #4921: the turn session whose inline records this sweep covers (omitted:
+	 * the coordinator's). Another session's are swept at its own turn end,
+	 * against its own cwd.
+	 */
+	sessionId?: string | undefined;
 	/** Forward-import resolution override; defaults to tree-sitter extraction. */
 	resolveForwardImports?: ForwardImportResolver;
 	/**
@@ -1172,7 +1204,9 @@ export async function sweepInlineBlockerFreshness(
 		recordedHash?: string;
 	}>;
 	try {
-		inlineEntries = runtime.getInlineBlockersSnapshot();
+		inlineEntries = runtime.getInlineBlockersSnapshot({
+			sessionId: options?.sessionId,
+		});
 	} catch {
 		return counts;
 	}

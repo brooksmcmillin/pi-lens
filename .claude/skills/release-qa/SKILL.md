@@ -33,9 +33,9 @@ These outrank convenience, habit, and the shape of any previous pass.
    terminal state under a stated cap. Expiry means you did not see the result.
 5. **BLOCKED is not a failure and not a pass.** If pi cannot boot, no ship
    verdict is issued at all. Say BLOCKED and stop.
-6. **The repo's runbook outranks habit.** `docs/release-qa-baseline.md` and
-   `AGENTS.md` are the contract. If a step here disagrees with them, they win
-   and this file is wrong.
+6. **The repo's runbook outranks habit.** `docs/release-qa-baseline.md`,
+   `docs/pi-lens-release.md` and `AGENTS.md` are the contract. If a step here
+   disagrees with them, they win and this file is wrong.
 
 ## Procedure
 

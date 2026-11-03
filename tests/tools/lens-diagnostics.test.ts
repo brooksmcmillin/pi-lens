@@ -23,7 +23,12 @@ import {
 	resetOncePerSessionPhases,
 } from "../../clients/latency-logger.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
-import { pinFixtureHome, removeTempDirSync } from "../clients/test-utils.js";
+import {
+	pinFixtureHome,
+	removeTempDirSync,
+	createPathIdentityFixture,
+} from "../clients/test-utils.js";
+import { STALE_LINE_MARKER } from "../../clients/stale-marker.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
@@ -228,6 +233,7 @@ describe("lens_diagnostics compact filename", () => {
 		fs.writeFileSync(file, "const app = 1;\n");
 		const service = {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -257,6 +263,7 @@ describe("lens_diagnostics compact filename", () => {
 		fs.writeFileSync(unrelated, "const unrelated = 1;\n");
 		const service = {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -312,7 +319,7 @@ describe("lens_diagnostics compact line for a file no language server answered (
 			.render(200)
 			.join("\n");
 		expect(rendered).toContain(
-			"lens_diagnostics probe.json — unconfirmed (no language server answered)",
+			"lens_diagnostics probe.json — unconfirmed (no primary language server answered)",
 		);
 	});
 });
@@ -361,6 +368,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		);
 		const service = {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () =>
 				tiers.map(([_, message, severity]) => ({
@@ -441,6 +449,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		);
 		const service = {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => [
 				{
@@ -487,6 +496,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		fs.writeFileSync(file, "const value: number = 'bad';\n");
 		const service = {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => [
 				{
@@ -530,6 +540,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		const service = {
 			runWorkspaceDiagnostics: vi.fn(async () => []),
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -561,6 +572,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		const touched: string[] = [];
 		const service = {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async (file: string) => {
 				touched.push(file);
 				return undefined;
@@ -595,6 +607,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		function makeService(key: string) {
 			return {
 				announceCreatedFiles: vi.fn(),
+				sweepDocumentDrift: vi.fn(async () => undefined),
 				touchFile: vi.fn(async (f: string) => {
 					touchedByScope.set(key, [...(touchedByScope.get(key) ?? []), f]);
 					return undefined;
@@ -723,10 +736,7 @@ describe("lens_diagnostics source=lsp compact render", () => {
 		expect(line).toContain("timed out");
 	});
 
-	it("preserves navigation-only and unavailable outcomes", () => {
-		expect(
-			render({ source: "lsp", filesChecked: 1, navigationOnlyFiles: 1 }),
-		).toContain("navigation-only");
+	it("preserves unavailable outcomes", () => {
 		expect(
 			render({
 				source: "lsp",
@@ -3429,6 +3439,30 @@ describe("lens_diagnostics mode=full", () => {
 		expect(text).not.toMatch(/(?<![A-Za-z0-9_])lens_diagnostics/);
 	});
 
+	// #4682 F4 (PR #4809 verify round 2): `pi` registers this tool with no
+	// `host` in ctx, so `host: ctx.host ?? "pi"` decides which names a pi agent
+	// reads. Recurrence: flipping that default to "mcp" left the whole file
+	// green (165 passed), so nothing pinned the pi half of the same seam the
+	// MCP case above pins.
+	it("mode=full without refreshRunners names the pi tool when the caller names no host (#4682 F4)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		const tool = makeTool({}, lspService);
+		const result = await tool.execute(
+			"1",
+			{ mode: "full" },
+			new AbortController().signal,
+			null,
+			{ cwd: "/proj" },
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("not run this call (quick mode)");
+		expect(text).toContain("lens_diagnostics mode=full");
+		expect(text).not.toContain("pilens_");
+	});
+
 	it("mode=full refreshRunners=cached triggers the analyzer fresh-fetch for the resolved cwd (#585)", async () => {
 		mockSummaries.length = 0;
 		const lspService = {
@@ -3547,6 +3581,51 @@ describe("lens_diagnostics mode=full", () => {
 			(result.details as { coldRunners?: string[] }).coldRunners,
 		).toContain("jscpd");
 	});
+
+	// RECURRENCE GUARDED: #4911. The project-walk note compared spellings, so a
+	// cwd or a HOME spelled through a link read as a project under the home:
+	// the two walks it describes refused (they compare real paths), and the
+	// empty result rendered as a clean sweep with no note. Both directions,
+	// each with a real directory link and the real `os.homedir()` read.
+	it.each([["home-link"], ["root-link"]] as const)(
+		"mode=full: says the project walk was skipped when the %s spelling names the home (#4911)",
+		async (kind) => {
+			mockSummaries.length = 0;
+			const scratch = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-diag-home-link-"),
+			);
+			const pin = pinFixtureHome("lens-diagnostics-4911");
+			try {
+				const link = path.join(scratch, "link");
+				fs.symlinkSync(pin.home, link, "junction");
+				if (kind === "home-link") {
+					vi.stubEnv("HOME", link);
+					vi.stubEnv("USERPROFILE", link);
+				}
+				const lspService = {
+					runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+				};
+
+				const result = await run(
+					makeTool({}, lspService),
+					{ mode: "full", refreshRunners: "cached" },
+					kind === "root-link" ? link : pin.home,
+				);
+
+				expect(
+					(result.details as { projectWalkUnsafeRoot?: boolean })
+						.projectWalkUnsafeRoot,
+				).toBe(true);
+				expect(String(result.content[0].text)).toContain(
+					"project file walk skipped",
+				);
+			} finally {
+				vi.unstubAllEnvs();
+				pin.restore();
+				removeTempDirSync(scratch);
+			}
+		},
+	);
 
 	// #613: fetchFreshProjectDiagnostics used to be `await`ed only AFTER the LSP
 	// sweep's own Promise.all had already resolved — sequentially eating into
@@ -5930,5 +6009,353 @@ describe("lens_diagnostics scalar path resolution (#4577 M2)", () => {
 			restore();
 			removeTempDirSync(cwd);
 		}
+	});
+});
+
+/**
+ * #4689 item 3, batch 4: mode=full's merge pairs a `Set` of files the sweep
+ * is authoritative for (and a `Set` of files it could not reconcile) with the
+ * widget store's summaries, which are keyed by whatever spelling the writer
+ * used. The sweep names a file by its path identity, the widget store by the
+ * session's spelling, so one file reached through a link read as two.
+ */
+describe("lens_diagnostics mode=full keys one file once across link spellings (#4689)", () => {
+	const staleBlocker: Diag = {
+		severity: "error",
+		semantic: "blocking",
+		message: "stale mid-edit state",
+		line: 1,
+		rule: "ts:2393",
+		tool: "lsp",
+	};
+	let base: string;
+	let fx: ReturnType<typeof createPathIdentityFixture>;
+
+	beforeEach(() => {
+		base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-full-identity-"));
+		fx = createPathIdentityFixture(base);
+	});
+	afterEach(() => removeTempDirSync(base));
+
+	function fullTool(results: unknown[]) {
+		return createLensDiagnosticsTool(
+			makeCacheManager() as any,
+			() => fx.repo,
+			() =>
+				({
+					runWorkspaceDiagnostics: vi.fn().mockResolvedValue(results),
+				}) as any,
+		);
+	}
+
+	const lspRow = (message: string) => ({
+		severity: 1,
+		message,
+		range: {
+			start: { line: 0, character: 0 },
+			end: { line: 0, character: 1 },
+		},
+		source: "ts",
+		code: 2393,
+	});
+
+	// RECURRENCE GUARDED: a clean authoritative sweep named the file by its real
+	// path while the widget summary was stored under the link spelling, so
+	// `authoritativeLspFiles.has(path.resolve(summary.filePath))` missed and the
+	// stale mid-edit blocker rendered forever beside a clean sweep (#1993 again).
+	it("a clean sweep of the real path retires a blocker stored under the link", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		mockSummaries.push(
+			sum(
+				fx.fileLink,
+				{ blocking: 1, errors: 1 },
+				{ diagnostics: [staleBlocker] },
+			),
+		);
+		_setRecentPhasesForTest([]);
+		const result = await run(
+			fullTool([{ filePath: fx.realFile, diagnostics: [], count: 0 }]),
+			{ mode: "full" },
+			fx.repo,
+		);
+		expect(String(result.content[0].text)).not.toContain(
+			"stale mid-edit state",
+		);
+		expect(
+			(result.details as { totalBlocking?: number }).totalBlocking ?? 0,
+		).toBe(0);
+		// The retirement is counted by the same identity, so it stays observable.
+		expect(getRecentLoggedPhases().map((entry) => entry.phase)).toContain(
+			"lsp_authoritative_widget_retire",
+		);
+	});
+
+	// RECURRENCE GUARDED: the same split read the other way, a sweep that names
+	// the link and a widget summary stored under the real path.
+	it("a clean sweep of the link retires a blocker stored under the real path", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		mockSummaries.push(
+			sum(
+				fx.realFile,
+				{ blocking: 1, errors: 1 },
+				{ diagnostics: [staleBlocker] },
+			),
+		);
+		const result = await run(
+			fullTool([{ filePath: fx.fileLink, diagnostics: [], count: 0 }]),
+			{ mode: "full" },
+			fx.repo,
+		);
+		expect(String(result.content[0].text)).not.toContain(
+			"stale mid-edit state",
+		);
+	});
+
+	// RECURRENCE GUARDED: a result the store rejected joined `unreconciledFiles`
+	// under one spelling and the retained summary was looked up under another,
+	// so the retained finding rendered as live instead of stale-marked.
+	it("marks a retained link-spelled finding stale when the real path's result was not reconciled", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		reconcileScanDiagnosticsMock.mockReturnValue(false);
+		mockSummaries.push(
+			sum(
+				fx.fileLink,
+				{ blocking: 1, errors: 1 },
+				{ diagnostics: [{ ...staleBlocker, message: "retained blocker" }] },
+			),
+		);
+		const result = await run(
+			fullTool([{ filePath: fx.realFile, diagnostics: [], count: 0 }]),
+			{ mode: "full" },
+			fx.repo,
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("retained blocker");
+		expect(text).toContain(STALE_LINE_MARKER);
+	});
+
+	// RECURRENCE GUARDED: the dedup key and the per-file grouping took the
+	// session's spelling, so a partially covered sweep of the real path added
+	// the row the widget already held under the link, in a second file group.
+	it("renders one row in one group for a finding held under the link and swept under the real path", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		mockSummaries.push(
+			sum(
+				fx.fileLink,
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [{ ...staleBlocker, message: "held under the link" }],
+				},
+			),
+		);
+		const result = await run(
+			fullTool([
+				{
+					filePath: fx.realFile,
+					diagnostics: [lspRow("swept under the real path")],
+					count: 1,
+					unconfirmedServerIds: ["other-server"],
+				},
+			]),
+			{ mode: "full" },
+			fx.repo,
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("held under the link");
+		expect(text).not.toContain("swept under the real path");
+		expect(result.details).toMatchObject({ totalBlocking: 1 });
+		const headers = text
+			.split("\n")
+			.filter(
+				(line) => /(real|link)\.ts\b/.test(line) && !line.startsWith(" "),
+			);
+		expect(headers, text).toHaveLength(1);
+	});
+
+	// RECURRENCE GUARDED: keying the merge by identity must not turn two stored
+	// summaries of one file (a writer that missed an entry point) into an
+	// overwrite that drops the first one's rows; before #4689 they rendered as
+	// two groups, after a naive identity key as one group missing a row.
+	it("folds a link-spelled and a real-spelled stored summary into one group without losing a row", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		mockSummaries.push(
+			sum(
+				fx.fileLink,
+				{ blocking: 1, errors: 1 },
+				{ diagnostics: [{ ...staleBlocker, message: "row under the link" }] },
+			),
+			sum(
+				fx.realFile,
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [
+						{
+							...staleBlocker,
+							line: 1,
+							rule: "ts:9999",
+							message: "row under the real path",
+						},
+					],
+				},
+			),
+		);
+		const result = await run(fullTool([]), { mode: "full" }, fx.repo);
+		const text = String(result.content[0].text);
+		expect(text).toContain("row under the link");
+		expect(text).toContain("row under the real path");
+		const headers = text
+			.split("\n")
+			.filter(
+				(line) => /(real|link)\.ts\b/.test(line) && !line.startsWith(" "),
+			);
+		expect(headers, text).toHaveLength(1);
+		expect(result.details).toMatchObject({ totalBlocking: 2 });
+	});
+
+	// RECURRENCE GUARDED: the unreconciled Set filled by the spelling of the
+	// sweep's result, read by the identity of the stored summary: a sweep that
+	// names the link missed a summary stored under the real path. Both arms
+	// that fill the Set (a rejected write and a write that threw) are driven.
+	for (const [arm, arrange] of [
+		[
+			"a rejected write",
+			() => reconcileScanDiagnosticsMock.mockReturnValue(false),
+		],
+		[
+			"a write that threw",
+			() =>
+				reconcileScanDiagnosticsMock.mockImplementation(() => {
+					throw new Error("store refused");
+				}),
+		],
+	] as const) {
+		it(`marks a retained real-path finding stale when the link's result hit ${arm}`, async (ctx) => {
+			if (fx.skipReason) return ctx.skip(fx.skipReason);
+			arrange();
+			mockSummaries.push(
+				sum(
+					fx.realFile,
+					{ blocking: 1, errors: 1 },
+					{ diagnostics: [{ ...staleBlocker, message: "retained blocker" }] },
+				),
+			);
+			const result = await run(
+				fullTool([{ filePath: fx.fileLink, diagnostics: [], count: 0 }]),
+				{ mode: "full" },
+				fx.repo,
+			);
+			const text = String(result.content[0].text);
+			expect(text).toContain("retained blocker");
+			expect(text).toContain(STALE_LINE_MARKER);
+		});
+	}
+
+	// RECURRENCE GUARDED: a row the sweep adds under the link spelling opened a
+	// second group beside the widget's group for the same file, because the
+	// per-file map was keyed by the sweep's spelling.
+	it("adds a swept row under the link to the group the widget holds for the real path", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		mockSummaries.push(
+			sum(
+				fx.realFile,
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [
+						{ ...staleBlocker, message: "held under the real path" },
+					],
+				},
+			),
+		);
+		const result = await run(
+			fullTool([
+				{
+					filePath: fx.fileLink,
+					diagnostics: [{ ...lspRow("swept under the link"), code: 9999 }],
+					count: 1,
+					unconfirmedServerIds: ["other-server"],
+				},
+			]),
+			{ mode: "full" },
+			fx.repo,
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("held under the real path");
+		expect(text).toContain("swept under the link");
+		const headers = text
+			.split("\n")
+			.filter(
+				(line) => /(real|link)\.ts\b/.test(line) && !line.startsWith(" "),
+			);
+		expect(headers, text).toHaveLength(1);
+	});
+
+	// RECURRENCE GUARDED: the dedup key took the sweep's spelling while the
+	// stored row's key was recorded under the identity, so the same finding
+	// swept under the link rendered twice beside the widget's row.
+	it("renders one row for a finding held under the real path and swept under the link", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		mockSummaries.push(
+			sum(
+				fx.realFile,
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [
+						{ ...staleBlocker, message: "held under the real path" },
+					],
+				},
+			),
+		);
+		const result = await run(
+			fullTool([
+				{
+					filePath: fx.fileLink,
+					diagnostics: [lspRow("swept under the link")],
+					count: 1,
+					unconfirmedServerIds: ["other-server"],
+				},
+			]),
+			{ mode: "full" },
+			fx.repo,
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("held under the real path");
+		expect(text).not.toContain("swept under the link");
+		expect(result.details).toMatchObject({ totalBlocking: 1 });
+	});
+
+	// RECURRENCE GUARDED: folding two stored summaries of one file kept the
+	// first one's `hasFinalSnapshot`, so a final link summary swallowed a
+	// non-final real-path summary and the group lost its `(pending)` marker.
+	it("keeps the pending marker when a non-final summary folds into a final one", async (ctx) => {
+		if (fx.skipReason) return ctx.skip(fx.skipReason);
+		mockSummaries.push(
+			sum(
+				fx.fileLink,
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [
+						{ ...staleBlocker, message: "final row under the link" },
+					],
+				},
+			),
+			sum(
+				fx.realFile,
+				{ blocking: 1, errors: 1 },
+				{
+					hasFinalSnapshot: false,
+					diagnostics: [
+						{
+							...staleBlocker,
+							rule: "ts:9999",
+							message: "pending row under the real path",
+						},
+					],
+				},
+			),
+		);
+		const result = await run(fullTool([]), { mode: "full" }, fx.repo);
+		const text = String(result.content[0].text);
+		expect(text).toContain("pending row under the real path");
+		expect(text).toContain("(pending)");
 	});
 });

@@ -20,6 +20,11 @@ vi.mock("node:fs", async () => {
 	return {
 		...actual,
 		realpathSync: { ...actual.realpathSync, native: realpathNativeMock },
+		// The synthetic `/repo/...` cwds are not on disk; `canonicalProjectRoot`
+		// memoizes a cwd only when it exists (#2077), so they must count as present
+		// for the memo to be exercised (#4689 batch 2 moved the "resolved" answer
+		// from the realpath throwing to this probe).
+		existsSync: () => true,
 	};
 });
 

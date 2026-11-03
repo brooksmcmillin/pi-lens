@@ -371,6 +371,138 @@ describe("real wrapper effective compiler trust (#4299)", () => {
 			expect(fs.existsSync(hostile.marker)).toBe(!adopted);
 		},
 	);
+	it("refuses an adopted root's shim reached through a relative PATH entry (#4299 R2-F1, #4532)", async () => {
+		// #4532: husky's generated `.husky/_/h` exports a RELATIVE
+		// `node_modules/.bin` PATH entry for every git hook, and the pre-push
+		// hook chain hands that PATH to the whole test run. A relative entry
+		// follows each spawn's own cwd, so the bare `vscode-html-language-server`
+		// candidate resolved to the ADOPTED root's `.bin` inside the child while
+		// the launcher's own probe found nothing and the permission gate had no
+		// resolved path to refuse. Pin the ambient spelling: an adopted root's
+		// shim must not run however its PATH happens to be spelled.
+		const session = path.join(tmp, "session");
+		project(session);
+		const root = path.join(tmp, "adopted");
+		const file = path.join(root, "index.html");
+		project(root);
+		fs.writeFileSync(file, "<p>hello</p>");
+		const hostile = nativeCompilerTree(root, "relative-path-launcher");
+		const suffix = process.platform === "win32" ? ".cmd" : "";
+		const command = path.join(
+			root,
+			"node_modules",
+			".bin",
+			`vscode-html-language-server${suffix}`,
+		);
+		fs.copyFileSync(`${hostile.tsc}${suffix}`, command);
+		fs.chmodSync(command, 0o755);
+		selectedServer.value = "html";
+		expect(resolveAnalysisRoot(file, session)).toBe("adopted");
+		process.chdir(session);
+		setProjectTrustState("trusted");
+		const restorePath = withEnv({
+			PATH: `node_modules/.bin${path.delimiter}${process.env.PATH ?? ""}`,
+		});
+		try {
+			expect(await attach(session, root, file)).toBeUndefined();
+			expect(fs.existsSync(hostile.marker)).toBe(false);
+		} finally {
+			restorePath();
+		}
+	});
+	it("never runs a project-supplied which while resolving a bare server command (#4532 HIGH-2)", async () => {
+		// Round 2 moved the probe's cwd into the SPAWN cwd and used `which` from
+		// PATH — so the probe's own binary resolved through the same untrusted
+		// PATH and cwd it was added to judge. An adopted root shipping
+		// `node_modules/.bin/which` ran its own copy of the resolver, wrote its
+		// marker, and could answer anything: here it echoes the bare name, the
+		// launcher keeps the unresolved token, the permission gate has nothing to
+		// refuse, and the child execs the adopted root's `vscode-html-language-server`
+		// shim. The launcher now scans PATH in process; neither marker may appear.
+		const session = path.join(tmp, "session");
+		project(session);
+		const root = path.join(tmp, "adopted");
+		const file = path.join(root, "index.html");
+		project(root);
+		fs.writeFileSync(file, "<p>hello</p>");
+		const hostile = nativeCompilerTree(root, "hostile-which");
+		const suffix = process.platform === "win32" ? ".cmd" : "";
+		const bin = path.join(root, "node_modules", ".bin");
+		const command = path.join(bin, `vscode-html-language-server${suffix}`);
+		fs.copyFileSync(`${hostile.tsc}${suffix}`, command);
+		fs.chmodSync(command, 0o755);
+		const probeMarker = path.join(root, "hostile-which.marker");
+		const probe = path.join(
+			bin,
+			process.platform === "win32" ? "where.cmd" : "which",
+		);
+		fs.writeFileSync(
+			probe,
+			process.platform === "win32"
+				? `@echo off\r\necho ran> "${probeMarker}"\r\necho %1\r\n`
+				: `#!/bin/sh\necho ran > "${probeMarker}"\necho "vscode-html-language-server"\n`,
+		);
+		fs.chmodSync(probe, 0o755);
+		selectedServer.value = "html";
+		expect(resolveAnalysisRoot(file, session)).toBe("adopted");
+		process.chdir(session);
+		setProjectTrustState("trusted");
+		const restorePath = withEnv({
+			PATH: `node_modules/.bin${path.delimiter}${process.env.PATH ?? ""}`,
+		});
+		try {
+			// The marker assertions name the defect first: a spawn-based probe
+			// executes the project's `which` even when the shim itself is later
+			// refused, so "no project program ran" is the round-3 requirement.
+			const spawned = await attach(session, root, file);
+			expect(fs.existsSync(probeMarker)).toBe(false);
+			expect(fs.existsSync(hostile.marker)).toBe(false);
+			expect(spawned).toBeUndefined();
+		} finally {
+			restorePath();
+		}
+	});
+	it.skipIf(process.platform === "win32")(
+		"skips a PATH directory and a non-executable file of the server's name (#4532 F4)",
+		async () => {
+			// #4532 review F4: the in-process PATH scan replaced `which`, and its
+			// `isFile`/`X_OK` checks had no witness. Without them the scan returns
+			// the first entry of the right NAME: a directory (a directory passes
+			// X_OK) or a 0644 file, the launcher spawns it, and the real server
+			// later on PATH never starts. The kernel's own search skips both.
+			const session = path.join(tmp, "session");
+			const file = path.join(session, "index.html");
+			project(session);
+			fs.writeFileSync(file, "<p>hello</p>");
+			const server = nativeCompilerTree(session, "path-scan-launcher");
+			const name = "vscode-html-language-server";
+			const decoyDir = path.join(tmp, "path-decoy-dir");
+			fs.mkdirSync(path.join(decoyDir, name), { recursive: true });
+			const nonExecDir = path.join(tmp, "path-non-exec");
+			fs.mkdirSync(nonExecDir);
+			fs.writeFileSync(path.join(nonExecDir, name), "#!/bin/sh\nexit 0\n");
+			fs.chmodSync(path.join(nonExecDir, name), 0o644);
+			const binDir = path.join(tmp, "path-bin");
+			fs.mkdirSync(binDir);
+			fs.copyFileSync(server.tsc, path.join(binDir, name));
+			fs.chmodSync(path.join(binDir, name), 0o755);
+			selectedServer.value = "html";
+			expect(resolveAnalysisRoot(file, session)).toBe("session");
+			process.chdir(session);
+			setProjectTrustState("trusted");
+			const restorePath = withEnv({
+				PATH: [decoyDir, nonExecDir, binDir, process.env.PATH ?? ""].join(
+					path.delimiter,
+				),
+			});
+			try {
+				expect(await attach(session, session, file)).toBeDefined();
+				expect(fs.existsSync(server.marker)).toBe(true);
+			} finally {
+				restorePath();
+			}
+		},
+	);
 	it("forces an absolute managed compiler through the real wrapper under unknown trust", async () => {
 		const root = path.join(tmp, "project");
 		const file = project(root);

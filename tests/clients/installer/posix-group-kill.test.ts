@@ -21,6 +21,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { safeSpawnAsync } from "../../../clients/safe-spawn.js";
 import { removeTempDirSync } from "../test-utils.js";
+import { waitFor } from "../interleaving-kit.js";
+import { scaledTestTimeout } from "../../support/test-timeout-scale.js";
 
 const d = it.skipIf(process.platform === "win32");
 
@@ -96,10 +98,10 @@ describe("safeSpawnAsync POSIX process-group kill (#2026/#2027)", () => {
 
 			await safeSpawnAsync(script, ["--version"], { timeout: 30_000 });
 
-			for (let waited = 0; waited < 8_000; waited += 250) {
-				if (fs.existsSync(marker)) break; // observed: now assert dead
-				await new Promise((r) => setTimeout(r, 250));
-			}
+			await waitFor(() => fs.existsSync(marker), Boolean, {
+				timeoutMs: 8_000,
+				intervalMs: 250,
+			});
 			// Grandchild survives its own schedule in THIS scenario by design:
 			// the direct child exited normally, so no kill was ever issued.
 			// What matters for #2027: a KILLED tree must not leave markers -
@@ -107,7 +109,11 @@ describe("safeSpawnAsync POSIX process-group kill (#2026/#2027)", () => {
 			// exit does NOT trigger spurious kills.
 			expect(fs.existsSync(marker)).toBe(true);
 		},
-		20_000,
+		// The wait's 8,000 ms budget scales with `PI_LENS_TEST_TIMEOUT_SCALE`
+		// (24,000 ms on the Windows leg), so the test deadline must stay above it
+		// or a marker that never lands reports `Test timed out` instead of the
+		// wait's diagnostic (#4983).
+		scaledTestTimeout(30_000),
 	);
 });
 // flake-shape: real-process-spawn — real POSIX shell descendants prove process-group termination across OS process state

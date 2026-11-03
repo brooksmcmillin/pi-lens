@@ -25,3 +25,16 @@ export function scaledTestTimeout(
 ): number {
 	return baseMs * testTimeoutScale(env);
 }
+
+/**
+ * #4828: the budget for a test whose callback walks the repo tree (or reads a
+ * population a walk built). Vitest's 5 s default reds on the Windows unit leg
+ * (`Unit tests Windows`): the walk costs several times its Linux time there,
+ * and `pi-mock-importer-sweep` timed out at 5000 ms on #4823 where Linux takes
+ * 711 ms. The slowest Linux census in tests/config is 1.2 s
+ * (`real-home-reader-registry`), so 30 s is at least 4x that, and the lane's
+ * own scale (3 on Windows) widens it to 90 s. A ceiling only: a passing case
+ * costs what it always did. `tests/config/tree-census-timeout.test.ts` refuses
+ * a census that omits it.
+ */
+export const TREE_WALK_TIMEOUT_MS = scaledTestTimeout(30_000);

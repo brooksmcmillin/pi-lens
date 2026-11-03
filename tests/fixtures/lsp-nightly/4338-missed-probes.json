@@ -1,0 +1,1444 @@
+{
+ "source": "Reconstructed from #4512 (evidence) and PR #4338: the matrix at origin/master 23aebcc2c (matrix-before-4338.md, a recorded doc) replayed over eight nights. From 2026-10-10 the probe observes nothing for the five servers #4338 turned unknown (pyright, yaml-language-server, bash-language-server, docker-langserver, @prisma/language-server); every other measured cell is re-observed each night. On 2026-10-17 the probe observes the five again. The observation rows are derived from the recorded doc, not captured from a run log.",
+ "missedLangs": [
+  "python",
+  "yaml",
+  "shell",
+  "dockerfile",
+  "prisma"
+ ],
+ "nights": [
+  {
+   "day": "2026-10-10",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  },
+  {
+   "day": "2026-10-11",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  },
+  {
+   "day": "2026-10-12",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  },
+  {
+   "day": "2026-10-13",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  },
+  {
+   "day": "2026-10-14",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  },
+  {
+   "day": "2026-10-15",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  },
+  {
+   "day": "2026-10-16",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  },
+  {
+   "day": "2026-10-17",
+   "observations": [
+    {
+     "lang": "json",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "css",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "html",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "rust",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "svelte",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "deno",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "ruby",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "csharp",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "typescript",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "markdown",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "lua",
+     "cleanBehavior": "silent",
+     "firstPublish": "direct",
+     "tier": "3"
+    },
+    {
+     "lang": "python",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "jedi",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "yaml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "shell",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "dockerfile",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "dockerfile-official",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "toml",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "terraform",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "prisma",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "php",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "empty-first",
+     "tier": "2*"
+    },
+    {
+     "lang": "zig",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "vue",
+     "cleanBehavior": null,
+     "firstPublish": null,
+     "tier": null
+    },
+    {
+     "lang": "dart",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "gleam",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "clojure",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "opengrep",
+     "cleanBehavior": "publishes-unversioned",
+     "firstPublish": "direct",
+     "tier": "2*"
+    },
+    {
+     "lang": "ast-grep",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    },
+    {
+     "lang": "cue",
+     "cleanBehavior": "publishes-versioned",
+     "firstPublish": "direct",
+     "tier": "2"
+    }
+   ]
+  }
+ ]
+}

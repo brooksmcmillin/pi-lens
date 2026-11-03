@@ -20,6 +20,7 @@ import { handleAgentEnd } from "../../clients/runtime-agent-end.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { hashlineFixture } from "../support/hashline-anchor-vectors.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { assertNonEmptyScan, escapeRegExp } from "../support/sweep-kit.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -29,10 +30,6 @@ vi.mock("../../clients/pipeline.js", async (importOriginal) => {
 	return { ...actual, runPipeline: vi.fn() };
 });
 
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	notifyExternalFileChange: vi.fn(async () => undefined),
-}));
-
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
 	...(await importOriginal<
 		typeof import("../../clients/read-guard-logger.js")
@@ -40,7 +37,10 @@ vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
 	logReadGuardEvent: vi.fn(),
 }));
 
-beforeEach(() => {
+beforeEach(async () => {
+	// `notifyExternalFileChange` resolves undefined on the factory's default
+	// double, as the former one-export module mock did.
+	await installLspServiceDouble();
 	vi.mocked(logReadGuardEvent).mockClear();
 });
 
@@ -223,8 +223,8 @@ describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chai
 					}) as never,
 			} as never);
 
-			expect(formatted.map((fp) => path.resolve(fp))).toContain(
-				path.resolve(filePath),
+			expect(formatted.map((fp) => fs.realpathSync(fp))).toContain(
+				fs.realpathSync(filePath),
 			);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
@@ -1190,6 +1190,30 @@ describe("#3650 adapter-declared mutation path", () => {
 		expect(
 			readToolResultPathField({ toolName: "read", input: { path: ["/a.ts"] } }),
 		).toBe(undefined);
+	});
+
+	/**
+	 * RECURRENCE GUARDED (#5047 r1 F4): `file` is a declared alias of `path` on
+	 * `lsp_navigation` (#5041), but the tool_result reader and the arming
+	 * predicate read `path` only, so a rename sent with `file` resolved to no
+	 * path at either seam. `path` still wins when both are sent.
+	 */
+	it("reads the `file` alias of `path` at both host readers", async () => {
+		const { readMutationPathField, readToolResultPathField } =
+			await import("../../clients/mutating-tool.js");
+		const event = (input: Record<string, unknown>) => ({
+			toolName: "lsp_navigation",
+			input,
+		});
+		expect(readToolResultPathField(event({ file: "src/a.ts" }))).toBe(
+			"src/a.ts",
+		);
+		expect(readMutationPathField(event({ file: "src/a.ts" }))).toBe("src/a.ts");
+		expect(
+			readToolResultPathField(event({ path: "src/a.ts", file: "src/b.ts" })),
+		).toBe("src/a.ts");
+		expect(readToolResultPathField(event({ file: "" }))).toBe(undefined);
+		expect(readToolResultPathField(event({ file: 42 }))).toBe(undefined);
 	});
 
 	/**

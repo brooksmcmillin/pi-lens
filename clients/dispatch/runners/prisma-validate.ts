@@ -10,7 +10,7 @@ import type {
 } from "../types.js";
 import { resolveLocalFirstAsync } from "./utils/runner-helpers.js";
 import { getIsolatedNpxSpawnOptions } from "../../tool-probe.js";
-import { finishParsedRun } from "./utils/tool-failure.js";
+import { faultIfCutShort, finishParsedRun } from "./utils/tool-failure.js";
 
 /**
  * The trailer of prisma's own validation report, measured on prisma 6.16.2:
@@ -77,16 +77,20 @@ const prismaValidateRunner: RunnerDefinition = {
 			},
 		);
 
-		if (result.error && !result.stdout && !result.stderr) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
 		if (result.status === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
 
 		const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
 		const diagnostics = parsePrismaValidateOutput(output, ctx.filePath);
+		// #4130: a validate cut short is a fault whatever it printed, including
+		// startup lines only. Its findings count only when they are prisma's own
+		// validation report (below); any other output goes to the shared
+		// parse-error arm.
+		const findings = PRISMA_VALIDATION_REPORT.test(output) ? diagnostics : [];
+		const cutShort = faultIfCutShort(result, findings);
+		if (cutShort) return cutShort;
+
 		if (diagnostics.length === 0) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
@@ -99,7 +103,7 @@ const prismaValidateRunner: RunnerDefinition = {
 			// nonzero output (npm's E404 when `npx --no prisma` has nothing to
 			// run) is a tool that never validated, and goes to the shared
 			// parse-error arm instead of becoming a blocking "schema" finding.
-			diagnostics: PRISMA_VALIDATION_REPORT.test(output) ? diagnostics : [],
+			diagnostics: findings,
 			classify: () => ({ status: "failed", semantic: "blocking" }),
 		});
 	},

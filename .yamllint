@@ -8,10 +8,11 @@ ignore: |
   # Rule-pack YAML is pi-lens's own bespoke DSL (id/severity/pattern
   # fields), governed by scripts/validate-rule-catalog.mjs and
   # scripts/audit-astgrep-rule-pairs.mjs, not generic prose-config style —
-  # plus it includes the vendored CodeRabbit pack (AGENTS.md "Rule
-  # catalogs"), which is not ours to reformat.
+  # plus it includes the vendored CodeRabbit pack (AGENTS.md "Commands and gates"), which is not ours to reformat.
   rules/ast-grep-rules/
   rules/tree-sitter-queries/
+  # The repo-only governance rules (#4865) are the same ast-grep DSL.
+  scripts/governance-rules/
   # Vendored Vale style packages (.vale.ini's own StylesPath), same
   # not-ours-to-reformat reasoning.
   .vale/styles/

@@ -26,8 +26,19 @@ export function changesTestTreeFile(file: string): boolean;
 /** CI-only suites (file → why it cannot run in pre-push), #3426 H3432-1. */
 export const CI_ONLY_PRE_PUSH_TESTS: Record<string, string>;
 
-/** Returns pushed diff ranges, or null for a deletion-only push. */
-export function resolveDiffRange(input?: string): string[] | null;
+/** `upstream/master` when it has commits `origin/master` lacks (#4724). */
+export function resolveBaseRef(): "origin/master" | "upstream/master";
+
+/**
+ * Returns `<base>...<pushed sha>` ranges, or null for a deletion-only push.
+ * `remoteTip` returns the pre-#4724 ranges, the fallback for an unresolvable
+ * base.
+ */
+export function resolveDiffRange(
+	input?: string,
+	base?: string,
+	options?: { remoteTip?: boolean },
+): string[] | null;
 
 export function changesProductionFile(file: string): boolean;
 
@@ -95,6 +106,8 @@ export interface PrePushRecord {
 		| "tests-failed"
 		| "tests-lock-timeout"
 		| "tests-runner-failed";
+	/** Set only when the tests ran in a clean checkout of exactly this head. */
+	treeBound?: true;
 }
 
 export function readPrePushRecord(
@@ -114,6 +127,7 @@ export function writePrePushRecord(input: {
 	vitestExitCode: number | null;
 	wallTimeMs: number;
 	outcome?: PrePushRecord["outcome"];
+	treeBound?: boolean;
 }): PrePushRecord;
 
 export function parseVitestCounts(output: string): {

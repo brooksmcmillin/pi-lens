@@ -35,6 +35,7 @@ import {
 	_resetStateCacheForTests,
 } from "../../clients/diagnostic-dispositions.js";
 import type { LSPDiagnostic } from "../../clients/lsp/client.js";
+import { hasResolvableNodeModules } from "../../clients/lsp/environment-gap.js";
 import {
 	_resetOutstandingCascadeTouchesForTests,
 	recordOutstandingCascadeTouch,
@@ -275,6 +276,23 @@ describe("cold-neighbour cascade run applies the finding policy (#3102)", () => 
 		// delivery that dropped nothing could still announce
 		// "suppressed by disposition: 0 finding(s)" and no case would notice.
 		expect(content).not.toContain("suppressed by disposition:");
+	});
+
+	// #4532 round 5 (review F3; AGENTS.md shape 71): the quiet-window lane is the
+	// second caller of the cascade's display seam, so the same environment gap
+	// leaves its run too, and the real error stays.
+	it("drops a cold neighbour's environment-gap row in a root with no install (#4532)", async () => {
+		expect(hasResolvableNodeModules(env.tmpDir)).toBe(false);
+		const content = await reconcileAndDeliver([
+			errorDiag(
+				0,
+				"Cannot find module 'node:crypto' or its corresponding type declarations.",
+				2307,
+			),
+			errorDiag(1, OTHER_MESSAGE),
+		]);
+		expect(content).not.toContain("node:crypto");
+		expect(content).toContain(OTHER_MESSAGE);
 	});
 
 	it("#3168 F2: a carried run's re-rendered blocker is labeled with its observation age", async () => {

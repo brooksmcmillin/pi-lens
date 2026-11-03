@@ -11,11 +11,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
@@ -63,9 +58,12 @@ function makeDiagnostic(message: string) {
 }
 
 describe("getDiagnostics early-unblock", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});

@@ -17,7 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	flushLatencyLog,
 	getLatencyLogPath,
@@ -236,7 +236,7 @@ describe("a JSON file whose language server cannot start (#4322)", () => {
 		const result = await diagnose("all", { paths: [probe, secondProbe] });
 
 		expect(result.text).toContain(
-			"0 files confirmed clean, 2 unconfirmed: 2 with no language server " +
+			"0 files confirmed clean, 2 unconfirmed: 2 with no primary language server " +
 				"answer (it could not be started, or was still starting).",
 		);
 		// typos did answer, so the files are inconclusive, not "unavailable":
@@ -306,10 +306,20 @@ describe("a JSON file whose language server cannot start (#4322)", () => {
 		// would otherwise have supplied; run alone, the case is order-independent.
 		await diagnose("all", { path: mixed });
 
-		const result = await diagnose("primary", { paths: [mixed, slow] });
+		// #3801: the css shim holds its pull for 20 s and the tool waits out the
+		// production diagnostics budget (25.8 s). The case asserts the reason
+		// clause, which needs the check to time out, not how long it waited, so
+		// the window is capped for this call alone.
+		vi.stubEnv("PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS", "3000");
+		let result: Awaited<ReturnType<typeof diagnose>>;
+		try {
+			result = await diagnose("primary", { paths: [mixed, slow] });
+		} finally {
+			vi.unstubAllEnvs();
+		}
 
 		expect(result.text).toContain(
-			"1 with no language server answer (it could not be started, or was " +
+			"1 with no primary language server answer (it could not be started, or was " +
 				"still starting); the other 1: 1 timed out",
 		);
 	}, 60_000);
@@ -362,7 +372,7 @@ describe("a JSON file whose language server cannot start (#4322)", () => {
 
 		expect(result.text).toContain(TYPOS_FINDING);
 		expect(result.text).toContain(
-			"1 file with auxiliary findings only: no language server answered",
+			"1 file with auxiliary or fallback findings only: no primary language server answered",
 		);
 		const outcomes = result.details.outcomes as Array<{ reason?: string }>;
 		expect(outcomes.map((outcome) => outcome.reason)).toEqual([
@@ -381,7 +391,7 @@ describe("a JSON file whose language server cannot start (#4322)", () => {
 
 		expect(result.text).toContain(TYPOS_FINDING);
 		expect(result.text).toContain(
-			"1 file with auxiliary findings only: no language server answered",
+			"1 file with auxiliary or fallback findings only: no primary language server answered",
 		);
 		const outcomes = result.details.outcomes as Array<{ reason?: string }>;
 		expect(outcomes.map((outcome) => outcome.reason)).toEqual([

@@ -44,6 +44,8 @@ import {
 	resetLSPConfigWarnCache,
 } from "../../clients/lsp/config.js";
 import { removeTempDirSync } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 // Capture, never discard: the loader's records must reach the sinks, and a
 // test that throws the notices away cannot tell a suppressed one from an
@@ -118,16 +120,12 @@ function populateRunnerIdentity(): void {
 /** Pin the global tier to the fixture home; returns the env restore. */
 function homeEnvFor(home: string): { restore: () => void } {
 	const previousHome = process.env.PI_LENS_HOME;
-	const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
-	process.env.PI_LENS_CONFIG_PATH = path.join(home, ".pi-lens", "config.json");
+	setConfigPath(path.join(home, ".pi-lens", "config.json"));
 	return {
 		restore: () => {
 			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 			else process.env.PI_LENS_HOME = previousHome;
-			if (previousConfigPath === undefined) {
-				delete process.env.PI_LENS_CONFIG_PATH;
-			} else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 		},
 	};
 }

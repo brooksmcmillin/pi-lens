@@ -11,7 +11,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
  * `npm install --omit=dev` (peers omitted), so any *value* import of the host
  * SDK fails to resolve at user sites, and making it a real dependency drags a
  * transitive tree whose nested paths exceed Windows MAX_PATH — which breaks
- * `git clean -fdx` on `pi update`. See AGENTS.md, "Dependencies & install
+ * `git clean -fdx` on `pi update`. See HISTORY.md, "Dependencies & install
  * constraints".
  *
  * This invariant was previously prose only. It is load-bearing: it is exactly

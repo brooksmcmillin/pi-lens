@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AstGrepClient } from "../../clients/ast-grep-client.js";
 
 /** Build a client whose private SgRunner is replaced with a stubbed exec. */
@@ -227,6 +228,79 @@ describe("AstGrepClient validatePattern/validateRule", () => {
 		const dir = tempScanAsync.mock.calls[0][0] as string;
 		expect(dir).toContain("pi-lens-sg-rule-");
 		expect(seenFiles[0]).toContain("snippet.py");
+		expect(path.basename(dir)).toContain("pi-lens-sg-rule-");
+	});
+});
+
+// Recurrence: #4133 gave every scanner whose report directory is created with
+// `mkdtempSync` one temp-root seam (`scannerReportParentDir`), so a harness
+// that SIGKILLs the child before its `finally` strands the directory inside a
+// root the harness removes. These three snippet directories stayed on a raw
+// `os.tmpdir()` and would still land in the shared tmpdir.
+describe("AstGrepClient snippet directories use the scanner temp-root seam", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		for (const root of roots.splice(0))
+			fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	/** A harness-owned scanner root, resolved so the comparison is host-neutral. */
+	function ownedScannerRoot(): string {
+		const root = fs.realpathSync(
+			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-scanner-root-")),
+		);
+		roots.push(root);
+		vi.stubEnv("PI_LENS_TEST_SCANNER_TMPDIR", root);
+		return root;
+	}
+
+	it("dumpAst creates its snippet directory under the owned scanner root", async () => {
+		const root = ownedScannerRoot();
+		const execRaw = vi.fn(async (args: string[]) => ({
+			stdout: "",
+			stderr: "no tree",
+			status: 2,
+			args,
+		}));
+		const client = clientWithValidationRunner({ execRaw });
+
+		await client.dumpAst("const a = 1;", "typescript");
+
+		const snippet = execRaw.mock.calls[0][0].at(-1) as string;
+		expect(fs.realpathSync(path.dirname(path.dirname(snippet)))).toBe(root);
+		expect(path.basename(path.dirname(snippet))).toContain("pi-lens-ast-dump-");
+	});
+
+	it("validatePattern creates its snippet directory under the owned scanner root", async () => {
+		const root = ownedScannerRoot();
+		const execRaw = vi.fn(async (_args: string[]) => ({
+			stdout: "[]",
+			stderr: "",
+			status: 0,
+		}));
+		const client = clientWithValidationRunner({ execRaw });
+
+		await client.validatePattern("print($X)", "python");
+
+		const snippet = execRaw.mock.calls[0][0].at(-1) as string;
+		expect(fs.realpathSync(path.dirname(path.dirname(snippet)))).toBe(root);
+		expect(path.basename(path.dirname(snippet))).toContain(
+			"pi-lens-sg-validate-",
+		);
+	});
+
+	it("validateRule creates its snippet directory under the owned scanner root", async () => {
+		const root = ownedScannerRoot();
+		const tempScanAsync = vi.fn(async (..._args: unknown[]) => []);
+		const client = clientWithValidationRunner({ tempScanAsync });
+
+		await client.validateRule(
+			"id: py-call\nlanguage: Python\nrule:\n  kind: call",
+		);
+
+		const dir = tempScanAsync.mock.calls[0][0] as string;
+		expect(fs.realpathSync(path.dirname(dir))).toBe(root);
 		expect(path.basename(dir)).toContain("pi-lens-sg-rule-");
 	});
 });

@@ -55,7 +55,7 @@ async function _weakenedWithBoundsWorkDoesNotTypeCheck(): Promise<void> {
 // "function"`; weakening the constraint to plain `T` leaves every runtime case
 // in this file green and reds only `tsc` (TS2578), so the case guarded nothing
 // the probe function did not already guard — deleted in #2574 round 2 under
-// AGENTS.md "Vacuous and trivial tests are deleted in the PR that touches them".
+// HISTORY.md "Vacuous and trivial tests are deleted in the PR that touches them".
 void _weakenedWithBoundsWorkDoesNotTypeCheck;
 
 /**

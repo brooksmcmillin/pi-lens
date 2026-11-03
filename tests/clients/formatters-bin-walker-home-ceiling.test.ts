@@ -136,6 +136,32 @@ describe.each(WALKERS)(
 			}
 		});
 
+		// RECURRENCE GUARDED: #4911. The walk is spelled by design (#4689 item
+		// 6) and its ceiling compared spellings too, so a HOME or a project
+		// spelled through a link climbed to the home's bin. Both directions,
+		// each with a real directory link.
+		it.each([["home-link"], ["root-link"]] as const)(
+			"a bin AT the home directory is not resolved when the %s spelling names the home (#4911)",
+			(kind) => {
+				const { fakeHome, nested } = makeFixture();
+				try {
+					plantBin(fakeHome, binSubpath("oxfmt"));
+					const link = path.join(tmpDir, "link");
+					fs.symlinkSync(fakeHome, link, "junction");
+					const start =
+						kind === "root-link"
+							? path.join(link, path.relative(fakeHome, nested))
+							: nested;
+
+					expect(
+						walk("oxfmt", start, kind === "home-link" ? link : fakeHome),
+					).toBeNull();
+				} finally {
+					removeTempDirSync(tmpDir);
+				}
+			},
+		);
+
 		it("the project's OWN bin below HOME still resolves (~/proj/… layout)", () => {
 			const { fakeHome, project, nested } = makeFixture();
 			try {
@@ -149,7 +175,7 @@ describe.each(WALKERS)(
 			}
 		});
 
-		it("a re-spelled HOME still ceilings on win32 (drive-letter case) and stays case-sensitive on POSIX (#2544 F1)", () => {
+		it("a re-spelled HOME ceilings the walk when both spellings identify the planted home (#2544 F1)", () => {
 			const { fakeHome, nested } = makeFixture();
 			try {
 				plantBin(fakeHome, binSubpath("oxfmt"));
@@ -160,9 +186,9 @@ describe.each(WALKERS)(
 
 				const resolved = walk("oxfmt", nested, respelledHome);
 
-				if (isWin) {
-					// `c:\…` IS `C:\…`; the ceiling must hold, or a walk started from
-					// the lowercase-drive VS Code URI form climbs straight past HOME.
+				if (isWin || fs.existsSync(respelledHome)) {
+					// The only planted home is reachable under both spellings on
+					// case-insensitive filesystems, including macOS APFS.
 					expect(resolved).toBeNull();
 				} else {
 					// `<tmp>/HOME` is NOT `<tmp>/home` on a case-sensitive filesystem,

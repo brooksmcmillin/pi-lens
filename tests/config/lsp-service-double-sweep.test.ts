@@ -149,6 +149,11 @@ async function liveCounts(): Promise<Record<string, number>> {
 		if (NOT_SUBJECTS.has(rel)) continue;
 		const hits = await findHandRolledLspDoubles(source);
 		if (hits.length > 0) counts[rel] = hits.length;
+		// #4736: an `await` on a settled promise is a microtask and never lets
+		// `@ast-grep/napi` run the finalizer that frees the parsed tree; turn the
+		// loop so each file's tree is gone before the next parse (1,715 MB peak
+		// RSS of a 2,048 MB budget without it).
+		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 	return counts;
 }

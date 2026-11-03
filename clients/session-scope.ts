@@ -183,6 +183,8 @@ class Scope implements SessionScope {
 	private retiredReason: string | undefined;
 	/** The scope's store cells, by key (#3612); see {@link scopeCell}. */
 	readonly cells = new Map<string, unknown>();
+	/** The lookup keys {@link bindSessionId} bound to this scope. */
+	readonly boundKeys = new Set<string>();
 	// The stale-write record keeps its `runtime-session:<subject>` subject.
 	private readonly life = createGenerationSource("runtime-session");
 	private readonly branch = createGenerationSource("session-branch");
@@ -216,6 +218,8 @@ class Scope implements SessionScope {
 		// A host that sends no reason still ends the scope.
 		this.retiredReason = reason ?? "shutdown";
 		this.life.bump();
+		// #4965: the id lookup names live scopes only.
+		unbindScope(this);
 	}
 
 	moveBranch(): void {
@@ -370,6 +374,102 @@ export function recordDroppedRead(
 		subject: `${reason}:${site}`,
 		reason: `a ${site} read-guard write of scope ${captured.scope.scopeId} was dropped after the scope retired (${reason}); its entry is still on its conversation's branch`,
 	});
+}
+
+// --- Lookup by session id (#4965, shape 72) ---
+//
+// A caller that holds only a session id (a module-level hook such as the
+// cache observability, a coordinator serving a concurrent secondary's turn)
+// reaches the session's scope here instead of keeping a process-wide table of
+// its own. The index names LIVE scopes only: a scope's retirement removes its
+// keys, so a late call for a retired session finds nothing and cannot
+// resurrect its state.
+
+const SESSION_INDEX_FAMILY = "session-scope.session-index";
+const SESSION_INDEX_VERSION = 1;
+
+interface SessionIndex {
+	readonly byKey: Map<string, Scope>;
+}
+
+/** Process-wide, so a second module evaluation reads the same index (shape 25). */
+function sessionIndex(): SessionIndex {
+	return getProcessSingleton(
+		SESSION_INDEX_FAMILY,
+		SESSION_INDEX_VERSION,
+		(): SessionIndex => ({ byKey: new Map() }),
+	);
+}
+
+/** What a session with no id is reported as; see {@link sessionLookupKey}. */
+export const NO_SESSION_KEY = "<no-session>";
+
+/**
+ * The key a session is looked up by: pi's stable session id when the host
+ * gave one. A host that gave none keeps primary and concurrent-secondary
+ * activations in separate buckets (`primary:<no-session>`), so a secondary
+ * can never read the primary's state and classification fails closed.
+ */
+export function sessionLookupKey(
+	sessionId: string | undefined,
+	role?: "primary" | "concurrent-secondary",
+): string {
+	const id = sessionId?.trim();
+	return id ? id : `${role ?? "unknown"}:${NO_SESSION_KEY}`;
+}
+
+/**
+ * Name `scope` as the live scope of `key` ({@link sessionLookupKey}). Called
+ * once per session start, by the activation that begins the scope. A later
+ * scope bound to the same key (a `/reload`, a resumed session) replaces the
+ * earlier one; the earlier scope's retirement then leaves the key alone.
+ */
+export function bindSessionId(scope: SessionScope, key: string): void {
+	if (!scope.isLive()) return;
+	(scope as Scope).boundKeys.add(key);
+	sessionIndex().byKey.set(key, scope as Scope);
+}
+
+/**
+ * Give `scope`'s keys back: its session ended while the scope stays live for
+ * the activation's other members (a leave that is not the activation's last,
+ * or a member pi disposed beside a live sibling). A key a successor already
+ * re-bound stays with the successor. {@link retireScope} does this too.
+ */
+export function unbindScope(scope: SessionScope): void {
+	const own = scope as Scope;
+	const { byKey } = sessionIndex();
+	for (const key of own.boundKeys)
+		if (byKey.get(key) === own) byKey.delete(key);
+	own.boundKeys.clear();
+}
+
+/** The live scope bound to `key`, or `undefined` for a session that has none. */
+export function scopeOfSession(key: string): SessionScope | undefined {
+	return sessionIndex().byKey.get(key);
+}
+
+/**
+ * The cell `cellKey` of the session `key` names, created by `init` on first
+ * use. `undefined` when the session has no live scope: a read finds nothing,
+ * and a write (`init` given) is dropped and counted once per store, because a
+ * write for a session nobody started or already retired has no owner to
+ * retire it with.
+ */
+export function sessionCell<T>(
+	key: string,
+	cellKey: string,
+	init?: () => T,
+): T | undefined {
+	const scope = scopeOfSession(key);
+	if (scope) return scopeCell(scope, cellKey, init);
+	if (init)
+		incrementDegradationCount({
+			kind: "session-scope-lookup-missed",
+			subject: cellKey,
+			reason: `a ${cellKey} write named a session with no live scope, so it was dropped instead of held with no owner to retire it`,
+		});
+	return undefined;
 }
 
 // --- Session stores and the hand-off (#3612, slice S2 of the #3609 design) ---

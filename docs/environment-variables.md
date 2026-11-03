@@ -208,7 +208,41 @@ Unset or `0` preserves the prior local-LSP behavior exactly. Any transport,
 schema, freshness, deadline, or incumbent-liveness failure permanently falls
 back to a local LSP fleet for that session.
 
+## Variables pi-lens sets for its child processes
+
+### `GIT_OPTIONAL_LOCKS`
+
+pi-lens starts the child processes it runs through its spawn seam (its
+background `git status` reads included) with `GIT_OPTIONAL_LOCKS=0`, so a read
+does not refresh the index and cannot leave `.git/index.lock` behind after a
+timeout or a host exit. The value you export in your shell does not change this
+for those children, and your own git commands are unaffected. A caller that
+passes its own environment to a child keeps its value. Language servers are
+launched separately and inherit your environment unchanged. On a checkout whose
+index is stat-dirty, each status read re-hashes the dirty files until one of
+your own git commands refreshes the index.
+
 ## Language-specific
+
+### Ambient Python environments (`VIRTUAL_ENV`, `CONDA_PREFIX`, `UV_PROJECT_ENVIRONMENT`)
+
+pi-lens reads three ambient channels when it resolves the interpreter that runs
+pyright and jedi. `UV_PROJECT_ENVIRONMENT` names a uv project environment path
+(relative paths resolve against the uv project root) and is consulted only when
+the directory is a uv project root. The full chain, in the order the code walks
+it, is: `UV_PROJECT_ENVIRONMENT`, a uv workspace's `.venv` for a declared
+member, `VIRTUAL_ENV`, `CONDA_PREFIX`, the project's `.venv`, then its `venv`
+(relative to the root being resolved). The first that holds
+`bin/python` (`Scripts/python.exe` on Windows) wins, and the three variables are
+read in that position, not ahead of the workspace environment. An ambient
+environment is already active in the calling shell, so it needs no project
+trust; a `.venv` or `venv` found inside the project does, because its binary is
+project-sourced. Untrusted or absent, resolution falls through to the managed
+install and then `PATH`.
+
+These channels select an interpreter only. They never declare a syntax level;
+that comes from `target-version`, `pythonVersion`, `requires-python`, or
+`.python-version` (see [Features](features.md)).
 
 ### `PI_LENS_VULTURE_MIN_CONFIDENCE`
 
@@ -225,6 +259,16 @@ server. Lombok support is on by default when a Lombok jar is resolved.
 Explicit path to a Lombok jar for the Java language server, used when
 auto-resolution does not find one. The legacy `LOMBOK_JAR` variable is also
 honored.
+
+### `GROOVY_LANGUAGE_SERVER_JAR`
+
+Path to the `groovy-language-server-all.jar` the built-in Groovy row runs as
+`java -jar <jar>`, when no `groovy-language-server` launcher is on `PATH`.
+groovy-language-server publishes no release: build it with `./gradlew build` in
+a checkout of GroovyLanguageServer/groovy-language-server and point this at
+`build/libs/groovy-language-server-all.jar`. Java 17 or newer is found the same
+way the Java language server finds it. A path that is not a file reads as not
+installed, and the session start log says so.
 
 ## Project map
 

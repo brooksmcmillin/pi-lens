@@ -1,0 +1,181 @@
+[
+  {
+    "phase": "session_scope_transition",
+    "pid": 1474622,
+    "metadata": {
+      "transition": "end",
+      "reason": "superseded",
+      "scopeId": 1,
+      "role": "primary",
+      "branchEpoch": 0,
+      "evaluationOrdinal": 1
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1474622,
+    "metadata": {
+      "transition": "start",
+      "reason": "startup",
+      "scopeId": 2,
+      "parentScopeId": 1,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-0277-705b-9ed2-addee6645b42",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1,
+      "handoffSource": "none"
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1474622,
+    "metadata": {
+      "transition": "shutdown",
+      "reason": "reload",
+      "scopeId": 2,
+      "parentScopeId": 1,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-0277-705b-9ed2-addee6645b42",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1474622,
+    "metadata": {
+      "transition": "start",
+      "reason": "reload",
+      "scopeId": 3,
+      "parentScopeId": 2,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-0277-705b-9ed2-addee6645b42",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1,
+      "handoffSource": "slot"
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1474622,
+    "metadata": {
+      "transition": "shutdown",
+      "reason": "new",
+      "scopeId": 3,
+      "parentScopeId": 2,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-0277-705b-9ed2-addee6645b42",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1474622,
+    "metadata": {
+      "transition": "start",
+      "reason": "new",
+      "scopeId": 4,
+      "parentScopeId": 3,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-05aa-705b-9ed2-ade134079e1d",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1,
+      "handoffSource": "none"
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1474622,
+    "metadata": {
+      "transition": "shutdown",
+      "reason": "quit",
+      "scopeId": 4,
+      "parentScopeId": 3,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-05aa-705b-9ed2-ade134079e1d",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1475275,
+    "metadata": {
+      "transition": "end",
+      "reason": "superseded",
+      "scopeId": 1,
+      "role": "primary",
+      "branchEpoch": 0,
+      "evaluationOrdinal": 1
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1475275,
+    "metadata": {
+      "transition": "start",
+      "reason": "startup",
+      "scopeId": 2,
+      "parentScopeId": 1,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-05aa-705b-9ed2-ade134079e1d",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1,
+      "handoffSource": "own-sidecar"
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1475275,
+    "metadata": {
+      "transition": "shutdown",
+      "reason": "fork",
+      "scopeId": 2,
+      "parentScopeId": 1,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-05aa-705b-9ed2-ade134079e1d",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1475275,
+    "metadata": {
+      "transition": "start",
+      "reason": "fork",
+      "scopeId": 3,
+      "parentScopeId": 2,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-0967-779b-83f6-2e58befd57d6",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1,
+      "handoffSource": "slot"
+    }
+  },
+  {
+    "phase": "session_scope_transition",
+    "pid": 1475275,
+    "metadata": {
+      "transition": "shutdown",
+      "reason": "quit",
+      "scopeId": 3,
+      "parentScopeId": 2,
+      "role": "primary",
+      "branchEpoch": 0,
+      "sessionId": "01a16fab-0967-779b-83f6-2e58befd57d6",
+      "evaluationOrdinal": 1,
+      "coordinatorId": 1
+    }
+  }
+]

@@ -47,8 +47,9 @@ import { countFileLines } from "../../clients/read-guard-tool-lines.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import { evaluateGitGuard } from "../../clients/git-guard.js";
 import { setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
 
 vi.mock("../../clients/pipeline.js", () => ({
@@ -58,12 +59,6 @@ vi.mock("../../clients/pipeline.js", () => ({
 		isError: false,
 		fileModified: false,
 	})),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () => makeLspServiceDouble(),
-	resetLSPService: () => {},
-	notifyExternalFileChange: vi.fn(async () => undefined),
 }));
 
 vi.mock("../../clients/bootstrap.js", () => ({
@@ -166,7 +161,8 @@ if (!(MUTATION_BRIDGE_KEY in (globalThis as object))) {
 	});
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble();
 	resetObservedMutationNet();
 	resetMutationAttribution();
 	resetDegradationLedger();
@@ -266,6 +262,231 @@ function newSession(tmpDir: string): {
 	liveRoot = tmpDir;
 	return { runtime, cacheManager };
 }
+
+describe("#4733 r5 G1: the observed path answers its own dispatch latch", () => {
+	it("clears a crashed observed dispatch's latch when that file's next observed dispatch returns", async () => {
+		// RECURRENCE GUARDED: #4733 r5 G1. Both callers of the shared dispatch
+		// latch a crash, but only the classified chain answered it, so after an
+		// unclassified tool's crash the refusal's "write it again" never worked
+		// for that same tool: its next write took the observed path again.
+		const env = setupTestEnvironment("pi-lens-4733-observed-latch-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const filePath = path.join(env.tmpDir, "observed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const guarded = (name: string) =>
+				name === "no-lsp" || name === "lens-guard";
+			// Each call is a tool pi-lens has never met, so each takes the
+			// observed path (a learned name would be classified).
+			const observedWrite = async (toolName: string, next: string) => {
+				const event = { ...patchEvent(filePath, `call-${toolName}`), toolName };
+				await runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						...toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+						getFlag: guarded,
+					}),
+				);
+				fs.writeFileSync(filePath, next);
+				await handleToolResult({
+					...toolResultDeps({ event, runtime, cacheManager }),
+					getFlag: guarded,
+				});
+			};
+
+			vi.mocked(runPipeline).mockRejectedValueOnce(
+				new Error("runner exploded"),
+			);
+			await observedWrite("patch_one", SOURCE.replace("2", "22"));
+			const refusal = evaluateGitGuard(runtime, cacheManager, env.tmpDir);
+			expect(refusal.reason).toContain("(pipeline_crash)");
+			expect(refusal.reason).toContain("observed.ts");
+
+			await observedWrite("patch_two", SOURCE.replace("2", "23"));
+			expect(evaluateGitGuard(runtime, cacheManager, env.tmpDir).block).toBe(
+				false,
+			);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#4737 r2: an observed edit's blocker gates the commit before turn_end", () => {
+	it("refuses a commit on an observed edit's blocker, and a whole-file clean observed write reopens it", async () => {
+		// RECURRENCE GUARDED: #4737 r2 (#4732). The observed path analysed the
+		// write but never published the verdict, so a blocker an unknown tool's
+		// edit raised did not stop `git commit` until turn_end, and #4732 sends
+		// every tool that is not known read-only down that path.
+		const env = setupTestEnvironment("pi-lens-4737-observed-gate-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const filePath = path.join(env.tmpDir, "observed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const guarded = (name: string) =>
+				name === "no-lsp" || name === "lens-guard";
+			const observedWrite = async (
+				toolName: string,
+				next: string,
+				result: Record<string, unknown>,
+			) => {
+				const event = { ...patchEvent(filePath, `call-${toolName}`), toolName };
+				await runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						...toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+						getFlag: guarded,
+					}),
+				);
+				fs.writeFileSync(filePath, next);
+				vi.mocked(runPipeline).mockResolvedValueOnce(result as never);
+				await handleToolResult({
+					...toolResultDeps({ event, runtime, cacheManager }),
+					getFlag: guarded,
+				});
+			};
+			let commits = 0;
+			const commitBlocked = async () => {
+				const event = {
+					toolName: "bash",
+					toolCallId: `commit-${++commits}`,
+					input: { command: 'git commit -m "wip"' },
+				};
+				const verdict = (await runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						...toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+						getFlag: guarded,
+					}),
+				)) as { block?: boolean } | undefined;
+				return verdict?.block === true;
+			};
+			const summary =
+				"🔴 STOP — 1 issue(s) must be fixed:\n  L2: eval() is banned";
+
+			await observedWrite("patch_bad", SOURCE.replace("2", "eval(x)"), {
+				...PIPELINE_RESULT,
+				output: summary,
+				hasBlockers: true,
+				currentBlockerCount: 1,
+				inlineBlockerSummary: summary,
+				inlineBlockerSources: ["ast-grep-napi"],
+				inlineBlockerLines: [2],
+			});
+			expect(await commitBlocked()).toBe(true);
+
+			await observedWrite("patch_good", SOURCE, {
+				...PIPELINE_RESULT,
+				currentBlockerCount: 0,
+				fileVerdictComplete: true,
+			});
+			expect(await commitBlocked()).toBe(false);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#4737 r2 F3: an observed clean run retires its own blocker without a whole-file verdict", () => {
+	it("opens the commit gate and drops the file's section when the observed run that fixed it reached no whole-file verdict", async () => {
+		// RECURRENCE GUARDED: #4737 r2 F3 (state-table row O3). The observed path
+		// retires its own entry only as an authored run: the #4137 refusal keeps a
+		// record an unauthored run read the same bytes of. The sha matters: with
+		// none, that refusal cannot fire, so the caller's `authored: true` had no
+		// witness and the row was proven only by reading the shared publisher.
+		const env = setupTestEnvironment("pi-lens-4737-observed-retire-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const filePath = path.join(env.tmpDir, "observed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const guarded = (name: string) =>
+				name === "no-lsp" || name === "lens-guard";
+			const observedWrite = async (
+				toolName: string,
+				next: string,
+				result: Record<string, unknown>,
+			) => {
+				const event = { ...patchEvent(filePath, `call-${toolName}`), toolName };
+				await runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						...toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+						getFlag: guarded,
+					}),
+				);
+				fs.writeFileSync(filePath, next);
+				vi.mocked(runPipeline).mockResolvedValueOnce(result as never);
+				await handleToolResult({
+					...toolResultDeps({ event, runtime, cacheManager }),
+					getFlag: guarded,
+				});
+			};
+			let commits = 0;
+			const commitBlocked = async () => {
+				const event = {
+					toolName: "bash",
+					toolCallId: `commit-${++commits}`,
+					input: { command: 'git commit -m "wip"' },
+				};
+				const verdict = (await runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						...toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+						getFlag: guarded,
+					}),
+				)) as { block?: boolean } | undefined;
+				return verdict?.block === true;
+			};
+			const section = () =>
+				cacheManager
+					.readCache<{ blockerContent?: string }>(
+						"turn-end-findings",
+						env.tmpDir,
+						Number.POSITIVE_INFINITY,
+					)
+					?.data?.blockerContent?.includes(`${filePath}:`) ?? false;
+			const summary =
+				"🔴 STOP — 1 issue(s) must be fixed:\n  L2: eval() is banned";
+			// One content identity for both results: the bytes the record is about.
+			const fileContent = { size: 42, sha256: "a".repeat(64) };
+
+			await observedWrite("patch_bad", SOURCE.replace("2", "eval(x)"), {
+				...PIPELINE_RESULT,
+				output: summary,
+				hasBlockers: true,
+				currentBlockerCount: 1,
+				inlineBlockerSummary: summary,
+				inlineBlockerSources: ["ast-grep-napi"],
+				inlineBlockerLines: [2],
+				inlineBlockerFileContent: fileContent,
+			});
+			expect(await commitBlocked()).toBe(true);
+			expect(section()).toBe(true);
+
+			// Clean, but no whole-file verdict (a server went unconfirmed).
+			await observedWrite("patch_good", SOURCE, {
+				...PIPELINE_RESULT,
+				currentBlockerCount: 0,
+				fileVerdictComplete: false,
+				inlineBlockerFileContent: fileContent,
+			});
+			expect(await commitBlocked()).toBe(false);
+			expect(section()).toBe(false);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
 
 describe("#2430 acceptance 1 — the FIRST call of an unknown tool lands in turn state", () => {
 	it("observes the write and records it as an edit with the tool's own attribution", async () => {
@@ -555,6 +776,403 @@ describe("#4139 pi-lens tool attribution boundary", () => {
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#5160 provider replays are display-only", () => {
+	// RECURRENCE GUARDED: #5160. pi-cursor-sdk replays Cursor's native edit as a
+	// display-only `cursor` tool call (id `cursor-replay-*`, input
+	// {path, activityTitle, activitySummary}). Cursor's own write can land
+	// while the replay card is pending, so tier-4 learning attributed `cursor`
+	// as mutating (then persisted it) and the read guard refused every later
+	// replay "Edit without read" although the file was already written.
+	const replayEvent = (
+		filePath: string,
+		toolCallId: string,
+	): Record<string, unknown> => ({
+		toolName: "cursor",
+		toolCallId,
+		input: {
+			path: filePath,
+			activityTitle: "Cursor edit",
+			activitySummary: "edited the file",
+		},
+		content: [{ type: "text", text: "Cursor edit" }],
+	});
+	type Session = { runtime: RuntimeCoordinator; cacheManager: CacheManager };
+	const callOf = (
+		event: Record<string, unknown>,
+		env: { tmpDir: string },
+		session: Session,
+	) =>
+		runHandlerExpectingNoThrow(() =>
+			handleToolCall(
+				toolCallDeps({
+					event,
+					cwd: env.tmpDir,
+					runtime: session.runtime,
+					cacheManager: session.cacheManager,
+				}),
+			),
+		) as Promise<{ block?: boolean; reason?: string } | undefined>;
+	/** One call whose target changes while it is pending, then its result. */
+	const callWithWrite = async (
+		event: Record<string, unknown>,
+		filePath: string,
+		env: { tmpDir: string },
+		session: Session,
+		suffix: string,
+	) => {
+		await callOf(event, env, session);
+		fs.writeFileSync(filePath, `${SOURCE}const ${suffix} = 1;\n`);
+		await handleToolResult(
+			toolResultDeps({
+				event,
+				runtime: session.runtime,
+				cacheManager: session.cacheManager,
+			}),
+		);
+	};
+
+	it("does not refuse a replay after earlier replays touched the file", async () => {
+		const env = setupTestEnvironment("pi-lens-5160-replay-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "x.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const session = newSession(env.tmpDir);
+			for (const suffix of ["one", "two"]) {
+				await callWithWrite(
+					replayEvent(filePath, `cursor-replay-${suffix}`),
+					filePath,
+					env,
+					session,
+					suffix,
+				);
+			}
+			const unread = path.join(env.tmpDir, "unread.ts");
+			fs.writeFileSync(unread, SOURCE);
+			expect(
+				await callOf(replayEvent(unread, "cursor-replay-three"), env, session),
+			).toBeUndefined();
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("learns nothing from replays, in session or on disk", async () => {
+		const env = setupTestEnvironment("pi-lens-5160-not-learned-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "x.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const session = newSession(env.tmpDir);
+			for (const suffix of ["one", "two", "three"]) {
+				await callWithWrite(
+					replayEvent(filePath, `cursor-replay-${suffix}`),
+					filePath,
+					env,
+					session,
+					suffix,
+				);
+			}
+			expect(lookupLearnedMutatingTool("cursor")).toBeUndefined();
+			expect(
+				fs.existsSync(
+					path.join(getProjectDataDir(env.tmpDir), MUTATION_ATTRIBUTION_FILE),
+				),
+			).toBe(false);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("ignores a persisted cursor entry for a replay, and keys on the id rather than the name", async () => {
+		const env = setupTestEnvironment("pi-lens-5160-persisted-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const dataDir = getProjectDataDir(env.tmpDir);
+			fs.mkdirSync(dataDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(dataDir, MUTATION_ATTRIBUTION_FILE),
+				fs.readFileSync(
+					new URL(
+						"../fixtures/mutation-attribution/observed-mutating-tools-v1-cursor.json",
+						import.meta.url,
+					),
+				),
+			);
+			const session = newSession(env.tmpDir);
+			primePersistedMutationAttribution(env.tmpDir);
+			const unread = path.join(env.tmpDir, "unread.ts");
+			fs.writeFileSync(unread, SOURCE);
+
+			expect(
+				await callOf(replayEvent(unread, "cursor-replay-a"), env, session),
+			).toBeUndefined();
+			// Narrowness: the rule is the replay id, not the name `cursor`. A call
+			// of that name without the id is still the learned mutation it was.
+			const real = await callOf(
+				replayEvent(unread, "call-5160-real"),
+				env,
+				session,
+			);
+			expect(real?.block).toBe(true);
+			expect(real?.reason).toContain("Edit without read");
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	const editEvent = (filePath: string, toolCallId: string) => ({
+		toolName: "edit",
+		toolCallId,
+		input: {
+			path: filePath,
+			edits: [{ oldText: "const a = 1;", newText: "const a = 2;" }],
+		},
+	});
+
+	it("does not refuse a replayed built-in edit with no read", async () => {
+		// RECURRENCE GUARDED: #5160 review r1 probe P1. pi-cursor-sdk replays
+		// Cursor StrReplace as a native-looking `edit` card with a
+		// `cursor-replay-` id; the file was written before it arrived, so the
+		// read guard has nothing to protect.
+		const env = setupTestEnvironment("pi-lens-5160-replay-edit-");
+		try {
+			const unread = path.join(env.tmpDir, "unread.ts");
+			fs.writeFileSync(unread, SOURCE);
+			const session = newSession(env.tmpDir);
+			expect(
+				await callOf(editEvent(unread, "cursor-replay-1-1"), env, session),
+			).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("still refuses a real pi edit with no read, whatever near-miss id it carries", async () => {
+		// RECURRENCE GUARDED: #5160 review F2. A prefix widened to `cursor-` or
+		// matched with `includes` would exempt pi-cursor-sdk's real bridged
+		// executions (`cursor-pi-bridge-*`) and any id that merely contains it.
+		const env = setupTestEnvironment("pi-lens-5160-real-edit-");
+		try {
+			const unread = path.join(env.tmpDir, "unread.ts");
+			fs.writeFileSync(unread, SOURCE);
+			const session = newSession(env.tmpDir);
+			for (const id of [
+				"call-5160-edit",
+				"cursor-pi-bridge-ab-t1",
+				"xcursor-replay-x",
+			]) {
+				const verdict = await callOf(editEvent(unread, id), env, session);
+				expect(verdict?.block, id).toBe(true);
+				expect(verdict?.reason, id).toContain("Edit without read");
+			}
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("still refuses a genuinely mutating learned tool with no read", async () => {
+		const env = setupTestEnvironment("pi-lens-5160-learned-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "x.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const session = newSession(env.tmpDir);
+			for (const suffix of ["one", "two"]) {
+				await callWithWrite(
+					patchEvent(filePath, `call-5160-patch-${suffix}`),
+					filePath,
+					env,
+					session,
+					suffix,
+				);
+			}
+			expect(lookupLearnedMutatingTool("patch_file")).toBe("session");
+			const unread = path.join(env.tmpDir, "unread.ts");
+			fs.writeFileSync(unread, SOURCE);
+			// The near-miss ids are pi-cursor-sdk's real bridged executions and an id
+			// that merely contains the replay prefix (#5160 review F2).
+			for (const id of [
+				"call-5160-patch-three",
+				"cursor-pi-bridge-ab-t1",
+				"xcursor-replay-x",
+			]) {
+				const verdict = await callOf(patchEvent(unread, id), env, session);
+				expect(verdict?.block, id).toBe(true);
+				expect(verdict?.reason, id).toContain("Edit without read");
+			}
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	// RECURRENCE GUARDED: #5162 r3 (Greptile PRRT_kwDORt8rec6ycYW4, shape 65).
+	// A replayed built-in edit or write skips the pre-write check, yet its
+	// tool_result credited authorship as a checked own write: an existing
+	// authorship was re-baselined over the current disk bytes, erasing the
+	// evidence that another writer had changed the file.
+	const writeEvent = (
+		filePath: string,
+		toolCallId: string,
+		content: string,
+	) => ({
+		toolName: "write",
+		toolCallId,
+		input: { path: filePath, content },
+	});
+	const lines3 = (a: string, b: string, c: string) =>
+		[`const a = ${a};`, `const b = ${b};`, `const c = ${c};`, ""].join("\n");
+	/** The agent's earlier write, then a call and result with `onDisk` landing between them. */
+	const afterAuthoredWrite = async (
+		prefix: string,
+		event: (filePath: string) => Record<string, unknown>,
+		onDisk: (filePath: string) => void,
+		before?: (filePath: string, session: Session) => void,
+	) => {
+		const env = setupTestEnvironment(prefix);
+		const filePath = path.join(env.tmpDir, "authored.ts");
+		fs.writeFileSync(filePath, SOURCE);
+		const session = newSession(env.tmpDir);
+		session.runtime.readGuard.recordWritten(filePath, {
+			stampFileTime: false,
+			toolCallId: "call-5160-authored",
+		});
+		before?.(filePath, session);
+		const call = event(filePath);
+		const verdict = await callOf(call, env, session);
+		onDisk(filePath);
+		await handleToolResult({
+			...toolResultDeps({
+				event: { ...call, content: [{ type: "text", text: "ok" }] },
+				runtime: session.runtime,
+				cacheManager: session.cacheManager,
+			}),
+			readGuard: session.runtime.readGuard,
+		});
+		const entry = (
+			session.runtime.readGuard.exportAuthorship().entries ?? []
+		).find((row) => row.filePath === filePath);
+		return { env, filePath, session, verdict, entry };
+	};
+
+	it("keeps another writer's change visible after a replayed built-in edit", async () => {
+		const run = await afterAuthoredWrite(
+			"pi-lens-5160-replay-edit-authorship-",
+			(filePath) => editEvent(filePath, "cursor-replay-7-1"),
+			// Another writer changed line 3; Cursor's own edit changed line 1.
+			(filePath) => fs.writeFileSync(filePath, lines3("2", "2", "333")),
+		);
+		try {
+			expect(run.verdict).toBeUndefined();
+			expect(run.entry?.retired).toBe(true);
+			const verdict = run.session.runtime.readGuard.checkEdit(
+				run.filePath,
+				[3, 3],
+			);
+			expect(verdict.action).toBe("block");
+			expect(verdict.reason).toContain("File modified since your write");
+		} finally {
+			run.env.cleanup();
+		}
+	});
+
+	it("keeps another writer's change visible after a replayed built-in write", async () => {
+		const run = await afterAuthoredWrite(
+			"pi-lens-5160-replay-write-authorship-",
+			(filePath) =>
+				writeEvent(filePath, "cursor-replay-7-2", lines3("2", "2", "3")),
+			// Cursor wrote its content, then another writer changed line 3.
+			(filePath) => fs.writeFileSync(filePath, lines3("2", "2", "333")),
+		);
+		try {
+			expect(run.verdict).toBeUndefined();
+			expect(run.entry?.retired).toBe(true);
+			expect(run.entry?.toolCallId).toBe("call-5160-authored");
+			expect(
+				run.session.runtime.readGuard.exportAuthorship().written,
+			).not.toContain(run.filePath);
+		} finally {
+			run.env.cleanup();
+		}
+	});
+
+	it("still advances authorship for a real built-in edit after a read", async () => {
+		// Control for the replay rule: a checked own edit re-baselines its
+		// authorship over the bytes it wrote. Recurrence: the flag applied to
+		// every built-in edit, retiring the agent's own authorship.
+		const run = await afterAuthoredWrite(
+			"pi-lens-5160-real-edit-authorship-",
+			(filePath) => editEvent(filePath, "call-5160-real-edit"),
+			(filePath) => fs.writeFileSync(filePath, lines3("2", "2", "3")),
+			(filePath, session) =>
+				session.runtime.readGuard.recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: 4,
+					effectiveOffset: 1,
+					effectiveLimit: 4,
+					expandedByLsp: false,
+					turnIndex: session.runtime.turnIndex,
+					writeIndex: 0,
+					timestamp: Date.now(),
+				}),
+		);
+		try {
+			expect(run.verdict).toBeUndefined();
+			expect(run.entry?.retired).toBeUndefined();
+			expect(run.entry?.toolCallId).toBe("call-5160-real-edit");
+		} finally {
+			run.env.cleanup();
+		}
+	});
+
+	it("gives a replay on a file with no authorship only a write's first credit", async () => {
+		// Shape 65's writer rule: a producer with no pre-write check may still
+		// create a first authorship (a write's whole file), never a first
+		// UNKNOWN one (an edit's). Recurrence: the replay rule refused first
+		// credits too, or let an edit replay create one.
+		const env = setupTestEnvironment("pi-lens-5160-replay-first-credit-");
+		try {
+			const session = newSession(env.tmpDir);
+			const edited = path.join(env.tmpDir, "edited.ts");
+			const written = path.join(env.tmpDir, "written.ts");
+			for (const [filePath, event] of [
+				[edited, editEvent(edited, "cursor-replay-8-1")],
+				[written, writeEvent(written, "cursor-replay-8-2", SOURCE)],
+			] as const) {
+				fs.writeFileSync(filePath, SOURCE);
+				expect(await callOf(event, env, session)).toBeUndefined();
+				await handleToolResult({
+					...toolResultDeps({
+						event: { ...event, content: [{ type: "text", text: "ok" }] },
+						runtime: session.runtime,
+						cacheManager: session.cacheManager,
+					}),
+					readGuard: session.runtime.readGuard,
+				});
+			}
+			const entries =
+				session.runtime.readGuard.exportAuthorship().entries ?? [];
+			expect(entries.map((row) => row.filePath)).toEqual([written]);
+			expect(entries[0]?.toolCallId).toBe("cursor-replay-8-2");
+		} finally {
 			env.cleanup();
 		}
 	});
@@ -2154,5 +2772,148 @@ describe("#3763 a dead handler's mutation receipt stays out of session 2's turn"
 			// dropped receipt falls back to never reaches a pipeline.
 			expect(vi.mocked(runPipeline).mock.calls.length).toBe(dispatchedBefore);
 		});
+	});
+});
+
+// #4732: an unknown tool is also diffed as an opaque call. Recurrence
+// prevented: the diff dispatched the observed path as an unauthored replay
+// first, and that replay (it carries the call's id) settled the call's
+// observation under the name `write`, so the net never learned the tool and
+// the change log named the wrong tool. The named path is the settle's; the
+// diff answers for every OTHER file the call wrote.
+describe("#4732 an observed tool's opaque diff", () => {
+	it("leaves the named path to the settle and dispatches the rest once", async () => {
+		const env = setupTestEnvironment("pi-lens-4732-observed-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "observed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const event = patchEvent(filePath, "call-4732-observed");
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				),
+			);
+			fs.writeFileSync(
+				filePath,
+				["const a = 1;", "const b = 222;", "const c = 3;", ""].join("\n"),
+			);
+			const sidePath = path.join(env.tmpDir, "side.ts");
+			fs.writeFileSync(sidePath, "export const side = 1;\n");
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
+
+			const sources = readChangesSince(env.tmpDir, 0).map((entry) => [
+				path.basename(entry.filePath),
+				entry.source,
+			]);
+			expect(sources.sort()).toEqual([
+				["observed.ts", "agent-tool:patch_file"],
+				["side.ts", "opaque-script"],
+			]);
+			// The settle, not the replay, answered: the net learned the tool.
+			expect(
+				classifyMutatingTool(patchEvent(filePath, "call-4732-next")),
+			).toMatchObject({
+				toolName: "patch_file",
+				provenance: "learned",
+			});
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	// A RELATIVE path has no recorded attribution for a tool the classifier
+	// does not know, so the result used to return at `path_attribution_missing`
+	// and the observation armed from the call's own cwd was never settled. The
+	// path is still refused as a guess; the observation answers for it.
+	it("settles the observation of a tool that named a relative path", async () => {
+		const env = setupTestEnvironment("pi-lens-4732-relative-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "relative.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const event = patchEvent("relative.ts", "call-4732-relative");
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				),
+			);
+			fs.writeFileSync(
+				filePath,
+				["const a = 1;", "const b = 222;", "const c = 3;", ""].join("\n"),
+			);
+			fs.writeFileSync(
+				path.join(env.tmpDir, "relative-side.ts"),
+				"export const side = 1;\n",
+			);
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
+
+			expect(
+				readChangesSince(env.tmpDir, 0)
+					.map((entry) => [path.basename(entry.filePath), entry.source])
+					.sort(),
+			).toEqual([
+				["relative-side.ts", "opaque-script"],
+				["relative.ts", "agent-tool:patch_file"],
+			]);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	// An observation another session armed under the same call id is not this
+	// call's: its settle refuses it (catalog shape 22), so the diff must not
+	// leave the path to it, or the write reaches nothing (shape 54).
+	it("keeps a path whose observation belongs to another session", async () => {
+		const env = setupTestEnvironment("pi-lens-4732-stale-observation-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "stale.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			await armObservedMutation({
+				toolCallId: "call-4732-stale",
+				toolName: "patch_file",
+				targetPath: filePath,
+				cwd: env.tmpDir,
+				sessionGeneration: runtime.sessionGeneration + 1,
+				turnIndex: runtime.turnIndex,
+			});
+			// A tool with no path field: its own call arms nothing over the
+			// other session's entry.
+			const event = {
+				toolName: "gen_tool",
+				toolCallId: "call-4732-stale",
+				input: { query: "regenerate" },
+				content: [{ type: "text", text: "ok" }],
+			};
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
+
+			expect(
+				readChangesSince(env.tmpDir, 0).map((entry) => [
+					path.basename(entry.filePath),
+					entry.source,
+				]),
+			).toEqual([["stale.ts", "opaque-script"]]);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
 	});
 });

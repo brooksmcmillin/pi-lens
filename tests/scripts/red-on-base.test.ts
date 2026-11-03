@@ -188,6 +188,7 @@ type Probe = {
 	directoryTarget?: string;
 	hardlinkInode?: number;
 	target?: string;
+	destination?: string;
 	linkType?: string;
 };
 const probes = (repo: Repo): Probe[] =>
@@ -327,17 +328,20 @@ describe("red-on-base private dependencies", () => {
 			NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
 		});
 		expect(result.status, result.stderr).toBe(0);
-		expect(
-			probes(repo)
-				.filter(
-					(entry) => entry.phase === "symlink" && entry.linkType !== undefined,
-				)
-				.map(({ target, linkType }) => [target, linkType])
-				.sort(),
-		).toEqual([
-			["bytes", "file"],
-			["pkg", "dir"],
-		]);
+		// cpSync may emit earlier calls; the final writer must rebase each link.
+		const writes = probes(repo).reverse();
+		for (const [name, target, linkType] of [
+			["absolute", "bytes", "file"],
+			["directory", "pkg", "dir"],
+		]) {
+			expect(
+				writes.find(
+					(entry) =>
+						entry.phase === "symlink" &&
+						path.basename(entry.destination ?? "") === name,
+				),
+			).toMatchObject({ target, linkType });
+		}
 		expect(
 			probes(repo)
 				.filter((entry) => entry.phase === "dependencies")

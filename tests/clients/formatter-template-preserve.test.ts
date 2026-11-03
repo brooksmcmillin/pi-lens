@@ -1,3 +1,4 @@
+// real-home: read-only path probe for the maintainer's managed prettier (`~/.pi-lens/tools/node_modules/prettier`); prettier is not a devDependency, so without the real home this suite skips on the one host that has it.
 /**
  * Unconfigured template-bearing HTML/YAML must select NO formatter (#2384).
  *
@@ -27,7 +28,6 @@
 
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -41,6 +41,7 @@ import {
 	resetProjectTrust,
 	setProjectTrustState,
 } from "../../clients/project-trust.js";
+import { REAL_HOME } from "../support/vitest-setup.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const REPO_ROOT = path.resolve(
@@ -51,9 +52,10 @@ const REPO_ROOT = path.resolve(
 /**
  * Locate a real Prettier entry script (prettier 3.x ships `bin/prettier.cjs`),
  * mirroring the installer's own read-only discovery order: repo-local first,
- * then the managed tools tree under the real home. PI_LENS_HOME is hermetic
- * under vitest, so the managed probe reads the real home directly — it never
- * writes there.
+ * then the managed tools tree under the real home. PI_LENS_HOME, HOME and the
+ * XDG directories are pinned per worker (#4789), so the managed probe reads the
+ * real home through `REAL_HOME`, a named opt-out in
+ * `tests/support/real-home-readers.ts` — it never writes there.
  */
 function findRealPrettierEntry(): string | undefined {
 	const override = process.env.PI_LENS_TEST_PRETTIER_BIN;
@@ -66,7 +68,7 @@ function findRealPrettierEntry(): string | undefined {
 	const candidates = [
 		path.join(REPO_ROOT, "node_modules", "prettier", "bin", "prettier.cjs"),
 		path.join(
-			os.homedir(),
+			REAL_HOME,
 			".pi-lens",
 			"tools",
 			"node_modules",

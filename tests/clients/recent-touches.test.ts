@@ -5,25 +5,29 @@
  * consumer, mtime-gated hot path + dedup cursor for the parent turn_start
  * consumer, cross-form path handling, and the kill switch.
  *
- * `getProjectDataDir` is mocked to point at a per-test temp dir so these
- * tests never touch a real project's `.pi-lens`/`~/.pi-lens/projects` state.
+ * `PILENS_DATA_DIR` is pinned to a per-test temp dir so these tests never
+ * touch a real project's `.pi-lens`/`~/.pi-lens/projects` state.
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	_resetProjectDataDirMemoForTests,
+	getProjectDataDir,
+} from "../../clients/file-utils.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 let dir: string;
 const FAKE_CWD = "/fake/project";
 
-vi.mock("../../clients/file-utils.js", () => ({
-	getProjectDataDir: () => dir,
-}));
-
 function recordFilePath(): string {
-	return path.join(dir, "recent-touches.json");
+	const dataDir = getProjectDataDir(FAKE_CWD);
+	// The real resolver names the dir; production creates it on first write,
+	// so a case that seeds the record by hand creates it here.
+	fs.mkdirSync(dataDir, { recursive: true });
+	return path.join(dataDir, "recent-touches.json");
 }
 
 describe("recent-touches (#492 cross-process touched-files record)", () => {
@@ -31,10 +35,16 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 
 	beforeEach(() => {
 		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-recenttouches-"));
+		// The production knob for the data base; the memo is keyed on it, and
+		// is cleared so no earlier case's settled dir answers for this one.
+		vi.stubEnv("PILENS_DATA_DIR", dir);
+		_resetProjectDataDirMemoForTests();
 		vi.resetModules();
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
+		_resetProjectDataDirMemoForTests();
 		removeTempDirSync(dir);
 		if (originalEnv === undefined) {
 			delete process.env.PI_LENS_AGENT_NUDGE;
@@ -68,7 +78,7 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 			paths: ["/fake/project/b.ts"],
 		});
 
-		const entries = fs.readdirSync(dir);
+		const entries = fs.readdirSync(getProjectDataDir(FAKE_CWD));
 		expect(entries).toContain("recent-touches.json");
 		expect(entries.some((e) => e.includes(".tmp-"))).toBe(false);
 	});

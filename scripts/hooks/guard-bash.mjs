@@ -12,11 +12,13 @@
  * the shared checkout, so git followed the link and emptied the shared
  * install (#3173), all rules a hook can catch that prose could not:
  *
- *   - `git stash` in any form (CLAUDE.md non-negotiable)
+ *   - `git stash` in any form but the read-only `list` / `show` (CLAUDE.md
+ *     non-negotiable; an admit list, #5111)
  *   - `git reset --soft origin/<branch>` / `git reset --hard <anything>`
  *   - a HAND-typed `git worktree remove` with two force flags (the
- *     sanctioned removal is `node scripts/prune-agent-worktrees.mjs`,
- *     liveness-checked, or unlock + single force)
+ *     sanctioned removal is `node scripts/worktree-remove.mjs <path>` (#5111),
+ *     `node scripts/prune-agent-worktrees.mjs` (liveness-checked), or unlock +
+ *     single force)
  *   - ANY `git worktree remove` (force or not) on a worktree whose
  *     `node_modules` is a symlink pointing OUTSIDE that worktree (#3173,
  *     the #2704 class) -- see {@link hasNodeModulesSymlinkOutside}
@@ -31,10 +33,11 @@
  *     {@link classifyNodeModulesDelete}
  *   - an unpinned `node` probe that LOADS built runtime code from clients/
  *     or dist/ (not merely a payload that mentions "clients/" in passing --
- *     review round 2 F5) with no PI_LENS_HOME pin (AGENTS.md "Probe
- *     hygiene")
+ *     review round 2 F5) with no PI_LENS_HOME pin (docs/invariants/paths-os.md
+ *     "Paths, data, and operating systems")
  *   - `TMPDIR`/`TMP`/`TEMP` aimed at the vitest harness's own home
- *     (AGENTS.md "Probe hygiene", #3026) -- see {@link classifyTempDirVars}
+ *     (docs/invariants/paths-os.md "Paths, data, and operating systems", #3026) -- see
+ *     {@link classifyTempDirVars}
  *   - a WRITE under `/tmp` (#4348; tmpfs on the maintainer host): a redirect
  *     (`>`, `>>`, `2>`, `&>`, `>&file`), `tee`, a `cp`/`mv`/`install` target
  *     (last operand or `-t DIR`), `mkdir`, `touch` -- see {@link
@@ -127,11 +130,15 @@
  * are expanded the way bash would before the program sees them, then a relative
  * result resolves against the command's EFFECTIVE cwd (a preceding `cd`, a
  * `git -C`, else the payload cwd; a `cd` inside `( … )` does not leak out).
- * Bash expands git's path words before an inline `VAR=val` prefix applies,
- * so they are expanded without it, while git's own env check (`HUSKY=0`)
- * still sees it (#3997; `mktemp` and `node` words still see the prefix, as
- * on master). A path git or mktemp hands the kernel is resolved
- * physically, a `cd` target logically (#3997 H3). A path that cannot be
+ * Bash expands git's, mktemp's and node's path words before an inline
+ * `VAR=val` prefix applies, so they are expanded without it, while what the
+ * program reads from its own env still sees it: git's hook-bypass check
+ * (`HUSKY=0`), GNU mktemp's default `$TMPDIR` (no template, `-t`, bare
+ * `--tmpdir`; the rule models GNU mktemp), and node's `PI_LENS_HOME` (#3997,
+ * #4057). A path git or mktemp hands the kernel is resolved physically: the
+ * nearest existing ancestor through `realpath`, the missing tail as written
+ * (#3997 H3, #4060). A `cd` target resolves logically, or physically after
+ * `cd -P`. A path that cannot be
  * resolved statically (`$(…)`/backticks, `~user`, a variable with no known
  * value, a glob, a cwd made unknown by an unresolvable `cd`) makes
  * `git worktree remove` fail CLOSED (`worktreeUnresolved`); the tmp-checkout
@@ -241,24 +248,24 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** @typedef {"stash"|"reset"|"worktreeForce"|"worktreeSymlink"|"worktreeUnresolved"|"probe"|"tmpdirCollision"|"sharedKill"|"tmpCheckout"|"tmpWrite"|"checkUngated"|"hookBypass"|"forcePush"|"ciVerdictStatus"|"rebase"|"npmLinkedInstall"|"linkedNodeModulesDelete"} DenyRule */
+/** @typedef {"stash"|"reset"|"worktreeForce"|"worktreeSymlink"|"worktreeUnresolved"|"probe"|"tmpdirCollision"|"sharedKill"|"tmpCheckout"|"tmpWrite"|"checkUngated"|"hookBypass"|"forcePush"|"ciVerdictStatus"|"rebase"|"npmLinkedInstall"|"linkedNodeModulesDelete"|"unscannableCase"} DenyRule */
 
 /** @type {Record<DenyRule, string>} */
 export const RULE_MESSAGES = {
 	stash:
-		"git stash is forbidden (CLAUDE.md non-negotiable) -- it is repo-global across worktrees; use `git diff > fix.patch` / `git checkout --` / `git apply` instead.",
+		"git stash that writes is forbidden (CLAUDE.md non-negotiable) -- it is repo-global across worktrees; use `git diff > fix.patch` / `git checkout --` / `git apply` instead. Only the read-only `git stash list` and `git stash show [<flags>] [stash@{N}]` are admitted, as a bare command with no `-c`/global option other than `-C <dir>` and no env var (inline or exported) before it.",
 	reset:
 		"`git reset --soft origin/<branch>` / `git reset --hard` is forbidden (fixer playbook rule) -- use `git checkout HEAD -- <path>` to discard a single file instead.",
 	worktreeForce:
-		"a HAND-typed `git worktree remove` with two force flags is forbidden (fixer playbook rule) -- use `node scripts/prune-agent-worktrees.mjs` (liveness-checked; it applies the same double force internally once a tree is confirmed dead) for a stuck worktree, or `git worktree unlock` then a single-force remove.",
+		"a HAND-typed `git worktree remove` with two force flags is forbidden (fixer playbook rule) -- use `node scripts/worktree-remove.mjs <path> [--force]` (one force), `node scripts/prune-agent-worktrees.mjs` (liveness-checked; it applies the same double force internally once a tree is confirmed dead) for a stuck worktree, or `git worktree unlock` then a single-force remove.",
 	worktreeSymlink:
-		"git worktree remove on a tree whose node_modules symlink chain cannot be safely resolved or leads outside the tree is forbidden (#3173, the #2704 class -- git can follow the link and empty the SHARED install, not just this worktree's copy) -- unlink it first: `rm <tree>/node_modules` (removes only the symlink, not the shared install), then retry the remove; if it is a directory, remove only that worktree copy after confirming the main checkout is intact.",
+		"git worktree remove on a tree whose node_modules symlink chain cannot be safely resolved or leads outside the tree is forbidden (#3173, the #2704 class -- git can follow the link and empty the SHARED install, not just this worktree's copy) -- run `node scripts/worktree-remove.mjs <path>`: it unlinks the `node_modules` symlink (only the link, never the shared install), refuses a real `node_modules` directory, then runs `git worktree remove` (add `--force` for a single force).",
 	worktreeUnresolved:
-		"git worktree remove on a path this hook cannot resolve statically is forbidden (#3988) -- the #3173 node_modules-symlink check cannot run on it. The path, or the directory it is relative to, comes from a `$(...)`/backtick substitution, a `$VAR` with no value in the command or the hook environment, a `~user` or glob spelling, or an unresolvable `cd`/`git -C`/`popd`. Spell the worktree's absolute path literally (or `cd` to a literal directory first), or use `node scripts/prune-agent-worktrees.mjs`.",
+		"git worktree remove on a path this hook cannot resolve statically is forbidden (#3988) -- the #3173 node_modules-symlink check cannot run on it. The path, or the directory it is relative to, comes from a `$(...)`/backtick substitution, a `$VAR` with no value in the command or the hook environment, a `~user` or glob spelling, or an unresolvable `cd`/`git -C`/`popd`. Spell the worktree's absolute path literally (or `cd` to a literal directory first) and run `node scripts/worktree-remove.mjs <path>`, or use `node scripts/prune-agent-worktrees.mjs` for a stuck tree.",
 	probe:
-		"an unpinned node probe that LOADS runtime code from clients/ or dist/ is forbidden (AGENTS.md Probe hygiene) -- prefix `PI_LENS_HOME=<worktree>/.probe-home`.",
+		"an unpinned node probe that LOADS runtime code from clients/ or dist/ is forbidden (docs/invariants/paths-os.md, Paths, data, and operating systems) -- prefix `PI_LENS_HOME=<worktree>/.probe-home`.",
 	tmpdirCollision:
-		"TMPDIR/TMP/TEMP must not point at the vitest harness home (AGENTS.md Probe hygiene) -- tests/support/vitest-setup.ts keeps the real TMPDIR on purpose and mkdtemps PI_LENS_HOME under os.tmpdir(), so a TMPDIR inside `.probe-home` moves the harness home into a git-ignored directory in the worktree and reds unrelated suites (#3026). Pin PI_LENS_HOME/PILENS_DATA_DIR there; give TMPDIR its own directory.",
+		"TMPDIR/TMP/TEMP must not point at the vitest harness home (docs/invariants/paths-os.md, Paths, data, and operating systems) -- tests/support/vitest-setup.ts keeps the real TMPDIR on purpose and mkdtemps PI_LENS_HOME under os.tmpdir(), so a TMPDIR inside `.probe-home` moves the harness home into a git-ignored directory in the worktree and reds unrelated suites (#3026). Pin PI_LENS_HOME/PILENS_DATA_DIR there; give TMPDIR its own directory.",
 	sharedKill:
 		"pkill/killall with a bare (unscoped) pattern is forbidden (#3556) -- it matches machine-wide and can kill another concurrent session's TLC/vitest/etc run on this shared host -- kill the recorded PID of your own background job instead (`kill <pid>`), or use `pkill -f` with a pattern that includes your worktree's absolute path so only your own processes match.",
 	tmpCheckout:
@@ -277,6 +284,8 @@ export const RULE_MESSAGES = {
 		"npm ci/install/update/uninstall/prune/dedupe/rebuild (and `npx npm@… ci`) is forbidden where the node_modules symlink chain cannot be safely resolved or leads into another checkout (#4044, the #3173 shape -- `npm ci` removes node_modules/* before it reifies, ignores `--dry-run` on npm 9.2.0, and follows the link, so it emptied the SHARED install under every lane on 2026-10-07; the other verbs rewrite that shared install in place) -- answer install-flag questions in a scratch copy that holds no node_modules link (copy package.json and package-lock.json into a directory under $TMPDIR and run npm there), or `rm node_modules` in a separate command first (a chain is judged before its `rm` runs) and install into the lane's own real directory, or point `--prefix` at a real directory the hook can read, such as `--prefix $TMPDIR/<name>` (a `--prefix` from `$(…)`, backticks or an unknown variable is judged as this project).",
 	linkedNodeModulesDelete:
 		"a delete whose operand passes THROUGH a node_modules symlink chain that cannot be safely resolved or leads into another checkout is forbidden (#4044, the #3173 shape -- `rm -rf node_modules/`, `rm -rf node_modules/*` and `find node_modules/ -delete` follow the link and empty the SHARED install, measured with GNU coreutils on 2026-10-07) -- unlink the link itself instead: `rm node_modules` or `unlink node_modules` (no trailing slash, no glob; it removes only the link), and delete a real node_modules directory only in a scratch copy.",
+	unscannableCase:
+		"a command substitution holds a `case` word at a position this hook cannot classify (#4060) -- bash may open a case clause there, whose pattern `)` is not the substitution's closing paren, so the hook cannot tell where the substitution ends or which command it runs. Write the `case` as its own command (`case` at the start of a command, or after `;`, `&&`, `|`, `then`, `do`, `{`), keep it out of a `for`/`select`/`coproc`/`function` header and out of `((`/`$((`, or move the substitution's work into a script.",
 	ciVerdictStatus:
 		"ci-verdict's exit status is lost through a pipe -- read the final `ci-verdict: exit <N> (<kind>)` line, or run `; echo $?` before the pipe; do not read `$?` after `ci-verdict.mjs … | …` (#3883).",
 };
@@ -290,6 +299,26 @@ export const RULE_MESSAGES = {
  * two characters explicitly.
  */
 const WORD_BREAK = /[\s;&|<>]/;
+
+/**
+ * Reserved words whose grammar {@link lexRegions} does not model (`for ((…)) do
+ * case`, `coproc NAME case` and `function f case` all open a clause at a word
+ * that is not at a command position). A `case` before the next separator fails
+ * closed instead of guessing (#4060).
+ */
+const UNMODELLED_HEADS = new Set(["coproc", "function", "for", "select"]);
+
+/** One whitespace-and-metacharacter-delimited word, read from `lastIndex`. */
+const WORD_RUN = /[^\s;&|()<>]+/y;
+
+/**
+ * Left in the `lexRegions` output where a `case` word sits at a position the
+ * lexer cannot classify. Without a classification the hook cannot tell where
+ * the substitution ends, so {@link findDeny} refuses the command
+ * (`unscannableCase`) rather than guess (#4060). A private-use character,
+ * like {@link SUBSTITUTION_MARK}, so it never reads as shell syntax.
+ */
+const UNSCANNABLE_CASE = String.fromCharCode(0xe001);
 
 /**
  * Segment separators in the retained text. Single characters only: `&&`
@@ -495,6 +524,16 @@ function consumeHeredocBody(text, start, heredoc, out) {
  * span (#2699 review round 2's V1). That is a property of the shape, not a
  * case that was remembered.
  *
+ * Inside a `$( … )` body the pass also walks command positions (`mode`),
+ * because a `case` clause's pattern `)` is not the body's closing paren and
+ * only a `case` at a command position opens a clause. The positions are
+ * admitted, not guessed: the body start, a separator, `(`, a `case` pattern's
+ * `)`, a reserved word that starts a list ({@link COMMAND_KEYWORDS}). A word read
+ * at a command position that is not one of those is the command name, and
+ * everything after it is an argument. A `case` word where the walk does not
+ * know (the headers in {@link UNMODELLED_HEADS}, `((`, `$((`, `case(`) is left
+ * as {@link UNSCANNABLE_CASE}, which {@link findDeny} refuses (#4060).
+ *
  * Subtracted: comments, heredoc bodies, and substitution bodies (the last
  * are re-scanned via `out`, not discarded; each leaves one
  * {@link SUBSTITUTION_MARK} behind so a word that held one is still known to
@@ -511,10 +550,51 @@ function consumeHeredocBody(text, start, heredoc, out) {
 function lexRegions(text, start, closer, out) {
 	let retained = "";
 	let i = start;
-	/** @type {"single"|"double"|null} */
+	/** @type {"single"|"double"|"ansi"|null} */
 	let quote = null;
 	/** Nested plain `(`/`)` inside a `$( … )` body, so `$(( … ))` closes correctly. */
 	let parenDepth = 0;
+	/**
+	 * Open `case` clauses inside a `$( … )` body, innermost last (#4060). A
+	 * pattern's `)` ends the pattern, not the body, so the states are:
+	 * `subject` (`case` seen at a command position, up to its `in`),
+	 * `patternFirst` (after `in` or `;;`/`;&`/`;;&`: the first word is `esac`,
+	 * which pops the frame, or a pattern), `pattern` (up to the pattern's `)`)
+	 * and `body` (up to `;;`). The last clause may end with `esac` and no
+	 * `;;`; its `body` frame is left behind, inert, because only a pattern
+	 * state changes where a `)` goes.
+	 * @type {Array<"subject"|"patternFirst"|"pattern"|"body">}
+	 */
+	const cases = [];
+	/**
+	 * Where the next word sits in a `$( … )` body (#4060). `start`: a command
+	 * position, where a reserved word is one (`case`, `esac`, the openers in
+	 * {@link COMMAND_KEYWORDS}). `args`: a command name was read, so every later
+	 * word is an argument and a keyword-shaped one is plain text (`: do`,
+	 * `echo case`). `cond`: inside `[[ … ]]`, where `case` is a plain word and
+	 * a `(` opens no command. Any word that is not a recognised opener ends
+	 * `start`, assignments and redirections included (bash reads `x=1 case` and
+	 * `>f case` with `case` as the command name).
+	 * @type {"start"|"args"|"cond"}
+	 */
+	let mode = "start";
+	/** The opener read last at `start`, so `-p`/`--` after `time` keep it. */
+	let prevOpener = "";
+	/**
+	 * `parenDepth` at a header the lexer does not model, or `null`: `for`,
+	 * `select`, `coproc`, `function`, `((` and `$((`. A `case` word while held
+	 * is unclassifiable and fails closed; a separator at or below the depth ends
+	 * the hold (`for ((;;))` keeps its inner `;` out of it).
+	 * @type {number | null}
+	 */
+	let holdDepth = closer === ")" && text[start] === "(" ? 0 : null;
+	/** `retained.length` just past each open plain `(`, to tell `f()` from `(cmd)` at its `)`. */
+	/** @type {number[]} */
+	const parenOpens = [];
+	const startCommand = () => {
+		mode = "start";
+		prevOpener = "";
+	};
 	let atWordStart = true;
 	/** Heredoc markers seen on the current line, consumed in order at its newline. */
 	/** @type {Array<{ delimiter: string; stripTabs: boolean; quoted: boolean }>} */
@@ -525,6 +605,14 @@ function lexRegions(text, start, closer, out) {
 			retained += ch;
 			if (ch === "'") quote = null;
 			i++;
+			continue;
+		}
+		if (quote === "ansi") {
+			// `$'…'`: a backslash escapes the next character, so `\'` stays inside.
+			const taken = ch === "\\" ? text.slice(i, i + 2) : ch;
+			retained += taken;
+			if (ch === "'") quote = null;
+			i += taken.length;
 			continue;
 		}
 		if (quote === "double") {
@@ -559,17 +647,101 @@ function lexRegions(text, start, closer, out) {
 			i++;
 			continue;
 		}
+		if (closer === ")") {
+			const open = cases.length - 1;
+			const frame = cases[open];
+			if (ch === ";" || ch === "|" || ch === "\n" || ch === "&") {
+				if (holdDepth === null || parenDepth <= holdDepth) {
+					holdDepth = null;
+					if (mode !== "cond") startCommand();
+				}
+			} else if (
+				atWordStart &&
+				ch !== "#" &&
+				!/[\s;&|()<>]/.test(ch) &&
+				!(ch === "\\" && text[i + 1] === "\n")
+			) {
+				WORD_RUN.lastIndex = i;
+				const word = WORD_RUN.exec(text)?.[0] ?? "";
+				const next = text[i + word.length];
+				if (frame === "subject") {
+					if (word === "in") cases[open] = "patternFirst";
+				} else if (frame === "patternFirst") {
+					if (word === "esac") {
+						cases.pop();
+						mode = "args";
+					} else cases[open] = "pattern";
+				} else if (frame === "pattern") {
+					// A pattern word: no keyword is read here.
+				} else if (holdDepth !== null) {
+					if (word === "case") out.push(UNSCANNABLE_CASE);
+				} else if (mode === "cond") {
+					if (word === "]]") mode = "args";
+				} else if (mode === "start") {
+					if (UNMODELLED_HEADS.has(word)) holdDepth = parenDepth;
+					else if (
+						COMMAND_KEYWORDS.has(word) ||
+						word === "time" ||
+						((word === "-p" || word === "--") &&
+							(prevOpener === "time" || prevOpener === "-p"))
+					)
+						prevOpener = word;
+					else if (word === "case") {
+						// Only `case` + whitespace is a clause bash reads; `case(`,
+						// `case;` and the like are syntax errors or forms not modelled.
+						if (next !== undefined && /\s/.test(next)) {
+							cases.push("subject");
+							mode = "args";
+						} else out.push(UNSCANNABLE_CASE);
+					} else if (word === "[[") mode = "cond";
+					else mode = "args";
+				}
+			}
+			if (
+				(frame === "patternFirst" || frame === "pattern") &&
+				(ch === ")" || ch === "(")
+			) {
+				if (ch === ")") {
+					cases[open] = "body";
+					startCommand();
+				}
+				retained += ch;
+				atWordStart = true;
+				i++;
+				continue;
+			}
+			if (frame === "body" && ch === ";" && /[;&]/.test(text[i + 1])) {
+				const end = text.startsWith(";;&", i) ? i + 3 : i + 2;
+				cases[open] = "patternFirst";
+				retained += text.slice(i, end);
+				atWordStart = true;
+				i = end;
+				continue;
+			}
+		}
 		if (closer === ")" && ch === ")") {
 			if (parenDepth === 0) return { end: i + 1, retained, closed: true };
 			parenDepth--;
+			// `f()` is followed by a compound command (a command position);
+			// `(cmd)` and `<(cmd)` are followed by a separator or a redirection.
+			if (holdDepth === null && mode !== "cond") {
+				if (retained.slice(parenOpens.pop() ?? 0).trim() === "") startCommand();
+				else mode = "args";
+			} else parenOpens.pop();
 			retained += ch;
 			atWordStart = true;
 			i++;
 			continue;
 		}
 		if (closer === ")" && ch === "(") {
+			// `((` at a command position is an arithmetic command, or two
+			// subshells when the arithmetic reading fails: not modelled.
+			if (holdDepth === null && mode === "start" && text[i + 1] === "(")
+				holdDepth = parenDepth;
 			parenDepth++;
 			retained += ch;
+			parenOpens.push(retained.length);
+			if (holdDepth === null && mode !== "cond") startCommand();
 			atWordStart = true;
 			i++;
 			continue;
@@ -639,6 +811,13 @@ function lexRegions(text, start, closer, out) {
 			i = collectBacktickSpan(text, i, out);
 			retained += SUBSTITUTION_MARK;
 			atWordStart = false;
+			continue;
+		}
+		if (ch === "$" && text[i + 1] === "'") {
+			quote = "ansi";
+			retained += "$'";
+			atWordStart = false;
+			i += 2;
 			continue;
 		}
 		if (ch === "'") {
@@ -1194,15 +1373,29 @@ const TMP_ROOT = "/tmp";
  * @returns {boolean}
  */
 function isUnderTmpRoot(absoluteDir, root = TMP_ROOT) {
-	// Existing operands may be physical (/tmp -> /private/tmp on macOS),
-	// while not-yet-created operands retain their lexical spelling.
-	return [root, resolveShellPath(root, undefined, {}).path].some((spelling) => {
-		const rel = relative(spelling, absoluteDir);
-		return (
-			rel === "" ||
-			(!rel.startsWith(`..${SEP}`) && rel !== ".." && !isAbsolute(rel))
-		);
-	});
+	const rel = relative(root, absoluteDir);
+	return (
+		rel === "" ||
+		(!rel.startsWith(`..${SEP}`) && rel !== ".." && !isAbsolute(rel))
+	);
+}
+
+/**
+ * {@link isUnderTmpRoot} for the `tmpCheckout` destinations and the `tmpWrite`
+ * targets, by either spelling of the root. {@link physicalPath} puts a path where the kernel does,
+ * so where `/tmp` is a symlink (macOS: `/tmp` -> `private/tmp`) a missing leaf
+ * `/tmp/new` resolves to `/private/tmp/new`, which the literal root misses;
+ * master kept the lexical `/tmp/new` there and denied it (#4060 r2 F3,
+ * r3 F7). This also reads macOS's `/private/tmp/x` as `/tmp`.
+ *
+ * @param {string} absoluteDir
+ * @returns {boolean}
+ */
+function isUnderTmpCheckoutRoot(absoluteDir) {
+	return (
+		isUnderTmpRoot(absoluteDir) ||
+		isUnderTmpRoot(absoluteDir, physicalPath(TMP_ROOT, TMP_ROOT))
+	);
 }
 
 /** Bounds {@link expandShellWord}'s indirection loop -- generous for the real
@@ -1225,8 +1418,9 @@ const SUBSTITUTION_MARK = String.fromCharCode(0xe000);
  * The value `$NAME` expands to, or `undefined` when this static scan cannot
  * know it. `PWD` is the command's effective cwd. The command's variables
  * (`env`: the `export` and standalone `VAR=val` segments carried forward in
- * `sharedEnv`, #2699 review round 2 F2, plus the inline prefix for `mktemp`
- * and `node`; never for git's words, #3997 F4) win; then THIS hook's `process.env`,
+ * `sharedEnv`, #2699 review round 2 F2, plus the inline prefix only for
+ * GNU mktemp's own default `$TMPDIR`; never for a word bash expanded, #3997 F4,
+ * #4057) win; then THIS hook's `process.env`,
  * because the guard runs as a real child process inheriting the shell's
  * ambient environment (measured: a bare `mktemp -d` with an ambient,
  * non-command-text `TMPDIR` pointed off /tmp must allow). `TMPDIR`/`TMP`/
@@ -1327,9 +1521,10 @@ function expandShellWord(word, cwd, env) {
  * `..` in `lnk/../wt`, while `path.resolve` (and `fs.realpathSync`, which
  * normalizes first) drops the pair lexically. Measured: `git worktree remove
  * scratch/lnk/../linked` removed the tree `lnk` points at. A target that does
- * not exist keeps the lexical path. `logical` is bash's own `cd`, which
- * resolves `..` lexically (`cd lnk/.. && pwd` prints the directory holding
- * `lnk`).
+ * not exist yet resolves its nearest existing ancestor physically and keeps
+ * the missing tail as written ({@link physicalPath}, #4060). `logical` is
+ * bash's own `cd`, which resolves `..` lexically (`cd lnk/.. && pwd` prints
+ * the directory holding `lnk`); `cd -P` is the physical mode.
  *
  * @param {string} word
  * @param {string | null | undefined} cwd
@@ -1343,14 +1538,37 @@ function resolveShellPath(word, cwd, env, logical = false) {
 	let path = resolve(anchor, text);
 	if (reason === undefined && cwd === null && !isAbsolute(text))
 		return { path, reason: "a working directory that is not statically known" };
-	if (!logical) {
+	if (!logical)
+		path = physicalPath(isAbsolute(text) ? text : `${anchor}/${text}`, path);
+	return reason === undefined ? { path } : { path, reason };
+}
+
+/**
+ * Where the kernel puts `spelling`: `realpath` of the nearest existing
+ * ancestor of the RAW spelling (a `..` after a symlink is the kernel's, so the
+ * spelling is never collapsed first), then the missing tail joined lexically.
+ * A destination that does not exist yet (`git worktree add tl/new`, `tl` a
+ * symlink to /tmp) still lands where its parent really is (#4060). `fallback`
+ * is the lexical path, kept when not even the root resolves.
+ *
+ * @param {string} spelling
+ * @param {string} fallback
+ * @returns {string}
+ */
+function physicalPath(spelling, fallback) {
+	/** @type {string[]} */
+	const tail = [];
+	let head = spelling;
+	for (;;) {
 		try {
-			path = realpathSync.native(isAbsolute(text) ? text : `${anchor}/${text}`);
+			return resolve(realpathSync.native(head), ...tail);
 		} catch {
-			// No such path for the kernel either: the lexical path stands.
+			const parent = dirname(head);
+			if (parent === head) return fallback;
+			tail.unshift(basename(head));
+			head = parent;
 		}
 	}
-	return reason === undefined ? { path } : { path, reason };
 }
 
 /** `git worktree add [flags] <path> [<commit-ish>]` flags that consume a
@@ -1514,6 +1732,73 @@ function classifyHookBypass(args, i, env) {
 	return false;
 }
 
+/** `git stash list` / `git stash show` flags that only choose how history is
+ *  printed (#5111). An ADMIT set: a flag not named here is refused, including
+ *  `--output=`, `--ext-diff` and `--textconv`, which write or run programs. */
+const STASH_READ_FLAGS = new Set([
+	"--oneline",
+	"--stat",
+	"--shortstat",
+	"--numstat",
+	"--summary",
+	"--name-only",
+	"--name-status",
+	"--no-color",
+	"--no-patch",
+	"-p",
+	"--patch",
+	"-s",
+	"--include-untracked",
+	"--only-untracked",
+	"-u",
+]);
+
+/** The redirects agents append to a read (#5111): stderr to stdout, or output
+ *  to `/dev/null`. Exact words only; any other redirect target is refused. */
+const STASH_READ_REDIRECTS = new Set(["2>&1", "2>/dev/null", ">/dev/null"]);
+
+/** `--format=` / `--pretty=` with a value of plain format characters only: no
+ *  quote, `$`, backtick, `;`, `|`, `&`, `<`, `>` or the substitution mark. */
+const STASH_FORMAT_FLAG = /^--(?:format|pretty)=[A-Za-z0-9%:,._ -]*$/;
+
+/** The value of a `-C` before the subcommand (PR #5115 G1): one plain path word
+ *  of known-good characters and never a leading `-`. `$`, a backtick, a quote,
+ *  a glob, `{`, `(`, a backslash, a space and the substitution mark are not in
+ *  it, so a value bash could expand or split into more words is refused. */
+const STASH_DIR_VALUE = /^[A-Za-z0-9_./~+@:%=][A-Za-z0-9_./~+@:%=-]*$/;
+
+/** `git stash show`'s one optional stash operand: `stash@{N}` or a bare `N`. */
+const STASH_REF = /^(?:stash@\{\d+\}|\d+)$/;
+
+/**
+ * Is this `git ... stash ...` invocation one of the two read-only forms
+ * (#5111)? Fail closed: it is an ADMIT list, so everything it does not
+ * recognise -- a writing subcommand, bare `git stash`, a global option other
+ * than `-C <dir>`, any env var (inline or exported), a flag or operand
+ * outside the sets above, or a word holding a substitution -- is not read-only.
+ *
+ * @param {string[]} args
+ * @param {number} i index of the `stash` word
+ * @param {Record<string, string>} env
+ * @returns {boolean}
+ */
+function isReadOnlyStash(args, i, env) {
+	if (Object.keys(env).length > 0) return false;
+	for (let k = 0; k < i; k += 2)
+		if (args[k] !== "-C" || !STASH_DIR_VALUE.test(args[k + 1] ?? ""))
+			return false;
+	const [sub, ...rest] = args.slice(i + 1);
+	if (sub !== "list" && sub !== "show") return false;
+	let operands = 0;
+	for (const word of rest) {
+		if (STASH_READ_FLAGS.has(word) || STASH_READ_REDIRECTS.has(word)) continue;
+		if (STASH_FORMAT_FLAG.test(word)) continue;
+		if (sub === "show" && STASH_REF.test(word) && ++operands === 1) continue;
+		return false;
+	}
+	return true;
+}
+
 /**
  * Classify a `git` invocation's args (after the leading "git" word).
  *
@@ -1537,6 +1822,14 @@ function classifyGit(args, cwd, env = {}, expansionEnv = env) {
 		["false", "no", "0", "off"].includes(value.toLowerCase());
 	const i = gitSubcommandIndex(args);
 	const subcommand = args[i];
+	// A bare process substitution word before the subcommand (`git -C <(true)
+	// stash drop`): the lexer splits the segment at `<(`/`>(`, so the words
+	// after it are never classified. A git segment that ends before its
+	// subcommand on a dangling `<`/`>` word is refused, as the stash rule
+	// (PR #5115 verify r4). Glued values (`-c x=<(..)`) and redirect words
+	// read as the subcommand are not covered; see #4025.
+	if ((args.at(-1) === "<" || args.at(-1) === ">") && i >= args.length - 1)
+		return "stash";
 	if (classifyHookBypass(args, i, env)) return "hookBypass";
 	if (subcommand === "rebase") {
 		const rest = args.slice(i + 1);
@@ -1610,7 +1903,8 @@ function classifyGit(args, cwd, env = {}, expansionEnv = env) {
 			return "forcePush";
 		return null;
 	}
-	if (subcommand === "stash") return "stash";
+	if (subcommand === "stash")
+		return isReadOnlyStash(args, i, env) ? null : "stash";
 	if (subcommand === "reset") {
 		const rest = args.slice(i + 1);
 		if (rest.includes("--hard")) return "reset";
@@ -1668,7 +1962,9 @@ function classifyGit(args, cwd, env = {}, expansionEnv = env) {
 		const [pathArg] = collectPositionals(rest, WORKTREE_ADD_VALUE_FLAGS);
 		if (
 			pathArg !== undefined &&
-			isUnderTmpRoot(resolveShellPath(pathArg, gitCwd, expansionEnv).path)
+			isUnderTmpCheckoutRoot(
+				resolveShellPath(pathArg, gitCwd, expansionEnv).path,
+			)
 		)
 			return "tmpCheckout";
 		return null;
@@ -1682,7 +1978,7 @@ function classifyGit(args, cwd, env = {}, expansionEnv = env) {
 		// documented-blind-spot shape as a command word built by expansion).
 		if (
 			positionals.length >= 2 &&
-			isUnderTmpRoot(
+			isUnderTmpCheckoutRoot(
 				resolveShellPath(positionals[1], gitCwd, expansionEnv).path,
 			)
 		)
@@ -2016,6 +2312,13 @@ function classifyNpm(cmd, args, cwd, env) {
  *   - No template at all -- lands in `$TMPDIR`, or `/tmp` when unset
  *     (measured); folded through the same `$TMPDIR`-sentinel path.
  *
+ * The `$TMPDIR` sentinel (no template, `-t` with a relative template, bare
+ * `--tmpdir`) is GNU mktemp's own env read, so it expands with the inline
+ * `TMPDIR=` prefix, and an empty TMPDIR falls back to /tmp as an unset one
+ * does. Every word the command typed (a template, a
+ * `-p`/`--tmpdir=` value) was expanded by bash before that prefix applied, so
+ * it expands without it (#4057).
+ *
  * @param {string[]} args
  * @param {string | undefined} cwd
  * @param {Record<string, string>} env
@@ -2055,17 +2358,68 @@ function forEachBundledMktempFlag(a, handlers) {
 }
 
 /**
+ * The readings of a typed word (#4057, #4826): {@link expandShellWord}'s text
+ * as written, and, when that text still holds a reference this scan cannot
+ * resolve, the same text with each such reference removed, as if bash had
+ * expanded it to nothing. A rule that judges where the word lands reads both
+ * and denies when either denies, as {@link findDeny} reads a substitution
+ * (#3997). The gate admits no list of spellings that can be empty: a reference
+ * left unresolved after expansion is unknown, whatever its form. Removed: any
+ * `$NAME`, `${ … }` (nested braces too; an unterminated one runs to the end of
+ * the word), `$( … )` and `$(( … ))`, a positional `$1`-`$9`, `$@`, `$*`,
+ * `$!`, a backtick span, and a `~user`/`~+`/`~-` tilde. Kept as written: `$0`,
+ * `$#`, `$$`, `$?`, `$-` and a lone `$`, which bash always sets to something.
+ *
+ * @param {string} word
+ * @param {string | null | undefined} cwd
+ * @param {Record<string, string>} env see {@link lookupShellVariable}
+ * @returns {string[]} one reading, or two when the word holds an unresolved reference
+ */
+function expandShellReadings(word, cwd, env) {
+	const { text } = expandShellWord(word, cwd, env);
+	const unresolved = text.replace(/^~[^/]*/, "");
+	let bare = "";
+	for (let i = 0; i < unresolved.length; i++) {
+		const ch = unresolved[i];
+		const next = unresolved[i + 1] ?? "";
+		if (ch === "`") {
+			const close = unresolved.indexOf("`", i + 1);
+			i = close === -1 ? unresolved.length : close;
+		} else if (ch === "$" && (next === "{" || next === "(")) {
+			const close = next === "{" ? "}" : ")";
+			let depth = 0;
+			let end = i + 1;
+			for (; end < unresolved.length; end++) {
+				if (unresolved[end] === next) depth++;
+				else if (unresolved[end] === close && --depth === 0) break;
+			}
+			i = end;
+		} else if (ch === "$" && /[A-Za-z_]/.test(next)) {
+			i++;
+			while (/[A-Za-z0-9_]/.test(unresolved[i + 1] ?? "")) i++;
+		} else if (ch === "$" && /[1-9@*!]/.test(next)) {
+			i++;
+		} else bare += ch;
+	}
+	return bare === text ? [text] : [text, bare];
+}
+
+/**
  * Classify an `mktemp` invocation's args for #3526's `tmpCheckout` rule.
  * File-mode (no `-d`/`--directory`, bundled or not) always allows.
  *
  * @param {string[]} args
  * @param {string | undefined} cwd
- * @param {Record<string, string>} env
+ * @param {Record<string, string>} env mktemp's own env, inline `VAR=val` prefix included (GNU mktemp's default `$TMPDIR` reads it)
+ * @param {Record<string, string>} [expansionEnv] the shell variables bash expanded the typed words with: the inline prefix applies only after expansion (#4057)
  * @returns {DenyRule | null}
  */
-function classifyMktemp(args, cwd, env) {
+function classifyMktemp(args, cwd, env, expansionEnv = env) {
 	let isDir = false;
-	/** @type {string | undefined} */
+	// The `-p`/`--tmpdir` directory and the variables it expands with: a typed
+	// value is a word bash expanded, and bare `--tmpdir` is GNU mktemp's own
+	// `$TMPDIR`, read from its own env (#4057).
+	/** @type {{ dir: string | undefined; env: Record<string, string> } | undefined} */
 	let tmpdirOverride;
 	/** @type {string | undefined} */
 	let template;
@@ -2080,12 +2434,15 @@ function classifyMktemp(args, cwd, env) {
 		const a = args[i];
 		if (a === "--tmpdir") {
 			// Bare form (no "="): GNU mktemp's own "use $TMPDIR" spelling.
-			tmpdirOverride = "$TMPDIR";
+			tmpdirOverride = { dir: "$TMPDIR", env };
 			i++;
 			continue;
 		}
 		if (a.startsWith("--tmpdir=")) {
-			tmpdirOverride = a.slice("--tmpdir=".length);
+			tmpdirOverride = {
+				dir: a.slice("--tmpdir=".length),
+				env: expansionEnv,
+			};
 			i++;
 			continue;
 		}
@@ -2105,7 +2462,7 @@ function classifyMktemp(args, cwd, env) {
 			});
 			i++;
 			if (needsTmpdirValue) {
-				tmpdirOverride = args[i];
+				tmpdirOverride = { dir: args[i], env: expansionEnv };
 				i++;
 			}
 			continue;
@@ -2122,19 +2479,46 @@ function classifyMktemp(args, cwd, env) {
 		i++;
 	}
 	if (!isDir) return null;
-	// #3988: bash expands `~`/`$TMPDIR`/`$HOME` in the template BEFORE mktemp
-	// sees it, so `$TMPDIR/x.XXXXXX` is an ABSOLUTE template, not a relative
-	// one that lands in cwd.
-	if (template !== undefined)
-		template = expandShellWord(template, cwd, env).text;
-	/** @type {string} */
-	let targetDir;
-	if (tmpdirOverride !== undefined) targetDir = tmpdirOverride;
-	else if (template !== undefined && isAbsolute(template))
-		targetDir = dirname(template);
-	else if (template === undefined || forceTmpdirRelative) targetDir = "$TMPDIR";
-	else targetDir = cwd ?? process.cwd();
-	return isUnderTmpRoot(resolveShellPath(targetDir, cwd, env).path)
+	// Where the directory can land, every reading of every word that decides
+	// it ({@link expandShellReadings}; the first reading that lands under /tmp
+	// denies). #3988: bash expands `~`/`$TMPDIR`/`$HOME` in a typed word
+	// BEFORE mktemp sees it, so `$TMPDIR/x.XXXXXX` is an ABSOLUTE template, not
+	// a relative one that lands in cwd; it expands them before an inline
+	// prefix applies (#4057). A reading that is empty lands in mktemp's own
+	// default directory: GNU mktemp takes an empty `-p ''`/`--tmpdir=` as its
+	// `$TMPDIR`, and takes an empty or unset `$TMPDIR` as /tmp (coreutils
+	// mktemp.c: `env && *env ? env : "/tmp"`). Quotes are gone by now, so
+	// `-p "$D"` and `-p $D` read alike.
+	const defaultDirs = () =>
+		expandShellReadings("$TMPDIR", cwd, env).map((dir) =>
+			dir === "" ? TMP_ROOT : dir,
+		);
+	/** @type {string[]} */
+	let targetDirs;
+	if (tmpdirOverride?.dir !== undefined)
+		targetDirs = expandShellReadings(
+			tmpdirOverride.dir,
+			cwd,
+			tmpdirOverride.env,
+		).flatMap((dir) => (dir === "" ? defaultDirs() : [dir]));
+	else if (template === undefined) targetDirs = defaultDirs();
+	else
+		targetDirs = expandShellReadings(template, cwd, expansionEnv).flatMap(
+			(text) => {
+				if (isAbsolute(text)) return [dirname(text)];
+				// `-t` roots a relative template at $TMPDIR; so does a template
+				// that vanished. Otherwise it lands in the template's own directory
+				// under mktemp's cwd (`.` for a bare name, #4060).
+				return forceTmpdirRelative || text === ""
+					? defaultDirs()
+					: [dirname(text)];
+			},
+		);
+	// The words are expanded already; what is left in them is unresolved in
+	// every environment, so the prefix is never consulted again (#4057).
+	return targetDirs.some((dir) =>
+		isUnderTmpCheckoutRoot(resolveShellPath(dir, cwd, {}).path),
+	)
 		? "tmpCheckout"
 		: null;
 }
@@ -2143,7 +2527,11 @@ function classifyMktemp(args, cwd, env) {
  * The harness's own session directory, `/tmp/claude-<uid>`: the harness
  * creates and manages it, and the Bash tool's scratchpad lives there, so a
  * write into it is not agent-chosen /tmp scratch (#4348). `undefined` where
- * the platform has no uid (Windows has no `/tmp` either).
+ * the platform has no uid (Windows has no `/tmp` either). {@link
+ * isTmpWriteTarget} exempts it by NAME below the physical tmp root, never by
+ * where the entry resolves: a `claude-<uid>` symlink to the tmp root, to a
+ * directory above it or to a sibling would otherwise exempt everything there
+ * (#4060 r4).
  */
 const HARNESS_TMP_DIR =
 	typeof process.getuid === "function"
@@ -2175,8 +2563,14 @@ function isTmpWriteTarget(word, cwd, env) {
 	);
 	const { path } = resolveShellPath(word, cwd, { ...unsetIsEmpty, ...env });
 	return (
-		isUnderTmpRoot(path) &&
-		!(HARNESS_TMP_DIR !== undefined && isUnderTmpRoot(path, HARNESS_TMP_DIR))
+		isUnderTmpCheckoutRoot(path) &&
+		!(
+			HARNESS_TMP_DIR !== undefined &&
+			isUnderTmpRoot(
+				path,
+				join(physicalPath(TMP_ROOT, TMP_ROOT), basename(HARNESS_TMP_DIR)),
+			)
+		)
 	);
 }
 
@@ -2514,13 +2908,21 @@ const RUNTIME_LOAD_PATTERN =
  * own env assignments nor `process.env` carries `PI_LENS_HOME`.
  *
  * @param {string[]} args
- * @param {Record<string, string>} env
+ * @param {Record<string, string>} env node's own env, inline `VAR=val` prefix included (the `PI_LENS_HOME` check reads it)
  * @param {string} rawSegment
  * @param {string | null | undefined} cwd
  * @param {string | undefined} initialIdentity
+ * @param {Record<string, string>} [expansionEnv] the shell variables bash expanded the file word with: the inline prefix applies only after expansion (#4057)
  * @returns {DenyRule | null}
  */
-function classifyNode(args, env, rawSegment, cwd, initialIdentity) {
+function classifyNode(
+	args,
+	env,
+	rawSegment,
+	cwd,
+	initialIdentity,
+	expansionEnv = env,
+) {
 	const hasFlag = args.some(
 		(a) =>
 			a === "-e" ||
@@ -2533,16 +2935,20 @@ function classifyNode(args, env, rawSegment, cwd, initialIdentity) {
 		(a) => !a.startsWith("-") && /\.(?:mjs|js)$/.test(a),
 	);
 	// #3988: the FILE argument is a shell word (`~/r/dist/x.mjs`, `$HOME/…`),
-	// so it is expanded like every other path argument; an `-e` payload's
-	// specifiers are JavaScript, which no shell expansion reaches.
-	const fileArg =
-		fileArgWord === undefined
-			? undefined
-			: expandShellWord(fileArgWord, cwd, env).text;
+	// so it is expanded like every other path argument, before an inline
+	// prefix applies (#4057). Two words are not expanded here, as on master:
+	// the `-e`/`-p` payload is matched as raw segment text, though bash still
+	// expands a `$NAME` inside a double-quoted payload, and an attached
+	// `--require=`/`--import=`/`--loader=` value is a flag to this scan, never
+	// the file word.
 	const fileArgLoadsRuntimeCode =
-		fileArg !== undefined &&
-		(fileArgUnderDir(fileArg, "clients") || fileArgUnderDir(fileArg, "dist")) &&
-		loadsPiLensRuntime(fileArg, cwd, initialIdentity);
+		fileArgWord !== undefined &&
+		expandShellReadings(fileArgWord, cwd, expansionEnv).some(
+			(fileArg) =>
+				(fileArgUnderDir(fileArg, "clients") ||
+					fileArgUnderDir(fileArg, "dist")) &&
+				loadsPiLensRuntime(fileArg, cwd, initialIdentity),
+		);
 	const evalPayloadLoadsRuntimeCode =
 		hasFlag &&
 		[...rawSegment.matchAll(RUNTIME_LOAD_PATTERN)].some((match) =>
@@ -2564,8 +2970,9 @@ function classifyNode(args, env, rawSegment, cwd, initialIdentity) {
 const TEMP_DIR_VARS = ["TMPDIR", "TMP", "TEMP"];
 
 /**
- * The directory name AGENTS.md "Probe hygiene" prescribes for a pinned
- * `PI_LENS_HOME` (and the {@link RULE_MESSAGES}.probe message hands out).
+ * The directory name docs/invariants/paths-os.md "Paths, data, and operating systems"
+ * prescribes for a pinned `PI_LENS_HOME` (and the {@link RULE_MESSAGES}.probe message
+ * hands out).
  */
 const HARNESS_HOME_SEGMENT = ".probe-home";
 
@@ -2630,7 +3037,9 @@ const RUNNER_PREFIX_WORDS = new Set(["command", "exec", "env", "sudo", "time"]);
  * Reserved words and operators after which bash runs the NEXT word as a
  * command (#3787, each probed in bash 5.3: the side effect happened). Not
  * `case`/`esac`/`fi`/`done`/`in`/`select`: they run nothing at that word, and
- * a `case` arm is split off by its `)`.
+ * a `case` arm is split off by its `)`. {@link lexRegions} reads the same set
+ * (plus `time`, minus `coproc`) for the words after which a `case` still sits
+ * at a command position (#4060).
  */
 const COMMAND_KEYWORDS = new Set([
 	"{",
@@ -2767,8 +3176,9 @@ export function classifySegment(
 	const effectiveEnv = { ...sharedEnv, ...segmentEnv };
 	const cmd = commandBasename(rest[0]);
 	const args = rest.slice(1);
-	// git reads its env with the inline prefix (`HUSKY=0 git commit`), but bash
-	// expanded git's path words before that prefix applied (#3997 H1, F4).
+	// git, node and mktemp read their env with the inline prefix (`HUSKY=0 git
+	// commit`, `PI_LENS_HOME=…`, GNU mktemp's default `$TMPDIR`), but bash expanded
+	// their path words before that prefix applied (#3997 H1, F4; #4057).
 	if (cmd === "git") return classifyGit(args, cwd, effectiveEnv, sharedEnv);
 	if (cmd === "node" || cmd === "nodejs")
 		return classifyNode(
@@ -2777,6 +3187,7 @@ export function classifySegment(
 			rawSegment,
 			cwd,
 			repositoryIdentity(repositoryRoot(originCwd)),
+			sharedEnv,
 		);
 	// #4044: a `cd` this scan could not resolve leaves `cwd === null`. The
 	// node_modules rules then judge the PAYLOAD cwd, failing closed: a linked
@@ -2787,7 +3198,8 @@ export function classifySegment(
 		return classifyNpm(cmd, args, projectCwd, sharedEnv);
 	if (cmd === "find" || DELETE_COMMANDS.has(cmd))
 		return classifyNodeModulesDelete(cmd, args, projectCwd, sharedEnv);
-	if (cmd === "mktemp") return classifyMktemp(args, cwd, effectiveEnv);
+	if (cmd === "mktemp")
+		return classifyMktemp(args, cwd, effectiveEnv, sharedEnv);
 	if (SHARED_KILL_COMMANDS.has(cmd))
 		return classifyPkillKillall(cmd, args, cwd);
 	return null;
@@ -2839,6 +3251,15 @@ export function splitSegmentsWithSeparators(region) {
 			buf += ch;
 			if (ch === '"') quote = null;
 			i++;
+			continue;
+		}
+		if (ch === "$" && region[i + 1] === "'") {
+			// ANSI-C quote: `\'` stays inside it, as splitWords reads it (#4060).
+			let end = i + 2;
+			while (end < region.length && region[end] !== "'")
+				end += region[end] === "\\" ? 2 : 1;
+			buf += region.slice(i, end + 1);
+			i = end + 1;
 			continue;
 		}
 		if (ch === "'") {
@@ -3199,6 +3620,7 @@ function findPipedCiVerdictStatusRead(segments) {
  */
 export function findDeny(commandText, cwd) {
 	const unknownReading = scannableRegions(commandText);
+	if (unknownReading.includes(UNSCANNABLE_CASE)) return "unscannableCase";
 	const readings = unknownReading.some((region) =>
 		region.includes(SUBSTITUTION_MARK),
 	)
@@ -3216,7 +3638,9 @@ export function findDeny(commandText, cwd) {
 			const env = index === 0 ? sharedEnv : { ...sharedEnv };
 			/** @type {string | null | undefined} */
 			let effectiveCwd = cwd;
-			/** @type {Array<string | null | undefined>} the cwd to restore at each `)`: a `( cd x && … )` subshell's `cd` never leaks out */
+			/** @type {string | null | undefined} every `cd` read logically, as before #4060: after `cd -P lnk` the physical path no longer names the link, so `cd -P node_modules && rm -rf *` stays denied only through this second reading */
+			let logicalCwd = cwd;
+			/** @type {Array<[string | null | undefined, string | null | undefined]>} the cwds to restore at each `)`: a `( cd x && … )` subshell's `cd` never leaks out */
 			const subshellCwds = [];
 			const segments = splitSegmentsWithSeparators(regions[index]);
 			const ciVerdictRule = findPipedCiVerdictStatusRead(segments);
@@ -3225,13 +3649,18 @@ export function findDeny(commandText, cwd) {
 			if (chainRule) return chainRule;
 			for (const { text: segment, sep } of segments) {
 				for (const ch of sep ?? "") {
-					if (ch === "(") subshellCwds.push(effectiveCwd);
+					if (ch === "(") subshellCwds.push([effectiveCwd, logicalCwd]);
 					else if (ch === ")" && subshellCwds.length > 0)
-						effectiveCwd = subshellCwds.pop();
+						[effectiveCwd, logicalCwd] = subshellCwds.pop();
 				}
-				const rule = classifySegment(segment, env, effectiveCwd, cwd);
+				const rule =
+					classifySegment(segment, env, effectiveCwd, cwd) ??
+					(logicalCwd === effectiveCwd
+						? null
+						: classifySegment(segment, env, logicalCwd, cwd));
 				if (rule) return rule;
 				effectiveCwd = cwdAfterSegment(segment, effectiveCwd, env);
+				logicalCwd = cwdAfterSegment(segment, logicalCwd, env, false);
 			}
 		}
 	}
@@ -3245,26 +3674,39 @@ export function findDeny(commandText, cwd) {
  * (statically unknown) after a target that cannot be resolved, `cd -`, a bare
  * `pushd` (swaps with the stack) or `popd`; a later absolute `cd` recovers a
  * known cwd. Assumes the `cd` succeeded and is not backgrounded or piped
- * (documented blind spot: `cd x & …`, `cd x | …`), and resolves the target
- * logically even after `-P` (documented blind spot: `cd -P lnk/..`).
+ * (documented blind spot: `cd x & …`, `cd x | …`). The target resolves
+ * logically, or physically when the last of `-L`/`-P` is `-P` (#4060; `set -P`
+ * and `set -o physical` are not read). {@link findDeny} also reads every `cd`
+ * logically (`honorPhysical` false), because a physical cwd no longer names the
+ * link it came through. `pushd` has no `-P` (bash rejects it), so a `pushd -P`
+ * is resolved logically like any `pushd`.
  *
  * @param {string} segment
  * @param {string | null | undefined} cwd
  * @param {Record<string, string>} env
+ * @param {boolean} [honorPhysical] `false` reads every `cd` logically ({@link findDeny}'s second reading)
  * @returns {string | null | undefined}
  */
-function cwdAfterSegment(segment, cwd, env) {
+function cwdAfterSegment(segment, cwd, env, honorPhysical = true) {
 	const words = stripCommandGroupAndRunnerPrefixes(splitWords(segment));
 	const command = words[0];
 	if (command === "popd") return null;
 	if (command !== "cd" && command !== "pushd") return cwd;
 	let k = 1;
-	while (k < words.length && /^-[LPe@]+$/.test(words[k])) k++;
+	let physical = false;
+	while (k < words.length && /^-[LPe@]+$/.test(words[k])) {
+		// The last of -L/-P wins, clustered or not (`-LP` is physical, `-PL` logical).
+		for (const flag of words[k])
+			if (flag === "L" || flag === "P")
+				physical = honorPhysical && command === "cd" && flag === "P";
+		k++;
+	}
 	if (words[k] === "--") k++;
 	const target = words[k] ?? (command === "cd" ? "~" : undefined);
 	if (target === undefined || target === "-") return null;
-	// Logical, like bash's default `cd -L`: `cd lnk/..` lands beside `lnk`.
-	const resolved = resolveShellPath(target, cwd, env, true);
+	// Logical, like bash's default `cd -L`: `cd lnk/..` lands beside `lnk`;
+	// `cd -P` follows `lnk` first (#4060).
+	const resolved = resolveShellPath(target, cwd, env, !physical);
 	return resolved.reason === undefined ? resolved.path : null;
 }
 

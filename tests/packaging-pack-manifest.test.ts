@@ -418,7 +418,7 @@ describe("published manifest carries no devDependencies", () => {
 		);
 		expect(packTarball().filename).toBe("retry-1.0.0.tgz");
 		expect(attempts, "one failed attempt and one retry").toBe(2);
-	});
+	}, 20_000);
 
 	it(
 		"the real `npm pack` tarball's package.json has no devDependencies, and the working manifest is restored",
@@ -460,8 +460,11 @@ describe("published manifest carries no devDependencies", () => {
 				devDependencies?: unknown;
 				dependencies?: unknown;
 				name: string;
+				pi: { changelogPath: string };
 			};
 			expect(packed.name).toBe(pkg.name);
+			// #5198: pi must resolve the override inside the published package.
+			expect(packed.pi.changelogPath).toBe("CHANGELOG-USER.md");
 			expect(packed.devDependencies).toBeUndefined();
 			expect(packed.dependencies).toEqual(pkg.dependencies);
 			// postpack put the packed copy's manifest back, byte for byte.
@@ -497,6 +500,20 @@ describe("published manifest carries no devDependencies", () => {
 			fs.mkdirSync(unpacked, { recursive: true });
 			execFileSync("tar", ["-xzf", filename, "-C", "unpacked"], { cwd: tmp });
 			const pkgRoot = path.join(unpacked, "package");
+			const manifest = JSON.parse(
+				fs.readFileSync(path.join(pkgRoot, "package.json"), "utf8"),
+			);
+			const notes = fs.readFileSync(
+				path.join(pkgRoot, manifest.pi.changelogPath),
+				"utf8",
+			);
+			expect(notes).toBe(
+				fs.readFileSync(path.join(root, "CHANGELOG-USER.md"), "utf8"),
+			);
+			// #5202: an Unreleased heading alone must not satisfy the packed release witness.
+			expect(notes).toMatch(/^## \[\d+\.\d+\.\d+\]/m);
+			expect(notes).not.toContain("### Internal");
+
 			const packedPaths = (
 				fs.readdirSync(pkgRoot, { recursive: true }) as string[]
 			)

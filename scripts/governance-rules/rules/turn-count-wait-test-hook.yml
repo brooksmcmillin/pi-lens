@@ -1,0 +1,27 @@
+# The same shape inside a production module's test hook (a function named
+# `*ForTests`): the hook is test support that ships in clients/, and its callers
+# are tests (#4969: waitForProjectSnapshotPersistsForTests).
+id: turn-count-wait-test-hook
+language: TypeScript
+severity: error
+message: >-
+  Turn-count wait (shape 86) in a test hook: this loop polls a fixed number of
+  times and then returns without a signal. Bound it by a real-clock deadline.
+note: >-
+  Exempt a loop only with `// ast-grep-ignore: turn-count-wait-test-hook --
+  <reason>`, or record it in scripts/governance-rules/baseline.json with a
+  reason.
+files:
+  - "clients/**"
+rule:
+  all:
+    - matches: turn-count-loop
+    - inside:
+        stopBy: end
+        any:
+          - kind: function_declaration
+            has: { field: name, regex: 'ForTests$' }
+          - kind: variable_declarator
+            has: { field: name, regex: 'ForTests$' }
+          - kind: method_definition
+            has: { field: name, regex: 'ForTests$' }

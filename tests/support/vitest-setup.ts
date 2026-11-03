@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { afterAll, afterEach, beforeEach, expect, vi } from "vitest";
 import { installGitFixtureEnv } from "./git-fixture-env.js";
 import { installKillGuard, killGuardReport } from "./kill-guard.js";
-import { reportPeakRss } from "./worker-peak-rss.js";
+import { currentPeakRssMb, reportPeakRss } from "./worker-peak-rss.js";
 import {
 	fixtureHomeRoot,
 	fixtureHomeRootIn,
@@ -18,10 +18,13 @@ import {
 import {
 	formatTmpRootCreators,
 	formatTmpRootSweep,
+	formatTmpRootSweepRecords,
 	getTmpRootRegistry,
 	installTmpRootInterposer,
+	REPO_ROOT_CREATE_PREFIX,
 	sampleTmpRoots,
 	sweepTmpRoots,
+	TMP_ROOT_SWEEP_PREFIX,
 	type TmpRootFsTarget,
 } from "./tmp-root-registry.js";
 // The tail's dependency leaf, never `instance-registry.js`: this file loads
@@ -29,6 +32,8 @@ import {
 // the mock registers (#3703 round 1: 56 files red).
 import { _settleRegistryMutationsForTests } from "../../clients/instance-registry-tail.js";
 import {
+	claimScratchDir,
+	SCRATCH_DIR_ROOT,
 	SWEEP_ANY_AGE,
 	sweepScratchDirs,
 } from "../../scripts/lib/scratch-dir.mjs";
@@ -110,6 +115,10 @@ delete process.env.PI_LENS_STARTUP_MODE;
 // owner observes the same namespace as production. Workers report additions;
 // the serialized owner removes entries after its assertion.
 const tmpHygieneRealTmp = os.tmpdir();
+/** The checkout root a worker runs in (#4864): the same default
+ *  `unadmittedRepoRootEntries` judges, captured once so a case that `chdir`s
+ *  into its own fixture repo cannot move which parent is judged. */
+const tmpHygieneRepoRoot = process.cwd();
 
 const tmpHygieneHome = process.env.PI_LENS_HOME
 	? path.resolve(process.env.PI_LENS_HOME)
@@ -278,6 +287,26 @@ function flushTmpRootCreators(): void {
 	}
 }
 
+/** The wall clock as this module saw it at load. A case that installs fake
+ *  timers replaces the global `Date`, and a sweep that runs inside that scope
+ *  would stamp its record with the fake clock; the census compares the stamp
+ *  with filesystem times, which are the kernel's (#4591). */
+const hygieneNow = Date.now.bind(Date);
+/** Append this sweep's per-root records (#4591) to the run's creators record.
+ *  Each fork sweeps once per `via` (afterAll, then SIGTERM), so there is no
+ *  repeat to dedupe. Closed with the creators record, so the setup's own
+ *  afterAll, which runs after the owner's cleanup, cannot recreate the file
+ *  the owner removed. */
+function flushTmpRootSweepRecords(lines: readonly string[]): void {
+	if (tmpHygieneCreatorsClosed || lines.length === 0) return;
+	try {
+		fs.appendFileSync(tmpHygieneCreatorsPath, `${lines.join("\n")}\n`);
+	} catch {
+		// Costs the diagnosis only: the census then prints the entry without a
+		// sweep record, which it names as such.
+	}
+}
+
 /** Remove the run's creators record and close the flush. `cleanupTmpHygiene`
  *  runs in the owner's afterAll, which runs BEFORE the setup's own afterAll
  *  under the stack hook order; without the closed latch the setup flush would
@@ -293,10 +322,31 @@ export function closeTmpHygieneCreators(): void {
 	}
 }
 
-/** Test seam (#4307 sweep): run the setup's flush so a test can prove the
- *  closed latch suppresses it. */
-export function flushTmpRootCreatorsForTests(): void {
+/** Test seam (#4307 sweep, #5081 review F4): run both of the setup's flushes
+ *  (the creators record, then `sweepLines` as a sweep's records) so a test can
+ *  prove the closed latch suppresses each. */
+export function flushTmpHygieneRecordsForTests(
+	sweepLines: readonly string[],
+): void {
 	flushTmpRootCreators();
+	flushTmpRootSweepRecords(sweepLines);
+}
+
+/**
+ * #4864: the directories a test process NAMED directly at the repository root
+ * this run, keyed by entry name with the creating file. Read from the same
+ * per-run record as `tmpHygieneCreators`, on the `repo-root:` prefix that
+ * marks the kind, so a transient fixture counts: the leftover census above
+ * cannot see one that its own cell removed before the run ended.
+ */
+export function tmpHygieneRepoRootCreates(
+	creatorsPath: string = tmpHygieneCreatorsPath,
+): Map<string, string> {
+	const creates = new Map<string, string>();
+	for (const [entry, file] of tmpHygieneCreators(creatorsPath))
+		if (entry.startsWith(REPO_ROOT_CREATE_PREFIX))
+			creates.set(entry.slice(REPO_ROOT_CREATE_PREFIX.length), file);
+	return creates;
 }
 
 /** The observed creator of each leaked entry, keyed by entry name. An EMPTY map
@@ -421,6 +471,11 @@ installTmpRootInterposer(
 	nodeFs as unknown as TmpRootFsTarget,
 	tmpHygieneRealTmp,
 	() => tmpHygieneOwnFile,
+	// #4864: the repository root is judged by the same rule as the tmp root, so
+	// a fixture NAMED there is recorded and the hygiene owner can fail it. It
+	// is the worker's own working directory, which is the checkout root (the
+	// same default `unadmittedRepoRootEntries` reads).
+	tmpHygieneRepoRoot,
 );
 syncBuiltinESMExports();
 const tmpRootIo = {
@@ -445,9 +500,15 @@ function sweepOwnTmpRoots(via: "afterAll" | "SIGTERM"): void {
 	// the registry is gone with the fork, so the serialized owner can name the
 	// test file behind a leak. One line per entry; a second teardown is a no-op.
 	flushTmpRootCreators();
+	const sweep = sweepTmpRoots(tmpRootRegistry, tmpRootIo);
+	// #4591: which roots the registry held when this sweep ran, and what it found
+	// at each, so a root that reappears afterwards is attributable.
+	flushTmpRootSweepRecords(
+		formatTmpRootSweepRecords(tmpRootRegistry, sweep, via, hygieneNow()),
+	);
 	const line = formatTmpRootSweep(
 		tmpHygieneOwnFile,
-		sweepTmpRoots(tmpRootRegistry, tmpRootIo),
+		sweep,
 		tmpRootRegistry,
 		via,
 	);
@@ -470,6 +531,7 @@ process.once("SIGTERM", () => {
 	// nested vitest run a test launched has no owner to sweep its homes.
 	try {
 		tmpRootIo.remove(TMP_HYGIENE_WORKER_HOME);
+		tmpRootIo.remove(workerPinnedHomeRoot);
 	} catch {
 		// Best effort, like the sweep above: the owner reclaims what is left.
 	}
@@ -601,6 +663,63 @@ process.env.PI_LENS_TMP_HYGIENE_FIXTURE_HOME = fixtureHomeRootIn(
 	process.env.PI_LENS_TMP_HYGIENE_RUN_ID ?? "local",
 	process.pid,
 );
+// #4789: pinning PI_LENS_HOME alone left HOME and the XDG directories at the
+// maintainer's REAL home, so every tool a test spawns that resolves its own
+// config from them wrote there (2026-10-23: the #4780 verify left
+// `$HOME/.config/.opengrep` and `$HOME/.config/.semgrep` behind). The whole set
+// is pinned here once, in the worker, so every child inherits it. `USERPROFILE`
+// is `os.homedir()`'s source on Windows. The XDG directories take the layout a
+// tool falls back to without them (`~/.config`, `~/.cache`, `~/.local/share`),
+// so a tool that reads the variable and one that reads the default agree.
+//
+// The home is the worker's own directory under the sanctioned scratch root
+// (`claimScratchDir`: owner.pid, swept when its owner is dead), NOT under the
+// checkout's `.probe-home` beside the worker home: the repo root is every
+// test's `cwd`, a home inside it makes that cwd an ANCESTOR of HOME, and the
+// home-ceiling guards (`isAtOrAboveHomeDir`) then refuse it (32 cases in
+// `ast-grep-search.test.ts` went red on exactly that). The real home sits above
+// the checkout, so the pin keeps that relation. A test that needs a project
+// file under HOME uses `pinFixtureHome`, as AGENTS.md requires: a path under a
+// `pi-*` temp directory is pi-owned housekeeping to `isPiOwnedTempPath`.
+//
+// The pinned home follows TMPDIR (`os.tmpdir()`), so on a host whose TMPDIR is
+// /tmp it is under /tmp: a suite that applies a /tmp rule to what `~` expands to
+// (tests/scripts/guard-bash-hook.test.ts) gives its classifier its own HOME.
+// A test that needs another home sets HOME itself and wins. Assigned once for
+// the process and never restored, like PI_LENS_HOME above: restoring between
+// cases would re-open the real home.
+//
+// `REAL_HOME` is the opt-out: the maintainer's real home as the passwd entry
+// names it (`os.userInfo()` does not read `HOME`), captured BEFORE the pin. A
+// test that reads it on purpose is a row in `tests/support/real-home-readers.ts`
+// with a header reason, and `tests/config/real-home-reader-registry.test.ts`
+// fails any other file that spells it, or `userInfo`.
+export const REAL_HOME: string = (() => {
+	try {
+		return os.userInfo().homedir;
+	} catch {
+		// No passwd entry for this uid (a container): the ambient value is the
+		// best answer left, and still the real one, as nothing has pinned yet.
+		return os.homedir();
+	}
+})();
+sweepScratchDirs(SCRATCH_DIR_ROOT, "vitest-home-", {
+	maxAgeMs: 6 * 60 * 60 * 1000,
+});
+const workerPinnedHomeRoot = claimScratchDir(SCRATCH_DIR_ROOT, "vitest-home");
+const workerPinnedHome = path.join(workerPinnedHomeRoot, "home");
+for (const dir of [
+	workerPinnedHome,
+	path.join(workerPinnedHome, ".config"),
+	path.join(workerPinnedHome, ".cache"),
+	path.join(workerPinnedHome, ".local", "share"),
+])
+	fs.mkdirSync(dir, { recursive: true });
+process.env.HOME = workerPinnedHome;
+process.env.USERPROFILE = workerPinnedHome;
+process.env.XDG_CONFIG_HOME = path.join(workerPinnedHome, ".config");
+process.env.XDG_CACHE_HOME = path.join(workerPinnedHome, ".cache");
+process.env.XDG_DATA_HOME = path.join(workerPinnedHome, ".local", "share");
 // #2651: scripts/warm-loader-cache.mjs appends to PI_LENS_INSTALL_LOG before
 // it falls back to PI_LENS_HOME/install.log, so an ambient value (a
 // developer's shell pointing it at the real ~/.pi-lens/install.log) would
@@ -870,9 +989,18 @@ export function repoRootBaseline(): readonly string[] | undefined {
 export function untrackedUnignoredEntries(
 	names: readonly string[],
 	root: string = process.cwd(),
+	/** Names the caller KNOWS are directories. The repo-root ledger records a
+	 *  `mkdir` creation, so its entries are directories even though the creating
+	 *  cell has usually removed the bytes by judgment time. A directory-only
+	 *  ignore rule (`coverage/`, `dist/`, `.probe-home/`) matches only when git is
+	 *  asked with a trailing slash or the directory is still on disk, so
+	 *  re-deriving the kind from `lstatSync` reports an admitted creation as a
+	 *  leak once it is gone (#4864 F4). */
+	directories?: ReadonlySet<string>,
 ): string[] | undefined {
 	if (names.length === 0) return [];
 	const withSlash = names.map((name) => {
+		if (directories?.has(name)) return `${name}/`;
 		const stat = fs.lstatSync(path.join(root, name), { throwIfNoEntry: false });
 		return stat?.isDirectory() ? `${name}/` : name;
 	});
@@ -963,8 +1091,9 @@ export function unadmittedRepoRootEntries(
 // `[mem-watch]` low-water mark is the record that says how close the run
 // actually came.
 //
-// `maxRSS` is kilobytes on every platform: libuv normalizes the Win32 peak
-// working set for `uv_getrusage`, so no per-platform scaling is needed.
+// `maxRSS` is kilobytes on linux and win32 (libuv normalizes the Win32 peak
+// working set); `currentPeakRssMb` owns the conversion, and enforcement stays
+// linux-only because darwin reports bytes.
 //
 // #3139 (#3137 review): this used to be its own top-level `afterAll`,
 // registered FIRST so Vitest's LIFO afterAll order ran it LAST — the reading
@@ -994,7 +1123,7 @@ const memReportThresholdMb = Number(
 function emitMemReport(): void {
 	if (memReportThresholdMb <= 0) return;
 	const usage = process.memoryUsage();
-	const peakMb = Math.round(process.resourceUsage().maxRSS / 1024);
+	const peakMb = currentPeakRssMb();
 	if (peakMb < memReportThresholdMb) return;
 	const file = String(expect.getState().testPath ?? "unknown")
 		.replace(/\\/g, "/")
@@ -1541,6 +1670,17 @@ export interface TmpHygieneLeakOriginFacts {
 	children?: string[];
 }
 
+/** The bounded first-level children of a leaked entry, the one phrase the
+ *  origin line and the census diagnosis share. */
+function describeLeakChildren(children: string[] | undefined): string {
+	if (children === undefined) return "first-level children unavailable";
+	if (children.length === 0) return "first-level children: none";
+	const shown = children.slice(0, TMP_HYGIENE_ORIGIN_CHILD_LIMIT).join(",");
+	return children.length > TMP_HYGIENE_ORIGIN_CHILD_LIMIT
+		? `first-level children: ${shown} (+${children.length - TMP_HYGIENE_ORIGIN_CHILD_LIMIT} more)`
+		: `first-level children: ${shown}`;
+}
+
 /** The shipped reader. The parameter exists so a test can drive the arm this
  *  host's filesystems never produce — a stat that succeeds with a zero birth
  *  time — instead of leaving it unproven; `unadmittedRootBackstopEntries` and
@@ -1583,22 +1723,179 @@ export function formatTmpHygieneLeakOrigin(
 ): string {
 	const name = path.basename(dir);
 	const { birthtimeMs, children } = facts;
-	const listed =
-		children === undefined
-			? "first-level children unavailable"
-			: children.length === 0
-				? "first-level children: none"
-				: `first-level children: ${children
-						.slice(0, TMP_HYGIENE_ORIGIN_CHILD_LIMIT)
-						.join(",")}${
-						children.length > TMP_HYGIENE_ORIGIN_CHILD_LIMIT
-							? ` (+${children.length - TMP_HYGIENE_ORIGIN_CHILD_LIMIT} more)`
-							: ""
-					}`;
+	const listed = describeLeakChildren(children);
 	if (birthtimeMs === undefined || !(birthtimeMs > 0))
 		return `[tmp-hygiene-origin] ${name} birth time unavailable (${listed})\n`;
 	const ageMs = Math.max(0, Math.round(now - birthtimeMs));
 	return `[tmp-hygiene-origin] ${name} born ${ageMs}ms before this line (created at ${new Date(birthtimeMs).toISOString()}; ${listed})\n`;
+}
+
+/** One sweep's finding at one recorded root (#4591), parsed back from the
+ *  creators record `formatTmpRootSweepRecords` wrote. */
+export interface TmpHygieneSweepRecord {
+	via: "afterAll" | "SIGTERM";
+	kind: "registered" | "observed";
+	outcome: "removed" | "failed" | "held" | "absent";
+	/** Epoch ms of the sweep, read from the clock the filesystem shares. */
+	at: number;
+}
+
+const SWEEP_VIAS: readonly string[] = ["afterAll", "SIGTERM"];
+const SWEEP_KINDS: readonly string[] = ["registered", "observed"];
+const SWEEP_OUTCOMES: readonly string[] = [
+	"removed",
+	"failed",
+	"held",
+	"absent",
+];
+
+/** The sweep records per entry name, from the creators map (the persisted
+ *  record carries them under `TMP_ROOT_SWEEP_PREFIX`). Admits the one shape the
+ *  writer produces and drops everything else, so a torn or foreign line is
+ *  absent from the diagnosis rather than misread as a sweep. */
+export function tmpHygieneSweepRecords(
+	creators: ReadonlyMap<string, string>,
+): Map<string, TmpHygieneSweepRecord[]> {
+	const records = new Map<string, TmpHygieneSweepRecord[]>();
+	for (const [key, value] of creators) {
+		if (!key.startsWith(TMP_ROOT_SWEEP_PREFIX)) continue;
+		const rest = key.slice(TMP_ROOT_SWEEP_PREFIX.length);
+		const colon = rest.indexOf(":");
+		const [kind, outcome, at, ...extra] = value.split(",");
+		const stamp = Number(at);
+		if (
+			colon <= 0 ||
+			colon === rest.length - 1 ||
+			extra.length > 0 ||
+			!SWEEP_VIAS.includes(rest.slice(0, colon)) ||
+			!SWEEP_KINDS.includes(kind) ||
+			!SWEEP_OUTCOMES.includes(outcome) ||
+			!(at !== undefined && at.length > 0 && Number.isFinite(stamp))
+		)
+			continue;
+		const name = rest.slice(colon + 1);
+		const list = records.get(name) ?? [];
+		list.push({
+			via: rest.slice(0, colon) as TmpHygieneSweepRecord["via"],
+			kind: kind as TmpHygieneSweepRecord["kind"],
+			outcome: outcome as TmpHygieneSweepRecord["outcome"],
+			at: stamp,
+		});
+		records.set(name, list);
+	}
+	return records;
+}
+
+/** What a leaked entry reports about itself for the diagnosis: its times and
+ *  first-level children. An `undefined` field is the unreadable arm. */
+export interface TmpHygieneLeakTimes {
+	birthtimeMs?: number;
+	mtimeMs?: number;
+	ctimeMs?: number;
+	children?: string[];
+}
+
+function readTmpHygieneLeakTimes(dir: string): TmpHygieneLeakTimes {
+	const times: TmpHygieneLeakTimes = {};
+	try {
+		const stat = fs.statSync(dir);
+		times.birthtimeMs = stat.birthtimeMs;
+		times.mtimeMs = stat.mtimeMs;
+		times.ctimeMs = stat.ctimeMs;
+	} catch {
+		// Gone since the census listed it: the facts stay undefined and say so.
+	}
+	times.children = readTmpHygieneLeakOrigin(dir).children;
+	return times;
+}
+
+/**
+ * #4591: which of the two producer candidates a leaked census entry matches,
+ * with the facts that decide it, one bounded string per entry for the census
+ * failure message.
+ *
+ *  - candidate 1 (`recreated-after-sweep`): the registry held the root at sweep
+ *    time and the sweep recorded it, yet the entry was born after the sweep, so
+ *    a deferred writer under the pinned HOME or cwd recreated it. Its first-level
+ *    children name the writer (`home` is HOME, `workspace` is cwd).
+ *  - candidate 2 (`unrecorded`): no creator on record and no sweep record, so the
+ *    interposer never saw the root and the sweep never owned it.
+ *  - the other verdicts keep the remaining cells explicit instead of folding them
+ *    into one of the two: a root the creator recorded but no sweep ever listed
+ *    (`recorded-not-swept`: a sibling `mkdir`, or a worker killed before any
+ *    sweep), a root already present when its last sweep ran (`present-at-sweep`),
+ *    and an entry whose birth time the filesystem withholds (`order-unknown`).
+ * Times are signed milliseconds from the LAST sweep record, so `+9034ms` reads
+ * "9034 ms after the sweep".
+ */
+export function diagnoseTmpHygieneLeak(
+	entry: string,
+	creator: string | undefined,
+	records: readonly TmpHygieneSweepRecord[],
+	times: TmpHygieneLeakTimes,
+): string {
+	const children = describeLeakChildren(times.children);
+	const sweeps =
+		records.length === 0
+			? "no sweep record"
+			: `sweeps: ${records
+					.map(
+						(r) =>
+							`${r.via} ${r.kind} ${r.outcome} at ${new Date(r.at).toISOString()}`,
+					)
+					.join("; ")}`;
+	const registry =
+		records.length > 0
+			? "in the registry at sweep time"
+			: creator === undefined
+				? "not in the registry (no creator on record)"
+				: "creator on record, never a sweep root";
+	const last = records.reduce<TmpHygieneSweepRecord | undefined>(
+		(latest, r) => (latest === undefined || r.at > latest.at ? r : latest),
+		undefined,
+	);
+	const born = times.birthtimeMs;
+	const bornKnown = born !== undefined && born > 0;
+	const delta = (ms: number | undefined): string =>
+		ms === undefined || last === undefined || !(ms > 0)
+			? "unavailable"
+			: `${ms >= last.at ? "+" : "-"}${Math.abs(Math.round(ms - last.at))}ms`;
+	let verdict: string;
+	if (last === undefined)
+		verdict = creator === undefined ? "unrecorded" : "recorded-not-swept";
+	else if (!bornKnown) verdict = "order-unknown";
+	else if (born > last.at) verdict = "recreated-after-sweep";
+	else verdict = `present-at-sweep(${last.outcome})`;
+	const against =
+		last === undefined
+			? ""
+			: `; vs last sweep: birth ${delta(born)}, mtime ${delta(times.mtimeMs)}, ctime ${delta(times.ctimeMs)}`;
+	return `${entry} [${verdict}] ${registry}; ${sweeps}${against}; ${children}`;
+}
+
+/** The diagnosis for each leaked entry, bounded: a census that leaked a whole
+ *  run's roots names the first few and counts the rest. */
+export const TMP_HYGIENE_DIAGNOSIS_LIMIT = 6;
+
+export function diagnoseTmpHygieneLeaks(
+	entries: readonly string[],
+	creators: ReadonlyMap<string, string>,
+	tmpRoot: string = tmpHygieneRealTmp,
+	readTimes: (dir: string) => TmpHygieneLeakTimes = readTmpHygieneLeakTimes,
+): string {
+	const records = tmpHygieneSweepRecords(creators);
+	const shown = entries
+		.slice(0, TMP_HYGIENE_DIAGNOSIS_LIMIT)
+		.map((entry) =>
+			diagnoseTmpHygieneLeak(
+				entry,
+				creators.get(entry),
+				records.get(entry) ?? [],
+				readTimes(path.join(tmpRoot, entry)),
+			),
+		);
+	const more = entries.length - shown.length;
+	return `${shown.join(" | ")}${more > 0 ? ` | (+${more} more)` : ""}`;
 }
 
 export function writeTmpHygieneLeakNotice(
@@ -1745,6 +2042,7 @@ afterAll(async () => {
 			// beside its own home, so they go when it does.
 			removeTempDirSync(fixtureHomeRoot());
 			removeTempDirSync(TMP_HYGIENE_WORKER_HOME);
+			removeTempDirSync(workerPinnedHomeRoot);
 		}
 	}
 });

@@ -24,7 +24,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isUnderDir, normalizeMapKey } from "../path-utils.js";
+import { isUnderDir, normalizeMapKey, walkUpDirs } from "../path-utils.js";
 import {
 	aliasedImportTargets,
 	referencedProjectImportTarget,
@@ -390,10 +390,11 @@ function pythonRoots(cwd: string, fileDir: string): string[] {
 	// is anchored. Add cwd and cwd/src as conventional fallbacks.
 	let p = fileDir;
 	const root = path.resolve(cwd);
-	while (isFile(path.join(p, "__init__.py")) && isWithin(cwd, p)) {
-		const parent = path.dirname(p);
-		if (parent === p) break;
-		p = parent;
+	// The bound is `cwd` on the caller's spelling (graph keys are taken from
+	// the spelled file), so the climb stays on the spelling.
+	for (const dir of walkUpDirs(fileDir, { spelling: true })) {
+		p = dir;
+		if (!(isFile(path.join(dir, "__init__.py")) && isWithin(cwd, dir))) break;
 	}
 	const roots = new Set([p, root, path.join(root, "src")]);
 	return [...roots].filter((r) => isDir(r));
@@ -438,9 +439,11 @@ function findGoModule(
 	cwd: string,
 	filePath: string,
 ): { moduleDir: string; modulePath: string } | null {
-	let dir = path.dirname(path.resolve(filePath));
+	const start = path.dirname(path.resolve(filePath));
 	const root = path.resolve(cwd);
-	while (true) {
+	// Spelled climb, bounded by `cwd` on the same spelling (see `pythonRoots`).
+	for (const dir of walkUpDirs(start, { spelling: true })) {
+		if (dir !== start && !isWithin(cwd, dir)) break;
 		try {
 			const content = fs.readFileSync(path.join(dir, "go.mod"), "utf-8");
 			const m = content.match(/^[^\S\n\r\u2028\u2029]*module\s+(\S+)/m);
@@ -449,9 +452,6 @@ function findGoModule(
 			// no go.mod here — keep climbing
 		}
 		if (dir === root) break;
-		const parent = path.dirname(dir);
-		if (parent === dir || !isWithin(cwd, parent)) break;
-		dir = parent;
 	}
 	return null;
 }
@@ -481,13 +481,11 @@ function javaSourceRoots(cwd: string, filePath: string): string[] {
 	}
 	// The importing file's own source root is one of its ancestors, so a
 	// same-project import resolves even on a non-conventional layout.
-	let p = path.dirname(path.resolve(filePath));
-	while (true) {
-		roots.add(p);
-		if (p === root) break;
-		const parent = path.dirname(p);
-		if (parent === p || !isWithin(cwd, parent)) break;
-		p = parent;
+	const start = path.dirname(path.resolve(filePath));
+	for (const dir of walkUpDirs(start, { spelling: true })) {
+		if (dir !== start && !isWithin(cwd, dir)) break;
+		roots.add(dir);
+		if (dir === root) break;
 	}
 	return [...roots].filter((r) => isDir(r));
 }

@@ -11,6 +11,7 @@
 
 import { promises as fs } from "node:fs";
 import * as fsSync from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { BoundedLruCache } from "../clients/bounded-cache.js";
 import { Type } from "../clients/deps/typebox.js";
@@ -27,7 +28,7 @@ import { DEPENDENCY_DRIFT_MAX_DELIVERIES } from "../clients/blocker-freshness.js
 import { freshnessFromMtime } from "../clients/freshness.js";
 import {
 	applyFindingPolicy,
-	loadProjectRulePolicyMap,
+	loadProjectRulePolicy,
 } from "../clients/dispatch/finding-policy.js";
 import { readFileContent } from "../clients/dispatch/runners/utils.js";
 import {
@@ -39,21 +40,40 @@ import {
 	formatCacheAgeLabel,
 	markUnreconciledFindings,
 } from "../clients/finding-delivery-gate.js";
+import {
+	detectPythonTargetVersion,
+	isJediCompileVerdict,
+	partitionOutrankedPythonCompileVerdicts,
+	PYTHON_DECLARATION_CONCURRENCY,
+	type PythonCompileVerdictPartition,
+	type PythonTargetVersion,
+	type PythonVerdictRow,
+	recordPythonCompileVerdictDrop,
+} from "../clients/python-environment.js";
+import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
 import { normalizeRuleId } from "../clients/dispatch/rule-id-normalize.js";
 import {
 	applyRulePolicy,
-	rulePolicyMapFromConfig,
+	type RulePolicy,
 } from "../clients/dispatch/rule-policy.js";
 import { compactRenderResult } from "./render-compact.js";
+import {
+	MAX_PATHS_ENTRIES,
+	readFilePath,
+	readPathsArgument,
+} from "./shared.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
-import { getProjectIgnoreMatcher } from "../clients/file-utils.js";
+import {
+	getProjectIgnoreMatcher,
+	isWithinPathForm,
+} from "../clients/file-utils.js";
 import {
 	isAtOrAboveHomeDir,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
 	normalizeMapKey,
 	realpathOrResolve,
-	resolveHostToolPath,
+	toProjectRelativePath,
 } from "../clients/path-utils.js";
 import { getLSPService } from "../clients/lsp/capabilities.js";
 import { retireInlineBlockerAndResyncGuard } from "../clients/git-guard.js";
@@ -126,6 +146,7 @@ import { logExtension } from "../clients/extension-log.js";
 import { recordDegradationOnce } from "../clients/degradation-ledger.js";
 import { convertLspDiagnostics } from "../clients/dispatch/utils/lsp-diagnostics.js";
 import {
+	configDisabledAuxiliaryLspServerIds,
 	findAuxiliaryProfileForSource,
 	retagAuxiliaryDiagnostics,
 } from "../clients/dispatch/auxiliary-lsp.js";
@@ -135,8 +156,9 @@ import { makeProgressReporter, scanningSummaryLine } from "./scan-progress.js";
 import {
 	createLspDiagnosticsTool,
 	LSP_SEVERITY_FILTERS,
-	MAX_BATCH_FILES,
 	renderBatchOutcomeLines,
+	mergeWithheld,
+	withheldCompileNote,
 	type BatchOutcomeDetail,
 	type LspDiagnosticsFlagReader,
 } from "./lsp-diagnostics.js";
@@ -155,8 +177,7 @@ const MAX_DIAGNOSTICS_PER_FILE = 50;
 // only"), not a bulk-listing mechanism — a wrapper that hits this needs to
 // narrow, not paginate. Erroring (rather than silently truncating) means a
 // caller can never believe it checked files it didn't (issue's stated
-// invariant).
-const MAX_PATHS_ENTRIES = MAX_BATCH_FILES;
+// invariant). The cap itself is the shared one every tool applies (#5041).
 
 // #1623: the reason rendered for every heavyweight-analyzer lane (gitleaks,
 // trivy, govulncheck, dead-code, knip, jscpd, madge, opengrep, test-runner)
@@ -182,6 +203,7 @@ type LSPServiceLike = ReturnType<typeof getLSPService> & {
 			onServerReady?: () => void;
 			nextWriteIndex?: () => number;
 			files?: string[];
+			excludeServerIds?: ReadonlySet<string>;
 		},
 	) => Promise<WorkspaceLspDiagnosticResult[]>;
 };
@@ -266,6 +288,32 @@ async function findFullScanBindingMismatches(
 	return mismatched;
 }
 
+/**
+ * #4638 review (F1/F10): resolve a file's declared level only when the file
+ * carries one of jedi's `compile` rows, then apply the owner rule. The guard is
+ * the rule's own pre-filter, so a file with no such row costs no I/O and no
+ * await — the same check the full-sweep site makes before its walk.
+ */
+async function applyDeclarationRule<T extends PythonVerdictRow>(
+	filePath: string,
+	diagnostics: readonly T[],
+): Promise<
+	PythonCompileVerdictPartition<T> & { declared?: PythonTargetVersion }
+> {
+	if (!diagnostics.some(isJediCompileVerdict)) {
+		return { kept: [...diagnostics], dropped: 0 };
+	}
+	const declared = await detectPythonTargetVersion(filePath);
+	const partition = partitionOutrankedPythonCompileVerdicts(
+		diagnostics,
+		declared,
+	);
+	if (partition.dropped > 0 && declared) {
+		recordPythonCompileVerdictDrop(filePath, declared, partition.dropped);
+	}
+	return declared ? { ...partition, declared } : partition;
+}
+
 export function createLensDiagnosticsTool(
 	cacheManager: CacheManager,
 	getCwd: () => string,
@@ -321,7 +369,7 @@ export function createLensDiagnosticsTool(
 				logExtension({
 					subsystem: "git-guard",
 					level: "debug",
-					message: `inline_blocker: retired for ${info.filePath}`,
+					message: `inline_blocker: retired or narrowed to its uncovered source rows for ${info.filePath}`,
 				});
 			}
 		},
@@ -357,7 +405,6 @@ export function createLensDiagnosticsTool(
 			totalDiagnostics?: number;
 			cleanFiles?: number;
 			unconfirmedFiles?: number;
-			navigationOnlyFiles?: number;
 			timedOutFiles?: number;
 			outcomeCounts?: Record<string, number>;
 			outcomes?: BatchOutcomeDetail[];
@@ -392,8 +439,6 @@ export function createLensDiagnosticsTool(
 				const scope = files > 1 ? ` across ${files} files` : singleFile;
 				if (isError)
 					return `lens_diagnostics lsp — ${text.split("\n")[0] ?? "error"}`;
-				if ((details.navigationOnlyFiles ?? 0) > 0)
-					return `lens_diagnostics${scope} — ${count} ${noun} · ${details.cleanFiles ?? 0} clean · ${details.navigationOnlyFiles} navigation-only`;
 				if ((details.unconfirmedFiles ?? 0) > 0)
 					return `lens_diagnostics${scope} — ${count} ${noun} · ${details.cleanFiles ?? 0} clean · ${details.unconfirmedFiles} unconfirmed${details.timedOutFiles ? ` (${details.timedOutFiles} timed out)` : ""}`;
 				const outcomeCounts = details.outcomeCounts;
@@ -416,7 +461,7 @@ export function createLensDiagnosticsTool(
 						? `lens_diagnostics${scope} — timed out (result may be incomplete)`
 						: // #4322: no language server answered; it is not a silent server.
 							details.primaryUnavailable !== undefined
-							? `lens_diagnostics${scope} — unconfirmed (no language server answered)`
+							? `lens_diagnostics${scope} — unconfirmed (no primary language server answered)`
 							: `lens_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
 				return `lens_diagnostics${scope} — ${count} ${noun}`;
 			}
@@ -520,6 +565,10 @@ export function createLensDiagnosticsTool(
 					description: "One file or directory for source=lsp checks.",
 				}),
 			),
+			file: Type.Optional(Type.String({ description: "Alias for `path`." })),
+			filePath: Type.Optional(
+				Type.String({ description: "Alias for `path`." }),
+			),
 			concurrency: Type.Optional(
 				Type.Number({
 					description: "Source=lsp batch concurrency (maximum 16).",
@@ -601,6 +650,48 @@ export function createLensDiagnosticsTool(
 						: "delta"
 					: "workspace");
 			const cwd = ctx.cwd ?? getCwd();
+			// #5041: `path` is the canonical single-file parameter; `file` and
+			// `filePath` stay accepted so a caller written against either keeps
+			// working (#2418). A conflicting pair is refused rather than guessed at.
+			const singlePath = readFilePath(params);
+			if (singlePath.refusal) {
+				return {
+					content: [{ type: "text" as const, text: singlePath.refusal }],
+					isError: true,
+					details: {},
+				};
+			}
+			// #5041: one reader owns the `paths` entry rules (non-string, blank,
+			// empty list, cap) and the host-path spelling, on both routes below.
+			const pathsRead = readPathsArgument(params.paths, { cwd });
+			if (pathsRead.refusal) {
+				return {
+					content: [{ type: "text" as const, text: pathsRead.refusal }],
+					isError: true,
+					details: { mode: legacyMode ?? "delta", pathsError: true },
+				};
+			}
+			// The `source=lsp` route gets the caller's own, reader-validated `paths`,
+			// not `pathsRead.entries`: that route resolves each entry itself
+			// (`expandPathsToFiles`), and `resolveHostToolPath` is not idempotent for
+			// an absolute entry holding a host-unicode space, so a second pass named a
+			// sibling directory that does not exist (#5047 F2). The cache routes below
+			// read `pathEntries`, resolved exactly once.
+			params = {
+				...params,
+				...(singlePath.path ? { path: singlePath.path } : {}),
+			};
+			// #5041: a caller that named ONE file must not get the default scope's
+			// answer. On the cache routes the scope is built from entries, so the
+			// single `path` joins them as its own one-entry list; the `source=lsp`
+			// route returns below and keeps its file route (a directory `path` under
+			// `scope=workspace` still scans that directory, #2052).
+			const pathEntries = singlePath.path
+				? [
+						...pathsRead.entries,
+						...readPathsArgument([singlePath.path], { cwd }).entries,
+					]
+				: pathsRead.entries;
 			if (source === "lsp") {
 				const lspParams = { ...params };
 				delete lspParams.source;
@@ -685,21 +776,7 @@ export function createLensDiagnosticsTool(
 			const maxLspFiles = parsePositiveInt(params.maxLspFiles);
 			const includeGenerated = params.includeGenerated === true;
 
-			let pathsScope: PathsScope | undefined;
-			try {
-				pathsScope = resolvePathsScope(cwd, params.paths);
-			} catch (err) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: err instanceof Error ? err.message : String(err),
-						},
-					],
-					isError: true,
-					details: { mode, pathsError: true },
-				};
-			}
+			const pathsScope: PathsScope | undefined = resolvePathsScope(pathEntries);
 
 			// Escape aborts the agent *turn*, which fires ctx.signal (the turn-wired
 			// abort); the positional signal is the tool-call signal. A registered
@@ -778,6 +855,14 @@ export function createLensDiagnosticsTool(
 							? params.analysisRoot
 							: undefined,
 					host: ctx.host ?? "pi",
+					// #4944: the sweep leaves an auxiliary the operator turned off
+					// (`--no-ast-grep`, `astGrep.enabled=false`) unstarted, as the
+					// `source=lsp` probe does.
+					...(getFlag && {
+						excludeServerIds: configDisabledAuxiliaryLspServerIds((name) =>
+							getFlag(name, cwd),
+						),
+					}),
 				});
 			}
 			return formatDeltaMode(cacheManager, cwd, severity, pathsScope);
@@ -991,7 +1076,7 @@ function applyCachedDispositions<
 function filterDeltaReportDispositions(
 	report: ProjectDiagnosticsDeltaReport | undefined,
 	cwd: string,
-	policyMap: ReturnType<typeof rulePolicyMapFromConfig>,
+	policyMap: RulePolicy | undefined,
 ): ProjectDiagnosticsDeltaReport | undefined {
 	if (!report?.diagnostics.length) return report;
 	const kept = report.diagnostics.filter(
@@ -1165,17 +1250,20 @@ function getDeltaFileGroup(
 	cwd: string,
 	filePath: string,
 ): DeltaFileGroup {
-	const rel = path.relative(cwd, filePath);
-	let group = groups.get(rel);
+	// Producers arrive on either path axis (#4689 review r2 B): actionable
+	// rows carry the dispatch identity, quality rows the session spelling.
+	// Key by identity so one file is one group, and render on one axis.
+	const key = normalizeMapKey(filePath);
+	let group = groups.get(key);
 	if (!group) {
 		group = {
-			rel,
+			rel: toProjectRelativePath(filePath, cwd),
 			actionableLines: [],
 			qualityLines: [],
 			projectLines: [],
 			incomplete: false,
 		};
-		groups.set(rel, group);
+		groups.set(key, group);
 	}
 	return group;
 }
@@ -1214,7 +1302,7 @@ function formatDeltaMode(
 	// policy oversight (the per-edit dispatch already filters, but the cache
 	// snapshots predate the user's project config edit and would replay
 	// filtered findings). Weak-anchored like weak disposition — zero I/O.
-	const policyMap = loadProjectRulePolicyMap(cwd);
+	const policyMap = loadProjectRulePolicy(cwd);
 	const projectDelta = filterDeltaReportDispositions(
 		loadProjectDiagnosticsDeltaReport(cwd),
 		cwd,
@@ -1450,33 +1538,13 @@ interface PathsScope {
 }
 
 /**
- * Resolves the `paths` param into a scope predicate. Returns `undefined` when
- * `paths` was not provided (callers fall back to no restriction). Throws a
- * plain `Error` when the cap is exceeded — the caller turns that into a
- * clear tool error rather than silently truncating (a wrapper must not
- * believe it checked files it didn't).
+ * Resolves the `paths` entries into a scope predicate. Returns `undefined` when
+ * the caller sent none (callers then fall back to no restriction). The entries
+ * arrive from `readPathsArgument` (#5041): admitted, absolute and host-resolved
+ * already, so this function owns the filesystem classification only.
  */
-function resolvePathsScope(
-	cwd: string,
-	rawPaths: unknown,
-): PathsScope | undefined {
-	if (!Array.isArray(rawPaths) || rawPaths.length === 0) return undefined;
-	if (rawPaths.length > MAX_PATHS_ENTRIES) {
-		throw new Error(
-			`paths has ${rawPaths.length} entries, over the ${MAX_PATHS_ENTRIES} cap. ` +
-				"Narrow the list or omit paths to scan without a restriction.",
-		);
-	}
-	const entries = rawPaths
-		.filter(
-			(entry): entry is string =>
-				typeof entry === "string" && entry.trim().length > 0,
-		)
-		// #4576: `paths` is a host-supplied tool input like any other, so it
-		// goes through the same resolver (`~`, `file://`, `@` prefix, unicode
-		// spaces) instead of a bare `path.resolve` that pinned a literal `~`
-		// under the session cwd.
-		.map((entry) => resolveHostToolPath(entry, cwd));
+function resolvePathsScope(entries: string[]): PathsScope | undefined {
+	if (entries.length === 0) return undefined;
 
 	const missing: string[] = [];
 	const fileEntries: string[] = [];
@@ -1593,7 +1661,7 @@ function filterProjectDiagnosticsDeltaReport(
  */
 function applyProjectRulePolicy<T extends { diagnostics: ProjectDiagnostic[] }>(
 	value: T | undefined,
-	policyMap: ReturnType<typeof rulePolicyMapFromConfig>,
+	policyMap: RulePolicy | undefined,
 	root: string,
 ): T | undefined {
 	if (!value) return undefined;
@@ -1725,13 +1793,15 @@ function projectDiagnosticToWidget(
 // normalization itself now lives in `clients/dispatch/rule-id-normalize.ts` so the
 // inline suppression parser, the project rule-policy matcher, and dedup all apply
 // the same canonical form.
-
+//
+// `fileKey` is the file's path identity (`normalizeMapKey`), never a spelling,
+// so one file reached through a link dedups against its real path (#4689).
 function diagnosticDedupKey(
-	filePath: string,
+	fileKey: string,
 	diagnostic: WidgetDiagnostic,
 ): string {
 	const ruleId = normalizeRuleId(diagnostic.rule ?? diagnostic.tool ?? "");
-	return [path.resolve(filePath), diagnostic.line ?? "?", ruleId].join(":");
+	return [fileKey, diagnostic.line ?? "?", ruleId].join(":");
 }
 
 /**
@@ -1773,12 +1843,16 @@ export function runnerRetirementDecision(
 	}
 	const realFilePath = realpathOrResolve(filePath);
 	for (const entry of coverage) {
-		const root = entry.root;
-		const relative = path.relative(root, realFilePath);
-		const underRoot =
-			relative === "" ||
-			(!relative.startsWith("..") && !path.isAbsolute(relative));
-		if (!underRoot) continue;
+		// #4993 review: both operands are ALREADY kernel-real identities —
+		// `record()` (fresh-fetch.ts) stores `realpathOrResolve(analysisRoot)` as
+		// the root and `realpathOrResolve(file)` in `entry.files`, and
+		// `realFilePath` above is that same call. Comparing one form here is
+		// `isUnderDir`'s identity disjunct without its two `normalizeFilePath`
+		// lookups (and its two spelling lookups) per finding x coverage-root
+		// miss on the mode=full path: `isWithinPathForm` folds separators and
+		// case exactly as the `path.relative` copy it replaced did, and touches
+		// no filesystem.
+		if (!isWithinPathForm(realFilePath, entry.root)) continue;
 		if (entry.files.has(realFilePath)) {
 			return "retire";
 		}
@@ -2038,15 +2112,37 @@ function mergeDiagnosticsWithWidgetSummaries(
 	const byFile = new Map<string, FileDiagnosticSummary>();
 	const seen = new Set<string>();
 
+	const addDiagnostic = (
+		filePath: string,
+		widgetDiagnostic: WidgetDiagnostic,
+	) => {
+		const fileKey = normalizeMapKey(filePath);
+		const existing = byFile.get(fileKey);
+		const diagnostics = existing ? [...existing.diagnostics] : [];
+		const key = diagnosticDedupKey(fileKey, widgetDiagnostic);
+		if (seen.has(key)) return;
+		seen.add(key);
+		diagnostics.push(widgetDiagnostic);
+		byFile.set(
+			fileKey,
+			summarizeDiagnostics(
+				existing?.filePath ?? filePath,
+				diagnostics,
+				existing?.hasFinalSnapshot ?? true,
+			),
+		);
+	};
+
 	for (const summary of widgetSummaries) {
 		const filePath = path.resolve(summary.filePath);
+		const fileKey = normalizeMapKey(summary.filePath);
 		// NOTE (#1993 review): dispositions recorded against a CACHED copy's
 		// message text may not match this file's fresh sweep copy (weak
 		// anchors key on message). Both copies derive from the same LSP
 		// diagnostic via convertLspDiagnostics, so identity is stable in
 		// practice; inline pi-lens-ignore comments are the primary
 		// suppression mechanism.
-		if (authoritativeLspFiles?.has(filePath)) continue;
+		if (authoritativeLspFiles?.has(fileKey)) continue;
 		const retained = summary.diagnostics ?? [];
 		const diagnostics = retained
 			.filter(
@@ -2059,8 +2155,23 @@ function mergeDiagnosticsWithWidgetSummaries(
 					) !== "retire",
 			)
 			.map((d) => ({ ...d }));
+		// Two stored summaries for one file (a writer that missed an entry point,
+		// #4689) fold into the first by the same dedup the later producers use,
+		// never overwrite it: an overwrite would drop the earlier rows.
+		const prior = byFile.get(fileKey);
+		if (prior) {
+			// The merged group is final only when both summaries are.
+			byFile.set(fileKey, {
+				...prior,
+				hasFinalSnapshot:
+					(prior.hasFinalSnapshot ?? true) &&
+					(summary.hasFinalSnapshot ?? true),
+			});
+			for (const diagnostic of diagnostics) addDiagnostic(filePath, diagnostic);
+			continue;
+		}
 		byFile.set(
-			filePath,
+			fileKey,
 			// #2154 v4: when the filter retires rows, the stored tallies describe
 			// diagnostics that are no longer delivered — full mode rendered
 			// `main.go 1W … 1 warning` with no row under it. Recompute from what
@@ -2074,29 +2185,9 @@ function mergeDiagnosticsWithWidgetSummaries(
 					),
 		);
 		for (const diagnostic of diagnostics) {
-			seen.add(diagnosticDedupKey(filePath, diagnostic));
+			seen.add(diagnosticDedupKey(fileKey, diagnostic));
 		}
 	}
-
-	const addDiagnostic = (
-		filePath: string,
-		widgetDiagnostic: WidgetDiagnostic,
-	) => {
-		const existing = byFile.get(filePath);
-		const diagnostics = existing ? [...existing.diagnostics] : [];
-		const key = diagnosticDedupKey(filePath, widgetDiagnostic);
-		if (seen.has(key)) return;
-		seen.add(key);
-		diagnostics.push(widgetDiagnostic);
-		byFile.set(
-			filePath,
-			summarizeDiagnostics(
-				filePath,
-				diagnostics,
-				existing?.hasFinalSnapshot ?? true,
-			),
-		);
-	};
 
 	for (const result of lspResults) {
 		const filePath = path.resolve(result.filePath);
@@ -2157,13 +2248,13 @@ function mergeDiagnosticsWithWidgetSummaries(
  * Also applies the project's `.pi-lens.json` `rules.<id>.disable`/`select`
  * policy AFTER inline suppression / disposition so the same set of findings
  * the per-edit `dispatcher.ts` filters is what's rendered here. The policy
- * map is passed in (computed once per `formatFullMode` call) rather than
- * re-deriving per file — see `loadProjectRulePolicyMap(cwd)`.
+ * is passed in (built once per `formatFullMode` call, memoizing each config
+ * owner) and reads each file's own owner — see `loadProjectRulePolicy(cwd)`.
  */
 async function applyInlineSuppressionsToSummaries(
 	summaries: FileDiagnosticSummary[],
 	cwd: string,
-	policyMap: ReturnType<typeof rulePolicyMapFromConfig>,
+	policyMap: RulePolicy | undefined,
 	/**
 	 * #1634: receives the rows a disposition mark hid, so the caller can state
 	 * the count scoped to its severity. Inline `pi-lens-ignore` and rule-policy
@@ -2211,6 +2302,12 @@ async function applyInlineSuppressionsToSummaries(
 				content,
 				policyMap,
 			});
+			// #4638 review (F1/F10): the owner rule the post-write runner and the
+			// probe already apply, asked only when the file carries jedi's row.
+			const pythonKept = await applyDeclarationRule(
+				summary.filePath,
+				policyKept,
+			);
 			if (disposed.length < inlineKept.length) {
 				const survivors = new Set(disposed);
 				for (const d of inlineKept) {
@@ -2221,7 +2318,7 @@ async function applyInlineSuppressionsToSummaries(
 			// is already in hand here (unlike mode=all/delta's cache-only path), so
 			// this is the one place the tag can be computed without adding I/O to
 			// the "instant" modes.
-			for (const d of policyKept) {
+			for (const d of pythonKept.kept) {
 				// flagged is weak-anchored (module doc, diagnostic-dispositions.ts) so
 				// the tag survives incidental edits to the flagged line itself.
 				const { weak } = anchorsForDiagnostic(
@@ -2234,10 +2331,12 @@ async function applyInlineSuppressionsToSummaries(
 					(d as { flagged?: boolean }).flagged = true;
 				}
 			}
-			if (policyKept.length === summary.diagnostics.length) return summary;
+			if (pythonKept.kept.length === summary.diagnostics.length) {
+				return summary;
+			}
 			return summarizeDiagnostics(
 				summary.filePath,
-				policyKept,
+				pythonKept.kept,
 				summary.hasFinalSnapshot,
 			);
 		}),
@@ -2365,6 +2464,8 @@ async function formatFullMode(
 		onServerReady?: () => void;
 		pathsScope?: PathsScope;
 		nextWriteIndex?: () => number;
+		/** Auxiliary servers the operator's configuration turns off (#4944). */
+		excludeServerIds?: ReadonlySet<string>;
 		runtime?: import("../clients/runtime-coordinator.js").RuntimeCoordinator;
 		/**
 		 * #1107 phase 2 review: scan WITHOUT the generated/artifact NAME-
@@ -2460,6 +2561,7 @@ async function formatFullMode(
 			onServerReady: options.onServerReady,
 			nextWriteIndex: options.nextWriteIndex,
 			files: explicitFiles,
+			excludeServerIds: options.excludeServerIds,
 		}),
 		getProjectDiagnosticsSnapshotForFullMode(cwd, {
 			...options,
@@ -2483,13 +2585,52 @@ async function formatFullMode(
 	// merge, the rendered counts — demote TypeScript errors on files tsserver
 	// checked in its INFERRED project. Applied once, here, so a single seam
 	// governs the whole sweep instead of each renderer learning the rule.
-	const lspResults = await demoteInferredProjectSweepResults(
+	//
+	// #4532 (AGENTS.md defect shape 71): the sweep runs the environment-gap rule
+	// too, inside `demoteInferredProjectSweepResults`, the sweep form of the one
+	// pipeline the per-edit runner and `lsp_diagnostics` call (round 5, review
+	// F3), so one file reads the same in all three.
+	let lspResults = await demoteInferredProjectSweepResults(
 		rawLspResults.filter((result) => includeFile(result.filePath)),
 		cwd,
 		lspService,
 		// #1645 review F1: the sweep that produced these results is signal-bounded,
 		// so the probe loop that post-processes them must be too.
 		signal,
+	);
+	// #4638 review (F1): the sweep's answers still carry the server id here, so
+	// the declaration's owner rule runs before the widget/store conversion that
+	// drops it. `mode=full` and the `source=session` store it writes then see the
+	// same filtered set the probe and post-write lanes already deliver.
+	// The same pass counts what it withheld (#4638 r3 N2): the filtered report
+	// names the rows instead of reading as "No issues" with only the ledger to
+	// say otherwise. Collected per file in sweep order, so the aggregate's named
+	// declaration does not depend on which walk finished first.
+	const pythonSweep = await mapWithConcurrency(
+		lspResults,
+		PYTHON_DECLARATION_CONCURRENCY,
+		async (result) => {
+			const pythonKept = await applyDeclarationRule(
+				result.filePath,
+				result.diagnostics,
+			);
+			if (pythonKept.dropped === 0) return { result };
+			return {
+				result: { ...result, diagnostics: pythonKept.kept },
+				withheld: pythonKept.declared && {
+					count: pythonKept.dropped,
+					declared: pythonKept.declared,
+				},
+			};
+		},
+	);
+	lspResults = pythonSweep.map((entry) => entry.result);
+	// Each project's rows are cited under that project's own declaration
+	// (#4638 r4 F3).
+	const withheldCompile = mergeWithheld(
+		pythonSweep.map((entry) =>
+			"withheld" in entry ? entry.withheld : undefined,
+		),
 	);
 	// A result bound to a different document must not replace the current
 	// widget state, even when it contains real diagnostics. Pull results may carry
@@ -2535,11 +2676,15 @@ async function formatFullMode(
 	// applies. A project config read failure is treated as "no policy"
 	// (defensive, matches the `applyInlineSuppressionsToSummaries` read-error
 	// discipline).
-	const policyMap = loadProjectRulePolicyMap(cwd);
+	const policyMap = loadProjectRulePolicy(cwd);
 	// #571: reconcile this scan's fresh, CONFIRMED per-file results into the
 	// footer cache. A footer write is never allowed to fail the tool call, so
 	// any unexpected throw is swallowed.
 	for (const result of fullyCoveredLspResults) {
+		// The sweep names a file by its path identity and the widget store by the
+		// writer's spelling, so both Sets and their readers key by identity
+		// (#4689).
+		const fileKey = normalizeMapKey(result.filePath);
 		try {
 			// #692: provenance label ONLY — must never affect `rule`/identity (see
 			// `ConvertLspDiagnosticsOptions.scanOrigin`'s doc comment).
@@ -2578,9 +2723,16 @@ async function formatFullMode(
 				content: content ?? "",
 				policyMap,
 			});
-			const retired = reconcileScanDiagnostics(
+			// #4638 review (F1/F10): the store is what `source=session` later serves,
+			// so the owner rule runs before this write — and only for a file that
+			// carries jedi's row.
+			const pythonKept = await applyDeclarationRule(
 				result.filePath,
 				policyKept,
+			);
+			const retired = reconcileScanDiagnostics(
+				result.filePath,
+				pythonKept.kept,
 				true,
 				// The service reserves this token when the file enters the scan. The
 				// fallback preserves compatibility with older test doubles/services.
@@ -2598,9 +2750,9 @@ async function formatFullMode(
 			// Strict `=== true`: `undefined` (a double that predates the boolean
 			// return) takes the unreconciled arm, never the retiring one.
 			if (retired === true) {
-				authoritativeLspFiles.add(path.resolve(result.filePath));
+				authoritativeLspFiles.add(fileKey);
 			} else {
-				unreconciledFiles.add(path.resolve(result.filePath));
+				unreconciledFiles.add(fileKey);
 				recordDegradationOnce({
 					kind: "diagnostic-retained-unreconciled",
 					subject: `${path.resolve(result.filePath)}:lsp`,
@@ -2610,7 +2762,7 @@ async function formatFullMode(
 			}
 		} catch {
 			// Never let a footer-reconciliation hiccup fail the scan itself.
-			unreconciledFiles.add(path.resolve(result.filePath));
+			unreconciledFiles.add(fileKey);
 			recordDegradationOnce({
 				kind: "diagnostic-retained-unreconciled",
 				subject: `${path.resolve(result.filePath)}:lsp`,
@@ -2676,7 +2828,7 @@ async function formatFullMode(
 	const authoritativeRetiredCount = getFileDiagnosticSummaries().filter(
 		(summary) =>
 			includeFile(summary.filePath) &&
-			authoritativeLspFiles.has(path.resolve(summary.filePath)) &&
+			authoritativeLspFiles.has(normalizeMapKey(summary.filePath)) &&
 			(summary.diagnostics?.length ?? 0) > 0,
 	).length;
 	if (authoritativeRetiredCount > 0) {
@@ -2775,7 +2927,7 @@ async function formatFullMode(
 	);
 	if (unreconciledFiles.size > 0) {
 		summaries = summaries.map((summary) =>
-			unreconciledFiles.has(path.resolve(summary.filePath))
+			unreconciledFiles.has(normalizeMapKey(summary.filePath))
 				? summarizeDiagnostics(
 						summary.filePath,
 						markUnreconciledFindings(summary.diagnostics),
@@ -2806,7 +2958,7 @@ async function formatFullMode(
 			projectScanObservedAt,
 		);
 	}
-	const result = await formatAllMode(
+	const formatted = await formatAllMode(
 		cwd,
 		severity,
 		summaries,
@@ -2847,6 +2999,21 @@ async function formatFullMode(
 			analyzersByLane: extracted.dispositionSuppressedByLane ?? {},
 		},
 	);
+	// #4638 r3 (N2): every return below builds on `result`, so the disclosure of
+	// rows the declaration withheld is added once, here, to text and details.
+	const withheldText = withheldCompileNote(withheldCompile);
+	const result = withheldText
+		? {
+				...formatted,
+				content: [
+					{
+						type: "text" as const,
+						text: `${formatted.content[0].text}\n\n${withheldText}`,
+					},
+				] as [{ type: "text"; text: string }],
+				details: { ...formatted.details, withheldCompile },
+			}
+		: formatted;
 	const missingNote = pathsScopeMissingNote(pathsScope);
 	// #630: mirrors `tools/lsp-diagnostics.ts`'s `unconfirmedReasonClause`/
 	// `tallyConfirmation` semantic guarantee (never silently render
@@ -2910,6 +3077,20 @@ async function formatFullMode(
 	const auxiliaryCoverageNote =
 		uncoveredScannerIds.length > 0
 			? `\n\n⚠ Auxiliary coverage incomplete: ${uncoveredScannerIds.join(", ")} did not answer for ${partiallyCoveredLspResults.length} file(s). Findings from answering servers are included; this is not a clean verdict for the named scanner lane(s).`
+			: "";
+	// #4944: an auxiliary the operator turned off was never asked, so it is in
+	// neither list above; say so, as `lsp_diagnostics` does ("Switched off, not
+	// run"), so a sweep with no ast-grep rows is not read as an ast-grep result.
+	// The switch names the auxiliary LSP server only: the project scan above
+	// still reports `ast-grep-napi` rows under `--no-ast-grep`, so the note says
+	// which ast-grep did not run. Code-unit order, for the same determinism as
+	// the lane names above.
+	const switchedOffServerIds = [...(options.excludeServerIds ?? [])].sort(
+		(a, b) => Number(a > b) - Number(a < b),
+	);
+	const switchedOffNote =
+		switchedOffServerIds.length > 0
+			? `\n\nSwitched off, not run (auxiliary LSP): ${switchedOffServerIds.join(", ")}.`
 			: "";
 	// #646: primary-vs-auxiliary split of the raw LSP-sweep findings (before
 	// they're merged into the widget-state summaries below), mirroring
@@ -3043,7 +3224,10 @@ async function formatFullMode(
 	// bypasses both walks, so it is never unsafe. Their empty results in that
 	// case are "walked nothing", not "clean" — say so, matching the fresh-fetch
 	// unsafeRoot note above.
-	const walkUnsafeRoot = explicitFiles === undefined && isAtOrAboveHomeDir(cwd);
+	// By real path on both sides, the same verdict the two walks reach (#4911).
+	const walkUnsafeRoot =
+		explicitFiles === undefined &&
+		isAtOrAboveHomeDir(realpathOrResolve(cwd), realpathOrResolve(os.homedir()));
 	const walkUnsafeRootNote = walkUnsafeRoot
 		? `\n\nproject file walk skipped: the working directory resolves at or above the home directory, so the cheap project scan and the LSP workspace sweep would each enumerate every unrelated tree under it. Re-run from inside a project directory. Absence of their findings is NOT a clean verdict.`
 		: "";
@@ -3227,6 +3411,7 @@ async function formatFullMode(
 						note +
 						unconfirmedLspNote +
 						auxiliaryCoverageNote +
+						switchedOffNote +
 						lspPrimaryVsAuxiliaryNote +
 						partialNote +
 						coldNote +
@@ -3260,6 +3445,7 @@ async function formatFullMode(
 		cheapScanStatusNote ||
 		unconfirmedLspNote ||
 		auxiliaryCoverageNote ||
+		switchedOffNote ||
 		lspPrimaryVsAuxiliaryNote
 	) {
 		return {
@@ -3270,6 +3456,7 @@ async function formatFullMode(
 						result.content[0].text +
 						unconfirmedLspNote +
 						auxiliaryCoverageNote +
+						switchedOffNote +
 						lspPrimaryVsAuxiliaryNote +
 						partialNote +
 						coldNote +
@@ -3336,7 +3523,7 @@ async function formatAllMode(
 	// dispositions through the shared applyCachedDispositions seam — strict
 	// false-positive anchors against current content when the file is
 	// unchanged since observation, weak-only fallback otherwise.
-	const policyMap = loadProjectRulePolicyMap(cwd);
+	const policyMap = loadProjectRulePolicy(cwd);
 	// #1634 criterion 4: what marks hide is counted and said, scoped to the
 	// requested paths and severity like the rows themselves. Without it a file
 	// whose findings the agent marked after a mode=full read "No issues ✓" a
@@ -3613,7 +3800,10 @@ async function formatAllMode(
 	let totalAdvisories = 0;
 
 	for (const s of rendered) {
-		const rel = path.relative(cwd, s.filePath);
+		// Widget rows are keyed by path identity, the root is the session's
+		// spelling: the owner renders `src/x.ts` under a root reached through a
+		// link, where a lexical relative path read `../repo/src/x.ts` (#4689 r2).
+		const rel = toProjectRelativePath(s.filePath, cwd);
 		const parts: string[] = [];
 		if (s.blocking > 0) parts.push(`🔴 ${s.blocking} blocking`);
 		if (s.errors > 0 && s.blocking === 0) parts.push(`${s.errors}E`);

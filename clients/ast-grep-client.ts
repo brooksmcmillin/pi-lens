@@ -10,7 +10,6 @@
 
 import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	AstGrepRuleManager,
@@ -30,6 +29,7 @@ import { getMutationBridge } from "./mutation-bridge.js";
 import type { LineageHandle } from "./session-scope.js";
 import { normalizeFilePath } from "./path-utils.js";
 import { resolvePackagePath } from "./package-root.js";
+import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { getAstGrepRuleFingerprint } from "./sgconfig.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import {
@@ -88,8 +88,7 @@ function reportAstGrepRulesHealth(bundledRuleDir: string): void {
  */
 function recordAstGrepApply(
 	matches: AstGrepMatch[],
-	lineage: LineageHandle | undefined,
-	toolCallId: string | undefined,
+	{ lineage, toolCallId, sessionId }: AstGrepApplyProvenance = {},
 ): void {
 	const bridge = getMutationBridge();
 	if (!bridge || matches.length === 0) return;
@@ -119,8 +118,19 @@ function recordAstGrepApply(
 			// call's own id lets the guard advance exactly the paths that call
 			// checked, and end the authorship of every other file it rewrote.
 			...(toolCallId !== undefined && { toolCallId }),
+			// #4943: the calling session owns the deferred pass of what it rewrote.
+			...(sessionId !== undefined && { sessionId }),
 		});
 	}
+}
+
+/** Who an apply ran for: the call's session scope, its id, and its session. */
+interface AstGrepApplyProvenance {
+	lineage?: LineageHandle | undefined;
+	/** #4187 R4-1: the call whose `tool_call` licensed the paths it named. */
+	toolCallId?: string | undefined;
+	/** #4943: pi's stable id of the session that called the tool. */
+	sessionId?: string | undefined;
 }
 
 // --- Client ---
@@ -346,11 +356,7 @@ export class AstGrepClient {
 		ruleYaml: string,
 		paths: string[],
 		apply: boolean,
-		options?: {
-			lineage?: LineageHandle | undefined;
-			/** #4187 R4-1: the call whose `tool_call` licensed the paths it named. */
-			toolCallId?: string | undefined;
-		},
+		options?: AstGrepApplyProvenance,
 	): Promise<{
 		matches: AstGrepMatch[];
 		totalMatches: number;
@@ -400,8 +406,7 @@ export class AstGrepClient {
 		// #4140 (F9): the structural apply rewrites files with `--update-all`
 		// exactly as the pattern apply does, and no tool_result describes it, so
 		// it reaches the same bridge with the matches captured before the write.
-		if (apply)
-			recordAstGrepApply(allMatches, options?.lineage, options?.toolCallId);
+		if (apply) recordAstGrepApply(allMatches, options);
 		return {
 			matches: allMatches,
 			totalMatches: allMatches.length,
@@ -502,7 +507,9 @@ export class AstGrepClient {
 		lang: string,
 		options: { includeAnonymous?: boolean } = {},
 	): Promise<{ output?: string; error?: string }> {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ast-dump-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(scannerReportParentDir(), "pi-lens-ast-dump-"),
+		);
 		const tmpFile = path.join(
 			tmpDir,
 			`snippet.${lang.replace(/[^a-z0-9_-]/gi, "") || "txt"}`,
@@ -551,7 +558,7 @@ export class AstGrepClient {
 
 		const snippet = validationSnippetFor(lang);
 		const tmpDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-sg-validate-"),
+			path.join(scannerReportParentDir(), "pi-lens-sg-validate-"),
 		);
 		const tmpFile = path.join(tmpDir, `snippet.${snippet.ext}`);
 		try {
@@ -612,7 +619,9 @@ export class AstGrepClient {
 
 		const language = extractRuleLanguage(ruleYaml) ?? "typescript";
 		const snippet = validationSnippetFor(language);
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-rule-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(scannerReportParentDir(), "pi-lens-sg-rule-"),
+		);
 		try {
 			fs.writeFileSync(
 				path.join(tmpDir, `snippet.${snippet.ext}`),
@@ -737,12 +746,7 @@ export class AstGrepClient {
 		lang: string,
 		paths: string[],
 		apply = false,
-		options?: {
-			strictness?: string;
-			lineage?: LineageHandle;
-			/** #4187 R4-1: the call whose `tool_call` licensed the paths it named. */
-			toolCallId?: string;
-		},
+		options?: AstGrepApplyProvenance & { strictness?: string },
 	): Promise<{
 		matches: AstGrepMatch[];
 		totalMatches: number;
@@ -824,7 +828,7 @@ export class AstGrepClient {
 		// the same seam an extension would use. Fire-and-forget: the bridge never
 		// throws, and a missing bridge (pi-lens not activated, guard disabled) is
 		// a silent no-op.
-		recordAstGrepApply(preCheck.matches, options?.lineage, options?.toolCallId);
+		recordAstGrepApply(preCheck.matches, options);
 		return {
 			matches: preCheck.matches,
 			totalMatches: preCheck.totalMatches,

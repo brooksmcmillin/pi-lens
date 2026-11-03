@@ -1,6 +1,7 @@
 // flake-shape: real-process-spawn — the regression must run the real installer against executable fake package-manager boundaries.
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,7 +11,10 @@ const execFileAsync = promisify(execFile);
 const scratchDirs: string[] = [];
 
 function scratchDir(): string {
-	const dir = fs.mkdtempSync(path.join(process.cwd(), ".tmp-pip-pep668-"));
+	// Outside the session root (#4530): the child runs in this checkout, and a
+	// PATH entry inside the session repository is no answer until pi trusts
+	// the project; these fake package managers are global tools here.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pip-pep668-"));
 	scratchDirs.push(dir);
 	return dir;
 }
@@ -624,7 +628,7 @@ broken=no
 if [ -n "\${FAKE_STALE_VENV:-}" ]; then
   broken=yes
 elif [ -n "\${FAKE_REQUIRE_CONSTRAINT:-}" ]; then
-  if [ -z "$backend_constraint" ] || ! /bin/grep -q "pygls<2" "$backend_constraint"; then
+  if [ -z "$backend_constraint" ] || ! /usr/bin/grep -q "pygls<2" "$backend_constraint"; then
     broken=yes
   fi
 fi

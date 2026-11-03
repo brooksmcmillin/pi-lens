@@ -21,8 +21,10 @@ const SETTLE_MS = 400; // let a late publish land + past the touch debounce
 
 // A byte-changing, diagnostic-neutral edit: append a trailing comment line in the
 // file's comment syntax (falls back to a blank line). Keeps the diagnostic SET
-// unchanged so a re-publish is purely the server's clean-scan behavior.
-function commentFor(file) {
+// unchanged so a re-publish is purely the server's clean-scan behavior. Shared
+// with scripts/probe-save-verdict.mjs's `savedWrite` arm, which needs the same
+// property for the same reason — one comment-syntax table, not a sibling.
+export function commentFor(file) {
 	const ext = path.extname(file).toLowerCase();
 	if (
 		[

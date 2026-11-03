@@ -1,0 +1,51 @@
+{
+	"content": "Unresolved from this turn — src/target.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
+	"blockerContent": "Unresolved from this turn — src/target.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
+	"blockingFiles": [
+		"<PROJECT>/src/target.ts"
+	],
+	"carriedBlockers": [
+		{
+			"sessionId": "v4750-first-session",
+			"blockerContent": "🔴 STOP — CRITICAL dependency CVEs (trivy, scanned <1m ago). Upgrade before shipping:\n  CVE-2026-0001 (left-pad@1.0.0) — upgrade to 1.0.1 or later\n",
+			"blockingFiles": [
+				"<PROJECT>/src/target.ts"
+			],
+			"blockerWrittenAt": 1792698620570
+		}
+	],
+	"blockerWrittenAt": 1792698620581,
+	"hasBlockers": true,
+	"affectedFiles": [
+		"<PROJECT>/src/target.ts"
+	],
+	"sessionId": "v4750-second-session",
+	"projectSeqStart": 1,
+	"projectSeqEnd": 2,
+	"fileSeqByPath": {
+		"<PROJECT>/src/target.ts": 2
+	},
+	"fileContentHashes": {
+		"<PROJECT>/src/target.ts": "3ebf951ba9fd2bc02e0e044437e845dd55842e87fc1ddc32e6373794175f06af"
+	},
+	"consumed": true,
+	"affectedFilesTruncated": false,
+	"provenance": {
+		"revision": {
+			"sessionId": "v4750-second-session",
+			"projectSeq": 1,
+			"turnIndex": 1,
+			"generation": 0,
+			"capturedAt": 1792698620576
+		},
+		"files": [
+			{
+				"path": "<PROJECT>/src/target.ts",
+				"role": "affected",
+				"mtimeMs": 1792698620570.9363,
+				"size": 9,
+				"sha256": "3ebf951ba9fd2bc02e0e044437e845dd55842e87fc1ddc32e6373794175f06af"
+			}
+		]
+	}
+}

@@ -48,6 +48,7 @@ const env = setupTestEnvironment("pi-lens-4323-svc-");
 const workspace = fs.realpathSync(env.tmpDir);
 const probe = path.join(workspace, "probe.json");
 const secondProbe = path.join(workspace, "second.json");
+const tsProbe = path.join(workspace, "probe.ts");
 const yamlProbe = path.join(workspace, "probe.yaml");
 const secondYamlProbe = path.join(workspace, "second.yaml");
 const nested = path.join(workspace, "nested");
@@ -160,6 +161,9 @@ describe("an explicit LSP check with Opengrep switched off (#4323)", () => {
 			JSON.stringify({
 				serverOverrides: {
 					json: { command: [process.execPath, jsonShim] },
+					// #4956 F2: the primary a TypeScript probe needs; fallow, the opt-in
+					// auxiliary on that file, keeps its real command and must never start.
+					typescript: { command: [process.execPath, jsonShim] },
 					yaml: {
 						command: [
 							path.join(workspace, "missing", "yaml-language-server"),
@@ -171,6 +175,7 @@ describe("an explicit LSP check with Opengrep switched off (#4323)", () => {
 				disabledServers: ["ast-grep", "typos", "zizmor"],
 			}),
 		);
+		fs.writeFileSync(tsProbe, "export const a = 1;\n");
 		fs.writeFileSync(probe, '{"a": 1}\n');
 		fs.writeFileSync(secondProbe, '{"b": 2}\n');
 		fs.writeFileSync(yamlProbe, "a: 1\n");
@@ -238,6 +243,37 @@ describe("an explicit LSP check with Opengrep switched off (#4323)", () => {
 		expect(result.text).toBe(
 			"Primary LSP (json): confirmed clean.\n\nNo auxiliary findings.",
 		);
+	});
+
+	it("names an enabled opt-in fallow as not run, and never claims its coverage (#4956 F2)", async () => {
+		// Recurrence: the all-server door leaves fallow unstarted (an opt-in server
+		// the door never starts), yet the covered set named it and the rendered line
+		// read as its clean answer: the #4323/#4391 F8 shape on a new server.
+		const confirmed: ConfirmedNoBlockers[] = [];
+		const result = await diagnose(
+			{ path: tsProbe },
+			(name) => name === "lens-fallow" || noOpengrep(name),
+			confirmed,
+		);
+
+		expect(result.text).toBe(
+			"Primary LSP (typescript): confirmed clean.\n\n" +
+				"No auxiliary findings. Switched off, not run: opengrep. Opt-in, not run by this check: fallow.",
+		);
+		expect(confirmed.map((info) => info.coveredSources)).toEqual([["lsp"]]);
+	});
+
+	it("keeps the plain report, and no fallow claim, while fallow is not enabled (#4956 F2)", async () => {
+		// The report of an operator who never asked for fallow is the same bytes it
+		// was before the server existed.
+		const confirmed: ConfirmedNoBlockers[] = [];
+		const result = await diagnose({ path: tsProbe }, noOpengrep, confirmed);
+
+		expect(result.text).toBe(
+			"Primary LSP (typescript): confirmed clean.\n\n" +
+				"No auxiliary findings. Switched off, not run: opengrep.",
+		);
+		expect(confirmed.map((info) => info.coveredSources)).toEqual([["lsp"]]);
 	});
 
 	it("does not start Opengrep for a batch check", async () => {

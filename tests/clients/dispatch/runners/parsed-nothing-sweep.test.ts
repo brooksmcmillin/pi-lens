@@ -187,10 +187,12 @@ describe("parsed-nothing sweep (#1948)", () => {
 		const ratchetDeclared = new Set(
 			[...ratchet.matchAll(/^\s+"([a-z0-9-]+\.ts)":/gm)].map((m) => m[1]),
 		);
+		// 12 -> 11 (#4130 r2): gleam-check left NOT_YET_ON_PRIMITIVE when it
+		// took the shared cut-short rule.
 		expect(
 			ratchetDeclared.size,
 			"the ratchet registry scraper matched nothing",
-		).toBeGreaterThanOrEqual(12);
+		).toBeGreaterThanOrEqual(11);
 
 		const doubleDeclared = Object.keys(EXEMPT).filter((name) =>
 			ratchetDeclared.has(name),

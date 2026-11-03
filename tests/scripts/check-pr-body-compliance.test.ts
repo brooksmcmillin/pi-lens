@@ -218,6 +218,35 @@ describe("diff-keyed compliance (#4585)", () => {
 			).join(),
 		).toContain("row 2");
 	});
+	// #5026 r4 verify N4: both row readers split cells the way GitHub does.
+	// Recurrence: a naive `split("|").slice(1, -1)` drops the last cell of a row
+	// with no trailing pipe and splits at an escaped pipe, so a mutation row's
+	// label went unread and a one-cell Controls row read as file plus reason.
+	it("reads the label of a mutation row with no trailing pipe", () => {
+		const { diff, headFiles } = image(
+			"clients/path-utils.ts",
+			"if (ready) return value;",
+		);
+		const body =
+			"## Mutations\n| File | Mutation | Transcript |\n|---|---|---|\n| `clients/path-utils.ts` | remove ready guard | M1\n\n```text\nM1 clients/path-utils.ts\nFAIL tests/a.test.ts > broken guard\nTests 1 failed\n```\n\nWindows: cannot differ because this guard compares booleans without filesystem calls.";
+		expect(errors(body, diff, headFiles)).toEqual([]);
+	});
+	it("reads Controls cells the way GitHub splits them", () => {
+		const { diff, headFiles } = image(
+			"tests/a.test.ts",
+			'it("first case", () => {});',
+		);
+		const control = (row: string) =>
+			errors(`| Control | Reason |\n|---|---|\n${row}`, diff, headFiles).join();
+		// The reason is the last cell of a row with no trailing pipe.
+		expect(control("| `tests/a.test.ts` | the case predates this diff")).toBe(
+			"",
+		);
+		// An escaped pipe keeps one cell: no reason cell, so no control.
+		expect(
+			control("| `tests/a.test.ts` \\| the case predates this diff |"),
+		).toContain("row 1");
+	});
 	it("finds aliases, indirect calls and titles reached through bindings", () => {
 		for (const source of [
 			'import { it as check } from "vitest"; check("alias case", () => {});',
@@ -1150,5 +1179,74 @@ describe("diff-keyed compliance (#4585)", () => {
 				headFiles,
 			).join(),
 		).toContain("row 1");
+	});
+});
+
+// #4717 F1: a row belongs to the section the reader sees, so both row scanners
+// take their heading lines from the lexer. Recurrence: each scanner ran
+// `HEADING.exec(row)`, a column-0 `## ` regex, so a setext or an indented ATX
+// heading never ended a table's section and a later section's row proved the
+// mutation (or Controls) evidence the section above it did not. `marked`'s own
+// gfm render hides nothing there: the heading is a heading.
+describe("row scanners read the lexer's headings (#4717 F1)", () => {
+	const ended = [
+		["a setext heading", "Blast radius\n------------"],
+		["an indented ATX heading", "   ## Blast radius"],
+	];
+	const evidenceTable = (file: string, evidence: string) =>
+		[
+			"| file | evidence |",
+			"| --- | --- |",
+			`| \`${file}\` | ${evidence} |`,
+		].join("\n");
+
+	it.each(ended)("does not credit a mutation row past %s", (_name, heading) => {
+		const { diff, headFiles } = image(
+			"scripts/sample.mjs",
+			"if (ready) return value;",
+		);
+		const body = [
+			"## Mutations",
+			evidenceTable("scripts/other.mjs", "`Tests 1 failed`"),
+			"",
+			heading,
+			"",
+			evidenceTable("scripts/sample.mjs", "`Tests 1 failed`"),
+		].join("\n");
+		expect(errors(body, diff, headFiles).join()).toContain("row 2");
+		// The same row inside its own section still proves the mutation.
+		expect(
+			errors(
+				[
+					"## Mutations",
+					evidenceTable("scripts/sample.mjs", "`Tests 1 failed`"),
+				].join("\n"),
+				diff,
+				headFiles,
+			),
+		).toEqual([]);
+	});
+
+	it.each(ended)("does not credit a Controls row past %s", (_name, heading) => {
+		const { diff, headFiles } = image(
+			"tests/a.test.ts",
+			`it("fails for stale bytes", () => {});`,
+		);
+		const control = evidenceTable(
+			"tests/a.test.ts",
+			"the case predates this diff",
+		);
+		const body = [
+			"## Controls",
+			"No control is named here.",
+			"",
+			heading,
+			"",
+			control,
+		].join("\n");
+		expect(errors(body, diff, headFiles).join()).toContain("row 1");
+		expect(
+			errors(["## Controls", control].join("\n"), diff, headFiles),
+		).toEqual([]);
 	});
 });

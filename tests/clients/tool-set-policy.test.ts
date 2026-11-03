@@ -189,6 +189,40 @@ describe("tool-set cache policy", () => {
 			});
 		});
 
+		// #4913 recurrence: `--no-tool <name>` reaches the extension after the
+		// factory registered every tool, so the plan is what drops a named tool.
+		it("drops a disabled tool from the kept set and from the restored one", () => {
+			const plan = planToolSet(
+				ALL_ACTIVE,
+				LAZY,
+				new Set(["ast_grep_search", "lsp_navigation"]),
+				new Set(["lens_diagnostics", "lsp_navigation"]),
+			);
+
+			expect(plan.desired).toEqual([
+				"pi_lens_activate_tools",
+				"ast_grep_search",
+			]);
+			expect(plan.changed).toBe(true);
+			// lens_diagnostics (kept baseline) and lsp_navigation (remembered)
+			// both go; the plan counts what it removed from the host's set.
+			expect(plan.removedCount).toBe(ALL_ACTIVE.length - 2);
+			// #4917 F3: the two the command line named, apart from the lazy rest.
+			expect(plan.policyDisabledCount).toBe(2);
+		});
+
+		it("re-adds no disabled tool the host did not report as active", () => {
+			const plan = planToolSet(
+				["lens_diagnostics"],
+				LAZY,
+				new Set(["lsp_navigation"]),
+				new Set(["lsp_navigation"]),
+			);
+
+			expect(plan.desired).toEqual(["lens_diagnostics"]);
+			expect(plan.changed).toBe(false);
+		});
+
 		it("reports no change when the active set already matches", () => {
 			const plan = planToolSet(
 				["lens_diagnostics", "ast_grep_search"],

@@ -24,6 +24,7 @@ import {
 } from "../../clients/generation-lock.js";
 import { getProjectChangeLogPath } from "../../clients/project-changes.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
+import { readNdjsonRows } from "../support/ndjson-rows.js";
 
 /** Derive the receipt key exactly as the seam does - never hardcode it. */
 const keyOf = (p: string) => normalizeMapKey(path.resolve(p));
@@ -353,6 +354,43 @@ describe("recordProjectMutation — the one mutation seam", () => {
 			expect(path.resolve(entry.filePath)).toBe(
 				path.resolve(path.join(cwd, "src", "a.ts")),
 			);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("names the writing session in the change-log row, and the coordinator's when none is given (#4943)", () => {
+		// RECURRENCE GUARDED: #4943. An in-process subagent's edit was logged
+		// under the coordinator's (the primary's) session id, so the change log
+		// credited it to the wrong session.
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-mutation-seam-4943-"),
+		);
+		try {
+			const runtime = makeRuntime();
+			runtime.setSessionLifecycle({ sessionId: "primary-session" });
+			runtime.recordProjectMutation({
+				filePath: path.join(cwd, "src", "own.ts"),
+				source: "agent-edit",
+				cwd,
+			});
+			runtime.recordProjectMutation({
+				filePath: path.join(cwd, "src", "subagent.ts"),
+				source: "agent-edit",
+				cwd,
+				sessionId: "subagent-session",
+			});
+			const { rows, skipped } = readNdjsonRows<{
+				sessionId: string;
+				filePath: string;
+			}>(getProjectChangeLogPath(cwd));
+			expect(skipped).toBe(0);
+			expect(
+				rows.map((row) => [path.basename(row.filePath), row.sessionId]),
+			).toEqual([
+				["own.ts", "primary-session"],
+				["subagent.ts", "subagent-session"],
+			]);
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}

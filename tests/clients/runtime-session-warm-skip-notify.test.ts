@@ -43,17 +43,7 @@ import {
 	setupTestEnvironment,
 } from "./test-utils.js";
 import { suspendAt, waitFor } from "./interleaving-kit.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
-
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() => makeLspServiceDouble()),
-}));
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 // The quick-mode warmup's scan is the one await the N1 tests must hold open
 // while another session starts; the spy delegates to the real walk otherwise.
@@ -82,6 +72,8 @@ import {
 	_resetStartupScanMaxEntriesForTests,
 	getStartupScanMaxEntries,
 } from "../../clients/startup-scan.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 const WARM_SKIP_LINE = "Project-size limits disabled background warm scans";
 
@@ -201,12 +193,17 @@ describe("warm-pipeline size-skip notify (#775)", () => {
 	afterEach(cleanupWarmSkipNotifyTemps);
 	afterAll(cleanupWarmSkipNotifyTemps);
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// The real config loader walks up from the session cwd to HOME (#4709);
+		// a pinned fixture HOME keeps that read off the maintainer's home.
+		pinFixtureHome("runtime-session-warm-skip-notify");
+		await installLspServiceDouble();
 		restoreStartupMode = setStartupMode("full");
 		previousDataDir = process.env.PILENS_DATA_DIR;
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		restoreStartupMode();
 		if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 		else process.env.PILENS_DATA_DIR = previousDataDir;

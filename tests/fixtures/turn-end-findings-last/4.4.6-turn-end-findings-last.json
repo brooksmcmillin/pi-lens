@@ -1,0 +1,6 @@
+{
+  "signature": "src/f1.ts::Unresolved from this turn — src/bad.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L3: Debugger statement — remove before committing\n    💡 Fix: remove this statement",
+  "sessionId": "replaced-by-the-test",
+  "projectSeqStart": 1,
+  "projectSeqEnd": 2
+}

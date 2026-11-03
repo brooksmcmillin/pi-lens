@@ -36,6 +36,7 @@ import {
 	lexShellAligned,
 	npmPinBoundAt,
 } from "../support/workflow-shell-portability.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
@@ -122,23 +123,27 @@ describe("workflow npx calls are pinned (#4339)", () => {
 		expect(pkg.packageManager).toMatch(/^npm@\d+\.\d+\.\d+$/);
 	});
 
-	it("every npx call in every workflow and composite action is pinned", () => {
-		const files = repoWorkflowFiles();
-		assertNonEmptyScan("npx pin scan: workflow files", files.length, 15);
-		const findings = files.map((file) => ({
-			file,
-			...scanWorkflowSource(readFileSync(join(ROOT, file), "utf8")),
-		}));
-		assertNonEmptyScan(
-			"npx pin scan: npx words in lexed run scripts",
-			findings.reduce((sum, f) => sum + f.calls, 0),
-			10,
-		);
-		const violations = findings.flatMap((f) =>
-			f.violations.map((v) => `${f.file}: ${v}`),
-		);
-		expect(violations).toEqual([]);
-	});
+	it(
+		"every npx call in every workflow and composite action is pinned",
+		() => {
+			const files = repoWorkflowFiles();
+			assertNonEmptyScan("npx pin scan: workflow files", files.length, 15);
+			const findings = files.map((file) => ({
+				file,
+				...scanWorkflowSource(readFileSync(join(ROOT, file), "utf8")),
+			}));
+			assertNonEmptyScan(
+				"npx pin scan: npx words in lexed run scripts",
+				findings.reduce((sum, f) => sum + f.calls, 0),
+				10,
+			);
+			const violations = findings.flatMap((f) =>
+				f.violations.map((v) => `${f.file}: ${v}`),
+			);
+			expect(violations).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it.each([
 		["flags a bare npx <bin>", "npx vitest run tests/a.ts", 1],

@@ -21,12 +21,6 @@ const createLSPClient = vi.fn();
 const loadReverseDependencyIndexFromSnapshot = vi.fn(() => null);
 const getReverseDepsFromIndex = vi.fn(() => [] as string[]);
 
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -122,6 +116,9 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		loadReverseDependencyIndexFromSnapshot.mockReset().mockReturnValue(null);
@@ -755,6 +752,136 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 			expect(
 				group?.latestReasons.some((e) => /resync FAILED/.test(e.reason)),
 			).toBe(true);
+		});
+	});
+
+	/**
+	 * #4956 F6. Recurrence: the aggregate door dropped every opt-in auxiliary
+	 * (fallow) from the touch, so the drift resync never reached a fallow client
+	 * the per-edit door had started, and `recordFullyCoveredSync` refused to
+	 * stamp while that untargeted client held the document. Every pass then
+	 * reported the file `failed`, wrote "resync FAILED ... view still stale", and
+	 * fallow kept the pre-edit bytes until the next edit through the per-edit
+	 * door. The second case pins the other half of the rule: a door that does
+	 * not name an opt-in server reaches a client already holding THIS root and
+	 * never starts one anywhere else.
+	 */
+	describe("an opt-in auxiliary the per-edit door started (#4956 F6)", () => {
+		/** fallow is opt-in by its profile; each directory is its own root. */
+		function primaryAndFallow() {
+			return [
+				makeServer(dir, "typescript", "language"),
+				{
+					...makeServer(dir, "fallow", "auxiliary"),
+					root: async (filePath: string) =>
+						path.dirname(path.resolve(filePath)),
+				},
+			];
+		}
+
+		async function primeWithFallow() {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const primary = makeClient(new Set<string>());
+			const fallow = makeClient(new Set<string>(), {}, "fallow");
+			const fallowStarts: string[] = [];
+			getServersForFileWithConfig.mockReturnValue(primaryAndFallow());
+			createLSPClient.mockImplementation(
+				async (args: { serverId: string; root: string }) => {
+					if (args.serverId !== "fallow") return primary;
+					fallowStarts.push(args.root);
+					return fallow;
+				},
+			);
+			// The per-edit door: the runner names fallow because the operator
+			// turned it on, so this touch starts it beside the primary.
+			await service.touchFile(file, ORIGINAL, {
+				diagnostics: "none",
+				clientScope: "with-auxiliary",
+				auxiliaryServerIds: ["fallow"],
+				source: "lsp_sync",
+			});
+			expect(primary.received).toEqual([ORIGINAL]);
+			expect(fallow.received).toEqual([ORIGINAL]);
+			expect(fallowStarts).toHaveLength(1);
+			return { service, primary, fallow, fallowStarts };
+		}
+
+		it("the drift resync reaches the held fallow view and stamps the record", async () => {
+			const { service, primary, fallow } = await primeWithFallow();
+			const { getDegradationSummary, resetDegradationLedger } =
+				await import("../../../clients/degradation-ledger.js");
+			resetDegradationLedger();
+
+			await fs.writeFile(file, BULK_EDITED, "utf-8");
+			const first = await service.sweepDocumentDrift({ force: true });
+
+			expect(first?.resynced).toBe(1);
+			expect(first?.failed).toBe(0);
+			expect(primary.received).toEqual([ORIGINAL, BULK_EDITED]);
+			expect(fallow.received).toEqual([ORIGINAL, BULK_EDITED]);
+			const reasons =
+				getDegradationSummary()
+					.find((entry) => entry.kind === "lsp-document-drift")
+					?.latestReasons.map((entry) => entry.reason) ?? [];
+			expect(reasons.some((reason) => /resync FAILED/.test(reason))).toBe(
+				false,
+			);
+			// The record advanced, so the next pass has nothing to heal.
+			const second = await service.sweepDocumentDrift({ force: true });
+			expect(second?.candidates).toBe(0);
+		});
+
+		it("a sync touch reaches fallow only where its client holds the root, and never starts it", async () => {
+			const { service, fallow, fallowStarts } = await primeWithFallow();
+			// A sibling root: a NESTED directory with no project marker would
+			// reuse the held ancestor client, which is the registry's own rule.
+			const otherRoot = await fs.mkdtemp(
+				path.join(os.tmpdir(), "pi-lens-drift-other-"),
+			);
+			try {
+				const elsewhere = path.join(otherRoot, "b.ts");
+				await fs.writeFile(elsewhere, ORIGINAL, "utf-8");
+
+				// A content sync for a file under another root, with no exclusions:
+				// no fallow client holds that root, so the door must not start one.
+				await service.touchFile(elsewhere, ORIGINAL, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+				});
+				expect(fallowStarts).toHaveLength(1);
+				expect(fallow.notify.open.mock.calls.map((call) => call[0])).toEqual([
+					file,
+				]);
+
+				// The same door for the file whose root the client holds reaches it.
+				await service.touchFile(file, BULK_EDITED, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+				});
+				expect(fallow.received).toEqual([ORIGINAL, BULK_EDITED]);
+				expect(fallowStarts).toHaveLength(1);
+			} finally {
+				await fs.rm(otherRoot, { recursive: true, force: true });
+			}
+		});
+
+		it("a collecting all-server touch never consults the held fallow client", async () => {
+			const { service, primary, fallow } = await primeWithFallow();
+
+			// `getDiagnostics`, the sweep and `lsp_diagnostics` ask this door for
+			// answers; fallow is not named there, so a warm client must not change
+			// who answers. The record stays unstamped and the drift pass heals it.
+			await service.touchFile(file, BULK_EDITED, {
+				diagnostics: "document",
+				collectDiagnostics: true,
+				clientScope: "all",
+				source: "lsp_diagnostics",
+			});
+			expect(primary.received).toEqual([ORIGINAL, BULK_EDITED]);
+			expect(fallow.received).toEqual([ORIGINAL]);
 		});
 	});
 

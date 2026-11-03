@@ -19,7 +19,7 @@ import {
 	wrapSessionEventHandler,
 	wrapSessionEventHandlerWithResult,
 } from "../../clients/session-event-guard.js";
-import { makeStaleCtx, STALE_CTX_MESSAGE } from "../support/pi-mock.js";
+import { makeStaleCtx, STALE_CTX_MESSAGE } from "../support/stale-ctx.js";
 
 /** A live ctx: `isIdle()` answers instead of throwing, so the probe says true. */
 function liveCtx(): unknown {

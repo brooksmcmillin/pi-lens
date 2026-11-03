@@ -11,7 +11,12 @@ import {
 	type FileKind,
 } from "./file-kinds.js";
 import { getProjectIgnoreMatcher } from "./file-utils.js";
-import { direntsHaveMarkerGlobMatch, normalizeMapKey } from "./path-utils.js";
+import {
+	direntsHaveMarkerGlobMatch,
+	isUnderDir,
+	normalizeMapKey,
+	realpathOrResolve,
+} from "./path-utils.js";
 import {
 	LANGUAGE_POLICY,
 	type ProjectLanguageProfile,
@@ -265,7 +270,10 @@ export function resolveLanguageRootForFile(
 	workspaceRoot: string,
 ): string {
 	const absoluteFilePath = path.resolve(filePath);
-	const startDir = path.dirname(absoluteFilePath);
+	// #4689 item 6: the package the file lives in. The directory of a file
+	// link is a real directory of the link's package, so the identity is taken
+	// on the file; `handleToolResult` passes the spelling the agent used.
+	const startDir = path.dirname(realpathOrResolve(absoluteFilePath));
 	const kind = detectFileKind(absoluteFilePath);
 	if (!kind) return path.resolve(workspaceRoot);
 
@@ -287,13 +295,14 @@ export function resolveLanguageRootForFile(
 	const found = findNearestDirWithAnyBasename(startDir, markers);
 	if (!found) return path.resolve(workspaceRoot);
 
+	// The containment owner, not a `path.relative` of two spellings (#4689
+	// review r1 F3): `found` walks from the file's path, which is an identity
+	// when the caller holds a key (`createDispatchContext`), while the
+	// workspace is the session's spelling. Under a root reached through a link
+	// a lexical relative path read every nested package as outside and
+	// collapsed it to the workspace; `isUnderDir` answers on either axis.
 	const workspace = path.resolve(workspaceRoot);
-	const relative = path.relative(workspace, found);
-	if (relative.startsWith("..") || path.isAbsolute(relative)) {
-		return workspace;
-	}
-
-	return found;
+	return isUnderDir(found, workspace) ? found : workspace;
 }
 
 // ---------------------------------------------------------------------------

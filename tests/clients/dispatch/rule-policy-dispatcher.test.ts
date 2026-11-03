@@ -25,6 +25,8 @@ import type {
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { resetProjectLensConfigCache } from "../../../clients/project-lens-config.js";
 import { removeTempDirSync } from "../test-utils.js";
+import { useConfigPath } from "../../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 function makeContext(cwd: string, facts: FactStore): DispatchContext {
 	return createDispatchContext(
@@ -107,7 +109,6 @@ describe("dispatcher filter — rules.<id>.disable", () => {
 
 	it("cannot widen a global path denial from a project config", async () => {
 		const previous = process.env.PI_LENS_HOME;
-		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 		const globalDir = path.join(tmpDir, "global", ".pi-lens");
 		fs.mkdirSync(globalDir, { recursive: true });
 		fs.writeFileSync(
@@ -121,7 +122,7 @@ describe("dispatcher filter — rules.<id>.disable", () => {
 			JSON.stringify({ rules: { "no-eval": { ignorePaths: [] } } }),
 		);
 		process.env.PI_LENS_HOME = path.join(tmpDir, "global");
-		process.env.PI_LENS_CONFIG_PATH = path.join(globalDir, "config.json");
+		setConfigPath(path.join(globalDir, "config.json"));
 		try {
 			const registry = new RunnerRegistry();
 			registry.register(
@@ -147,9 +148,6 @@ describe("dispatcher filter — rules.<id>.disable", () => {
 		} finally {
 			if (previous === undefined) delete process.env.PI_LENS_HOME;
 			else process.env.PI_LENS_HOME = previous;
-			if (previousConfigPath === undefined)
-				delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 		}
 	});
 

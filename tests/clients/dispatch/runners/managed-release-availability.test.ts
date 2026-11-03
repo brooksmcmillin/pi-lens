@@ -25,18 +25,8 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../../test-utils.js";
 
-const { piLensDirHolder, logLatencySpy } = vi.hoisted(() => ({
-	piLensDirHolder: { dir: "" },
+const { logLatencySpy } = vi.hoisted(() => ({
 	logLatencySpy: vi.fn(),
-}));
-
-// The installer captures `GITHUB_BIN_DIR` at module load, so the redirect has
-// to be in place before the fresh import each test takes (`vi.resetModules`).
-vi.mock("../../../../clients/file-utils.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../../../clients/file-utils.js")
-	>()),
-	getGlobalPiLensDir: () => piLensDirHolder.dir,
 }));
 
 vi.mock("../../../../clients/latency-logger.js", async (importOriginal) => ({
@@ -81,6 +71,7 @@ const decisions = () =>
 		.filter((entry) => entry?.phase === "availability_decision");
 
 let tmpHome = "";
+let previousHome: string | undefined;
 let cwd = "";
 
 /**
@@ -175,11 +166,17 @@ beforeEach(async () => {
 	logLatencySpy.mockReset();
 	tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2140-home-"));
 	cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2140-cwd-"));
-	piLensDirHolder.dir = tmpHome;
+	// The installer captures `GITHUB_BIN_DIR` at module load, so the redirect
+	// has to be in place before the fresh import each test takes
+	// (`vi.resetModules`). `PI_LENS_HOME` is the knob `getGlobalPiLensDir` reads.
+	previousHome = process.env.PI_LENS_HOME;
+	process.env.PI_LENS_HOME = tmpHome;
 });
 
 afterEach(async () => {
 	vi.useRealTimers();
+	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+	else process.env.PI_LENS_HOME = previousHome;
 	(await import("../../../../clients/project-trust.js")).resetProjectTrust();
 	removeTempDirSync(tmpHome);
 	removeTempDirSync(cwd);

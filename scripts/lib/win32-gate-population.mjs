@@ -1,7 +1,8 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { BoundedSet } from "../../clients/bounded-cache.js";
+import { walkFiles } from "./walk-files.mjs";
 
 const TESTS_ROOT = "tests";
 const TEST_FILE = /\.test\.ts$/;
@@ -22,6 +23,11 @@ export const WINDOWS_LANE_ADMISSIONS = Object.freeze([
 		file: "tests/clients/dispatch/runners/reported-path-attribution.test.ts",
 		reason:
 			"#3278 (+#3285, gleam-check): the eleven members' case-variant cells assert the host filesystem's own case-folding answer, and for the nine members whose tool echoes our argv that arm is the only lane where the case direction reds; every boundary mocked is a process boundary, so no toolchain is required.",
+	}),
+	Object.freeze({
+		file: "tests/clients/lsp/server-policy.test.ts",
+		reason:
+			"#4638 F5: the jedi spawn fixtures build the venv shape of the host (`.venv/Scripts/python.exe` vs `.venv/bin/python`), and only a real Windows host can exercise the Scripts branch; every boundary is mocked, so no Python toolchain is required.",
 	}),
 	Object.freeze({
 		file: "tests/clients/ruff-client-reported-path.test.ts",
@@ -79,17 +85,11 @@ function blankSource(source) {
 }
 
 function sourceFiles(root) {
-	const files = [];
-	const visit = (directory) => {
-		for (const entry of readdirSync(directory, { withFileTypes: true })) {
-			const absolute = join(directory, entry.name);
-			if (entry.isDirectory()) visit(absolute);
-			else if (entry.isFile() && TEST_FILE.test(entry.name))
-				files.push(absolute);
-		}
-	};
-	visit(join(root, TESTS_ROOT));
-	return files.sort();
+	return walkFiles(
+		join(root, TESTS_ROOT),
+		(entry) => entry.isFile() && TEST_FILE.test(entry.name),
+		(directory) => recordVanishedPath(directory, "its descent"),
+	);
 }
 
 /**
@@ -139,14 +139,17 @@ export function readWalkedFile(absolute) {
 		return readFileSync(absolute, "utf8");
 	} catch (error) {
 		if (error?.code !== "ENOENT") throw error;
-		if (!vanishedBetweenWalkAndRead.has(absolute)) {
-			vanishedBetweenWalkAndRead.add(absolute);
-			process.stderr.write(
-				`[win32-gate-population] ${absolute} vanished between the walk and the read; skipped (#3082)\n`,
-			);
-		}
+		recordVanishedPath(absolute, "the read");
 		return undefined;
 	}
+}
+
+function recordVanishedPath(absolute, phase) {
+	if (vanishedBetweenWalkAndRead.has(absolute)) return;
+	vanishedBetweenWalkAndRead.add(absolute);
+	process.stderr.write(
+		`[win32-gate-population] ${absolute} vanished between the walk and ${phase}; skipped (#3082)\n`,
+	);
 }
 
 function isWindowsOnlyGate(match, rawSpan) {

@@ -19,7 +19,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import { fileURLToPath } from "node:url";
 import { minimatch } from "minimatch";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".pi-lens");
@@ -222,6 +221,7 @@ function createState(files) {
 			toolResults: counter(),
 			phaseCounts: counter(),
 			phaseTimeouts: counter(),
+			skillsResolved: counter(),
 			// D1: every latency row timestamp (ms) in window, for the coverage-gap
 			// scan. Sorted after all files are read.
 			rowTs: [],
@@ -475,6 +475,14 @@ async function analyzeLatency(files, state) {
 			} else if (entry.type === "phase") {
 				const phase = entry.phase ?? "unknown";
 				state.latency.phaseCounts.inc(phase);
+				if (phase === "skills_resolved") {
+					// A non-string or empty status is malformed: count it as unknown rather
+					// than render a blank label or [object Object].
+					const status = entry.metadata?.status;
+					state.latency.skillsResolved.inc(
+						typeof status === "string" && status !== "" ? status : "unknown",
+					);
+				}
 				if (phase.endsWith("_timeout")) state.latency.phaseTimeouts.inc(phase);
 				if (phase === "test_runner_verdict_delivery") {
 					const sessionId = entry.metadata?.sessionId ?? "unknown";
@@ -2631,6 +2639,7 @@ function buildReport(state) {
 			toolResults: state.latency.toolResults.toJSON(),
 			phaseCounts: state.latency.phaseCounts.top(limit),
 			phaseTimeouts: state.latency.phaseTimeouts.toJSON(),
+			skillsResolved: state.latency.skillsResolved.toJSON(),
 			workspaceDiagnostics: {
 				started: ws.started,
 				completed: ws.completed,
@@ -2873,6 +2882,11 @@ function printReport(report) {
 		(x) => `${x.count.toString().padStart(5)}  ${x.key}`,
 	);
 	section(
+		"Skills resolution",
+		Object.entries(report.latency.skillsResolved),
+		([status, count]) => `${count.toString().padStart(5)}  ${status}`,
+	);
+	section(
 		"Runner statuses",
 		report.latency.runnerStatus,
 		(x) => `${x.count.toString().padStart(5)}  ${x.key}`,
@@ -3024,8 +3038,4 @@ function formatExample(ex) {
 	if (ex.error) bits.push(`— ${String(ex.error).slice(0, 160)}`);
 	if (!bits.length && ex.key) bits.push(`${ex.count} × ${ex.key}`);
 	return bits.join(" ");
-}
-
-if (process.argv[1] === fileURLToPath(import.meta.url) && args.help) {
-	printHelp();
 }

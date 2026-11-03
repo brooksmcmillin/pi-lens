@@ -44,13 +44,6 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/latency-logger.js")>()),
 	logLatency,
 }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => lsp.service,
-}));
-
 import {
 	applyConservativeActionableWarningFixes,
 	type ActionableWarningsReport,
@@ -63,6 +56,7 @@ import { setHostFileMutationQueueLoader } from "../../clients/file-mutation-queu
 import { setupIncomingHandlers } from "../../clients/lsp/client.js";
 import { applyWorkspaceEdit } from "../../clients/lsp/edits.js";
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
 function gate() {
 	let open!: () => void;
@@ -167,11 +161,13 @@ function useActionableFix(codeAction: () => Promise<unknown[]>) {
 			packages: { "node_modules/eslint": { version: "9.0.0" } },
 		}),
 	);
-	lsp.service = makeLspServiceDouble({
-		supportsLSP: () => true,
-		openFile: async () => undefined,
-		codeAction,
-	});
+	lsp.service = installLspService(
+		makeLspServiceDouble({
+			supportsLSP: () => true,
+			openFile: async () => undefined,
+			codeAction,
+		}),
+	);
 }
 
 /** One autofix-eligible warning on line 1 of F. */
@@ -247,11 +243,13 @@ describe("#3541: each LSP writer applies its edit inside pi's mutation queue", (
 	});
 
 	it("lsp_navigation's applied rename does not erase an agent edit made while it applies", async () => {
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			rename: async () => valueEdit(),
-		});
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				rename: async () => valueEdit(),
+			}),
+		);
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		await assertAgentEditSurvives(async () => {
 			const result = await tool.execute(
@@ -626,6 +624,47 @@ describe("#3541: the actionable fix writes only the warning's own file", () => {
 			});
 		},
 	);
+});
+
+/**
+ * #4689 batch 2: the multi-file guard (`clients/actionable-warnings.ts`, the
+ * `target` / `writesOtherFile` pair) answers a second file that is not on disk
+ * like one that is. The link-spelling cells of the same guard are the
+ * `it.each` of the stale_content describe above (report and edit through a
+ * linked directory); an edit that names F and a link to F is merged into one
+ * op by `planWorkspaceEdit` before the guard sees it, so it cannot reach it.
+ */
+describe("#4689: the actionable fix's one-file guard answers a missing second file", () => {
+	// A second file that is not on disk is still a second file: the fix is
+	// refused as multi_file_edit before any write, the same answer as for a
+	// second file that exists. Recurrence: the raw realpath threw on it, so the
+	// refusal read as apply_failed (a failed fix) and counted toward the batch's
+	// failure total.
+	it("a quick fix whose edit names a file that is not on disk is refused as multi_file_edit and writes nothing", async () => {
+		const missing = path.join(env.tmpDir, "missing.ts");
+		useActionableFix(async () => [
+			{
+				...fixIt(),
+				edit: {
+					changes: {
+						...valueEdit(filePath).changes,
+						...valueEdit(missing).changes,
+					},
+				},
+			},
+		]);
+		const summary = await applyConservativeActionableWarningFixes({
+			cwd: env.tmpDir,
+			report: actionableReport(),
+		});
+		expect(summary).toMatchObject({
+			applied: 0,
+			changedFiles: [],
+			skipped: [{ id: "eslint:fix", reason: "multi_file_edit" }],
+		});
+		expect(fs.readFileSync(filePath, "utf8")).toBe("value = 1;\n");
+		expect(fs.existsSync(missing)).toBe(false);
+	});
 });
 
 /**

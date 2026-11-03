@@ -14,8 +14,8 @@
  */
 
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	resetProjectTrust,
 	setProjectTrustState,
@@ -31,6 +31,8 @@ import {
 	resetLazyInstallAttempts,
 	tryLazyInstall,
 } from "../../clients/dispatch/runners/utils/lazy-installer.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 /** The first cooldown the shared install ladder owes (#1514's list, not a formula). */
 const FIRST_COOLDOWN_MS = INSTALL_TRANSIENT_COOLDOWNS_MS[0] ?? 0;
@@ -45,15 +47,6 @@ vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 // The session_start wiring assertion drives the real handler, so the heavy
 // collaborators it reaches are stubbed the same way
 // `runtime-session-dispatch-reset.test.ts` stubs them.
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() => makeLspServiceDouble()),
-}));
-
 const okResult = { stdout: "", stderr: "", status: 0 };
 
 /** The install ran and exited nonzero — the retry candidate. */
@@ -142,7 +135,11 @@ function makeSessionStartDeps(
 let cwdSeq = 0;
 const freshCwd = () => `/proj/lazy-install-${cwdSeq++}`;
 
-beforeEach(() => {
+beforeEach(async () => {
+	// The real config loader walks up from the session cwd to HOME (#4709);
+	// a pinned fixture HOME keeps that read off the maintainer's home.
+	pinFixtureHome("lazy-install-retry");
+	await installLspServiceDouble();
 	safeSpawnAsync.mockReset();
 	resetLazyInstallAttempts();
 	setProjectTrustState("trusted");
@@ -561,4 +558,8 @@ describe("lazy-install state re-arms and is readable (#1537)", () => {
 		safeSpawnAsync.mockResolvedValue(okResult);
 		expect(await tryLazyInstall("rust-clippy", cwd)).toBe(true);
 	});
+});
+
+afterEach(() => {
+	resetLSPConfigStateForTests();
 });

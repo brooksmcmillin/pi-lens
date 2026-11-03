@@ -548,8 +548,8 @@
 {"command":"git ${NOSUCH} stash","lane":"real","expect":"allow","reason":"master blind spot (eval, bash -c, nohup, xargs, unset-variable word); not from the #3997 rule","source":"verify-3997-r4.md § (1) Head allows that master also allows (documented blind spots)"}
 {"command":"git stash${NOSUCH}","lane":"real","expect":"allow","reason":"master blind spot (eval, bash -c, nohup, xargs, unset-variable word); not from the #3997 rule","source":"verify-3997-r4.md § (1) Head allows that master also allows (documented blind spots)"}
 {"command":"${NOSUCH:-} git stash","lane":"real","expect":"allow","reason":"master blind spot (eval, bash -c, nohup, xargs, unset-variable word); not from the #3997 rule","source":"verify-3997-r4.md § (1) Head allows that master also allows (documented blind spots)"}
-{"command":"git $(case x in x) : ;; esac) stash","lane":"real","expect":"deny","gap":"#4060","source":"verify-3997-r4.md § (1) lexRegions span defects"}
-{"command":"$(: $'\\'' ) git stash","lane":"real","expect":"deny","gap":"#4060","source":"verify-3997-r4.md § (1) lexRegions span defects"}
+{"command":"git $(case x in x) : ;; esac) stash","lane":"real","expect":"deny","source":"verify-3997-r4.md § (1) lexRegions span defects"}
+{"command":"$(: $'\\'' ) git stash","lane":"real","expect":"deny","source":"verify-3997-r4.md § (1) lexRegions span defects"}
 {"command":"git $(printf stash)","lane":"real","expect":"deny","gap":"#4025","source":"verify-3997-r4.md § (1) (#4025 output-built words are untouched by the round)"}
 {"command":"$(printf 'git stash')","lane":"real","expect":"deny","gap":"#4025","source":"verify-3997-r4.md § (1) (#4025 output-built words are untouched by the round)"}
 {"command":"git `printf stash`","lane":"real","expect":"deny","gap":"#4025","source":"verify-3997-r4.md § (1) (#4025 output-built words are untouched by the round)"}
@@ -561,7 +561,7 @@
 {"command":"git -C {{OTHER}}/hop/.. worktree remove lane","lane":"linked","cwd":"{{OTHER}}","expect":"deny","source":"verify-3997-r4.md § (3) Physical vs logical"}
 {"command":"git worktree remove ../lane","lane":"linked","cwd":"{{HOP}}","expect":"deny","source":"verify-3997-r4.md § (3) Physical vs logical (payload cwd inside the link)"}
 {"command":"cd hop/.. && git worktree remove lane","lane":"linked","cwd":"{{OTHER}}","expect":"allow","source":"verify-3997-r4.md § (3) Physical vs logical (cd is logical in bash)"}
-{"command":"cd -P hop/.. && git worktree remove lane","lane":"linked","cwd":"{{OTHER}}","expect":"deny","gap":"#4060","source":"verify-3997-r4.md § (3) Physical vs logical residual (a) cd -P"}
+{"command":"cd -P hop/.. && git worktree remove lane","lane":"linked","cwd":"{{OTHER}}","expect":"deny","source":"verify-3997-r4.md § (3) Physical vs logical residual (a) cd -P"}
 {"command":"git worktree remove --force $(printf linked)","lane":"both","expect":"deny","source":"review-4078.md § F4 (round-1 row 48, labelled a #4025 gap but master denies it)"}
 {"command":"rm -rf node_modules/..","lane":"linked","expect":"deny","source":"review-4054.md \u00a7 Bypass matrix, deletes / verify-4054-r4.md \u00a7 (1); decision on PR #4078 comment 6038238221","reason":"over-denial accepted: GNU rm refuses `..` operands anyway"}
 {"command":"rm -rf node_modules/a/..","lane":"linked","expect":"deny","source":"review-4054.md \u00a7 Bypass matrix, deletes / verify-4054-r4.md \u00a7 (1); decision on PR #4078 comment 6038238221","reason":"over-denial accepted: GNU rm refuses `..` operands anyway"}

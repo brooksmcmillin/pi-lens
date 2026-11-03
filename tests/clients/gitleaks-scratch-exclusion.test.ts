@@ -205,6 +205,30 @@ describe("classifyAndFilterFindings — secrets-lane scratch exclusion (#1562)",
 		}
 	});
 
+	it("does not call a finding outside the project a nested repository", async () => {
+		const env = setupTestEnvironment("pi-lens-gitleaks-outside-repo-");
+		try {
+			const project = path.join(env.tmpDir, "project");
+			const sibling = path.join(env.tmpDir, "sibling");
+			fs.mkdirSync(project, { recursive: true });
+			fs.mkdirSync(sibling, { recursive: true });
+			initGitRepo(project);
+			initGitRepo(sibling);
+			fs.writeFileSync(
+				path.join(sibling, ".env"),
+				"SECRET=real-shaped-value\n",
+			);
+
+			const [outside] = await classifyAndFilterFindings(
+				[finding({ file: path.join(sibling, ".env") })],
+				project,
+			);
+			expect(outside?.pathStatus).not.toBe("nested-repository");
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("labels a tracked finding 'tracked'", async () => {
 		const env = setupTestEnvironment("pi-lens-gitleaks-tracked-");
 		try {

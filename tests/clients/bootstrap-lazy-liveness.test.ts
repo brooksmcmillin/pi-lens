@@ -10,14 +10,30 @@
  * The seam is spied rather than replaced: the double resolves the same client
  * set through the same loader, so a case cannot pass because the double
  * quietly answered differently from production.
+ *
+ * TIER 2 (#4937 L6). Every case runs the extension inside a real pi
+ * `AgentSession` (`tests/support/pi-session.ts`, inline-factory mode), so the
+ * seam it spies is the one pi's own `session_start`, `tool_call` and turn loop
+ * call: the file hand-emitted those events on the pi double before. The
+ * `vi.doMock` of `clients/bootstrap.js` is registered before the factory import
+ * the helper makes, which is the one thing the path load could not do.
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createPiMock, makeCtx } from "../support/pi-mock.js";
-import { removeTempDirSync } from "./test-utils.js";
+import {
+	endTurn,
+	readTarget,
+	step,
+} from "../support/pi-session-commit-gate.js";
+import {
+	fauxToolCall,
+	piSessionFixture,
+	startPiSession,
+	type PiFauxReply,
+	type PiSession,
+} from "../support/pi-session.js";
 
 /** Every demand made on the bootstrap seam, in order, with its stated reason. */
 const demands: string[] = [];
@@ -77,10 +93,36 @@ function stubClients(): Record<string, unknown> {
 	};
 }
 
-/** Install the counting seam and load a fresh `index.ts` behind it. */
-async function activateWithSpiedBootstrap(): Promise<
-	ReturnType<typeof createPiMock>
-> {
+/** What `startSpied` hands back beside the session. */
+interface Spied {
+	readonly handle: PiSession;
+	/** The demands on the seam when the factory returned, before any session event. */
+	readonly demandsAfterFactory: readonly string[];
+	/**
+	 * The demands made INSIDE each `tool_call` hook, in order, one entry per
+	 * event. pi runs the whole turn around a tool call (`tool_result`,
+	 * `turn_end`), and those hooks load the clients legitimately; the claims
+	 * below are about the `tool_call` hook alone.
+	 */
+	readonly toolCallWindows: readonly (readonly string[])[];
+}
+
+/**
+ * Install the counting seam and start a real session behind it. The factory is
+ * wrapped so the demand count is read the moment it returns: pi emits
+ * `session_start` only after that, so the count is activation's alone.
+ */
+async function startSpied(options: {
+	cwd: string;
+	startupMode: "quick" | "full";
+	responses?: readonly PiFauxReply[];
+	flags?: ReadonlyMap<string, boolean | string>;
+	/**
+	 * Runs after the module graph is reset and the seam is mocked, before the
+	 * session starts: a module it imports is the copy the extension will use.
+	 */
+	prepare?: () => Promise<void>;
+}): Promise<Spied> {
 	vi.resetModules();
 	demands.length = 0;
 	served.length = 0;
@@ -118,84 +160,129 @@ async function activateWithSpiedBootstrap(): Promise<
 	const { _resetSessionLifecycleForTests } =
 		await import("../../clients/session-lifecycle.js");
 	_resetSessionLifecycleForTests();
-	const { default: registerExtension } = await import("../../index.js");
-	const pi = createPiMock({ "no-autoformat": true, "no-lsp": true });
-	registerExtension(pi.asExtensionAPI());
-	return pi;
+	await options.prepare?.();
+	let demandsAfterFactory: readonly string[] = [];
+	const toolCallWindows: string[][] = [];
+	const handle = await startPiSession({
+		root: fixture.root,
+		cwd: options.cwd,
+		startupMode: options.startupMode,
+		responses: options.responses ?? [endTurn()],
+		...(options.flags ? { flags: options.flags } : {}),
+		inlineFactory: async () => {
+			const { default: registerExtension } = await import("../../index.js");
+			return (pi) => {
+				// Two probe handlers bracket pi-lens's own `tool_call` handlers:
+				// pi runs one extension's handlers in registration order, so the
+				// slice between them is what the hook asked of the seam.
+				let windowStart = 0;
+				pi.on("tool_call", () => {
+					windowStart = demands.length;
+				});
+				registerExtension(pi);
+				demandsAfterFactory = [...demands];
+				pi.on("tool_call", () => {
+					toolCallWindows.push(demands.slice(windowStart));
+				});
+			};
+		},
+	});
+	return { handle, demandsAfterFactory, toolCallWindows };
+}
+
+/** A project directory of its own under the file's one fixture root. */
+function project(slug: string): string {
+	const cwd = path.join(fixture.root, slug, "proj");
+	fs.mkdirSync(cwd, { recursive: true });
+	return cwd;
 }
 
 afterEach(() => {
-	delete process.env.PI_LENS_STARTUP_MODE;
 	// resetModules does not clear the mock registry (#2883).
 	vi.doUnmock("../../clients/bootstrap.js");
 	vi.resetModules();
 });
 
+const fixture = piSessionFixture();
+
 describe("#2467 — activation never loads the analyzer bootstrap", () => {
 	it("registers every host surface without one demand on the seam", async () => {
-		const pi = await activateWithSpiedBootstrap();
+		const { handle, demandsAfterFactory } = await startSpied({
+			cwd: project("activate"),
+			startupMode: "quick",
+		});
 		// The registrations really happened — otherwise "no demands" would be
 		// satisfied by an activation that did nothing at all (shape 7).
-		expect(pi.tools.size).toBeGreaterThan(0);
-		expect(pi.handlers.size).toBeGreaterThan(0);
-		expect(demands).toEqual([]);
+		// The extension runner's own tool list, not the session's: the session
+		// also counts pi's built-in tools, so a count there passes with nothing
+		// of pi-lens registered.
+		expect(
+			handle.session.extensionRunner
+				.getAllRegisteredTools()
+				.map((tool) => tool.definition.name),
+		).toEqual(expect.arrayContaining(["lens_diagnostics", "ast_grep_search"]));
+		expect(handle.session.extensionRunner.hasHandlers("tool_call")).toBe(true);
+		expect(handle.session.extensionRunner.hasHandlers("session_start")).toBe(
+			true,
+		);
+		expect(demandsAfterFactory).toEqual([]);
 	}, 30_000);
 });
 
 describe("#2467 — session start pays only for what it uses", () => {
 	it("quick mode completes without loading the analyzer graph", async () => {
-		process.env.PI_LENS_STARTUP_MODE = "quick";
-		const pi = await activateWithSpiedBootstrap();
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-quick-"));
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			// Quick mode is the process's FIRST session — the start the user is
-			// waiting on — and it uses none of these clients.
-			expect(demands).toEqual([]);
-		} finally {
-			removeTempDirSync(cwd);
-		}
+		const { handle } = await startSpied({
+			cwd: project("quick"),
+			startupMode: "quick",
+		});
+		// Quick mode is the process's FIRST session — the start the user is
+		// waiting on — and it uses none of these clients.
+		expect(handle.errors).toEqual([]);
+		expect(demands).toEqual([]);
 	}, 30_000);
 
 	it("full mode still reaches the analyzers, on demand", async () => {
-		process.env.PI_LENS_STARTUP_MODE = "full";
-		const pi = await activateWithSpiedBootstrap();
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-full-"));
+		const cwd = project("full");
 		fs.writeFileSync(path.join(cwd, "index.ts"), "export const a = 1;\n");
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			// The liveness half: lazification must not mean "never".
-			expect(demands.some((d) => d.startsWith("request:session-start"))).toBe(
-				true,
-			);
-		} finally {
-			removeTempDirSync(cwd);
-		}
+		const { handle } = await startSpied({ cwd, startupMode: "full" });
+		expect(handle.errors).toEqual([]);
+		// The liveness half: lazification must not mean "never".
+		expect(demands.some((d) => d.startsWith("request:session-start"))).toBe(
+			true,
+		);
 	}, 60_000);
 });
 
 describe("#2467 — session-start demands are not turn-scoped", () => {
 	it("a leftover aborted turn signal does not cancel the startup scans", async () => {
-		process.env.PI_LENS_STARTUP_MODE = "full";
-		const pi = await activateWithSpiedBootstrap();
 		// A `session_start` can land mid-turn (sequential replacement, /new), so
 		// the ambient signal of the turn that is being torn down is still
 		// installed when the handler runs. Binding it to the deferred scans
 		// meant the whole session silently ran with no todo/dead-code/knip/jscpd
 		// scan and no retry — #1394's exact lesson.
-		const { setAmbientAbortSignal } =
-			await import("../../clients/safe-spawn.js");
-		const stale = new AbortController();
-		stale.abort();
-		setAmbientAbortSignal(stale.signal);
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-stale-"));
+		const cwd = project("stale");
 		fs.writeFileSync(path.join(cwd, "index.ts"), "export const a = 1;\n");
 		fs.writeFileSync(
 			path.join(cwd, "package.json"),
 			JSON.stringify({ name: "stale-signal-fixture", version: "0.0.0" }),
 		);
+		let clearSignal: () => void = () => undefined;
 		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
+			const { handle } = await startSpied({
+				cwd,
+				startupMode: "full",
+				// The signal goes on the safe-spawn copy the extension will import:
+				// one imported before the reset would be a second copy.
+				prepare: async () => {
+					const { setAmbientAbortSignal } =
+						await import("../../clients/safe-spawn.js");
+					const stale = new AbortController();
+					stale.abort();
+					setAmbientAbortSignal(stale.signal);
+					clearSignal = () => setAmbientAbortSignal(undefined);
+				},
+			});
+			expect(handle.errors).toEqual([]);
 			// Not merely "the demand was made" — EVERY demand was SERVED, so the
 			// scan and probe bodies behind them actually ran. Pre-fix the demands
 			// are identical and `served` is empty: the aborted signal made every
@@ -207,111 +294,101 @@ describe("#2467 — session-start demands are not turn-scoped", () => {
 			expect(served).toEqual(requested);
 			expect(served).toContain("session-start-tool-probes");
 		} finally {
-			setAmbientAbortSignal(undefined);
-			removeTempDirSync(cwd);
+			clearSignal();
 		}
 	}, 60_000);
 });
 
+/**
+ * One scripted turn over a quick-started session: what the `tool_call` hook
+ * itself asked of the seam, across `calls` scripted calls.
+ */
+async function demandsOfOneToolCall(
+	slug: string,
+	call: (cwd: string) => Record<string, unknown>,
+	prepare?: (cwd: string) => void,
+	flags?: ReadonlyMap<string, boolean | string>,
+	calls = 1,
+): Promise<{ handle: PiSession; turnDemands: string[] }> {
+	const cwd = project(slug);
+	prepare?.(cwd);
+	const { handle, toolCallWindows } = await startSpied({
+		cwd,
+		startupMode: "quick",
+		responses: [
+			...Array.from({ length: calls }, () => step(call(cwd))),
+			endTurn(),
+		],
+		...(flags ? { flags } : {}),
+	});
+	await handle.prompt("go");
+	expect(handle.errors).toEqual([]);
+	// The hook ran once per scripted call: a window count short of that would
+	// make an empty answer vacuous.
+	expect(toolCallWindows).toHaveLength(calls);
+	return { handle, turnDemands: toolCallWindows.flat() };
+}
+
 describe("#2467 — tool_call loads only for a branch that needs it", () => {
 	it("an irrelevant tool call neither loads nor awaits the graph", async () => {
-		process.env.PI_LENS_STARTUP_MODE = "quick";
-		const pi = await activateWithSpiedBootstrap();
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-bash-"));
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			await pi.emit("turn_start", {}, makeCtx({ cwd }));
-			demands.length = 0;
-			await pi.emit(
-				"tool_call",
-				{ toolName: "bash", input: { command: "echo hi" } },
-				makeCtx({ cwd }),
-			);
-			expect(demands).toEqual([]);
-		} finally {
-			removeTempDirSync(cwd);
-		}
+		const { turnDemands } = await demandsOfOneToolCall("bash", () =>
+			fauxToolCall("bash", { command: "echo hi" }),
+		);
+		expect(turnDemands).toEqual([]);
 	}, 30_000);
 
 	it("a read of a vendored file neither loads nor awaits the graph", async () => {
-		process.env.PI_LENS_STARTUP_MODE = "quick";
-		const pi = await activateWithSpiedBootstrap();
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-vendor-"));
 		// A `node_modules` read is the shape the pre-fix code paid the whole
 		// seventeen-module load for and then threw away: `isExternalOrVendor` is
 		// the very next check after the load it used to sit above. The bash case
 		// above returns before that point, so it cannot see this defect at all.
-		const vendorDir = path.join(cwd, "node_modules", "left-pad");
-		fs.mkdirSync(vendorDir, { recursive: true });
-		const filePath = path.join(vendorDir, "index.ts");
-		fs.writeFileSync(filePath, "export const pad = 1;\n");
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			await pi.emit("turn_start", {}, makeCtx({ cwd }));
-			demands.length = 0;
-			await pi.emit(
-				"tool_call",
-				{ toolName: "read", input: { path: filePath } },
-				makeCtx({ cwd }),
-			);
-			expect(demands).toEqual([]);
-		} finally {
-			removeTempDirSync(cwd);
-		}
+		const { turnDemands } = await demandsOfOneToolCall(
+			"vendor",
+			(cwd) =>
+				readTarget(path.join(cwd, "node_modules", "left-pad", "index.ts")),
+			(cwd) => {
+				const vendorDir = path.join(cwd, "node_modules", "left-pad");
+				fs.mkdirSync(vendorDir, { recursive: true });
+				fs.writeFileSync(
+					path.join(vendorDir, "index.ts"),
+					"export const pad = 1;\n",
+				);
+			},
+			new Map([["no-complexity", false]]),
+		);
+		expect(turnDemands).toEqual([]);
 	}, 30_000);
 
 	it("a read of an unsupported file type never demands the graph", async () => {
-		process.env.PI_LENS_STARTUP_MODE = "quick";
-		const pi = await activateWithSpiedBootstrap();
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-md-"));
 		// A markdown read resolves to a real, in-project, non-vendored path, so
 		// every cheap guard admits it — and then the complexity client answers
 		// "unsupported" and no baseline is ever produced. Because a baseline is
 		// what memoizes the file, the demand fires again on EVERY later read of
 		// it. Docs, JSON, YAML, CSS, Java, shell: the whole non-analyzed
 		// majority of a repo used to pay the seventeen-module load per read.
-		const filePath = path.join(cwd, "README.md");
-		fs.writeFileSync(filePath, "# readme\n");
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			await pi.emit("turn_start", {}, makeCtx({ cwd }));
-			demands.length = 0;
-			await pi.emit(
-				"tool_call",
-				{ toolName: "read", input: { path: filePath } },
-				makeCtx({ cwd }),
-			);
-			// Twice, because the never-cached half of the defect only shows on
-			// the second read.
-			await pi.emit(
-				"tool_call",
-				{ toolName: "read", input: { path: filePath } },
-				makeCtx({ cwd }),
-			);
-			expect(demands).toEqual([]);
-		} finally {
-			removeTempDirSync(cwd);
-		}
+		// Twice, because the never-cached half of the defect only shows on the
+		// second read.
+		const { turnDemands } = await demandsOfOneToolCall(
+			"markdown",
+			(cwd) => readTarget(path.join(cwd, "README.md")),
+			(cwd) => fs.writeFileSync(path.join(cwd, "README.md"), "# readme\n"),
+			new Map([["no-complexity", false]]),
+			2,
+		);
+		expect(turnDemands).toEqual([]);
 	}, 30_000);
 
 	it("a bootstrap-dependent tool call does demand the clients", async () => {
-		process.env.PI_LENS_STARTUP_MODE = "quick";
-		const pi = await activateWithSpiedBootstrap();
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-read-"));
-		const filePath = path.join(cwd, "sample.ts");
-		fs.writeFileSync(filePath, "export const sample = 1;\n");
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			await pi.emit("turn_start", {}, makeCtx({ cwd }));
-			demands.length = 0;
-			await pi.emit(
-				"tool_call",
-				{ toolName: "read", input: { path: filePath } },
-				makeCtx({ cwd }),
-			);
-			expect(demands).toContain("request:tool-call-complexity-baseline");
-		} finally {
-			removeTempDirSync(cwd);
-		}
+		const { turnDemands } = await demandsOfOneToolCall(
+			"sample",
+			(cwd) => readTarget(path.join(cwd, "sample.ts")),
+			(cwd) =>
+				fs.writeFileSync(
+					path.join(cwd, "sample.ts"),
+					"export const sample = 1;\n",
+				),
+			new Map([["no-complexity", false]]),
+		);
+		expect(turnDemands).toContain("request:tool-call-complexity-baseline");
 	}, 30_000);
 });

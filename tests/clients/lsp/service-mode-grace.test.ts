@@ -4,14 +4,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { _setServersForFileForTests } from "../../../clients/lsp/config.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
@@ -65,6 +61,16 @@ function fakeClient(waitMs: number, diags: ReturnType<typeof diag>[]) {
 		getDiagnostics: vi.fn(() => diags),
 	};
 }
+
+// #4709: the setter is module state. It is armed per case at file scope and
+// dropped after each case, so no describe reads a list an earlier describe
+// armed (a shuffled run orders the describes freely).
+beforeEach(() => {
+	_setServersForFileForTests(getServersForFileWithConfig);
+});
+afterEach(() => {
+	_setServersForFileForTests(undefined);
+});
 
 describe("getDiagnostics — mode-aware grace (1B)", () => {
 	beforeEach(() => {

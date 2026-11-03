@@ -203,6 +203,52 @@ describe("bookkeepLspMutation — direct path and bridge fallback are equivalent
 		);
 	});
 
+	it("name the issuing session in the change-log receipt on both branches (#4943)", () => {
+		// RECURRENCE GUARDED: #4943. An LSP edit issued by an in-process subagent
+		// (`context.sessionId`) was logged under the coordinator's id on both
+		// branches; a context with no session stays under the runtime's own.
+		const directFile = writeFixture(dirDirect, "subagent.ts");
+		const bridgeFile = writeFixture(dirBridge, "subagent.ts");
+		recordLspMutation(
+			{
+				cwd: dirDirect,
+				correlationId: "subagent-direct",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command",
+				runtime: runtimeDirect as never,
+				cacheManager: cacheManagerDirect,
+				readGuard: runtimeDirect.readGuard,
+				emitSummary: false,
+				sessionId: "s-4943-subagent",
+			},
+			{ results: resultsFor(directFile) },
+		);
+		recordLspMutation(
+			{
+				cwd: dirBridge,
+				correlationId: "subagent-bridge",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command",
+				emitSummary: false,
+				sessionId: "s-4943-subagent",
+			},
+			{ results: resultsFor(bridgeFile) },
+		);
+		const sessionsOf = (dir: string) =>
+			readChangesSince(dir, 0).map((change) => [
+				path.basename(change.filePath),
+				change.sessionId,
+			]);
+		expect(sessionsOf(dirDirect)).toEqual([
+			["target.ts", "s-2450-equiv-direct"],
+			["subagent.ts", "s-4943-subagent"],
+		]);
+		expect(sessionsOf(dirBridge)).toEqual([
+			["target.ts", "s-2450-equiv-bridge"],
+			["subagent.ts", "s-4943-subagent"],
+		]);
+	});
+
 	it("enqueue no deferred autofix/format pass on either branch (F3)", () => {
 		// bookkeepLspMutation's direct path never enqueues a deferred pass for
 		// an LSP-applied edit; before this round the bridge fallback always did

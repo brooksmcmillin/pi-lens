@@ -46,6 +46,7 @@ import {
 } from "../support/test-env-restore-gate.js";
 import { TEST_ENV_RESTORE_ADMISSIONS } from "../support/test-env-restore-admissions.js";
 import { TEST_ENV_RESTORE_BASELINE } from "../support/test-env-restore-baseline.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const TESTS_ROOT = path.join(REPO_ROOT, "tests");
@@ -995,20 +996,28 @@ describe("#4589 test-env-restore ratchet", () => {
 	// order cannot move the cost into a 60 s case (the #4549 shape).
 	beforeAll(() => sweepOnce(), 120_000);
 
-	it("reports every unrestored env write and reds on a new one", () => {
-		const findings = sweepOnce();
-		const problems = unadmittedOffenders(findings, BASELINE);
-		process.stderr.write(
-			`test-env-restore-sweep: ${findings.length} live write(s), ${BASELINE.size} baselined, ${problems.length} new\n`,
-		);
-		expect(problems, problems.join("\n")).toEqual([]);
-	}, 60_000);
+	it(
+		"reports every unrestored env write and reds on a new one",
+		() => {
+			const findings = sweepOnce();
+			const problems = unadmittedOffenders(findings, BASELINE);
+			process.stderr.write(
+				`test-env-restore-sweep: ${findings.length} live write(s), ${BASELINE.size} baselined, ${problems.length} new\n`,
+			);
+			expect(problems, problems.join("\n")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("baseline entries remain live", () => {
-		// The shrink-only direction: a restore added anywhere makes its row
-		// stale, and a stale row reds until it is deleted.
-		expect(staleBaselineRows(sweepOnce(), BASELINE)).toEqual([]);
-	}, 60_000);
+	it(
+		"baseline entries remain live",
+		() => {
+			// The shrink-only direction: a restore added anywhere makes its row
+			// stale, and a stale row reds until it is deleted.
+			expect(staleBaselineRows(sweepOnce(), BASELINE)).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it.skipIf(!process.env.TEST_ENV_RESTORE_REGEN)(
 		"regenerates the baseline",
@@ -1036,7 +1045,7 @@ describe("#4589 test-env-restore ratchet", () => {
 				].join("\n"),
 			);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 });
 
@@ -1084,37 +1093,41 @@ describe("#4589 test-env-restore admission guard", () => {
 			).toBeGreaterThan(40);
 	});
 
-	it("re-checks every admission's mechanism against the file it names", () => {
-		// The reason's mechanism is a claim about the file's source, re-derived
-		// here by the detector's own classifier (#4589 review round 1). A
-		// `teardown` claim needs a teardown hook, and a `vi.hoisted` or
-		// module-scope write cannot be `teardown`: no hook runs before the suite.
-		const findingsByFile = new Map<string, EnvRestoreFinding[]>();
-		for (const finding of sweepOnce()) {
-			const list = findingsByFile.get(finding.file) ?? [];
-			list.push(finding);
-			findingsByFile.set(finding.file, list);
-		}
-		const problems: string[] = [];
-		for (const [file, admission] of Object.entries(
-			TEST_ENV_RESTORE_ADMISSIONS,
-		)) {
-			const source = readWalkedFile(path.join(REPO_ROOT, file));
-			if (source === undefined) {
-				problems.push(`${file}: admission names a file the walk skips`);
-				continue;
+	it(
+		"re-checks every admission's mechanism against the file it names",
+		() => {
+			// The reason's mechanism is a claim about the file's source, re-derived
+			// here by the detector's own classifier (#4589 review round 1). A
+			// `teardown` claim needs a teardown hook, and a `vi.hoisted` or
+			// module-scope write cannot be `teardown`: no hook runs before the suite.
+			const findingsByFile = new Map<string, EnvRestoreFinding[]>();
+			for (const finding of sweepOnce()) {
+				const list = findingsByFile.get(finding.file) ?? [];
+				list.push(finding);
+				findingsByFile.set(finding.file, list);
 			}
-			const mechanisms: EnvRestoreMechanism[] = envRestoreMechanisms(
-				source,
-				findingsByFile.get(file) ?? [],
-			);
-			if (!mechanisms.includes(admission.mechanism))
-				problems.push(
-					`${file}: admitted as ${admission.mechanism}, but the file shows [${mechanisms.join(", ")}]`,
+			const problems: string[] = [];
+			for (const [file, admission] of Object.entries(
+				TEST_ENV_RESTORE_ADMISSIONS,
+			)) {
+				const source = readWalkedFile(path.join(REPO_ROOT, file));
+				if (source === undefined) {
+					problems.push(`${file}: admission names a file the walk skips`);
+					continue;
+				}
+				const mechanisms: EnvRestoreMechanism[] = envRestoreMechanisms(
+					source,
+					findingsByFile.get(file) ?? [],
 				);
-		}
-		expect(problems, problems.join("\n")).toEqual([]);
-	});
+				if (!mechanisms.includes(admission.mechanism))
+					problems.push(
+						`${file}: admitted as ${admission.mechanism}, but the file shows [${mechanisms.join(", ")}]`,
+					);
+			}
+			expect(problems, problems.join("\n")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("crosses the boundary: a hoisted write cannot be admitted as teardown", () => {
 		// The guard's own seam, driven through the production classifier: the

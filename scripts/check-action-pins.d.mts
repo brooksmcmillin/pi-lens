@@ -30,6 +30,13 @@ export function resolveGithubMatchingTags(
 	env?: NodeJS.ProcessEnv,
 ): Promise<MatchingTag[]>;
 export function workflowFiles(root?: string): Promise<string[]>;
+/** A repository-relative path as a message spells it, with forward slashes. */
+export function displayPath(
+	repoRelativePath: string,
+	separator?: string,
+): string;
+/** Interpreter-pin errors for one workflow or composite action's text. */
+export function interpreterPinErrors(text: string, file?: string): string[];
 export function checkActionPins(options?: {
 	root?: string;
 	fetchImpl?: typeof fetch;

@@ -36,9 +36,9 @@ import * as path from "node:path";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { hasAnyDispositionMarks } from "./diagnostic-dispositions.js";
 import {
-	applyFindingPolicy,
+	applyFindingPolicyByOwner,
 	inlineBlockerIdentities,
-	loadProjectRulePolicyMap,
+	loadProjectRulePolicy,
 } from "./dispatch/finding-policy.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import type { Diagnostic } from "./dispatch/types.js";
@@ -103,13 +103,15 @@ function readCurrentContent(filePath: string): string {
  * helm-render) reports blocking diagnostics against sibling files — the same
  * cross-file population `pipeline.ts` filters out of `inlineBlockerLines`.
  * Anchoring those against the record's path would derive the wrong strict
- * anchor and read the wrong file's `pi-lens-ignore` comments.
+ * anchor and read the wrong file's `pi-lens-ignore` comments. A file that
+ * cannot be read, or lies outside `cwd`, suppresses nothing (the same
+ * fail-closed rule `applyFindingPolicyByOwner` gives the dispatcher).
  */
 export function applyInlineBlockerPolicy(
 	record: InlineBlockerPolicyInput,
 	cwd: string,
 ): InlineBlockerPolicyOutcome {
-	const diagnostics = record.diagnostics;
+	const { diagnostics, filePath } = record;
 	if (!diagnostics || diagnostics.length === 0) {
 		// Bounded per (kind, subject) by the ledger itself — this condition
 		// recurs every turn end for the same record, so a counted row would
@@ -120,7 +122,7 @@ export function applyInlineBlockerPolicy(
 		if (hasAnyDispositionMarks(cwd)) {
 			recordDegradationOnce({
 				kind: "inline-blocker-unstructured",
-				subject: `inline-blocker:${toRunnerDisplayPath(cwd, record.filePath)}`,
+				subject: `inline-blocker:${toRunnerDisplayPath(cwd, filePath)}`,
 				reason:
 					"record carries no structured diagnostics; disposition marks cannot be applied to its rendered summary",
 			});
@@ -134,42 +136,32 @@ export function applyInlineBlockerPolicy(
 		};
 	}
 
-	const byFile = new Map<string, Diagnostic[]>();
-	for (const diagnostic of diagnostics) {
-		// Resolved against the PROJECT root, never `process.cwd()`: a runner that
-		// reports a project-relative path would otherwise be grouped under the
-		// agent host's working directory and read the wrong file's bytes. No
-		// case/separator fold on the key (catalog shape 1): two spellings of one
-		// file would only cost a duplicate read here — `anchorsForDiagnostic`
-		// canonicalizes both the cwd and the file path itself, so the anchors,
-		// and therefore the verdict, are identical either way.
-		const owner = path.resolve(cwd, diagnostic.filePath);
-		const group = byFile.get(owner);
-		if (group) group.push(diagnostic);
-		else byFile.set(owner, [diagnostic]);
-	}
-
-	// `loadPiLensProjectConfig` is mtime-cached, so several groups cost one stat.
-	const policyMap = loadProjectRulePolicyMap(cwd);
-	const dropped = new Set<Diagnostic>();
-	for (const [filePath, group] of byFile) {
-		const { kept } = applyFindingPolicy(group, {
+	// Each finding is judged by the file it names (#5044), through the one
+	// per-owner seam the dispatcher shares. Resolved against the PROJECT root,
+	// never `process.cwd()`: a runner that reports a project-relative path would
+	// otherwise be read from the agent host's working directory. The resolved
+	// copies pair with `diagnostics` by index, so the record keeps its objects.
+	const inProject = (file: string): string => path.resolve(cwd, file);
+	const resolved = diagnostics.map((diagnostic) => ({
+		...diagnostic,
+		filePath: inProject(diagnostic.filePath),
+	}));
+	const recordPath = inProject(filePath);
+	const survivors = new Set(
+		applyFindingPolicyByOwner(resolved, {
 			cwd,
-			filePath,
-			content: readCurrentContent(filePath),
-			policyMap,
+			filePath: recordPath,
+			content: readCurrentContent(recordPath),
+			// One policy for every file: each config owner resolves once.
+			policyMap: loadProjectRulePolicy(cwd),
 			identities: inlineBlockerIdentities,
-		});
-		const survivors = new Set(kept);
-		for (const diagnostic of group) {
-			if (!survivors.has(diagnostic)) dropped.add(diagnostic);
-		}
-	}
-
-	const kept =
-		dropped.size === 0
-			? [...diagnostics]
-			: diagnostics.filter((diagnostic) => !dropped.has(diagnostic));
+		}).kept,
+	);
+	const kept = diagnostics.filter((_, index) => {
+		const twin = resolved[index];
+		return twin !== undefined && survivors.has(twin);
+	});
+	const dropped = diagnostics.length - kept.length;
 	return {
 		body:
 			kept.length === 0
@@ -177,7 +169,7 @@ export function applyInlineBlockerPolicy(
 				: formatDiagnostics(kept, "blocking").trim(),
 		candidates: diagnostics.length,
 		kept: kept.length,
-		suppressed: dropped.size,
+		suppressed: dropped,
 		unstructured: false,
 	};
 }
@@ -196,8 +188,10 @@ export interface InlineBlockerPolicyTallyEntry {
 	sources: readonly string[] | undefined;
 	/**
 	 * True for a record the freshness/past-EOF gates demoted. Those render
-	 * through the advisory channel and the policy does not run on them, so they
-	 * are counted but contribute no candidates.
+	 * through the advisory channel; since #4990 they run the SAME policy pass as
+	 * the live branch, so their `outcome` is the one that decides whether the
+	 * demoted body survives, and their candidates/suppression counts belong to
+	 * the same per-turn record.
 	 */
 	stale: boolean;
 	outcome?: InlineBlockerPolicyOutcome;

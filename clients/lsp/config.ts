@@ -61,6 +61,8 @@ import * as os from "node:os";
 import path from "node:path";
 import { LSP_NAMESPACE_KEY } from "../config-locations.js";
 import {
+	boundedKeyLabel,
+	finalizeRecords,
 	type MigrationRecord,
 	migrationSubject,
 } from "../config-core/records.js";
@@ -116,6 +118,7 @@ import {
 	registeredServers,
 } from "./file-server-match.js";
 import {
+	getServerById,
 	LSP_SERVERS,
 	resetLSPCaseSensitivityState,
 	resolveLspServerCwd,
@@ -129,7 +132,12 @@ import { DEFAULT_LSP_SERVER_ROLE, isAuxiliary } from "./server-traits.js";
 export interface CustomServerConfig {
 	name: string;
 	extensions: string[];
-	command: string;
+	/**
+	 * The launcher: a bare command (default args `["--stdio"]`) or the
+	 * canonical argv array the docs show (#5127) — head is the program, the
+	 * rest precedes `args`, and no default `--stdio` is appended.
+	 */
+	command: string | readonly string[];
 	args?: string[];
 	rootMarkers?: string[];
 	env?: Record<string, string>;
@@ -177,6 +185,11 @@ export interface LSPConfig {
 	 * built-in defaults so you only need to specify the keys you want to change.
 	 */
 	serverOverrides?: Record<string, ServerInitOverride>;
+	/**
+	 * Denied server ids. An id that names neither a built-in server nor a
+	 * server declared under `lsp.servers` is dropped at load, with a
+	 * `PILENS_CFG_0005` notice (#5141).
+	 */
 	disabledServers?: string[];
 	/** Files to open at session start to seed lazy LSP indexing (e.g., clangd). */
 	warmFiles?: string[];
@@ -483,15 +496,15 @@ export async function loadLSPConfig(
 	// one notice. Filtering here (as round 2 did) silently dropped a pi-lens-
 	// owned record from a document only this multi-file resolution discovered.
 	//
-	// The projection VALIDATES the resolved value's covers claims (#3968), and
-	// the funnel owns the NEW records because it owns the resolution's
+	// The projection VALIDATES the resolved value's covers claims (#3968) and its
+	// deny-list ids (#5141), and the funnel owns the NEW records because it owns the resolution's
 	// provenance (`coversClaimRecords`'s file/tier lookups) and the reporting
 	// gate (`report: false` exists so a QUERY cannot warn or consume the
 	// warn-once latch; the ledger row below is durable telemetry and follows
 	// `recordConfigResolved`'s "report: false is not a gate" rule). The
 	// resolution's records and the covers records report here, once, together.
-	const coversProblems = newCoversClaimProblems();
-	const config = lspConfigOf(resolution.value, coversProblems);
+	const configProblems = newLspConfigProblems();
+	const config = lspConfigOf(resolution.value, configProblems);
 	// Preserve the source map for the registry compiler without changing the
 	// enumerable loader projection consumed by existing callers.
 	Object.defineProperty(config, "__provenance", {
@@ -501,10 +514,11 @@ export async function loadLSPConfig(
 	if (reporting) {
 		reportPiLensConfigRecords([
 			...resolution.records,
-			...coversClaimRecords(resolution, coversProblems),
+			...coversClaimRecords(resolution, configProblems),
+			...disabledServerRecords(resolution, configProblems),
 		]);
 	}
-	recordCoversUnvalidated(resolution, coversProblems);
+	recordCoversUnvalidated(resolution, configProblems);
 	// #2526: the session's one positive record that config resolution HAPPENED,
 	// written where the resolution actually exists. `report: false` is not a
 	// gate here — the option suppresses USER-FACING notices, and a record in
@@ -571,13 +585,19 @@ export interface CoversClaimUnvalidated {
  * and the bounded ledger row (`recordCoversUnvalidated`). A caller that
  * passes no collector gets the same validated projection silently.
  */
-export interface CoversClaimProblems {
+export interface LspConfigProblems {
 	readonly refusals: CoversClaimRefusal[];
 	readonly unvalidated: CoversClaimUnvalidated[];
+	/**
+	 * `lsp.disabledServers` members that name no server, in resolved order
+	 * (#5141). `index` is the member's position in the resolved array, where
+	 * its provenance pointer lives.
+	 */
+	readonly unknownDisabled: { readonly id: string; readonly index: number }[];
 }
 
-function newCoversClaimProblems(): CoversClaimProblems {
-	return { refusals: [], unvalidated: [] };
+export function newLspConfigProblems(): LspConfigProblems {
+	return { refusals: [], unvalidated: [], unknownDisabled: [] };
 }
 
 /**
@@ -625,7 +645,7 @@ function coversClaimSource(
  */
 function coversClaimRecords(
 	resolution: PiLensConfigResolution,
-	problems: CoversClaimProblems,
+	problems: LspConfigProblems,
 ): MigrationRecord[] {
 	return problems.refusals.map((refusal) => {
 		const pointer = coversPointer(refusal.serverId);
@@ -646,6 +666,36 @@ function coversClaimRecords(
 	});
 }
 
+/**
+ * THE `PILENS_CFG_0005` records for `lsp.disabledServers` members that name no
+ * server (#5141), the deny-list sibling of `coversClaimRecords`. The reason says
+ * the entry was dropped, and it quotes the entry the way the dispatch sibling
+ * does (`disabledRunnersOf`), so the user can match it to what they typed.
+ * Finalized like that sibling, so a pasted list ends in one suppression count.
+ * `effectiveConfig` counts the same records through this function without
+ * reporting them (#5141).
+ */
+export function disabledServerRecords(
+	resolution: PiLensConfigResolution,
+	problems: LspConfigProblems,
+): readonly MigrationRecord[] {
+	const records: MigrationRecord[] = problems.unknownDisabled.map(
+		({ id, index }) => {
+			const pointer = `/${LSP_NAMESPACE_KEY}/disabledServers/${index}`;
+			const { file, tier } = coversClaimSource(resolution, pointer);
+			return {
+				code: "PILENS_CFG_0005",
+				file,
+				key: pointer,
+				subject: migrationSubject(file, pointer),
+				reason: `lsp.disabledServers entry "${boundedKeyLabel(id)}" is not a recognized LSP server id; dropped`,
+				...(tier ? { tier } : {}),
+			};
+		},
+	);
+	return finalizeRecords(records, records.at(-1));
+}
+
 /** The refusal tail: what remains of the claim after the drop. */
 function keptTail(keptCount: number): string {
 	return keptCount > 0
@@ -664,7 +714,7 @@ function keptTail(keptCount: number): string {
  */
 function recordCoversUnvalidated(
 	resolution: PiLensConfigResolution,
-	problems: CoversClaimProblems,
+	problems: LspConfigProblems,
 ): void {
 	for (const unvalidated of problems.unvalidated) {
 		const pointer = coversPointer(unvalidated.serverId);
@@ -697,7 +747,7 @@ function recordCoversUnvalidated(
  */
 function coversValidatedServers(
 	servers: Record<string, unknown>,
-	problems: CoversClaimProblems | undefined = undefined,
+	problems: LspConfigProblems | undefined = undefined,
 ): Record<string, CustomServerConfig> {
 	const out: Record<string, CustomServerConfig> = {};
 	for (const [id, raw] of Object.entries(servers)) {
@@ -748,9 +798,44 @@ export function customServerSpecsOf(
 	return servers ? coversValidatedServers(servers) : {};
 }
 
+/**
+ * The deny list a loaded config carries: each member that names a built-in
+ * server or a server declared under `lsp.servers` (#5141). A member that names
+ * neither is dropped, because it matches no server and would otherwise read as
+ * a server the operator turned off, and it goes into the collector for the
+ * funnel to report. The resolver's deny union already folds duplicate members
+ * (`resolveArrayDeny`), so each unknown id reaches here once.
+ *
+ * A non-string member is kept as it always was. The schema does not type the
+ * items of `lsp.disabledServers` (`LSP_KEY_TYPES` is `array`), and such a member
+ * matches no server either way.
+ */
+function knownDisabledServerIds(
+	members: readonly unknown[],
+	declared: Record<string, unknown> | undefined,
+	problems: LspConfigProblems | undefined,
+): unknown[] {
+	const kept: unknown[] = [];
+	members.forEach((member, index) => {
+		if (typeof member !== "string") {
+			kept.push(member);
+			return;
+		}
+		if (
+			getServerById(member) !== undefined ||
+			(declared !== undefined && Object.hasOwn(declared, member))
+		) {
+			kept.push(member);
+			return;
+		}
+		problems?.unknownDisabled.push({ id: member, index });
+	});
+	return kept;
+}
+
 export function lspConfigOf(
 	value: Record<string, unknown>,
-	problems?: CoversClaimProblems,
+	problems?: LspConfigProblems,
 	provenance?: ProvenanceMap,
 ): LSPConfig {
 	const section = lspSectionOf(value);
@@ -765,7 +850,11 @@ export function lspConfigOf(
 		>;
 	}
 	if (Array.isArray(section.disabledServers)) {
-		config.disabledServers = section.disabledServers as string[];
+		config.disabledServers = knownDisabledServerIds(
+			section.disabledServers,
+			servers,
+			problems,
+		) as string[];
 	}
 	if (Array.isArray(section.warmFiles)) {
 		config.warmFiles = section.warmFiles as string[];
@@ -782,12 +871,51 @@ export function lspConfigOf(
 // --- Custom Server Factory ---
 
 /**
+ * The program and argv a custom server launches with (#5127). A string
+ * command takes `args` (default `["--stdio"]`); an argv array supplies its own
+ * arguments, then `args`. Anything else throws, naming the field, so the
+ * failure reaches the launch-failure records instead of Node's
+ * `The "path" argument must be of type string`.
+ */
+function customServerLaunch(
+	config: CustomServerConfig,
+	id: string,
+): { program: string; argv: string[] } {
+	const { command } = config;
+	if (typeof command === "string" && command !== "") {
+		return { program: command, argv: config.args ?? ["--stdio"] };
+	}
+	if (
+		Array.isArray(command) &&
+		typeof command[0] === "string" &&
+		command[0] !== "" &&
+		command.every((part) => typeof part === "string")
+	) {
+		return {
+			program: command[0],
+			argv: [...command.slice(1), ...(config.args ?? [])],
+		};
+	}
+	throw new Error(
+		`lsp.servers.${id}.command must be a non-empty string or a non-empty array of strings`,
+	);
+}
+
+/**
  * Create LSPServerInfo from user configuration
  */
 export function createCustomServer(
 	config: CustomServerConfig,
 	id: string,
 ): LSPServerInfo {
+	// An unusable value (a hand-edited non-string/array) projects no token; the
+	// spawn names the field.
+	const commandToken: string | undefined =
+		typeof config.command === "string"
+			? config.command
+			: Array.isArray(config.command)
+				? (config.command[0] as string | undefined)
+				: undefined;
 	return {
 		id,
 		name: config.name,
@@ -795,7 +923,7 @@ export function createCustomServer(
 		// The own-command token the runner-coverage seam gates this row's
 		// covers claim on (#3968 F2): the declared covering lane's binary must
 		// be probeable before the claim can defer a CLI runner.
-		command: config.command,
+		...(commandToken === undefined ? {} : { command: commandToken }),
 		extensions: config.extensions,
 		// A config-declared server is a language server. The public
 		// `lsp.servers.<id>.role` field is validated and projected by
@@ -820,7 +948,8 @@ export function createCustomServer(
 			: async (file) =>
 					resolveToolCwd("lsp", id, file, { cwd: process.cwd() }).cwd,
 		async spawn(root) {
-			const proc = await launchLSP(config.command, config.args ?? ["--stdio"], {
+			const { program, argv } = customServerLaunch(config, id);
+			const proc = await launchLSP(program, argv, {
 				cwd: root,
 				env: config.env ? { ...process.env, ...config.env } : process.env,
 			});
@@ -855,6 +984,11 @@ function normalizeWorkspacePath(cwd: string): string {
 type ProvenanceMap = ReadonlyMap<string, Provenance>;
 let unknownTrustNoticeGeneration = -1;
 
+type ServersForFile = (filePath: string) => LSPServerInfo[];
+
+/** The test-only selection `_setServersForFileForTests` arms (#4709). */
+let serversForFileOverride: ServersForFile | undefined;
+
 function sourceFor(
 	provenance: ProvenanceMap,
 	key: string,
@@ -881,6 +1015,7 @@ function executableAllowed(
 
 function registryDecision(
 	id: string,
+	section: "servers" | "serverOverrides",
 	field: string,
 	provenance: Provenance | undefined,
 	trust: ProjectTrustState,
@@ -888,7 +1023,11 @@ function registryDecision(
 ): void {
 	if (allowed || !provenance || !isRepoTier(provenance.tier)) return;
 	const subject = `${id}:${field}:${provenance.tier}`;
-	const reason = `project LSP ${field} refused for ${id}: pi project trust is ${trust}`;
+	const outcome =
+		section === "servers"
+			? `the ${id} entry is not applied for this project`
+			: `the project's ${id} override is not applied`;
+	const reason = `project LSP ${field} refused for ${id}: pi project trust is ${trust}; ${outcome}`;
 	recordDegradationOnce({
 		kind: "lsp-registry-decision",
 		subject,
@@ -910,14 +1049,132 @@ function registryDecision(
 	}
 }
 
+/** One field's answer to "may an untrusted repo tier set this?" (#5147). */
+interface RepoFieldDecision {
+	/** True = a repo tier may set the field without pi's `trusted` answer. */
+	readonly admit: boolean;
+	readonly why: string;
+}
+
+/**
+ * #5147: the fields of `lsp.servers.<id>` a repo tier may set WITHOUT pi's
+ * `trusted` answer. The gate admits this short list and refuses everything
+ * else (shape 69): a field the table does not name, on the type or only in
+ * the file, is refused and recorded. The mapped type
+ * refuses to compile until a new `CustomServerConfig` member is decided.
+ *
+ * The test for admission is "reaches no launch input": argv, environment,
+ * working directory or root, and initialization options are all launch
+ * inputs, and so is anything that changes which analysis runs. The merge
+ * keeps the winning tier's value only, so a refused repo value may have
+ * shadowed a value the user set. For `lsp.servers` the caller therefore does
+ * not register the server when any field is refused (fail closed). For
+ * `lsp.serverOverrides` it applies the global tier's entry for that id instead,
+ * resolved on its own: never a partly stripped override.
+ */
+export const REPO_TIER_SERVER_FIELDS: {
+	readonly [K in keyof CustomServerConfig]-?: RepoFieldDecision;
+} = {
+	name: {
+		admit: true,
+		why: "Display label only: it selects nothing and reaches no argv, environment, working directory or initialization option.",
+	},
+	extensions: {
+		admit: false,
+		why: "Routing: decides which repo files start the user's server (a repo could send `.env` to it, or unroute it with `[]`).",
+	},
+	command: {
+		admit: false,
+		why: "Launch: the program and, for the array form, the leading argv.",
+	},
+	args: {
+		admit: false,
+		why: "Launch: appended to the child's argv (customServerLaunch).",
+	},
+	rootMarkers: {
+		admit: false,
+		why: "Launch: chooses the root, and the root is the child's working directory (spawn(root) hands it to launchLSP as cwd).",
+	},
+	env: {
+		admit: false,
+		why: "Launch: merged into the child's environment.",
+	},
+	initializationOptions: {
+		admit: false,
+		why: "Launch: sent to the server in the initialize request.",
+	},
+	covers: {
+		admit: false,
+		why: "Changes which analysis runs: a covered runner defers to the server, so a repo could silence a runner the user kept.",
+	},
+};
+
+/**
+ * #5147: the same table for `lsp.serverOverrides.<id>`. All three members
+ * launch the catalog server with another binary, environment or settings, so
+ * none is admitted; a field not named here is refused as well.
+ */
+export const REPO_TIER_OVERRIDE_FIELDS: {
+	readonly [K in keyof ServerInitOverride]-?: RepoFieldDecision;
+} = {
+	command: {
+		admit: false,
+		why: "Launch: replaces the catalog server's binary and argv.",
+	},
+	env: {
+		admit: false,
+		why: "Launch: merged into the child's environment.",
+	},
+	initializationOptions: {
+		admit: false,
+		why: "Launch: sent to the server in the initialize request.",
+	},
+};
+
+/**
+ * The keys of one config entry that an untrusted repo tier may not set. A key
+ * is allowed when the table admits it, when its source is not a repo tier, or
+ * when pi marked the project trusted. A key no table names is refused and
+ * recorded under one fixed label, never under the repo's own spelling.
+ */
+function refusedRepoFields(
+	id: string,
+	section: "servers" | "serverOverrides",
+	entry: unknown,
+	table: Readonly<Record<string, RepoFieldDecision>>,
+	provenance: ProvenanceMap,
+	trust: ProjectTrustState,
+	labelOf: (key: string) => string,
+): Set<string> {
+	const refused = new Set<string>();
+	if (!entry || typeof entry !== "object") return refused;
+	for (const key of Object.keys(entry)) {
+		const named = Object.hasOwn(table, key);
+		if (named && table[key]?.admit) continue;
+		const source = sourceFor(provenance, `/lsp/${section}/${id}/${key}`);
+		const allowed = executableAllowed(source, trust);
+		registryDecision(
+			id,
+			section,
+			named ? labelOf(key) : "unrecognized field",
+			source,
+			trust,
+			allowed,
+		);
+		if (!allowed) refused.add(key);
+	}
+	return refused;
+}
+
 function getConfigForFile(filePath: string): RegisteredLSPConfig {
 	return sessionRootConfigForFile(filePath) ?? EMPTY_CONFIG;
 }
 
 /**
  * THE `LSPConfig` → `RegisteredLSPConfig` conversion: construct the custom
- * servers, index the deny list, index the overrides. Pure — it reads no
- * module state and writes none.
+ * servers, index the deny list, index the overrides. It writes no registry
+ * state; an override refused for an untrusted project reads the global config
+ * files once to apply the user's own entry (#5147).
  *
  * Extracted from `initLSPConfig`'s body in #2427 review round 3 so that
  * `effectiveConfig` can build the config its question needs WITHOUT calling
@@ -940,6 +1197,177 @@ export function registerLSPConfig(config: LSPConfig): RegisteredLSPConfig {
 	return compileLspRegistry(config, config.__provenance);
 }
 
+/** One trait's decision for a command-override copy (#4833). */
+interface OverrideTraitDecision {
+	/** True = the copy keeps the catalog row's value; false = it resets. */
+	readonly keep: boolean;
+	readonly why: string;
+}
+
+/**
+ * #4833: what a `lsp.serverOverrides.<id>.command` copy does with EVERY
+ * `LSPServerInfo` trait, decided once, here. The override swaps the binary and
+ * keeps the catalog row's identity, but the row's measured values were
+ * measured on the CATALOG binary, so the copy runs another binary under facts
+ * nobody measured for it. #4829 found `resendRecheck` riding the copy; this
+ * table replaces that one-off drop.
+ *
+ * The rule: a trait is KEPT only when it is routing identity (which files the
+ * entry serves) or when its failure direction is restrictive (a guard that
+ * declines or refuses, a budget that only waits longer, a ceiling that only
+ * lowers a shared default), so keeping a value measured on another binary
+ * costs speed or coverage and never a wrong verdict. Every trait that is an
+ * optimistic claim about how the binary behaves RESETS to its documented
+ * fail-safe default (absent, or `unmeasured`).
+ *
+ * Fail closed: the copy is built from the kept keys only, so a field the table
+ * does not name never reaches the copy, and the mapped type below refuses to
+ * compile until a new `LSPServerInfo` member is decided.
+ * `tests/config/lsp-override-copy-census.test.ts` holds the table to the
+ * interface's real declaration in both directions.
+ *
+ * The server-id-keyed wait strategy (`wait-policy/strategies.ts`) is not a
+ * field here: the copy's `spawn` reports `launchVariant: "override"` and
+ * `getStrategy` answers that with the default strategy, so silentOnClean,
+ * emptyFirstPublish, diagnosticsFence and workspaceIndexing (and the rest of
+ * the row) reset too.
+ */
+export const OVERRIDE_COPY_TRAITS: {
+	readonly [K in keyof LSPServerInfo]-?: OverrideTraitDecision;
+} = {
+	id: {
+		keep: true,
+		why: "Routing identity: the override is keyed by this id.",
+	},
+	name: {
+		keep: true,
+		why: "Routing identity: how the entry is named in output.",
+	},
+	extensions: {
+		keep: true,
+		why: "Routing: which files the entry serves; an override swaps the binary, not the language mapping.",
+	},
+	role: {
+		keep: true,
+		why: "Routing: primary versus auxiliary selection is a policy of the entry, not a measurement.",
+	},
+	root: {
+		keep: true,
+		why: "Routing: where the workspace is hosted; the override changes the binary only.",
+	},
+	rootMarkers: {
+		keep: true,
+		why: "Routing: the marker table behind the shared root seam.",
+	},
+	fallbackFor: {
+		keep: true,
+		why: "Routing: which preferred server this entry backs up.",
+	},
+	pathFilter: {
+		keep: true,
+		why: "Routing: the candidacy gate beyond extensions.",
+	},
+	executesProjectCode: {
+		keep: true,
+		why: "Protective: a true value refuses an untrusted spawn; resetting would widen.",
+	},
+	looseFileRoot: {
+		keep: true,
+		why: "Protective: a decline keeps a home-directory walk from starting; resetting would widen.",
+	},
+	spawnNeedsProjectFile: {
+		keep: true,
+		why: "Protective: a decline before spawn; wrongly kept it costs a spawn, never a verdict.",
+	},
+	requiresProjectRoot: {
+		keep: true,
+		why: "Restrictive: only demotes an empty answer to unconfirmed.",
+	},
+	availabilityKey: {
+		keep: true,
+		why: "Protective: the adopted-root project-local binary refusal reads it; resetting would widen.",
+	},
+	projectLocalCommand: {
+		keep: true,
+		why: "Protective: the adopted-root project-local binary refusal reads it; resetting would widen.",
+	},
+	settingsSection: {
+		keep: true,
+		why: "Documented (#4758): the section sits on the server so a command override keeps it.",
+	},
+	initializeTimeoutMs: {
+		keep: true,
+		why: "Wait budget at or above the shared default; too short kills a slow-bootstrap server, too long only waits.",
+	},
+	clientWaitTimeoutMs: {
+		keep: true,
+		why: "Wait budget; a longer wait costs time and never a wrong verdict.",
+	},
+	notifyInflightLimit: {
+		keep: true,
+		why: "Ceiling that only lowers the shared default; a lower cap costs round trips, a higher one risks the stall it bounded.",
+	},
+	idleEviction: {
+		keep: false,
+		why: "Reset to unmeasured (never evicted): 'transparent' needs per-server evidence.",
+	},
+	replyOrdering: {
+		keep: false,
+		why: "Reset to unmeasured (barrier armed): the notify barrier's soundness rests on the measured ordering.",
+	},
+	resendRecheck: {
+		keep: false,
+		why: "Reset to unmeasured (no re-send): a server that publishes nothing for unchanged bytes loses the answer (#4782).",
+	},
+	autoPropagateDiagnostics: {
+		keep: false,
+		why: "Reset (active touch of neighbours): an optimistic claim that the server pushes dependents.",
+	},
+	autoInstall: {
+		keep: false,
+		why: "Reset: it installs the catalog binary, not the override's.",
+	},
+	custom: {
+		keep: false,
+		why: "Reset: marks config-supplied rows; catalog rows never declare it.",
+	},
+	echoesOwnNotice: {
+		keep: false,
+		why: "Reset: the hold drops an empty publish on the catalog binary's measured recompile echo; on another binary it could keep an error the server really cleared.",
+	},
+	command: {
+		keep: false,
+		why: "Reset: the custom-row command token; the override's command lives in its spawn.",
+	},
+	covers: {
+		keep: false,
+		why: "Reset: the custom-row covers claim; catalog rows declare theirs in BUILTIN_SERVER_RUNNER_COVERS.",
+	},
+	trustAllowed: {
+		keep: false,
+		why: "Set by the copy: the registry admitted the override's command.",
+	},
+	spawn: {
+		keep: false,
+		why: "Set by the copy: launches the override's command.",
+	},
+};
+
+/** The kept traits of a catalog row; every key the table does not keep is absent. */
+function keptOverrideTraits(server: LSPServerInfo): Record<string, unknown> {
+	const kept: Record<string, unknown> = {};
+	for (const [trait, value] of Object.entries(server)) {
+		// A key the table does not name is dropped, not copied (fail closed).
+		if (
+			Object.hasOwn(OVERRIDE_COPY_TRAITS, trait) &&
+			OVERRIDE_COPY_TRAITS[trait as keyof LSPServerInfo].keep
+		) {
+			kept[trait] = value;
+		}
+	}
+	return kept;
+}
+
 /**
  * The one LSP config-to-runtime boundary. Every executable field is checked
  * here, before a server or override reaches selection, initialization, or a
@@ -956,30 +1384,24 @@ export function compileLspRegistry(
 
 	if (config.servers) {
 		for (const [id, serverConfig] of Object.entries(config.servers)) {
-			const commandSource = sourceFor(provenance, `/lsp/servers/${id}/command`);
-			const commandAllowed = executableAllowed(commandSource, trust);
-			registryDecision(id, "command", commandSource, trust, commandAllowed);
-			if (!commandAllowed) continue;
-			const envSource = sourceFor(provenance, `/lsp/servers/${id}/env`);
-			const initSource = sourceFor(
-				provenance,
-				`/lsp/servers/${id}/initializationOptions`,
-			);
-			const envAllowed = executableAllowed(envSource, trust);
-			const initAllowed = executableAllowed(initSource, trust);
-			registryDecision(id, "env", envSource, trust, envAllowed);
-			registryDecision(
+			const refused = refusedRepoFields(
 				id,
-				"initializationOptions",
-				initSource,
+				"servers",
+				serverConfig,
+				REPO_TIER_SERVER_FIELDS,
+				provenance,
 				trust,
-				initAllowed,
+				(key) => key,
 			);
-			const admitted: CustomServerConfig = { ...serverConfig };
-			if (!envAllowed) delete admitted.env;
-			if (!initAllowed) delete admitted.initializationOptions;
+			// #5147: a refused field may have shadowed the user's own value
+			// (the merge keeps the winner only), so the server is not registered
+			// rather than started on a stripped configuration.
+			if (refused.size > 0) continue;
+			// A server no file can select (`{"name":"x"}`) is not registered:
+			// selection iterates `extensions` for every file (fileMatchReason).
+			if (!Array.isArray(serverConfig.extensions)) continue;
 			try {
-				const server = createCustomServer(admitted, id);
+				const server = createCustomServer({ ...serverConfig }, id);
 				customServers.push({ ...server, trustAllowed: true });
 			} catch {
 				// pi-lens-ignore: missing-error-propagation — per-server registration, skip bad entries
@@ -988,42 +1410,44 @@ export function compileLspRegistry(
 	}
 
 	const serverOverrides = new Map<string, ServerInitOverride>();
+	// #5147: the global tier on its own, read only when an override is refused.
+	// No cwd skips the project walk; the two paths are the ones both production
+	// callers (`loadLSPConfig`, `effectiveConfig`) pass for their global tier.
+	let globalOverrides: Record<string, ServerInitOverride> | undefined;
 	if (config.serverOverrides) {
-		for (const [id, entry] of Object.entries(config.serverOverrides)) {
-			if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+		for (const [id, merged] of Object.entries(config.serverOverrides)) {
+			if (merged && typeof merged === "object" && !Array.isArray(merged)) {
+				const refused = refusedRepoFields(
+					id,
+					"serverOverrides",
+					merged,
+					REPO_TIER_OVERRIDE_FIELDS,
+					provenance,
+					trust,
+					(key) =>
+						key === "command" || key === "env" ? `${key} override` : key,
+				);
+				// #5147: the merge keeps the winner only, so a refused repo value
+				// may have shadowed the user's own. The global tier's entry for this
+				// id applies instead: every repo contribution goes, every global
+				// field stays, and an id with no global entry runs on the catalog.
+				let entry: ServerInitOverride | undefined = merged;
+				if (refused.size > 0) {
+					globalOverrides ??=
+						lspConfigOf(
+							resolvePiLensConfig({
+								globalDir: getGlobalPiLensDir(),
+								globalConfigPath: getPiLensGlobalConfigPath(),
+							}).value,
+						).serverOverrides ?? {};
+					entry = Object.hasOwn(globalOverrides, id)
+						? globalOverrides[id]
+						: undefined;
+				}
+				if (!entry) continue;
 				const initOpts = (entry as Record<string, unknown>)
 					.initializationOptions;
 				const command = (entry as ServerInitOverride).command;
-				const commandSource = sourceFor(
-					provenance,
-					`/lsp/serverOverrides/${id}/command`,
-				);
-				const envSource = sourceFor(
-					provenance,
-					`/lsp/serverOverrides/${id}/env`,
-				);
-				const initSource = sourceFor(
-					provenance,
-					`/lsp/serverOverrides/${id}/initializationOptions`,
-				);
-				const commandAllowed = executableAllowed(commandSource, trust);
-				const envAllowed = executableAllowed(envSource, trust);
-				const overrideInitAllowed = executableAllowed(initSource, trust);
-				registryDecision(
-					id,
-					"command override",
-					commandSource,
-					trust,
-					commandAllowed,
-				);
-				registryDecision(id, "env override", envSource, trust, envAllowed);
-				registryDecision(
-					id,
-					"initializationOptions",
-					initSource,
-					trust,
-					overrideInitAllowed,
-				);
 				if (
 					command !== undefined ||
 					(entry as ServerInitOverride).env !== undefined ||
@@ -1033,11 +1457,11 @@ export function compileLspRegistry(
 						!Array.isArray(initOpts))
 				) {
 					serverOverrides.set(id, {
-						...(overrideInitAllowed && initOpts !== undefined
+						...(initOpts !== undefined
 							? { initializationOptions: initOpts as Record<string, unknown> }
 							: {}),
-						...(commandAllowed && command !== undefined ? { command } : {}),
-						...(envAllowed && (entry as ServerInitOverride).env
+						...(command !== undefined ? { command } : {}),
+						...((entry as ServerInitOverride).env
 							? { env: (entry as ServerInitOverride).env }
 							: {}),
 					});
@@ -1067,8 +1491,15 @@ export function compileLspRegistry(
 		const argv = Array.isArray(override.command)
 			? override.command
 			: [override.command, "--stdio"];
+		// #4833: the copy keeps only what `OVERRIDE_COPY_TRAITS` keeps; every
+		// other measured trait of the catalog binary resets (`idleEviction` is
+		// the one required field, so its fail-safe value is spelled here).
 		return {
-			...server,
+			...(keptOverrideTraits(server) as Omit<
+				LSPServerInfo,
+				"spawn" | "trustAllowed" | "idleEviction"
+			>),
+			idleEviction: "unmeasured" as const,
 			trustAllowed: true,
 			async spawn(
 				root: string,
@@ -1082,7 +1513,9 @@ export function compileLspRegistry(
 					cwd: root,
 					env: override.env ? { ...process.env, ...override.env } : process.env,
 				});
-				return { process: proc };
+				// "override": the wait policy's server-id-keyed rows were measured on
+				// the catalog binary (`getStrategy`).
+				return { process: proc, launchVariant: "override" as const };
 			},
 		};
 	});
@@ -1258,6 +1691,7 @@ export function explainServersForFile(
 }
 
 export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
+	if (serversForFileOverride) return serversForFileOverride(filePath);
 	const config = getConfigForFile(filePath);
 	const { ext, base } = fileMatchKeys(filePath);
 	return registeredServers(config, LSP_SERVERS).filter(
@@ -1344,7 +1778,29 @@ export function getServerInitOverride(
 	return getConfigForFile(filePath).serverOverrides.get(serverId);
 }
 
+/**
+ * Test-only server selection (#4709). Replaces `getServersForFileWithConfig`'s
+ * answer (and so `primaryServerId`, `resolveLspCwdForFile`, which derive from
+ * it) with `select(filePath)` until `resetLSPConfigStateForTests` runs.
+ * A suite that needs a per-test server list calls this instead of
+ * `vi.mock`-ing this module, so every other export stays the real one.
+ *
+ * Product paths never reach it: nothing under `clients/`, `tools/`, `mcp/` or
+ * `index.ts` imports the name (`tests/clients/lsp/config-selection-setter.test.ts`
+ * scans for that), and the setter ignores an arm outside a Vitest process.
+ * Pass `undefined` to drop the injection without resetting the rest.
+ */
+export function _setServersForFileForTests(
+	select: ServersForFile | undefined,
+): void {
+	if (select && !process.env.VITEST) return;
+	serversForFileOverride = select;
+}
+
 export function resetLSPConfigStateForTests(): void {
+	// #4709: the injected selection is test state too; a later case that
+	// resets must see the real registry's answer, not the last case's list.
+	serversForFileOverride = undefined;
 	resetLSPCaseSensitivityState();
 	// One call clears both the served roots and their configs: since #2518 they
 	// are one store, so a reset cannot leave a cleared config store beside a

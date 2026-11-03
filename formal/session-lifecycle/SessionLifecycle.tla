@@ -174,6 +174,16 @@
 (*                       scope is the one the turn captured at entry       *)
 (*   "turnEndScoped"     #3613 R2: a shipped shape in which turn_end drains *)
 (*                       only its own scope's work                         *)
+(*   "blockerStore"      #4921: tool_results also leave inline-blocker     *)
+(*                       records (work kind `blocker`); off, none are made *)
+(*                       (the /new and /reload configs stay their size)    *)
+(*   "blockerScoped"     #4921: a turn_end delivers only its own session's *)
+(*                       inline-blocker records                            *)
+(*   "slotAddressed"     #4943: a request takes the per-project turn-end   *)
+(*                       message only when its own session staged it       *)
+(*   "slotHostAddressed" #4943 R2: the MCP host (another process sharing   *)
+(*                       the project's slot) takes only a message an MCP   *)
+(*                       server staged, to its one address                 *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -184,7 +194,8 @@ CONSTANTS
                     \*    "SecEnd","SecTurn","SecReload","SecFork","Dup",
                     \*    "Interrupt","InterruptPreScope","InterruptUnstarted",
                     \*    "DeferOwn","DrainDefer","TurnWork","TurnEnd",
-                    \*    "SecTurnEnd","ParkTake"}
+                    \*    "SecTurnEnd","ParkTake","Stage","TakeSlot",
+                    \*    "McpStage","McpTake"}
     Writers,        \* the writers in play, a subset of
                     \*   {"read","secRead","heartbeat","lsp","widget",
                     \*    "advisory","activate","stateW","debounce",
@@ -278,12 +289,13 @@ LegacyFence(s) == IF s = "RG" THEN "session" ELSE TargetFence(s)
 TargetSec(s) ==
     CASE s \in {"RG", "TC", "LZ"} -> "own" [] OTHER -> "shared"
 
-\* Merged master: S2 gave the lazy-tool memory a cell per scope (#3653), and
-\* #3613 the turn state: `beginTurn` takes the turn's session id and the
-\* per-turn records are partitioned by it (`clients/runtime-coordinator.ts`).
-\* A subagent's handlers still reach the module-level runtime's read guard
-\* (#3607, F4, the rest of #3613).
-MergedSec(s) == IF s \in {"LZ", "TC"} THEN "own" ELSE "shared"
+\* Merged master: S2 gave the lazy-tool memory a cell per scope (#3653), #3613
+\* the turn state (`beginTurn` takes the turn's session id and the per-turn
+\* records are partitioned by it, `clients/runtime-coordinator.ts`), and #4942
+\* the read guard (`RuntimeCoordinator.readGuardFor`, F4, the rest of #3613):
+\* a subagent's handlers reach a read guard of its own. Merged master is now
+\* the design's `TargetSec`; the name stays for the configs that pin it.
+MergedSec(s) == IF s \in {"LZ", "TC", "RG"} THEN "own" ELSE "shared"
 
 \* Merged master before #3613: the turn counter and per-turn maps were the
 \* module-level runtime's too (N2).
@@ -1618,14 +1630,27 @@ RegLand(t) ==
 (*       worklist (`ranges`, `addModifiedRange`), the turn summary          *)
 (*       (`summary`, `runtime.turnSummary`), the git-guard latch            *)
 (*       (`gitguard`, `updateGitGuardStatus`, `markGitGuardCacheUnknown`),  *)
-(*       and the stores a turn_end composer drains (`cascade`, `runner`).   *)
+(*       the stores a turn_end composer drains (`cascade`, `runner`), and   *)
+(*       the inline-blocker map it re-serves (`blocker`; #4921: its record  *)
+(*       names a secondary's session, `InlineBlockerRecord.session`).       *)
 (*   dq  the deferral queue (`deferMutation`): one file, so one merged      *)
 (*       record; its epoch is the `Math.max` of its pairs'.                 *)
 (*   pk  the cut-advisory park map (`parkCutAdvisoryItems`).                *)
 (***************************************************************************)
 
 StateKinds == {"ranges", "summary", "gitguard"}
+\* `blocker`: an inline-blocker record (`recordInlineBlockers`), produced only
+\* under "blockerStore". A turn_end re-serves it rather than draining it; its
+\* take below is the delivery, which is what the isolation clause constrains.
 WorkKinds  == {"ranges", "cascade", "runner"}
+                \cup (IF Has("blockerStore") THEN {"blocker"} ELSE {})
+\* `staged`: the message a turn_end staged in the per-project delivery slot
+\* (the `turn-end-findings` record, #4943). A turn_end never drains it; the
+\* next request takes it (`TakeSlot`).
+SlotKinds  == {"staged"}
+\* #4943 R2: the MCP host, a reader and stager of the slot outside every pi
+\* scope (another process on the same project cache). Not a ticket.
+Mcp == 0
 
 M4Kinds(x) == IF x \in {"stateW", "debounce"} THEN StateKinds ELSE {"-"}
 
@@ -1798,8 +1823,8 @@ ParkTake ==
 
 \* A live scope's tool_result leaves a work record in the coordinator's stores
 \* (the turn-state worklist owned by the coordinator's session id, cascade runs,
-\* pending runner findings), in the hook, with no await. A concurrent
-\* subagent's tool results reach the same coordinator.
+\* pending runner findings, the inline-blocker map), in the hook, with no
+\* await. A concurrent subagent's tool results reach the same coordinator.
 TurnWork ==
     /\ "TurnWork" \in Transitions /\ primary # 0 /\ pend.k = "none"
     /\ \E s \in Tickets, k \in WorkKinds :
@@ -1816,20 +1841,82 @@ TurnWork ==
 \* coordinator's session id owns, consumes the cascade runs and drains the
 \* pending runner findings. The shipped "turnEndScoped" rule keys each
 \* durable work record by its producing activation; shared cascade lifecycle
-\* remains settled through the coordinator scope.
+\* remains settled through the coordinator scope. Before "blockerScoped"
+\* (#4921) the inline-blocker map stayed outside that rule: every turn_end
+\* delivered every session's blockers.
 TurnEnd ==
     /\ primary # 0 /\ pend.k = "none"
     /\ \E s \in Tickets :
           /\ st[s] = "live"
           /\ \/ (s = primary /\ "TurnEnd" \in Transitions)
              \/ (role[s] = "secondary" /\ "SecTurnEnd" \in Transitions)
-          /\ LET take == {r \in co[last] : r.k \in WorkKinds
-                                           /\ (Has("turnEndScoped") => r.o = s)}
+          /\ LET scoped(r) == Has("turnEndScoped")
+                                /\ (r.k # "blocker" \/ Has("blockerScoped"))
+                 take == {r \in co[last] : r.k \in WorkKinds
+                                           /\ (scoped(r) => r.o = s)}
              IN
              /\ take # {}
              /\ consumed' = consumed \cup
                               {[k |-> r.k, o |-> r.o, by |-> s] : r \in take}
-             /\ co' = [co EXCEPT ![last] = @ \ take]
+             \* A blocker is re-served, not drained: its record stays in the
+             \* map until a write retires it, so a later turn end takes it again.
+             /\ co' = [co EXCEPT ![last] = @ \ {r \in take : r.k # "blocker"}]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, dq, pk,
+                   pkOut>>
+
+\* #4943: a turn_end of any activation stages its message in the one
+\* per-project slot (`writeCache("turn-end-findings", ...)` in
+\* `handleTurnEnd`), replacing whatever is staged there, its own earlier
+\* message included: the write is unconditional, so a session stages again
+\* after its message was taken. The configs that use it take no replacement
+\* transition, so the slot lives in the one coordinator generation.
+Stage ==
+    /\ "Stage" \in Transitions /\ primary # 0 /\ pend.k = "none"
+    /\ \E s \in Tickets :
+          /\ st[s] = "live"
+          /\ co' = [co EXCEPT ![last] = {r \in @ : r.k # "staged"}
+                                          \cup {[k |-> "staged", o |-> s]}]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, dq, pk,
+                   consumed, pkOut>>
+
+\* The next request of a live session (`consumeTurnEndFindings` in the
+\* request hook, `index.ts`) takes the staged message. Before
+\* "slotAddressed" the slot named no reader, so whichever session asked
+\* first took it: a primary took the message a subagent's turn_end staged.
+TakeSlot ==
+    /\ "TakeSlot" \in Transitions /\ primary # 0 /\ pend.k = "none"
+    /\ \E s \in Tickets, r \in co[last] :
+          /\ st[s] = "live"
+          /\ r.k = "staged"
+          /\ Has("slotAddressed") => r.o = s
+          /\ consumed' = consumed \cup {[k |-> r.k, o |-> r.o, by |-> s]}
+          /\ co' = [co EXCEPT ![last] = @ \ {r}]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, dq, pk,
+                   pkOut>>
+
+\* #4943 R2: an MCP server's turn end (`lens_turn_end`, a Stop pass with
+\* nothing cached) stages its message in the same slot, replacing what is
+\* there. Its address is one constant for every server process
+\* (`MCP_DELIVERY_ADDRESS`), so the record names the host, not a process.
+McpStage ==
+    /\ "McpStage" \in Transitions /\ primary # 0 /\ pend.k = "none"
+    /\ co' = [co EXCEPT ![last] = {r \in @ : r.k # "staged"}
+                                    \cup {[k |-> "staged", o |-> Mcp]}]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, dq, pk,
+                   consumed, pkOut>>
+
+\* #4943 R2: an MCP reader (`lens_turn_end`'s consume, the Stop pass's peek
+\* and the acknowledge that commits it, taken here as one step) takes the
+\* staged message. Before "slotHostAddressed" it named no reader, so it took
+\* a pi session's message. With it, it takes only the host's own, whichever
+\* server process staged it, so a restarted server still delivers.
+McpTake ==
+    /\ "McpTake" \in Transitions /\ primary # 0 /\ pend.k = "none"
+    /\ \E r \in co[last] :
+          /\ r.k = "staged"
+          /\ Has("slotHostAddressed") => r.o = Mcp
+          /\ consumed' = consumed \cup {[k |-> r.k, o |-> r.o, by |-> Mcp]}
+          /\ co' = [co EXCEPT ![last] = @ \ {r}]
     /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, dq, pk,
                    pkOut>>
 
@@ -1876,6 +1963,10 @@ Next ==
     \/ ParkTake
     \/ TurnWork
     \/ TurnEnd
+    \/ Stage
+    \/ TakeSlot
+    \/ McpStage
+    \/ McpTake
 
 Spec == Init /\ [][Next]_vars
 
@@ -1890,7 +1981,9 @@ TypeOK ==
     /\ primary \in 0..(MaxSteps + 2)
     /\ slot.reason \in {"-"} \cup SlotReasons
     /\ \A s \in Stores : \A r \in Reasons : Policy(s, r) \in Actions
-    /\ \A t \in Tickets : co[t] \subseteq [k : StateKinds \cup WorkKinds, o : Tickets]
+    /\ \A t \in Tickets :
+          co[t] \subseteq [k : StateKinds \cup WorkKinds, o : Tickets]
+                    \cup [k : SlotKinds, o : Tickets \cup {Mcp}]
     /\ \A t \in Tickets : dq[t] \subseteq [o : Tickets, e : Nat]
     /\ \A t \in Tickets : pk[t] \subseteq [o : Tickets, k : Files \cup {"-"}]
     /\ \A x \in M4Writers : mw[x].pc \in {"idle", "flight", "landed", "dropped"}
@@ -1907,10 +2000,11 @@ NoCrossSessionState ==
     \* M4: the live coordinator generation's work records come from its own
     \* scope or a concurrent subagent's (a shared coordinator, by design); a
     \* record from another primary scope is a retired session's write that
-    \* landed in the live one (#3759's rows 7, 12, 14, 15, 16).
+    \* landed in the live one (#3759's rows 7, 12, 14, 15, 16). The MCP host's
+    \* staged message is no pi scope's (#4943 R2).
     /\ \A t \in Tickets :
           st[t] = "live" =>
-              \A r \in co[t] : r.o = t \/ role[r.o] = "secondary"
+              \A r \in co[t] : r.o = t \/ r.o = Mcp \/ role[r.o] = "secondary"
 
 \* The design's NoOffBranchFact (#3521): a live scope's own-lineage facts
 \* name entries on its current branch.
@@ -1965,7 +2059,9 @@ SecondaryIsolation ==
     \* M4, the turn_end half (#3613's R2, #3758): a turn_end drains only its
     \* own scope's work, so a subagent's never clears the primary's worklist,
     \* cascade runs or pending runner findings, and the primary's never takes
-    \* a subagent's.
+    \* a subagent's. #4943: nor does a request take the turn-end message
+    \* another session's turn_end staged, nor (R2) the MCP host one a pi
+    \* session's turn_end staged, nor a pi request the MCP host's.
     /\ \A c \in consumed : c.o = c.by
 
 \* F2: the slot is taken only by a primary start that replaced the scope

@@ -5,11 +5,6 @@ const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 const logLatency = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
@@ -35,8 +30,11 @@ async function settle(turns = 50): Promise<void> {
 }
 
 describe("LSPService race hardening", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();

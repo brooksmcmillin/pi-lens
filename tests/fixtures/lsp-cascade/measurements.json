@@ -1,0 +1,78 @@
+{
+	"_comment": "First measured time-to-conclusive per priority server (#1712; the #1549 budget input). Raw artifact `lsp-cascade-times` of the tool-smoke workflow_dispatch run named in runner.runId (head 49b88c8cd, ubuntu runner, run 2026-10-30), unedited apart from this comment. Milliseconds. warmMs: cold start to the exporter and both importers answering a touch. timeToConclusiveMs: from the exporter's edit to both importers observed with the expected finding. The typescript7 row also carries the rename phase (#1677): renameMs is LSPService.renameFile, importersRewritten counts importers whose specifier the server rewrote, and its timeToConclusiveMs runs from the start of the renameFile call to every importer concluded, so it includes renameMs. The java row is a sample taken while java was in CASCADE_GRAPH_KINDS (head 49b88c8cd), before the set held it out; java is in the set again with #5040, and the next refreshed table replaces this row. Refresh it from a later nightly's artifact; tests/config/lsp-cascade-measurements.test.ts keeps it consistent with the fixtures and deadlines.",
+	"schema": 1,
+	"command": "node scripts/smoke-tools.mjs --lsp-cascade --install --times-out=<file>",
+	"date": "2026-10-30",
+	"runner": {
+		"os": "linux",
+		"arch": "x64",
+		"node": "v22.23.4",
+		"ci": true,
+		"runId": "41126423700",
+		"image": "20261026.354.1"
+	},
+	"rows": [
+		{
+			"lang": "typescript7",
+			"server": "typescript native (tsc --lsp --stdio, TS7+)",
+			"state": "pass",
+			"warmMs": 190,
+			"firstCascadeMs": 149,
+			"timeToConclusiveMs": 163,
+			"attempts": 1,
+			"neighbours": {
+				"src/b.ts": "findings",
+				"src/c.ts": "findings"
+			},
+			"rename": {
+				"state": "concluded",
+				"renameMs": 52,
+				"importersRewritten": 2,
+				"timeToConclusiveMs": 92,
+				"importers": {
+					"src/b.ts": "concluded",
+					"src/c.ts": "concluded"
+				}
+			}
+		},
+		{
+			"lang": "rust",
+			"server": "rust-analyzer",
+			"state": "pass",
+			"warmMs": 865,
+			"firstCascadeMs": 2389,
+			"timeToConclusiveMs": 2658,
+			"attempts": 1,
+			"neighbours": {
+				"src/b.rs": "findings",
+				"src/c.rs": "findings"
+			}
+		},
+		{
+			"lang": "go",
+			"server": "gopls",
+			"state": "pass",
+			"warmMs": 1600,
+			"firstCascadeMs": 1012,
+			"timeToConclusiveMs": 1330,
+			"attempts": 1,
+			"neighbours": {
+				"app/app.go": "findings",
+				"tool/tool.go": "findings"
+			}
+		},
+		{
+			"lang": "java",
+			"server": "jdtls",
+			"state": "pass",
+			"warmMs": 7995,
+			"firstCascadeMs": 910,
+			"timeToConclusiveMs": 1803,
+			"attempts": 1,
+			"neighbours": {
+				"src/app/B.java": "findings",
+				"src/app/C.java": "findings"
+			}
+		}
+	]
+}

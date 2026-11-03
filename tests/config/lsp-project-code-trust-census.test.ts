@@ -27,6 +27,7 @@ const PROJECT_CODE_SERVERS = new Set([
 	"fsharp",
 	"java",
 	"kotlin",
+	"groovy",
 	"lean",
 	"swift",
 	"dart",
@@ -70,6 +71,10 @@ const DOES_NOT_EXECUTE_PROJECT_CODE = new Map<string, string>([
 	[
 		"docker-official",
 		"Dockerfile language server alternate parses Dockerfiles only",
+	],
+	[
+		"fallow",
+		"static analysis of JS/TS source (Oxc parse, no Node runtime); it reads .fallowrc.json/fallow.toml as data and executes nothing",
 	],
 	["fish", "parses shell source; it never runs the project's scripts"],
 	[

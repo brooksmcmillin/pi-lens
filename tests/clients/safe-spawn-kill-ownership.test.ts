@@ -21,6 +21,7 @@
  * `process.kill` is mocked in every case that could reach it, so a regression
  * here can never deliver a real signal to the runner.
  */
+// flake-shape: real-process-spawn — the kill-ownership cases need a real live child of this process: the ownership guard reads its /proc ppid, which no double carries; the mock beside it on the same module would otherwise hide that spawn (#5064)
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -139,6 +140,12 @@ describe("lifetime signal cleanup (#3239)", () => {
 		});
 		try {
 			const { safeSpawnAsync } = await import("../../clients/safe-spawn.js");
+			// #4530: this host's path judgment reads the Windows-shaped PATH below as a
+			// relative directory under the session cwd, so the session's trust is
+			// adopted; the Windows trust cells run on the Windows lane.
+			const { setProjectTrustState } =
+				await import("../../clients/project-trust.js");
+			setProjectTrustState("trusted");
 			const {
 				getDegradationSummary: freshSummary,
 				resetDegradationLedger: freshReset,

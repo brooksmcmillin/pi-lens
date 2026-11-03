@@ -93,6 +93,7 @@ export type LanguageId =
 	| "swift"
 	| "systemverilog"
 	| "terraform"
+	| "terraform-vars"
 	| "terragrunt"
 	| "toml"
 	| "typescript"
@@ -180,6 +181,7 @@ export const PINNED_LANGUAGE_IDS = [
 	"swift",
 	"systemverilog",
 	"terraform",
+	"terraform-vars",
 	"terragrunt",
 	"toml",
 	"typescript",
@@ -499,7 +501,14 @@ export const LANGUAGES: readonly LanguageEntry[] = [
 	{ id: "svelte", kind: "jsts", extensions: [".svelte"] },
 	{ id: "swift", kind: "swift", extensions: [".swift"], grammar: "swift" },
 	{ id: "systemverilog", extensions: [".sv"] },
-	{ id: "terraform", kind: "terraform", extensions: [".tf", ".tfvars"] },
+	{ id: "terraform", kind: "terraform", extensions: [".tf"] },
+	// terraform-ls validates a variables file only when its `languageId` is
+	// `terraform-vars`; announced as `terraform` it decodes the file as module
+	// code and (with enhanced validation, its default since 0.32) reports every
+	// assignment as "Unexpected attribute" (hashicorp/vscode-terraform#1672).
+	// Same kind, so the same server, runners, and formatter policy; only the LSP
+	// `languageId` differs.
+	{ id: "terraform-vars", kind: "terraform", extensions: [".tfvars"] },
 	{
 		id: "terragrunt",
 		kind: "terragrunt",
@@ -846,7 +855,7 @@ export const SCAN_LANGUAGE_PRIORITY: readonly (readonly LanguageId[])[] = [
 	["haskell"],
 	["elixir"],
 	["gleam"],
-	["terraform"],
+	["terraform", "terraform-vars"],
 	["nix"],
 	["shell"],
 	["php"],

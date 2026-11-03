@@ -30,7 +30,7 @@ import { extensionsForLanguageToken } from "./language-registry.js";
 import { initLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/capabilities.js";
 import { acquireWarmWordIndex } from "./mcp/analyze.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { normalizeMapKey, relativeInside, toPosix } from "./path-utils.js";
 import { scanProjectDiagnostics } from "./project-diagnostics/scanner.js";
 import type { ProjectDiagnosticsSnapshot } from "./project-diagnostics/types.js";
 import { loadProjectSnapshotWithoutWordIndex } from "./project-snapshot.js";
@@ -78,14 +78,21 @@ export {
 } from "./mcp/session.js";
 export {
 	moduleReport,
+	projectModuleReport,
 	readEnclosing,
 	readSymbol,
 	renderCompactModuleReport,
+	renderModuleReportPreset,
+	resolveModuleReportPreset,
+	type ModuleReportFormat,
+	type ModuleReportPreset,
+	type ModuleReportPresetChoice,
+	type ModuleReportProjection,
 } from "./module-report.js";
 export {
 	type ProjectReport,
 	projectReport,
-	renderCompactProjectReport,
+	renderTextProjectReport,
 } from "./project-report.js";
 // Effective-config introspection (#2427). A facade rather than a wrapper for
 // the same reason the others are: the computation reaches into the config
@@ -109,9 +116,9 @@ export function recentLatency(
 ): DispatchLatencyReport[] {
 	let reports = getLatencyReports();
 	if (fileFilter) {
-		const needle = fileFilter.replace(/\\/g, "/");
+		const needle = toPosix(fileFilter);
 		reports = reports.filter((report) =>
-			report.filePath.replace(/\\/g, "/").endsWith(needle),
+			toPosix(report.filePath).endsWith(needle),
 		);
 	}
 	return reports.slice(-limit).reverse();
@@ -383,21 +390,32 @@ export function symbolSearchFileMatchesLang(
 
 /** Same glob semantics as ast_grep_search's `paths`: a bare directory/file
  * entry scopes its whole subtree (via a `/**` suffix match), a full glob
- * pattern is matched as-is. Matched relative to `cwd` so absolute index paths
- * and repo-relative globs line up regardless of platform path separators. */
+ * pattern is matched as-is. `paths` entries arrive host-resolved (#5038), so
+ * `src`, `./src` and the absolute directory scope the same files. An entry at
+ * or under `cwd` is matched as its `cwd`-relative spelling: the workspace
+ * prefix is a literal, never glob syntax, so a directory named `app[1]` or
+ * `app{a,b}` keeps its scope (#5047 F1), while the part the caller wrote after
+ * it (`src/**\/*.ts`) is still a pattern. Any other entry (outside `cwd`, or a
+ * relative glob) is also tried against the candidate's absolute spelling. */
 function fileMatchesPathGlobs(
 	file: string,
 	cwd: string,
 	globs: readonly string[],
 ): boolean {
 	const rel = path.relative(cwd, file).split(path.sep).join("/");
+	const abs = path.resolve(file).split(path.sep).join("/");
 	const options = { dot: true, nocase: process.platform === "win32" };
+	const matches = (candidate: string, pattern: string) =>
+		minimatch(candidate, pattern, options) ||
+		minimatch(candidate, `${pattern}/**`, options);
 	return globs.some((raw) => {
-		const pattern = raw.split("\\").join("/");
-		return (
-			minimatch(rel, pattern, options) ||
-			minimatch(rel, `${pattern}/**`, options)
-		);
+		const within = path.isAbsolute(raw) ? relativeInside(cwd, raw) : undefined;
+		// An entry at or under `cwd` is matched on the relative spelling alone,
+		// never against the absolute candidate, whose workspace prefix is not a
+		// pattern. `cwd` itself relativizes to "", which scopes the whole workspace.
+		if (within !== undefined) return matches(rel, toPosix(within) || "**");
+		const pattern = toPosix(raw);
+		return matches(rel, pattern) || (abs !== rel && matches(abs, pattern));
 	});
 }
 
@@ -405,7 +423,9 @@ function buildSymbolSearchFileFilter(
 	cwd: string,
 	options: SymbolSearchOptions,
 ): ((file: string) => boolean) | undefined {
-	const paths = options.paths?.filter((p) => p.trim().length > 0);
+	// The entries are reader-admitted (`readPathsArgument`, #5041): a blank one
+	// is refused there, so this seam keeps no copy of the rule (#5047 F5).
+	const paths = options.paths;
 	const lang = options.lang?.trim();
 	if (!paths?.length && !lang) return undefined;
 	return (file: string) => {
@@ -522,6 +542,13 @@ export async function symbolSearch(
 	limit = 20,
 	options: SymbolSearchOptions = {},
 ): Promise<SymbolSearchResult> {
+	// #5038: `limit` follows the same `max(1, floor)` rule as `project_report`.
+	// A zero, negative or fractional limit used to reach `searchWordIndex`
+	// unchanged, and `limit: 0` answered "no files matched" — a wrong answer for
+	// a call that only mis-spelled its budget.
+	const effectiveLimit = Number.isFinite(limit)
+		? Math.max(1, Math.floor(limit))
+		: 20;
 	const warmLease = acquireWarmWordIndex(cwd);
 	const snapshot = loadProjectSnapshotWithoutWordIndex(cwd);
 	const index = warmLease.index;
@@ -563,7 +590,11 @@ export async function symbolSearch(
 			(file) => normalizeMapKey(path.resolve(file)),
 		);
 		const fileFilter = buildSymbolSearchFileFilter(cwd, options);
-		results = searchWordIndex(index, query, { limit, centrality, fileFilter });
+		results = searchWordIndex(index, query, {
+			limit: effectiveLimit,
+			centrality,
+			fileFilter,
+		});
 	} finally {
 		warmLease.release();
 	}
@@ -580,6 +611,92 @@ export async function symbolSearch(
 		coverage: { files: index.docCount, truncated: index.truncated === true },
 		snapshotGeneratedAt: snapshot?.generatedAt,
 	};
+}
+
+/** Host-specific spelling of the outline tool the footer's next-step line
+ * names (#5104): pi's `module_report`, MCP's `pilens_module_report`. */
+export type SymbolSearchReportTool = "module_report" | "pilens_module_report";
+
+/** Options for `renderCompactSymbolSearch`. */
+export interface CompactSymbolSearchOptions {
+	/** Directory every hit path is printed relative to. */
+	cwd: string;
+	/** MCP-only staleness note (`graphStalenessNote` in `mcp/server.ts`). */
+	stalenessNote?: string;
+	/** Tool the next-step line names. Defaults to the pi spelling. */
+	reportTool?: SymbolSearchReportTool;
+}
+
+/** The index-coverage sentence both `symbol_search` surfaces print. A capped
+ * index says so: an incomplete answer must not read as a complete one. */
+function coverageLine(
+	coverage: SymbolSearchResult["coverage"],
+): string | undefined {
+	if (!coverage) return undefined;
+	return `Index covers ${coverage.files} files${coverage.truncated ? " (capped — results may be incomplete)" : ""}.`;
+}
+
+/** One ranked row: range first, one line number (`toSymbolSearchHit` sets
+ * `endLine = startLine`, so `12-12` would spend bytes on nothing), then the
+ * score, the hit count, and the graph annotations the hit carries. An
+ * annotation prints whenever its key is present: `fanIn: 0` is an answer ("no
+ * known importers"), so the gate is the type, never truthiness (#5104). */
+function formatSymbolSearchRow(
+	hit: SymbolSearchHit,
+	position: number,
+	cwd: string,
+): string {
+	const annotations = hit.annotations;
+	const detail = [
+		`score ${hit.score.toFixed(2)}`,
+		`${hit.hits} hit(s)`,
+		...(typeof annotations?.fanIn === "number"
+			? [`fanIn ${annotations.fanIn}`]
+			: []),
+		...(typeof annotations?.complexity === "number"
+			? [`complexity ${annotations.complexity}`]
+			: []),
+	];
+	return `  ${position}. ${path.relative(cwd, hit.file)} ${hit.startLine} (${detail.join(", ")})`;
+}
+
+/**
+ * The one renderer for `symbol_search`'s model-facing text (#5104): a header,
+ * one row per ranked hit (path relative to `cwd`, its line, score, hit count
+ * and any graph annotations), and a footer carrying the index coverage, on MCP
+ * the snapshot staleness note, and one next-step line naming the top-ranked
+ * hit through the host's own outline tool name. The pi tool and the MCP mirror
+ * both call this, so the surfaces cannot drift and neither appends a JSON
+ * payload — the ranked table IS the answer. The empty-result path renders
+ * through the same footer, so a capped index stays visible there too.
+ */
+export function renderCompactSymbolSearch(
+	result: SymbolSearchResult,
+	options: CompactSymbolSearchOptions,
+): string {
+	const hits = result.results;
+	const sections = [
+		hits.length > 0
+			? [
+					`Top ${hits.length} file(s) for "${result.query}":`,
+					...hits.map((hit, index) =>
+						formatSymbolSearchRow(hit, index + 1, options.cwd),
+					),
+				].join("\n")
+			: `No files matched "${result.query}".`,
+	];
+	const footer: string[] = [];
+	const coverage = coverageLine(result.coverage);
+	if (coverage) footer.push(coverage);
+	if (options.stalenessNote) footer.push(options.stalenessNote);
+	const top = hits[0];
+	if (top) {
+		footer.push(
+			`Next: ${options.reportTool ?? "module_report"} ${path.relative(options.cwd, top.file)}`,
+		);
+	}
+	if (footer.length > 0) sections.push(footer.join("\n"));
+	return sections.join("\n\n");
 }
 
 // symbolImpact was removed (#304 follow-up): the transitive blast radius is now

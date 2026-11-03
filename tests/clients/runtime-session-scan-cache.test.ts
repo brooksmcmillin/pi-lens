@@ -32,17 +32,7 @@ import {
 } from "../../clients/startup-scan.js";
 import { getStartupScanMaxSourceFilesDerived } from "../../clients/project-scale.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
-
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() => makeLspServiceDouble()),
-}));
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const resolveStartupScanContextSpy = vi.hoisted(() => vi.fn());
 const resolveStartupScanContextAsyncSpy = vi.hoisted(() => vi.fn());
@@ -71,6 +61,8 @@ vi.mock("../../clients/startup-scan.js", async (importOriginal) => {
 });
 
 import { handleSessionStart } from "../../clients/runtime-session.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 function setStartupMode(mode: "full" | "quick"): () => void {
 	const prev = process.env.PI_LENS_STARTUP_MODE;
@@ -134,7 +126,11 @@ describe("startup-scan verdict cache in session_start (#699)", () => {
 	let restoreStartupMode: () => void;
 	let previousDataDir: string | undefined;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// The real config loader walks up from the session cwd to HOME (#4709);
+		// a pinned fixture HOME keeps that read off the maintainer's home.
+		pinFixtureHome("runtime-session-scan-cache");
+		await installLspServiceDouble();
 		restoreStartupMode = setStartupMode("full");
 		previousDataDir = process.env.PILENS_DATA_DIR;
 		// #958: force the synchronous snapshot body writer so the gz body a
@@ -148,6 +144,7 @@ describe("startup-scan verdict cache in session_start (#699)", () => {
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		restoreStartupMode();
 		if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 		else process.env.PILENS_DATA_DIR = previousDataDir;

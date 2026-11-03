@@ -43,7 +43,7 @@ function loadWorkflow(workflowPath: string, source?: string): Workflow {
 // too, so a step added/removed under one of these jobs without updating this
 // table's own understanding of "how many steps share the cache" is visible.
 const WORKFLOWS: Array<[string, string, number]> = [
-	[".github/workflows/tool-smoke.yml", "tool-smoke", 9], // #2780 lens_diagnostics mode=full row added a ninth cache-sharing install (the clean gate was the seventh; #3645 idle-eviction the eighth).
+	[".github/workflows/tool-smoke.yml", "tool-smoke", 11], // #2780 lens_diagnostics mode=full row added a ninth cache-sharing install (the clean gate was the seventh; #3645 idle-eviction the eighth); #3405's save-verdict probe is the tenth; #1712's cascade layer is the eleventh (it reads the handshake census in the same shared home).
 	[".github/workflows/parser-smoke.yml", "parser-smoke", 1],
 ];
 

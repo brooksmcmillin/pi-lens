@@ -33,7 +33,7 @@
  * `clients/dispatch/runners/pyright.ts` and `clients/lsp/server.ts`, so a
  * multi-minute match is a wedged turn rather than a slow answer.
  *
- * Budget choice (AGENTS.md "loose bound" screen, applied in both directions):
+ * Budget choice (HISTORY.md "Test-authoring screens (#1829)" loose-bound screen, applied in both directions):
  * 50 ms is the number the issue's acceptance criterion names. It sits four
  * orders of magnitude below the pre-fix cost — decisive as a red, which the
  * vitest timeout reaches first — and ~20x above the post-fix cost, which is

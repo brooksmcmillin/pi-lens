@@ -161,6 +161,13 @@ export interface Diagnostic {
 	 * Never part of identity.
 	 */
 	positionStale?: true;
+	/**
+	 * #4130: the diagnostic reports the runner's own failure (`faultResult`), not
+	 * a finding about the code. Turn end delivers that fault once, as the
+	 * failure note, so the deferred verdict drops this row. Never part of
+	 * identity.
+	 */
+	runnerFault?: true;
 }
 
 /**
@@ -242,6 +249,26 @@ export interface DispatchResult {
 	 * read as clean: the write-time all-clear line gives this instead.
 	 */
 	unconfirmedStatus?: string;
+	/**
+	 * #4733 r2 (from #4734's review): the coverage rule's positive answer for
+	 * these bytes, set only where it found the file checked: `primary` (a
+	 * runner of the primary group reached a verdict), `in_flight` (a
+	 * collect-later primary whose answer reaches this session's blocker map at
+	 * turn end), `fallback` (a fallback linter the rule accepts in its place),
+	 * or `unconfigured` (this mode defines no primary group for the file, as in
+	 * a `--no-lsp` TypeScript write). Unset otherwise, including where an unset
+	 * `unconfirmedStatus` hides that no runner of a defined primary group ran.
+	 */
+	coverage?: "primary" | "in_flight" | "fallback" | "unconfigured";
+	/**
+	 * #4734 r3: the primary group's language server (its `lsp` runner) reached
+	 * a usable result for these bytes, with no server left unconfirmed. Absent
+	 * otherwise: no kind or primary group, `--no-lsp`, a CLI primary or a
+	 * fallback linter standing in, a primary deferred or still in flight, and a
+	 * partial notice the session latch withheld. The clean advisory's evidence
+	 * that a language server answered (`PipelineResult.checkedClean`).
+	 */
+	primaryLspChecked?: true;
 }
 
 // --- Runner Definition ---
@@ -266,14 +293,56 @@ export interface RunnerDefinition {
  * ownership reasons: a runner may skip because its capability is policy-
  * deferred to a lane that owns it, or because its tool categorically cannot
  * serve the file's dialect — both are policy decisions named at the delivery
- * surface, never an empty output read as clean). */
+ * surface, never an empty output read as clean). `disabled-by-config` is the
+ * operator's own decision (`dispatch.disabledRunners`): the runner never ran,
+ * which is neither a failure nor a verdict on the file. `not-enabled` is the
+ * same for an opt-in runner left off (#5042): nothing failed, and nothing was
+ * checked either. */
 export const RUNNER_SKIP_REASONS = [
 	"no-files-matched",
 	"configured-non-biome-linter",
 	"dialect-unsupported",
 	"covered-by-primary",
+	"disabled-by-config",
+	"not-enabled",
 ] as const;
 export type RunnerSkipReason = (typeof RUNNER_SKIP_REASONS)[number];
+
+/**
+ * The skip reasons that say a runner had nothing to check, so beside a
+ * `dispatch.disabledRunners` denial the coverage notice does not read them as
+ * a tool that failed. A closed admission list over {@link RUNNER_SKIP_REASONS}:
+ * a reason added to the taxonomy reads as a failure until it is listed here.
+ * `covered-by-primary` is left out on purpose: it defers to a lane whose answer
+ * is what the denial may have removed. `disabled-by-config` is the denial
+ * itself and the caller handles it. {@link reachedNoVerdict} admits the
+ * taxonomy as a verdict except `not-enabled`; this is the narrower "not a tool
+ * failure" subset, and `not-enabled` is in it (#5042): an opt-in runner left
+ * off failed at nothing.
+ */
+export const NOT_APPLICABLE_SKIP_REASONS: readonly RunnerSkipReason[] = [
+	"no-files-matched",
+	"configured-non-biome-linter",
+	"dialect-unsupported",
+	"not-enabled",
+];
+
+/** Whether a skip reason states the runner had nothing to check. */
+export function isNotApplicableSkipReason(
+	value: RunnerSkipReason | undefined,
+): boolean {
+	return NOT_APPLICABLE_SKIP_REASONS.some((reason) => reason === value);
+}
+
+/**
+ * #4130: why an invoked tool produced no result. The non-`ran` kinds of
+ * `classifyRunOutcome` (`runners/utils/spawn-outcome.ts`), so a new outcome
+ * kind fails to compile at `skipUnlessToolRan` until it is named here.
+ */
+export type RunnerSkipFault =
+	| "did-not-run"
+	| "rejected-invocation"
+	| "report-missing";
 
 /** Runtime guard for untyped/plugin-provided runner results. */
 export function isRunnerSkipReason(value: unknown): value is RunnerSkipReason {
@@ -330,6 +399,15 @@ export interface RunnerResult {
 	/** Bounded machine-readable reason when status is an expected skip. */
 	skipReason?: RunnerSkipReason;
 	/**
+	 * #4130: a skip that is a runner fault, not an absent tool. The tool was
+	 * invoked and broke (killed, timed out, rejected its invocation, wrote no
+	 * report), so the run reached no verdict for a reason the user cannot act
+	 * on by installing something. Set only through {@link faultSkip}; a skip
+	 * with no tool to invoke leaves it unset. Smoke classification reads it so
+	 * "absent" and "broken" stop rendering alike.
+	 */
+	skipFault?: RunnerSkipFault;
+	/**
 	 * When the skip is `covered-by-primary`: which fact source supplied the
 	 * claim (`declared` — the row's own `covers`; `builtin-fact` — the facts
 	 * table). The dispatcher admits it into latency metadata only on actual
@@ -377,6 +455,13 @@ export interface RunnerResult {
 	 */
 	outOfEditScope?: Diagnostic[];
 	/**
+	 * #4638 r3 (N2): one bounded sentence naming findings the runner withheld
+	 * from `diagnostics` on purpose (a project's declared syntax level outranks
+	 * jedi's `compile` verdict). A drop only the ledger knows about reads as a
+	 * clean edit, so the dispatcher renders this inline beside the blocker output.
+	 */
+	withheldNotice?: string;
+	/**
 	 * #4484 round 2: the run reached no verdict although it returned no
 	 * failure kind (the language server's diagnostics wait hit its deadline
 	 * with nothing collected, or a query run threw part way). What it did not
@@ -419,6 +504,50 @@ export function findingsResult(
 }
 
 /**
+ * The result of a run that BROKE and says so (#4130): `failed` with its own
+ * fault kind, never `blocking_diagnostics`. The synthetic diagnostic keeps the
+ * inline path from reading the run as clean. It is a warning by construction:
+ * a tool that could not read its own output says nothing about the code, so it
+ * must not enter the blocker map (#3814). `runnerFault` marks it, so turn end
+ * delivers the fault once, as the failure note. A runner with real partial
+ * findings beside a fault kind (rust-clippy) builds its own result instead.
+ */
+export function faultResult(
+	fault: { kind: string; failureMessage: string },
+	diagnostic: Pick<Diagnostic, "id" | "message" | "filePath" | "tool"> &
+		Partial<Pick<Diagnostic, "line" | "column" | "rule" | "fixable">>,
+): RunnerResult {
+	return {
+		status: "failed",
+		diagnostics: [
+			{
+				...diagnostic,
+				severity: "warning",
+				semantic: "warning",
+				runnerFault: true,
+			},
+		],
+		semantic: "warning",
+		failureKind: fault.kind,
+		failureMessage: fault.failureMessage.slice(0, 200),
+	};
+}
+
+/**
+ * The one skip a runner returns after it invoked its tool and the tool broke
+ * (#4130). An absent tool returns a bare skip instead: there is nothing to
+ * blame, and nothing was invoked.
+ */
+export function faultSkip(fault: RunnerSkipFault): RunnerResult {
+	return {
+		status: "skipped",
+		diagnostics: [],
+		semantic: "none",
+		skipFault: fault,
+	};
+}
+
+/**
  * Whether a runner result is usable coverage of the bytes it ran on (#3867).
  *
  * A `succeeded` run reached a verdict about the file. A `failed` run reached
@@ -450,8 +579,8 @@ export function hasUsableResult(result: {
  * the file and finished (R1 in PR #4491's round-3 table). That is a
  * `succeeded` run not flagged `inconclusive`, a `failed` run with its own
  * findings, or a skip that states a not-applicable reason from
- * {@link RUNNER_SKIP_REASONS}. Every other outcome has none: a `failed` run
- * without findings (timeout, spawn or server failure), a `deferred` one, a
+ * {@link RUNNER_SKIP_REASONS} (`not-enabled` excepted, below). Every other
+ * outcome has none: a `failed` run without findings (timeout, spawn or server failure), a `deferred` one, a
  * run flagged `inconclusive`, and any skip without a stated reason, since a
  * skip that never read the file (a size or line cap, an aborted WASM runtime,
  * a grammar or server that is unavailable) says nothing about it. Unknown
@@ -472,10 +601,99 @@ export function reachedNoVerdict(
 		case "deferred":
 			return true;
 		case "skipped":
-			return !isRunnerSkipReason(result.skipReason);
+			// #5042: an opt-in runner left off states why it did not run, which
+			// changes the notice's wording and nothing else. It still read nothing
+			// of the file, so it stays out of the verdicts exactly as its bare skip
+			// was: a recorded blocker of that runner is kept and its edited lines
+			// stay owed, not retired by a run that never happened.
+			return (
+				!isRunnerSkipReason(result.skipReason) ||
+				result.skipReason === "not-enabled"
+			);
 		default:
 			return false;
 	}
+}
+
+/**
+ * #4733 r1 F2: whether one dispatch checked the whole file, as far as this
+ * checkout can. The commit gate's record lets a clean write drop another
+ * session's blocker section for the file only on such a run, since another
+ * session's section names no runner a per-runner carry could judge it by.
+ *
+ * Admitted: no language server went unanswered (`serverIds`), the coverage
+ * rule found the file checked (`coverage`; #4733 r2: an unset
+ * `unconfirmedStatus` also holds when a defined primary group never ran),
+ * no verdict covers only the
+ * edit (`editScopedRunnerIds`), at least one runner ran and answered, and
+ * every runner that reached no verdict either skipped or is a collect-later
+ * run still in flight (its answer joins this session's own blocker map when
+ * it settles). Refused: everything else, a runner that failed or broke part
+ * way above all, and a no-verdict runner with no latency row. A skip carries
+ * no marker of why it skipped, so one that could not read the file (a size
+ * cap, an aborted WASM runtime) is admitted with the not-configured ones.
+ */
+export function checkedWholeFile(
+	result: Pick<
+		DispatchResult,
+		"coverage" | "editScopedRunnerIds" | "inconclusiveSources" | "latencyReport"
+	>,
+): boolean {
+	if (
+		result.coverage === undefined ||
+		result.editScopedRunnerIds !== undefined ||
+		(result.inconclusiveSources?.serverIds.length ?? 0) > 0
+	) {
+		return false;
+	}
+	const noVerdict = new Set(result.inconclusiveSources?.runnerIds);
+	const runners = result.latencyReport?.runners ?? [];
+	const outcomeOf = new Map(
+		runners.map((runner) => [runner.runnerId, runner.status]),
+	);
+	const skippedOrInFlight = new Set<string | undefined>(["skipped", "pending"]);
+	return (
+		[...outcomeOf.values()].includes("succeeded") &&
+		[...noVerdict].every((runnerId) =>
+			skippedOrInFlight.has(outcomeOf.get(runnerId)),
+		)
+	);
+}
+
+/**
+ * #5020: the runners that reached a verdict on this run's bytes: a row of the
+ * latency report with a usable result ({@link hasUsableResult}: it succeeded,
+ * or it completed and failed on findings) that is not in
+ * `inconclusiveSources`. A runner that skipped, broke, is still in flight or
+ * answered for part of the file speaks for nothing, which is why this is the
+ * evidence a retire of another file's row asks for
+ * (`RuntimeCoordinator.retireForeignRows`). A run that failed on findings
+ * speaks only through the caller's own guard: the retire also needs the run to
+ * hold no blocker of its own on the file (`stillReported` in
+ * `publishInlineVerdict`), so mypy answering `b.py` while reporting `c.py`
+ * retires the row about `b.py` and keeps every row about `c.py` (PR #5033
+ * round 3).
+ *
+ * An edit-scoped runner (`editScopedRunnerIds`) is refused here for the reason
+ * `checkedWholeFile` refuses the whole run for it: its verdict covers the
+ * edited ranges, so "no blocker reported" says nothing about the rest of the
+ * file a cross-file row would be judged against.
+ */
+export function verdictRunnerIds(
+	result: Pick<
+		DispatchResult,
+		"inconclusiveSources" | "editScopedRunnerIds" | "latencyReport"
+	>,
+): string[] {
+	const noWholeFileVerdict = new Set([
+		...(result.inconclusiveSources?.runnerIds ?? []),
+		...(result.editScopedRunnerIds ?? []),
+	]);
+	return (result.latencyReport?.runners ?? []).flatMap((runner) =>
+		hasUsableResult(runner) && !noWholeFileVerdict.has(runner.runnerId)
+			? [runner.runnerId]
+			: [],
+	);
 }
 
 // --- Dispatch Context ---
@@ -529,8 +747,19 @@ export interface DispatchContext {
 	readonly facts: import("./fact-store.js").FactStore;
 	/** Project-local .pi-lens.json config captured for this dispatch. */
 	readonly projectConfig?: PiLensProjectConfig;
-	/** Shared global+project rule policy, including path-scoped denials. */
+	/**
+	 * The EDITED file's config owner's rule policy, including path-scoped
+	 * denials: runners read it to skip a rule on this file, and the output filter
+	 * reuses it for findings under the same owner (every other owner's finding
+	 * reads its own, #5011 r8 F24).
+	 */
 	readonly rulePolicy?: RulePolicyMap;
+	/**
+	 * Runner ids the operator denied through `dispatch.disabledRunners`
+	 * (union of every config tier). Absent when nothing is denied. The
+	 * dispatcher skips these before their `when`/`run`, so the tool never spawns.
+	 */
+	readonly disabledRunnerIds?: ReadonlySet<string>;
 	/** Only run blocking rules (severity: error) - used for fast feedback on file write */
 	readonly blockingOnly?: boolean;
 	readonly modifiedRanges?: ModifiedRange[];

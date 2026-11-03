@@ -39,11 +39,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency,
 }));
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
@@ -272,8 +267,11 @@ async function makeService() {
 }
 
 describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -296,9 +294,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 
@@ -334,9 +331,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 
@@ -368,9 +364,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 
@@ -419,9 +414,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 
@@ -451,9 +445,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 
@@ -479,9 +472,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 		await sweep(service, sweepFiles(5));
@@ -507,9 +499,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 		const inflight = (
@@ -540,9 +531,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 		const inflight = (
@@ -624,9 +614,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 
@@ -668,9 +657,8 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 				replyOrdering === undefined ? {} : { replyOrdering },
 			),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : primary,
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : primary,
 		);
 		const service = await makeService();
 		const results = await sweep(service, sweepFiles(40));

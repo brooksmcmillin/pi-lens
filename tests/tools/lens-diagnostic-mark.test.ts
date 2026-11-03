@@ -9,6 +9,11 @@ import {
 	isDeferredThisSession,
 } from "../../clients/diagnostic-dispositions.js";
 import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
+import {
+	__testing,
 	clearWidgetState,
 	markWidgetFileBlockersStale,
 	recordDiagnostics,
@@ -63,6 +68,7 @@ type RecordedEntry = {
 	consumer?: string;
 	provenance?: string;
 	toolCallId?: string;
+	sessionId?: string;
 };
 const recordedEntries: RecordedEntry[] = [];
 Object.defineProperty(globalThis, MUTATION_BRIDGE_KEY, {
@@ -319,6 +325,53 @@ describe("lens_diagnostic_mark tool — line verification/reanchoring (#802)", (
 		expect((result.details as { line: number }).line).toBe(3);
 	});
 
+	// #4689 item 3: the tool is an entry point, so the path it hands the stores
+	// is the file's identity. The widget keys a record syntactically (#1020) and
+	// the pipeline recorded this finding under the identity; a mark typed with
+	// the link's spelling reached the store as that spelling, found no record,
+	// and left the footer row untagged (a recorded
+	// `widget-disposition-reconcile-fallback`).
+	// RECURRENCE GUARDED: a mark through the other spelling of a file the
+	// pipeline recorded never retired the widget row.
+	it("a mark typed through a link retires the widget row recorded under the file's identity", async (ctx) => {
+		const real = writeFile("real.ts", "const a = 1;\nconst target = bad();\n");
+		try {
+			fs.symlinkSync("real.ts", path.join(tmpDir, "link.ts"));
+		} catch (err) {
+			return ctx.skip(`cannot create symlinks here: ${String(err)}`);
+		}
+		resetDegradationLedger();
+		recordDiagnostics(fs.realpathSync(real), [
+			{
+				tool: "eslint",
+				rule: "no-bad",
+				message: "bad call",
+				line: 2,
+				severity: "error",
+				semantic: "blocking",
+			},
+		]);
+
+		const result = await run({
+			filePath: "link.ts",
+			line: 2,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "false-positive",
+		});
+
+		expect(result.isError).toBeFalsy();
+		expect(__testing.getWidgetStateSnapshot().files).toHaveLength(1);
+		expect(__testing.getWidgetStateSnapshot().files[0]).toMatchObject({
+			blocking: 0,
+			errors: 0,
+		});
+		expect(getDegradationSummary().map((row) => row.kind)).not.toContain(
+			"widget-disposition-reconcile-fallback",
+		);
+	});
+
 	it("suppress with reanchor writes the comment above the CURRENT line, not the stale caller line", async () => {
 		const absPath = writeFile(
 			"a.ts",
@@ -486,6 +539,31 @@ describe("lens_diagnostic_mark's suppress record names its call (#4187 R4-1)", (
 				provenance: "observed",
 				toolCallId: "call-4187-suppress",
 			}),
+		]);
+	});
+
+	it("names the session that called it, which owns the write's deferred pass (#4943)", async () => {
+		// RECURRENCE GUARDED: #4943 R1. A subagent's suppress write was queued
+		// under the coordinator's id, so the primary's settle formatted it.
+		recordedEntries.length = 0;
+		writeFile("owned.ts", "const a = 1;\nconst target = bad();\n");
+		const result = await tool.execute(
+			"call-4943-suppress",
+			{
+				filePath: "owned.ts",
+				line: 2,
+				message: "bad call",
+				rule: "no-bad",
+				tool: "eslint",
+				disposition: "suppress",
+			},
+			undefined,
+			() => {},
+			{ cwd: tmpDir, sessionManager: { getSessionId: () => "session-sub" } },
+		);
+		expect(result.isError).toBeFalsy();
+		expect(recordedEntries.map((entry) => entry.sessionId)).toEqual([
+			"session-sub",
 		]);
 	});
 

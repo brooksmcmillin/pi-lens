@@ -23,6 +23,7 @@ import {
 	resetDegradationLedger,
 } from "../../../clients/degradation-ledger.js";
 import type { LSPClientInfo } from "../../../clients/lsp/client.js";
+import { LSPService } from "../../../clients/lsp/index.js";
 import { initLSPConfig } from "../../../clients/lsp/config.js";
 import {
 	ClientRegistry,
@@ -156,8 +157,15 @@ const internals = (registry: ClientRegistry) =>
 
 const dirs: string[] = [];
 function tempProject(prefix: string, withMarker = true): string {
+	// #4867: these are ADOPTABLE project roots. A directory created directly at
+	// the tmp root is a pi-owned staging path (`isPiOwnedTempPath`), which the
+	// classifier refuses, so they live inside the checkout under the git-ignored
+	// `.probe-home` -- never at the checkout root itself (#4864).
+	fs.mkdirSync(path.join(process.cwd(), ".probe-home"), { recursive: true });
 	const dir = fs.realpathSync(
-		fs.mkdtempSync(path.join(process.cwd(), `.probe-reg4449-${prefix}-`)),
+		fs.mkdtempSync(
+			path.join(process.cwd(), ".probe-home", `reg4449-${prefix}-`),
+		),
 	);
 	if (withMarker) fs.writeFileSync(path.join(dir, "package.json"), "{}\n");
 	dirs.push(dir);
@@ -220,6 +228,7 @@ function linkedWorktreeFixture() {
 	const gitDir = path.join(repo, ".git", "worktrees", "wt");
 	fs.mkdirSync(gitDir, { recursive: true });
 	fs.writeFileSync(path.join(gitDir, "commondir"), "../..\n");
+	fs.writeFileSync(path.join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
 	fs.writeFileSync(path.join(repo, "package.json"), "{}\n");
 	fs.mkdirSync(other, { recursive: true });
 	fs.writeFileSync(path.join(other, "package.json"), "{}\n");
@@ -1129,33 +1138,56 @@ describe("ClientRegistry.resolveServerRoot (#4449)", () => {
 		).resolves.toBe(normalizeMapKey(project));
 	});
 
-	// Recurrence: boundary verdicts are immutable per root and cached for the
-	// service's life, negatives included, so a hot touch path does not re-stat the
-	// markers on every call. Observed through the real probe: a manifest that
-	// appears AFTER the first answer does not change the cached verdict, which a
-	// dropped `set` or an always-recompute `if (!boundary)` would.
-	it("keeps the first boundary verdict for a root for the registry's life", async () => {
-		const project = tempProject("res-cache", false);
+	// Recurrence (#4532 gap 14): the boundary verdict was cached for the
+	// registry's life, negatives included, so a marker created in a subdirectory
+	// AFTER the ancestor client answered kept the subdirectory coalesced into that
+	// ancestor: its own `pyrightconfig.json` and manifests reached no server and
+	// no client was ever hosted there (real pyright 1.1.414: the importer stayed
+	// stale through 40 calls over 20.25 s). The verdict is the filesystem's, so it
+	// is read on every resolution: a marker that appears and a marker that goes
+	// away both move the answer. A restored `projectBoundaryCache` (or any
+	// `if (!boundary)` around the probe) reds this cell on the second expect.
+	it("re-reads the boundary verdict when a marker appears or goes away", async () => {
+		const project = tempProject("res-boundary", false);
 		const nested = path.join(project, "nested");
 		fs.mkdirSync(nested, { recursive: true });
 		vi.spyOn(process, "cwd").mockReturnValue(project);
 		const registry = new ClientRegistry(makeHooks().hooks);
 		registry.clients.set(keyFor("ts", project), live(project));
+		// `rootServer` models `resolveLspServerCwd`'s answer for a marker-less tree:
+		// the file's own directory. That candidate is what this verdict decides on.
+		// (`NearestRoot` is not driven here: its own #3412 memo serves a hit across a
+		// same-tick create, which is a different seam from this one.)
+		const detected = rootServer("ts", nested);
 		const resolve = () =>
-			registry.resolveServerRoot(
-				rootServer("ts", nested),
-				path.join(nested, "a.ts"),
-			);
+			registry.resolveServerRoot(detected, path.join(nested, "a.ts"));
 
 		await expect(resolve()).resolves.toBe(project); // no marker: coalesced
 		fs.writeFileSync(path.join(nested, "package.json"), "{}\n");
-		await expect(resolve()).resolves.toBe(project); // verdict is cached
+		await expect(resolve()).resolves.toBe(nested); // the marker roots it
+		fs.rmSync(path.join(nested, "package.json"));
+		await expect(resolve()).resolves.toBe(project); // and its removal un-roots it
+	});
+
+	// Recurrence (#4854): a nested Xcode project (buildServer.json, no
+	// Package.swift) under a directory that already hosts a live Swift client was
+	// coalesced into that ancestor, so sourcekit-lsp never read the project's
+	// build settings. buildServer.json must count as a project boundary.
+	it("roots a nested Xcode project at its buildServer.json under an ancestor Swift client", async () => {
+		const monorepo = tempProject("res-xcode", false);
+		const app = path.join(monorepo, "App");
+		const file = path.join(app, "Sources", "View.swift");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(monorepo, "Package.swift"), "// tools\n");
+		fs.writeFileSync(path.join(app, "buildServer.json"), "{}\n");
+		fs.writeFileSync(file, "print(1)\n");
+		vi.spyOn(process, "cwd").mockReturnValue(monorepo);
+		const registry = new ClientRegistry(makeHooks().hooks);
+		registry.clients.set(keyFor("swift", monorepo), live(monorepo));
+
 		await expect(
-			new ClientRegistry(makeHooks().hooks).resolveServerRoot(
-				rootServer("ts", nested),
-				path.join(nested, "a.ts"),
-			),
-		).resolves.toBe(nested); // control: a fresh registry sees the manifest
+			registry.resolveServerRoot(rootServer("swift", app), file),
+		).resolves.toBe(app);
 	});
 });
 
@@ -2067,6 +2099,30 @@ describe("ClientRegistry.spawnClient success and shutdown guards (#4449)", () =>
 		vi.setSystemTime(T0);
 	});
 
+	// #4532 round 5 (review F6, shape 6): the install look's epoch was the
+	// post-initialize stamp, so an install that landed while the server was
+	// starting (it reads the tree from its spawn on) read as older than the
+	// client and became the first look's baseline. The look's epoch is the
+	// LAUNCH start; the #1127 breaker keeps its post-init `clientSpawnedAt`.
+	it("gives the install look the launch-start epoch, not the post-initialize one", async () => {
+		const f = ensureFixture();
+		createLSPClient.mockImplementation(async () => {
+			// A 5 s initialize handshake.
+			vi.setSystemTime(T0 + 5_000);
+			return fakeClient("ts", f.root);
+		});
+		await f.ensure();
+
+		expect(f.registry.clientSpawnedAt.get(f.key)).toBe(T0 + 5_000);
+		expect(f.registry.clientLaunchStartedAt.get(f.key)).toBe(T0);
+		expect(f.registry.livePrimaryClientRoots()).toEqual([
+			{ root: f.root, spawnedAt: T0 },
+		]);
+		// Retired with the client it describes.
+		f.registry.retireClient(f.key);
+		expect(f.registry.clientLaunchStartedAt.has(f.key)).toBe(false);
+	});
+
 	// Recurrence (#3502, #2356, #1934): publishing a client is one transaction. The
 	// replacement is registered with fresh spawn and use stamps, its readiness and
 	// stall-demotion markers are dropped, first contact is re-armed BEFORE the
@@ -2702,6 +2758,99 @@ describe("client-registry environment limits (#4449)", () => {
 			process.env.PI_LENS_LSP_CLIENT_CEILING = bad;
 			expect(getLspClientCeiling()).toBe(24);
 		}
+	});
+});
+
+/**
+ * #4532: the out-of-band install look runs at every live PRIMARY client's root,
+ * and `livePrimaryClientRoots` is the reader it asks. A mutant that made this
+ * accessor return `[]` survived every other test: they reach the look through
+ * the shared service double (`tests/support/lsp-service-double.ts`), which
+ * answers the accessor itself. These cells drive the REAL registry and the REAL
+ * `LSPService` accessor over the maps production writes, so the reader is
+ * observed at both ends of its own delegation.
+ */
+describe("live primary client roots (#4532)", () => {
+	const clientKey = (serverId: string, root: string) => `${serverId}:${root}`;
+
+	/** One entry in the maps a real spawn writes, with its own liveness. */
+	function register(
+		registry: ClientRegistry,
+		serverId: string,
+		root: string,
+		facts: { spawnedAt?: number; alive?: boolean } = {},
+	): void {
+		const key = clientKey(serverId, root);
+		const client = fakeClient(serverId, root);
+		if (facts.alive === false) client.kill();
+		registry.clients.set(key, client as unknown as LSPClientInfo);
+		if (facts.spawnedAt !== undefined)
+			registry.clientLaunchStartedAt.set(key, facts.spawnedAt);
+	}
+
+	// `restartPrimaryClientsUnder` retires EVERY primary overlapping a root, so a
+	// root whose newer client spawned after an install must not outrank an older
+	// one that read the pre-install tree: the earliest spawn answers.
+	it("reports each live primary root once, at that root's earliest spawn", () => {
+		const registry = new ClientRegistry(makeHooks().hooks);
+		register(registry, "typescript", "/w/a", { spawnedAt: 1_000 });
+		register(registry, "rust", "/w/a", { spawnedAt: 400 });
+		register(registry, "typescript", "/w/b", { spawnedAt: 700 });
+
+		expect(registry.livePrimaryClientRoots()).toEqual([
+			{ root: "/w/a", spawnedAt: 400 },
+			{ root: "/w/b", spawnedAt: 700 },
+		]);
+	});
+
+	// A look at an auxiliary's root would restart a server the install cannot
+	// help, a dead client's root names a server no longer holding the tree, and a
+	// key with no root carries no directory to walk.
+	it("omits auxiliaries, dead clients, and a key that names no root", () => {
+		const registry = new ClientRegistry(makeHooks().hooks);
+		register(registry, "typescript", "/w/a", { spawnedAt: 1_000 });
+		register(registry, "opengrep", "/w/a", { spawnedAt: 10 });
+		register(registry, "rust", "/w/dead", { spawnedAt: 20, alive: false });
+		// The bare-id shape `parseClientKey` reads as a server with no root.
+		registry.clients.set("typescript", {
+			...fakeClient("typescript", "/w/rootless"),
+		} as unknown as LSPClientInfo);
+
+		expect(registry.livePrimaryClientRoots()).toEqual([
+			{ root: "/w/a", spawnedAt: 1_000 },
+		]);
+	});
+
+	// A client that cannot say when it spawned reads as epoch 0: the first look
+	// then never treats the install it finds as older than the client.
+	it("reports an absent spawn stamp as 0 instead of dropping the root", () => {
+		const registry = new ClientRegistry(makeHooks().hooks);
+		register(registry, "typescript", "/w/c");
+
+		expect(registry.livePrimaryClientRoots()).toEqual([
+			{ root: "/w/c", spawnedAt: 0 },
+		]);
+	});
+
+	// The look reaches the registry through `LSPService`, and a destroyed service
+	// answers nothing: a restart request against it would race its own teardown.
+	// A client registered AFTER the teardown is the shape that guard exists for
+	// (`markDestroyed` is sticky, so a late spawn leaves the map unanswerable).
+	it("answers through the service until it is shut down", async () => {
+		const service = new LSPService();
+		const registry = (service as unknown as { clientRegistry: ClientRegistry })
+			.clientRegistry;
+		register(registry, "typescript", "/w/a", { spawnedAt: 5 });
+
+		expect(service.livePrimaryClientRoots()).toEqual([
+			{ root: "/w/a", spawnedAt: 5 },
+		]);
+
+		await service.shutdown();
+		expect(service.livePrimaryClientRoots()).toEqual([]);
+
+		register(registry, "rust", "/w/b", { spawnedAt: 7 });
+		expect(service.livePrimaryClientRoots()).toEqual([]);
 	});
 });
 

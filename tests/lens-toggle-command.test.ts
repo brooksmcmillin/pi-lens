@@ -1,83 +1,116 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import piLens from "../index.js";
+import { type PiRunner, startPiRunner } from "./support/pi-runner.js";
 import { createPiMock, makeCtx, type PiMock } from "./support/pi-mock.js";
+import {
+	fauxAssistantMessage,
+	fauxText,
+	piSessionFixture,
+	startPiSession,
+} from "./support/pi-session.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
+import { useConfigPath } from "./support/global-config.js";
+const setConfigPath = useConfigPath();
+const fixture = piSessionFixture();
 
-// Template for #171: a command test driven entirely through the shared
-// createPiMock() harness — no bespoke ExtensionAPI mock. Run the real entry,
-// then invoke the registered command handler and assert captured UI calls.
+// Template for #171: a command test driven through the shared harnesses — no
+// bespoke ExtensionAPI mock. Run the real entry, then invoke the registered
+// command handler and assert captured UI calls.
+//
+// #4913 moved the "session started with --no-lens" case to tier 2
+// (`tests/index-4913-cli-flag-timing.test.ts`): the double applies a flag value
+// before the factory runs, and pi applies it after.
+//
+// #4632 slice 9 moved the REGISTRATION case onto tier 1: the real host's
+// loader holds the flags and resolves the commands, so a command that pi drops
+// (or a name it prefixes) is a red here, not a value the double recorded.
+//
+// #4913 L3 moved the TOGGLE case to tier 2 with a recording UI: a real session
+// binds a UI context only when `captureUi` is set (without it, pi binds
+// `mode: "print"` with `hasUI() === false` and `notifyUi` suppresses the text).
+// The two WIDGET cases stay on the double, class `real-ui-harness`: they assert
+// the `ctx.ui.setWidget` calls, and the tier-2 recorder captures notifications
+// and status lines only. A widget recorder would be a new tier-2 hook, which
+// this lane does not build (review F4 on #4702).
 
 const tmpDirs: string[] = [];
-let previousConfigPath: string | undefined;
+let runner: PiRunner;
+
+beforeAll(async () => {
+	runner = await startPiRunner();
+});
 
 beforeEach(() => {
-	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-toggle-config-"));
 	tmpDirs.push(dir);
-	process.env.PI_LENS_CONFIG_PATH = path.join(dir, "missing-config.json");
+	setConfigPath(path.join(dir, "missing-config.json"));
 });
 
 afterEach(() => {
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	for (const dir of tmpDirs.splice(0)) {
 		removeTempDirSync(dir);
 	}
 });
 
-function installLens(
-	flagValues: Record<string, boolean | string> = {},
-): PiMock {
-	const pi = createPiMock(flagValues);
+function installLens(): PiMock {
+	const pi = createPiMock();
 	piLens(pi.asExtensionAPI());
 	return pi;
 }
 
 describe("lens-toggle command", () => {
 	it("registers the single session-level lens toggle command", () => {
-		const pi = installLens();
-
-		expect(pi.flags.has("no-lens")).toBe(true);
-		expect(pi.getCommand("lens-toggle")).toBeDefined();
-		expect(pi.getCommand("lens-widget-toggle")).toBeDefined();
-		expect(pi.getCommand("lens-enable")).toBeUndefined();
-		expect(pi.getCommand("lens-disable")).toBeUndefined();
-		expect(pi.getCommand("lens-status")).toBeUndefined();
-		expect(pi.getCommand("lens")).toBeUndefined();
+		// Tier 1 (#4632 slice 9): the real host's loader and command resolver
+		// hold the registration. The claim is the host's registry, not the
+		// arguments `index.ts` handed a stand-in.
+		expect(runner.getFlags().has("no-lens")).toBe(true);
+		const registered = runner
+			.getRegisteredCommands()
+			.map((command) => command.name);
+		expect(registered).toContain("lens-toggle");
+		expect(registered).toContain("lens-widget-toggle");
+		// The retired single-purpose commands stay gone, so this case fails on a
+		// roster that quietly re-adds one.
+		for (const retired of [
+			"lens-enable",
+			"lens-disable",
+			"lens-status",
+			"lens",
+		]) {
+			expect(registered).not.toContain(retired);
+		}
 	});
 
 	it("toggles an enabled session off and back on", async () => {
-		const pi = installLens();
-		const ctx = makeCtx();
-
-		await pi.runCommand("lens-toggle", "", ctx);
-		await pi.runCommand("lens-toggle", "", ctx);
-
-		expect(ctx.notifications[0]).toEqual({
-			message:
-				"pi-lens disabled for this session. Run /lens-toggle again to resume.",
-			type: "warning",
+		// Tier 2 (#4913 L3): `/lens-toggle` runs through pi's own command path in a
+		// real session, and the recording UI (`captureUi`) is what `ctx.ui.notify`
+		// reaches, so the two notifications are what the host showed.
+		const handle = await startPiSession({
+			root: fixture.root,
+			cwd: path.join(fixture.root, "toggle", "proj"),
+			captureUi: true,
+			responses: [fauxAssistantMessage(fauxText("ready"))],
 		});
-		expect(ctx.notifications[1]).toEqual({
-			message: "pi-lens enabled for this session.",
-			type: "info",
-		});
-	});
 
-	it("re-enables a session started with --no-lens", async () => {
-		const pi = installLens({ "no-lens": true });
-		const ctx = makeCtx();
+		await handle.prompt("/lens-toggle");
+		await handle.prompt("/lens-toggle");
 
-		await pi.runCommand("lens-toggle", "", ctx);
-
-		expect(ctx.notifications).toContainEqual({
-			message: "pi-lens enabled for this session.",
-			type: "info",
-		});
-	});
+		expect(handle.notifications).toEqual([
+			{
+				message:
+					"pi-lens disabled for this session. Run /lens-toggle again to resume.",
+				type: "warning",
+			},
+			{
+				message: "pi-lens enabled for this session.",
+				type: "info",
+			},
+		]);
+		expect(handle.errors).toEqual([]);
+	}, 60_000);
 
 	it("toggles the diagnostics widget off and on", async () => {
 		const pi = installLens();

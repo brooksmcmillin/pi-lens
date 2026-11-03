@@ -77,7 +77,7 @@ describe("#3540: index.ts reserves diagnostics-tool tokens turn first", () => {
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-3540-"));
 		file = path.join(tmp, "a.ts");
 		fs.writeFileSync(file, "export const a = 1;\n");
-		const pi = createPiMock({ "no-lsp": true });
+		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 		runtime = captured.runtime as RuntimeCoordinator;
 		reserve = captured.reserve as () => number;

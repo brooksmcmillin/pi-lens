@@ -15,5 +15,7 @@
 	"yaml": "Nightly runs 36860553809/37002646707/37118101220: eligible x3, respawn=ok, coverage=preserved; ~96 MB resident, ~1.02 s cold (docs/lsp-idle-eviction.md).",
 	"docker": "Nightly measurement (#3989): eligible, respawn ok and findings preserved on 2 consecutive runs, idle RSS 64 MB, cold start 566 ms.",
 	"json": "Nightly measurement (#3989): eligible, respawn ok and findings preserved on 2 consecutive runs, idle RSS 67 MB, cold start 1116 ms.",
-	"python-jedi": "Nightly measurement (#3989): eligible, respawn ok and findings preserved on 2 consecutive runs, idle RSS 51 MB, cold start 1796 ms."
+	"python-jedi": "Nightly measurement (#3989): eligible, respawn ok and findings preserved on 2 consecutive runs, idle RSS 51 MB, cold start 1796 ms.",
+	"docker-official": "Nightly measurement (#3989): eligible, respawn ok and findings preserved on 2 consecutive runs, idle RSS 62 MB, cold start 957 ms.",
+	"zizmor": "Nightly measurement (#3989): eligible, respawn ok and findings preserved on 2 consecutive runs, idle RSS 55 MB, cold start 1683 ms."
 }

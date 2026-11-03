@@ -120,6 +120,7 @@ export interface MutationBridgeDeps {
 			source: ProjectChangeSource;
 			cwd?: string;
 			changedRange?: { start: number; end: number };
+			sessionId?: string | undefined;
 			onAppendError?: (err: unknown) => void;
 		}) => unknown;
 		deferMutation?: (
@@ -483,6 +484,9 @@ function applyTurnAndChangeLog(
 		source: `agent-tool:${classification.toolName}`,
 		cwd: projectRoot,
 		changedRange,
+		// #4943: the writing session's change-log row (the turn-state range above
+		// reads the same entry field).
+		sessionId: entry.sessionId,
 		onAppendError: (err) =>
 			deps.dbg?.(`mutation_bridge: change log append failed: ${err}`),
 	});
@@ -514,7 +518,9 @@ function queueDeferredMutation(
 			classification.toolName,
 			projectRoot,
 			kind,
-			runtime.telemetrySessionId,
+			// #4943: the writing session owns the record, so its own settle drains
+			// it (the same owner the turn-state range above reads).
+			entry.sessionId ?? runtime.telemetrySessionId,
 			projectRoot,
 			// #3521: the settled sweep's epoch, so a record it queues after
 			// a /tree is not credited to the new branch. #3677: a value this

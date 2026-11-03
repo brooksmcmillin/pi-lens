@@ -12,7 +12,6 @@ import {
 	formatVersionTooOldMessage,
 	isGhMissingError,
 	mapRestMergeableState,
-	MIN_GH_TIMEOUT_MS,
 	nodeSupportsUseEnvProxy,
 	parseOwnerRepoFromGitRemote,
 	REEXEC_REEXEC,
@@ -281,10 +280,31 @@ describe("restResolveHeadSha (#3497)", () => {
 			token: "tok",
 			fetchImpl,
 		});
-		expect(result).toEqual({ sha: "c0ffee", mergeable: "MERGEABLE" });
+		expect(result).toEqual({
+			sha: "c0ffee",
+			mergeable: "MERGEABLE",
+			botAuthored: false,
+		});
 		expect(calls).toEqual([
 			"https://api.github.com/repos/acme/repo/pulls/2539",
 		]);
+	});
+
+	// Recurrence: #5062, same bot-authorship read as the gh transport.
+	it.each([
+		["a Bot user", { login: "github-actions[bot]", type: "Bot" }, true],
+		["a [bot] login", { login: "renovate[bot]", type: "User" }, true],
+		["a human", { login: "apmantza", type: "User" }, false],
+	])("reads %s as botAuthored=%s", async (_name, user, expected) => {
+		const fetchImpl = async () =>
+			new Response(
+				JSON.stringify({ head: { sha: "c0ffee" }, mergeable: true, user }),
+			);
+		const result = await restResolveHeadSha("acme/repo", "5066", {
+			token: "tok",
+			fetchImpl,
+		});
+		expect(result.botAuthored).toBe(expected);
 	});
 
 	it("resolves a bare SHA target with no fetch at all", async () => {
@@ -295,7 +315,11 @@ describe("restResolveHeadSha (#3497)", () => {
 			token: "tok",
 			fetchImpl,
 		});
-		expect(result).toEqual({ sha: "abc1234", mergeable: null });
+		expect(result).toEqual({
+			sha: "abc1234",
+			mergeable: null,
+			botAuthored: false,
+		});
 	});
 });
 
@@ -990,15 +1014,5 @@ describe("restFetchCheckRunsPayload — an empty 200 body is an empty answer (#3
 			fetchImpl,
 		});
 		expect(payload).toEqual({ total_count: 0, check_runs: [] });
-	});
-});
-
-// Sanity: MIN_GH_TIMEOUT_MS is re-imported here (used nowhere else in this
-// file) purely so a future accidental removal of the export from
-// ci-verdict.mjs breaks this file's import too, not just the owned suite.
-describe("shared exports stay importable", () => {
-	it("MIN_GH_TIMEOUT_MS is a small positive number", () => {
-		expect(MIN_GH_TIMEOUT_MS).toBeGreaterThan(0);
-		expect(MIN_GH_TIMEOUT_MS).toBeLessThan(60_000);
 	});
 });

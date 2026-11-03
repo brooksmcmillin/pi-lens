@@ -1,0 +1,10 @@
+{
+  "dispositions": {
+    "dd:164197458e2b": {
+      "disposition": "false-positive",
+      "reason": "4.1.6 fixture",
+      "createdAt": "2026-10-21T17:17:42.926Z",
+      "lastSeenAt": "2026-10-21T17:17:42.926Z"
+    }
+  }
+}

@@ -1,0 +1,4 @@
+style:
+  ForbiddenComment:
+    active: true
+  : : [

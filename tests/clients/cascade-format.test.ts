@@ -74,7 +74,7 @@ describe("the cascade's unanswered-primary line, per server (#4403 V1)", () => {
 		}),
 	});
 	const line = (ids: string): string =>
-		`⚠️ Cascade: no language server answered for neighbor files of ${ids} (it could not be started, or was still starting), so their cross-file errors were not checked (not a clean result).`;
+		`⚠️ Cascade: no primary language server answered for neighbor files of ${ids} (it could not be started, or was still starting), so their cross-file errors were not confirmed (not a clean result).`;
 	const neighbors = (): CascadeNeighborResult[] => [
 		neighbor("a.ts", ["typescript"]),
 		neighbor("b.py", ["pyright"]),

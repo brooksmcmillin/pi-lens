@@ -9,6 +9,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { faultSkip } from "../types.js";
 import { PRIORITY } from "../priorities.js";
 import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
@@ -73,7 +74,7 @@ const zigCheckRunner: RunnerDefinition = {
 		);
 
 		if (result.error && !result.stdout && !result.stderr) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			return faultSkip("did-not-run");
 		}
 
 		const raw = `${result.stdout || ""}\n${result.stderr || ""}`;

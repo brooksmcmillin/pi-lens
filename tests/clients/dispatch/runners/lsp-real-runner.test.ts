@@ -8,7 +8,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 import lspRunner from "../../../../clients/dispatch/runners/lsp.js";
 import {
 	initLSPConfig,
@@ -95,6 +103,28 @@ d("LSP dispatch runner — real server (#873)", () => {
 		resetLSPService({ fast: true });
 		resetLSPConfigStateForTests();
 		env?.cleanup();
+	});
+
+	beforeEach(async () => {
+		// Every case starts from the base config: the #4231 case below rewrites
+		// lsp.json with a delayed primary and leaves it that way for later cases.
+		await getLSPService().shutdown();
+		resetLSPService({ fast: true });
+		resetLSPConfigStateForTests();
+		fs.writeFileSync(
+			path.join(env.cwd, ".pi-lens", "lsp.json"),
+			JSON.stringify({
+				servers: {
+					"fake-real-runner": {
+						name: "Fake real-runner LSP",
+						extensions: [".real-lsp"],
+						command: process.execPath,
+						args: [fakeServerPath],
+					},
+				},
+			}),
+		);
+		await initLSPConfig(env.cwd);
 	});
 
 	it("maps a genuine server error to a 1-indexed blocking diagnostic", async () => {

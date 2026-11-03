@@ -4,11 +4,6 @@ import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.j
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
@@ -56,8 +51,11 @@ function makeDiagnostic(message: string) {
 }
 
 describe("LSPService.touchFile collectDiagnostics", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});
@@ -221,6 +219,9 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 			false,
 			// #3481: no read stamp, so the queue keeps last-enqueued-wins.
 			undefined,
+			// #2066: the #1095 fingerprint `touchFile` computed for these exact
+			// bytes, so the send binds diagnostics without walking them again.
+			hashDiagnosticContent("print('x')\n"),
 		);
 		expect(client.waitForDiagnostics).toHaveBeenCalledWith(FILE, 25);
 		expect(result?.diags).toEqual([attributedDiagnostic]);

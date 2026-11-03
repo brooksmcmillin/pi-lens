@@ -580,12 +580,12 @@ describe("close-keyword-verification.yml carries GITHUB_TOKEN (#2267 F1)", () =>
 		);
 		type WorkflowStep = { run?: string; env?: Record<string, string> };
 		type Workflow = {
-			jobs: { "close-keyword-lint": { steps: WorkflowStep[] } };
+			jobs: { "pr-metadata": { steps: WorkflowStep[] } };
 		};
 		const workflow = yaml.load(
 			fs.readFileSync(workflowPath, "utf8"),
 		) as Workflow;
-		const step = workflow.jobs["close-keyword-lint"].steps.find((s) =>
+		const step = workflow.jobs["pr-metadata"].steps.find((s) =>
 			(s.run ?? "").includes("check-close-keywords.mjs"),
 		);
 		if (!step) throw new Error("syntax-lint step not found in pr-metadata.yml");
@@ -1305,7 +1305,7 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 				const base = "a".repeat(40);
 				const imported = "1".repeat(40);
 				const head = "3".repeat(40);
-				const approved = "7f5af3a48ce72a7ad6b2ef712b09aa113541c1ac";
+				const approved = "52b91eca667a9138d6bc9e925c606d605e56ce2a";
 				const fetchPr = prFetch({ title: TITLE, body: BODY }, [
 					commit(
 						"closes #55",

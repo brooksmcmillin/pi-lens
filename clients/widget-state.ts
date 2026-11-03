@@ -51,6 +51,13 @@ import { dropStaleFiles } from "./session-state-store.js";
  * this does; on-disk canonical casing is irrelevant for merely deduplicating a
  * process-local footer cache. The human-readable path is preserved separately
  * on the record's `filePath` (see `toDisplayPath`) for rendering/summaries.
+ *
+ * The key is syntactic, so a link spelling and its target are one record only
+ * when every writer hands this module the file's path identity (#4689 item 3,
+ * maintainer decision 2026-10-24): the identity is resolved ONCE where a path
+ * enters (a tool or write event, `createDispatchContext`, `FormatService`), by
+ * `normalizeMapKey`, and this key is applied to a path that already is one.
+ * No filesystem call is made here per diagnostic write.
  */
 function fileMapKey(filePath: string): string {
 	return normalizeEphemeralMapKey(filePath);
@@ -1100,7 +1107,7 @@ function retainSuppressedRows(
 	});
 	if (retained.length > MAX_RETAINED_SUPPRESSED_PER_FILE) {
 		// Freshest observations win the cap. One record per FILE, never one per
-		// dropped row (AGENTS.md "bounded observability"): the chip under-counts
+		// dropped row (docs/engineering-principles.md "Every new failure path gets bounded observability"): the chip under-counts
 		// by exactly `dropped` for this file until its content changes.
 		retained.sort((a, b) => (b.observedAt ?? 0) - (a.observedAt ?? 0));
 		recordDegradationOnce({
@@ -1840,7 +1847,7 @@ export function incrementWidgetDependencyDriftDelivery(
  * `filePath` once its delivery cap is reached — by HIDING it from the
  * footer, not by dropping it.
  *
- * `RuntimeCoordinator.retireDemotedDependencyDriftBlocker` can delete its
+ * `RuntimeCoordinator.retireDemotedDriftBlocker` can delete its
  * whole `_pendingInlineBlockers` record because that store backs exactly one
  * surface (the turn-end advisory text). This store does not: `allDiagnostics`
  * is also what `getFileDiagnosticSummaries` serves to `lens_diagnostics

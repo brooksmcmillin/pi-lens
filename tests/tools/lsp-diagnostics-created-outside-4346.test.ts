@@ -719,11 +719,13 @@ describe("a workspace edit's resource operations (#4346)", () => {
 
 describe("the producer's cost gate (#4346)", () => {
 	// Recurrence: #4344 r1, where a per-call extra pass took the cached replay
-	// from 6 ms to 321 ms. A fresh clean entry for the current bytes cannot
-	// show a missing import (every import it names resolved), so a batch
-	// resolves every file except those (#4368 r1 F1 widened the gate from
-	// "has cached findings" to this).
-	it("resolves no file a fresh clean entry answers, and resolves it again once edited", async () => {
+	// from 6 ms to 321 ms. #4368 r1 F1 then skipped every file a fresh clean
+	// entry answers. #4532 gap 13 resolves those too, in their own capped
+	// call: an import changed outside pi must refuse the clean entry, and a
+	// replay of 32 clean files measured 18 ms against 19 ms with the skip
+	// (the extraction memo answers an unchanged file). One resolution per
+	// call, so a second pass per call reds here.
+	it("resolves a file a fresh clean entry answers once per call", async () => {
 		const { getCreatedImportScanRollup } =
 			await import("../../clients/lsp/created-import-targets.js");
 		fs.writeFileSync(path.join(workspace, "gate_module.ts"), "export {};\n");
@@ -738,12 +740,12 @@ describe("the producer's cost gate (#4346)", () => {
 		expect(resolved() - before).toBe(1);
 
 		await diagnose({ paths: [importer] });
-		expect(resolved() - before).toBe(1);
+		expect(resolved() - before).toBe(2);
 
 		fs.appendFileSync(importer, "// edited\n");
 		const later = new Date(Date.now() + 60_000);
 		fs.utimesSync(importer, later, later);
 		await diagnose({ paths: [importer] });
-		expect(resolved() - before).toBe(2);
+		expect(resolved() - before).toBe(3);
 	}, 30_000);
 });

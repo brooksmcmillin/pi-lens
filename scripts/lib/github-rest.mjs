@@ -58,3 +58,18 @@ export async function githubGet(path, fetchImpl) {
 		headers: githubHeaders(token),
 	});
 }
+
+/**
+ * Parses `owner/repo` out of a `git remote get-url origin` value -- both the
+ * SSH (`git@github.com:owner/repo.git`) and HTTPS
+ * (`https://github.com/owner/repo.git`) forms this repo's own clones use.
+ * `gh repo view` resolves the current repository the same way (from the
+ * checkout's remote), so this is the REST transport's equivalent when `gh`
+ * itself cannot be asked to do it.
+ */
+export function parseOwnerRepoFromGitRemote(remoteUrl) {
+	const match = /github\.com[:/]{1,2}([^/\s]+)\/([^/\s.]+?)(?:\.git)?\/?$/.exec(
+		String(remoteUrl ?? "").trim(),
+	);
+	return match ? `${match[1]}/${match[2]}` : null;
+}

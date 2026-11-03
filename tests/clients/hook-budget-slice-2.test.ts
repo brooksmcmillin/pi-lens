@@ -121,6 +121,7 @@ describe("#2523 slice 2 real hook budget seams", () => {
 		fs.writeFileSync(filePath, "const value = 1;\n");
 		service.recordRead(filePath);
 		const result = service.formatFile(filePath, {
+			sessionRoot: fs.realpathSync(os.tmpdir()),
 			budgetMs: HOOK_WALL_BUDGET_MS.tool_result_edit,
 		});
 		await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.tool_result_edit);
@@ -141,6 +142,7 @@ describe("#2523 slice 2 real hook budget seams", () => {
 		fs.writeFileSync(filePath, "const value = 1;\n");
 		service.recordRead(filePath);
 		const result = service.formatFile(filePath, {
+			sessionRoot: fs.realpathSync(os.tmpdir()),
 			budgetMs: HOOK_WALL_BUDGET_MS.agent_settled,
 			hook: "agent_settled",
 		});
@@ -169,6 +171,7 @@ describe("#2523 slice 2 real hook budget seams", () => {
 		fs.writeFileSync(filePath, "const value = 1;\n");
 		service.recordRead(filePath);
 		const result = service.formatFile(filePath, {
+			sessionRoot: fs.realpathSync(os.tmpdir()),
 			signal: controller.signal,
 		});
 		controller.abort();

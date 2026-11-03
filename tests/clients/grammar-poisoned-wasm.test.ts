@@ -33,9 +33,17 @@ import {
 	hasWasmMagic,
 } from "../../clients/grammar-source.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
+import {
+	resetUserNotifier,
+	wireUserNotifier,
+} from "../../clients/user-notify.js";
 
-const notifyUserDegradation = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/user-notify.js", () => ({ notifyUserDegradation }));
+const notifyUserDegradation = vi.fn();
+beforeEach(() => {
+	resetUserNotifier();
+	wireUserNotifier(() => notifyUserDegradation);
+});
+afterEach(() => resetUserNotifier());
 
 /** A minimal but genuinely valid wasm module header: magic + version 1. */
 const WASM_HEADER = new Uint8Array([

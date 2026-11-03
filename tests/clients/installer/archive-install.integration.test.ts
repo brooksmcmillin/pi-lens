@@ -166,14 +166,21 @@ describe("archive installer fixture path (#3020)", () => {
 			ensureTool("clangd", { forceReinstall: true }),
 		).resolves.toContain(path.join("tools", "clangd"));
 		const marker = path.join(HOME, "tools", "clangd", "bin");
-		archives.clangd = Buffer.from("not a zip archive");
-		// Pinned on purpose: this case is the EXTRACTION failure (bytes match the
-		// pin, the extractor rejects them), not the integrity refusal below.
-		pinFixture("clangd", archives.clangd);
-		await expect(
-			ensureTool("clangd", { forceReinstall: true }),
-		).resolves.toBeUndefined();
-		expect(fs.existsSync(marker)).toBe(true);
+		// `archives` is shared module state: the next case pins whatever bytes
+		// are here, so restore the good ZIP however this case ends (#4561 L9).
+		const goodClangd = archives.clangd;
+		try {
+			archives.clangd = Buffer.from("not a zip archive");
+			// Pinned on purpose: this case is the EXTRACTION failure (bytes match
+			// the pin, the extractor rejects them), not the integrity refusal below.
+			pinFixture("clangd", archives.clangd);
+			await expect(
+				ensureTool("clangd", { forceReinstall: true }),
+			).resolves.toBeUndefined();
+			expect(fs.existsSync(marker)).toBe(true);
+		} finally {
+			archives.clangd = goodClangd;
+		}
 	});
 	// #3400 through the production entry point with the REAL extractor: a zip
 	// shaped like fwcd's server.zip installs, and the same zip with one byte

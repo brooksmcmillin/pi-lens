@@ -2,7 +2,7 @@
 
 ### LSP Support
 
-pi-lens includes **49 language server definitions** (including four cross-cutting *auxiliary* scanners that attach alongside the file's language server — Opengrep, ast-grep, zizmor, and typos — see below). LSP is **enabled by default**; use `--no-lsp` to disable it for a session. Servers are auto-discovered from PATH, project `node_modules`, and managed installs. When a server with a managed installer is not installed, pi-lens offers an interactive install prompt; toolchain-bundled servers, such as Lean's `lake`, are PATH-only, and pi-lens never installs or manages them.
+pi-lens includes **51 language server definitions** (including four cross-cutting *auxiliary* scanners that attach alongside the file's language server — Opengrep, ast-grep, zizmor, and typos — and one opt-in, JS/TS-only auxiliary, fallow, off unless `fallow.enabled` is set; see below). LSP is **enabled by default**; use `--no-lsp` to disable it for a session. Servers are auto-discovered from PATH, project `node_modules`, and managed installs. When a server with a managed installer is not installed, pi-lens offers an interactive install prompt; toolchain-bundled servers, such as Lean's `lake`, are PATH-only, and pi-lens never installs or manages them.
 
 **LSP Idle Management:** LSP servers shut down after 240 seconds of inactivity (no files modified) to free resources. The timer resets when you resume editing, preventing cold-start penalties during active development.
 
@@ -19,7 +19,32 @@ pi-lens includes **49 language server definitions** (including four cross-cuttin
 - **`capabilities`** — shows which operations are supported by the active LSP server(s) for a file, read directly from the cached `initialize` response (no round-trip).
 - **Symbol column resolution** — passing `symbol: "myFunc"` instead of an exact `character` position resolves the correct column automatically. Use `symbol: "foo#2"` for the second occurrence of `foo` on the line.
 
-LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, PowerShell, C# (omnisharp), F#, Java (JDT LS, with Lombok javaagent support when a Lombok jar is available), Kotlin, Lean, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, Typst (tinymist), Markdown (marksman), OCaml, Clojure, CUE (syntax and parse diagnostics; evaluation errors via the cue-vet auxiliary runner), Terraform, Nix, Bash, Shuck (zsh-aware shell language server), Fish, CMake, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, CSS.
+LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, PowerShell, C# (omnisharp), F#, Java (JDT LS, with Lombok javaagent support when a Lombok jar is available), Kotlin, Groovy (groovy-language-server, from PATH or `GROOVY_LANGUAGE_SERVER_JAR`), Lean, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, Typst (tinymist), Markdown (marksman), OCaml, Clojure, CUE (syntax and parse diagnostics; evaluation errors via the cue-vet auxiliary runner), Terraform, Nix, Bash, Shuck (zsh-aware shell language server), Fish, CMake, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, CSS.
+
+
+### TypeScript and JavaScript server
+
+pi-lens picks the launch for JS/TS files in this order. The first two steps use only the project's own `node_modules`:
+
+1. **Effect language service** — when the nearest `node_modules/typescript` is version 7 or newer and the same `node_modules` holds `@effect/tsgo`, pi-lens runs the project's `effect-tsgo tsc --lsp --stdio`. Installing the package is the opt-in; there is no pi-lens setting. A malformed `@effect/tsgo` (no readable version, no `bin`) or a failure to start the process falls back to the next step; a server that starts and then fails to initialize does not fall back, and pi-lens never installs `@effect/tsgo`.
+2. **Native TypeScript 7** — the project's `node_modules/.bin/tsc --lsp --stdio`.
+3. **Classic** — `typescript-language-server` with a `tsserver.js`, when the nearest TypeScript is version 6 or older or no step above applies. This step can also use a server and TypeScript found on `PATH` or installed by pi-lens.
+
+The nearest installed `typescript` decides: an ancestor's TypeScript 7 never replaces a nearer, older or malformed install. The project's own compiler and launcher run only when pi has marked the project trusted (see [Configuring pi-lens](configuration.md)); otherwise the launch falls through to the next step.
+
+### Python: interpreter and syntax level
+
+Python carries two separate declarations, and pi-lens reads both from the project rather than from whichever interpreter happens to run a checker.
+
+**Interpreter** — `detectPythonEnvironment` takes the first directory that holds a Python binary, in this order: `UV_PROJECT_ENVIRONMENT` (only at a uv project root), a uv workspace's `.venv` for a declared member, `VIRTUAL_ENV`, `CONDA_PREFIX`, the project's `.venv`, then its `venv`. pyright and jedi both launch from it. A binary that comes from a project's own environment needs project trust; without it pi-lens falls back to the managed install and then `PATH`, and records the refusal once per session. A project launch that fails for any other reason also falls through to that fallback.
+
+**Syntax level** — `detectPythonTargetVersion` walks up from the file and, in each directory, takes the first readable declaration of ruff `target-version` (`.ruff.toml`, then `ruff.toml`, then `pyproject.toml` `[tool.ruff]`, the order ruff itself measures), pyright `pythonVersion` (`pyrightconfig.json`, which may use comments and trailing commas, then `pyproject.toml` `[tool.pyright]`), `requires-python` from `pyproject.toml` `[project]` reduced to its strongest lower bound (`>=3.12,>=3.14` is 3.14 in either order), then the first line of `.python-version`. The nearest directory holding a declaration wins. Each source ends its own walk where its tool stops: ruff at a ruff config (`.ruff.toml`, `ruff.toml`, or a `pyproject.toml` with `[tool.ruff]`, even one that sets no `target-version`), pyright at `pyrightconfig.json` or `[tool.pyright]`, `requires-python` at a `pyproject.toml` that carries the key, and `.python-version` at itself. A `pyproject.toml` that holds none of these is walked past, as ruff and pyright walk past it, so a nested config that owns a source blocks an ancestor's level for that source and nothing else does. Text that names no CPython major/minor — a `pypy-3.10` or branch name in `.python-version`, an empty file, a specifier with no lower bound — is no declaration at all; pi-lens never invents a default.
+
+When the declared level is 3.14 or newer, jedi's `compile` findings are dropped. jedi compiles with the interpreter it launched, so a 3.14-only construct reports a spurious `SyntaxError` (PEP 758's unparenthesized `except` is the common case). The drop is recorded once per session and file, naming the declared level and the file that declared it, and it applies to the fresh probe, its cached replay, `lsp_navigation`, `mode=full`, and the post-write runner that delivers the same server's answer. Every one of those surfaces names the rows it withheld on the text the agent reads (the count and the declaring file), including when the file would otherwise read as clean. A call that spans projects with different declarations cites each declaration with its own count. The structured result carries the same `details.withheldCompile` object (`count`, `declared`, and `declarations` when there is more than one) on `lsp_diagnostics`, `lens_diagnostics` and `lsp_navigation`. Pyright is unaffected: it parses at the level it resolves and stays the authority on type errors.
+
+ruff needs no override. Its pre-check, `--fix` pass, and lint run all read `target-version` from the project config, so pi-lens passes no level to any of them, and pre-check and fix cannot disagree about which syntax parses.
+
+Non-goal: pi-lens never installs, selects, or pins a Python interpreter, and never rewrites a project's declaration.
 
 ### Formatters
 
@@ -139,7 +164,7 @@ instead of a flat blob of source. See
 [`module-report-read-symbol.md`](module-report-read-symbol.md)
 for the full design and token-efficiency numbers.
 
-**`module_report(filePath, maxRefsPerSymbol?, focus?, view?, blastRadius?, blastRadiusDepth?)`** —
+**`module_report(path, maxRefsPerSymbol?, focus?, view?, blastRadius?, blastRadiusDepth?)`** —
 returns a structured outline: every symbol's name/kind/startLine/endLine/signature
 (plus a first-line `doc` summary when a doc comment is attached — #512),
 exported vs internal split (with class/interface members nested under their
@@ -153,13 +178,16 @@ path since they point at a different file. Pass `blastRadius: true` to also get
 the cross-file **blast radius** — transitive dependents aggregated to ranked
 file `read` args ("if you change this, verify these files"); read-only over
 the cached graph, omitted when cold (this replaced the standalone
-`pilens_impact` tool). `view: "compact"` returns a line-oriented text
-rendering (one line per symbol/callback, roughly a quarter of the JSON cost)
-instead of JSON — same data, opt-in. Tree-sitter extract + cached review-graph
+`pilens_impact` tool). `view` selects an output preset, projection × format
+(`"summary-text"` default = metrics off, text; `"summary-json"`; `"full-text"`;
+`"full-json"` = every field, JSON) — the text cell is lossless against the
+JSON payload; the default leaves out `usedBy`, `fanout` and `complexity`, at
+roughly half the byte
+size. Tree-sitter extract + cached review-graph
 lookup; never builds the graph, never calls LSP on this path.
 `semantic.source` reports what backed the data (`review-graph` | `none`).
 
-**`read_symbol(filePath, symbol)`** — returns the verbatim body of one
+**`read_symbol(path, symbol)`** — returns the verbatim body of one
 named symbol plus a one-line header (`<kind> <name>  <basename>:<startLine>-<endLine>`).
 Records the read against the read-guard so a follow-up edit anywhere in
 that symbol's range passes the read-before-edit check (an outline from
@@ -373,7 +401,7 @@ Pattern-based structural rules in `rules/ast-grep-rules/` across JS, TS, and Pyt
 [Opengrep](https://github.com/opengrep/opengrep) (an open, login-free fork of Semgrep) runs as a pi-lens **auxiliary diagnostic LSP** — a cross-cutting, diagnostic-only language server that attaches *alongside* the file's normal language server (TypeScript, Python, …) and contributes findings on the same on-write diagnostics path. Running it as a warm LSP server compiles its ruleset **once per session** rather than on every file, so per-file scans cost ~1–2s (vs ~8s for a cold CLI invocation per file). High-signal security findings become blocking; the rest are advisory.
 
 - **On by default** (it's a registered LSP server) when the `opengrep` binary is available; pi-lens **auto-installs it on demand** — a single GitHub-release binary, **no login, token, or telemetry**. Disable with `--no-opengrep`.
-- **Rules:** a repo `.opengrep.yml`/`.opengrep.yaml` (or a legacy `.semgrep.yml`/`.semgrep.yaml`, whose format Opengrep consumes natively) is used if present; otherwise it falls back to Opengrep's login-free `auto` Community ruleset.
+- **Rules:** a repo `.opengrep.yml`/`.opengrep.yaml` (or a legacy `.semgrep.yml`/`.semgrep.yaml`, whose format Opengrep consumes natively) is used if present; otherwise it uses the registry rule pack pi-lens refreshed into its own cache (a bounded weekly background download, validated by `opengrep --validate` before it replaces the previous file; pi-lens ships no rules), and only while no pack has been fetched yet does it fall back to Opengrep's login-free `auto` Community ruleset. Offline with no pack, that fallback is reported as an unconfirmed scan, never a clean one (#4764).
 
 This is the first adopter of pi-lens's **auxiliary-LSP capability** (`role:"auxiliary"` servers + `clients/dispatch/auxiliary-lsp.ts`) — the same path future cross-cutting scanners (spelling, secrets, …) plug into by registration.
 

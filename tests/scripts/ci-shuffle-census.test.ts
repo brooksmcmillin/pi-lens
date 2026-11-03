@@ -1269,7 +1269,7 @@ describe("the ratchet file", () => {
 	// sees a new order-dependent file admitted), fixing one lowers it. Lower
 	// this number in the PR that fixes a file; never raise it to admit a new
 	// one without a named seam and an issue.
-	const PINNED_FILES = 13;
+	const PINNED_FILES = 0;
 	// The by-design exemptions (#4561 D1), pinned the same way: a new one is a
 	// reviewable admission, never a quiet opt-out.
 	const PINNED_BY_DESIGN = 3;

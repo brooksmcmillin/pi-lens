@@ -39,6 +39,7 @@ import {
 	consumeAgentNudge,
 } from "../../clients/agent-nudge.js";
 import { handleAgentEnd } from "../../clients/runtime-agent-end.js";
+import { HOOK_WALL_BUDGET_MS } from "../../clients/hook-budgets.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import {
@@ -63,7 +64,6 @@ import {
 } from "../../clients/mutation-bridge.js";
 import { countFileLines } from "../../clients/read-guard-tool-lines.js";
 import { TestRunnerClient } from "../../clients/test-runner-client.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { waitFor } from "./interleaving-kit.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -127,14 +127,10 @@ vi.mock("../../clients/dispatch/integration.js", async (importOriginal) => ({
 }));
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
 
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(),
-}));
-import { getLSPService } from "../../clients/lsp/capabilities.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import { readNdjsonRows } from "../support/ndjson-rows.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 
 function gate() {
 	let open!: () => void;
@@ -171,6 +167,13 @@ const ORIGINAL = "pub fn f() { let x = 1; }\n";
 const TOOL_FIXED = "pub fn f() { let _x = 1; }\n";
 const KIND = "fix-run-agent-edit-overwritten";
 
+// File level, so the three describes that never install a service keep the
+// "no service" answer the former `getLSPService: vi.fn()` gave them; the first
+// describe's own hook installs the double over it.
+beforeEach(async () => {
+	await installLspServiceDouble(null);
+});
+
 describe("whole-package fixer restores agent edits (#3598)", () => {
 	let tmpDir: string;
 	let cleanup: () => void;
@@ -178,7 +181,7 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 	let mainRs: string;
 	let previousDebounce: string | undefined;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		notices = [];
 		resetDegradationLedger();
 		_resetAgentNudgeForTests();
@@ -213,12 +216,10 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 		fs.writeFileSync(mainRs, "mod a;\nmod b;\nfn main() {}\n");
 		fs.writeFileSync(path.join(srcDir, "a.rs"), ORIGINAL);
 		fs.writeFileSync(path.join(srcDir, "b.rs"), ORIGINAL);
-		vi.mocked(getLSPService).mockReturnValue(
-			makeLspServiceDouble({
-				supportsLSP: vi.fn().mockReturnValue(true),
-				hasLSP: vi.fn().mockResolvedValue(true),
-			}) as never,
-		);
+		await installLspServiceDouble({
+			supportsLSP: vi.fn().mockReturnValue(true),
+			hasLSP: vi.fn().mockResolvedValue(true),
+		});
 		vi.mocked(dispatchLintWithResult).mockReset();
 		vi.mocked(dispatchLintWithResult).mockResolvedValue({
 			diagnostics: [],
@@ -686,6 +687,255 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 		const nudge = consumeAgentNudge(undefined, runtime.sessionScope);
 		expect(nudge?.messages[0]?.content).toContain("a.rs");
 	});
+
+	// Recurrence: #5114 verify r2 F5. A concurrent secondary (#473) shares the
+	// coordinator, whose scope is the primary's; the drain queued the loss
+	// notice there, so the secondary's own context never carried it. The
+	// caller names the session (`advisoryScope`), as tool_result does.
+	it("tells a concurrent secondary, not the primary, about its own lost edit (#5108 F5)", async () => {
+		const aRs = path.join(srcDir, "a.rs");
+		const started = gate();
+		const proceed = gate();
+		fake.clippy = async () => {
+			started.open();
+			await proceed.p;
+			return 0;
+		};
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.deferMutation(
+			mainRs,
+			tmpDir,
+			"edit",
+			tmpDir,
+			"autofix",
+			"pi-5108-secondary",
+		);
+		const secondary = beginScope({ role: "secondary" });
+
+		const drain = handleAgentEnd({
+			ctxCwd: tmpDir,
+			getFlag: (name: string) => name === "no-lsp",
+			notify: () => {},
+			dbg: () => {},
+			runtime,
+			cacheManager: { addModifiedRange: vi.fn() } as never,
+			biomeClient: {} as never,
+			ruffClient: {} as never,
+			getFormatService: () =>
+				({
+					recordRead: () => {},
+					formatFile: async (filePath: string) => ({
+						filePath,
+						formatters: [],
+						anyChanged: false,
+						allSucceeded: true,
+					}),
+				}) as never,
+			currentSessionId: "pi-5108-secondary",
+			sessionRole: "concurrent-secondary",
+			advisoryScope: secondary.capture(),
+		} as never);
+		await started.p;
+		const edit = agentEdit(aRs, "let AGENT = 1;");
+		edit.write();
+		fs.writeFileSync(aRs, TOOL_FIXED);
+		await edit.deliver();
+		proceed.open();
+		await drain;
+
+		expect(consumeAgentNudge(undefined, runtime.sessionScope)).toBeUndefined();
+		const nudge = consumeAgentNudge(undefined, secondary);
+		expect(nudge?.messages[0]?.content).toContain("a.rs");
+	});
+
+	// Recurrence: #3915 review. The loss notice runs in the promise `bounded()`
+	// awaits, so a `notify` that throws there rejected the whole agent_end drain
+	// (or, once the deadline had fired, was swallowed by the boxed handler) and
+	// left no trace of the lost notice. The failure is a degradation record.
+	it("records a degradation when the loss notice's notify throws (#3915)", async () => {
+		const aRs = path.join(srcDir, "a.rs");
+		const started = gate();
+		const proceed = gate();
+		fake.clippy = async () => {
+			started.open();
+			await proceed.p;
+			return 0;
+		};
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.deferMutation(mainRs, tmpDir, "edit", tmpDir, "autofix");
+
+		const drain = handleAgentEnd({
+			ctxCwd: tmpDir,
+			getFlag: (name: string) => name === "no-lsp",
+			notify: () => {
+				throw new Error("notify exploded");
+			},
+			dbg: () => {},
+			runtime,
+			cacheManager: { addModifiedRange: vi.fn() } as never,
+			biomeClient: {} as never,
+			ruffClient: {} as never,
+			getFormatService: () =>
+				({
+					recordRead: () => {},
+					formatFile: async (filePath: string) => ({
+						filePath,
+						formatters: [],
+						anyChanged: false,
+						allSucceeded: true,
+					}),
+				}) as never,
+		});
+		await started.p;
+		const edit = agentEdit(aRs, "let AGENT = 1;");
+		edit.write();
+		fs.writeFileSync(aRs, TOOL_FIXED);
+		await edit.deliver();
+		proceed.open();
+		await drain;
+
+		expect(
+			consumeAgentNudge(undefined, runtime.sessionScope)?.messages[0]?.content,
+		).toContain("a.rs");
+		const group = getDegradationSummary().find(
+			(candidate) => candidate.kind === "fix-run-loss-notice-failed",
+		);
+		expect(group?.count).toBe(1);
+		expect(group?.latestReasons.at(-1)?.reason).toContain("notify exploded");
+	});
+
+	// Recurrence: #3915 verify round 2 (F6). The case above never fires the
+	// bound, so the post-bound path where a throwing notify was swallowed with
+	// no record was proven only by probe. This variant holds a.rs past the bound.
+	it(
+		"records the loss-notice failure once when the bound fired first (#3915)",
+		// The arming wait is 10s times PI_LENS_TEST_TIMEOUT_SCALE; the budget scales
+		// with it, and the 5s default would cut the wait.
+		{ timeout: scaledTestTimeout(60_000) },
+		async () => {
+			const aRs = path.join(srcDir, "a.rs");
+			const started = gate();
+			const proceed = gate();
+			const held = gate();
+			const release = gate();
+			fake.clippy = async () => {
+				started.open();
+				await proceed.p;
+				return 0;
+			};
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = tmpDir;
+			runtime.deferMutation(mainRs, tmpDir, "edit", tmpDir, "autofix");
+			let settled = false;
+			let holder: Promise<void> | undefined;
+			setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
+			const previousTestMode = process.env.PI_LENS_TEST_MODE;
+			await latencyLogger.flushLatencyLog();
+			const logPath = latencyLogger.getLatencyLogPath();
+			const fromByte = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
+			const drain = handleAgentEnd({
+				ctxCwd: tmpDir,
+				getFlag: (name: string) => name === "no-lsp",
+				notify: () => {
+					throw new Error("notify exploded");
+				},
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: vi.fn() } as never,
+				biomeClient: {} as never,
+				ruffClient: {} as never,
+				getFormatService: () =>
+					({
+						recordRead: () => {},
+						formatFile: async (filePath: string) => ({
+							filePath,
+							formatters: [],
+							anyChanged: false,
+							allSucceeded: true,
+						}),
+					}) as never,
+			}).then(() => {
+				settled = true;
+			});
+			try {
+				// These assertions read the real sink, suppressed by default in Vitest.
+				process.env.PI_LENS_TEST_MODE = "0";
+				await started.p;
+				const edit = agentEdit(aRs, "let AGENT = 1;");
+				edit.write();
+				fs.writeFileSync(aRs, TOOL_FIXED);
+				await edit.deliver();
+				holder = withFileMutationQueue(aRs, async () => {
+					held.open();
+					await release.p;
+				});
+				await held.p;
+				// Fake only the timer APIs. Keep fs and setImmediate real.
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				proceed.open();
+				// A real queue witness: the drain released its target hold.
+				await withFileMutationQueue(mainRs, async () => {});
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(settled).toBe(false);
+				// The bound is armed after the drain's real I/O (the fixer's restore),
+				// which no production event announces. Recurrence: #4850, where a
+				// 100-turn spin ended before that I/O did on a loaded CI host. Wait on
+				// real time instead: `setTimeout` is faked here, so the kit's wait
+				// yields on `setImmediate`, and its deadline reads the real clock.
+				await waitFor(
+					() => vi.getTimerCount(),
+					(count) => count > 0,
+					{
+						timeoutMs: 10_000,
+						yieldControl: () =>
+							new Promise<void>((resolve) => setImmediate(resolve)),
+					},
+				);
+				expect(vi.getTimerCount()).toBeGreaterThan(0);
+				await vi.advanceTimersByTimeAsync(
+					HOOK_WALL_BUDGET_MS.agent_settled - 1,
+				);
+				expect(settled).toBe(false);
+				await vi.advanceTimersByTimeAsync(1);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(settled).toBe(true);
+				vi.useRealTimers();
+				release.open();
+				await holder;
+				await drain;
+				await restoreSettled();
+				expect(
+					getDegradationSummary().find(
+						(candidate) => candidate.kind === "fix-run-loss-notice-failed",
+					)?.count,
+				).toBe(1);
+				await latencyLogger.flushLatencyLog();
+				const read = readNdjsonRows(logPath, fromByte);
+				expect(read.skipped).toBe(0);
+				const rows = read.rows.filter((row) => {
+					const meta = row.metadata as Record<string, unknown> | undefined;
+					return (
+						row.phase === "degradation_ledger" &&
+						meta?.kind === "fix-run-loss-notice-failed"
+					);
+				});
+				expect(rows).toHaveLength(1);
+			} finally {
+				if (previousTestMode === undefined)
+					delete process.env.PI_LENS_TEST_MODE;
+				else process.env.PI_LENS_TEST_MODE = previousTestMode;
+				vi.useRealTimers();
+				proceed.open();
+				release.open();
+				await holder;
+				await drain;
+				await restoreSettled();
+				setHostFileMutationQueueLoader(undefined);
+			}
+		},
+	);
 
 	it("does not hand a lost-edit advisory to the session that replaced the drain's own (#3748)", async () => {
 		const aRs = path.join(srcDir, "a.rs");
@@ -2119,6 +2369,199 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 			expect(lspRan).toBe(true);
 			expect(fs.readFileSync(aRs, "utf-8")).toBe("let ONE = 1;\n");
 		});
+
+		// #3915: a real sibling queue holder can outlive the hook. The wait
+		// must end without cancelling restore or losing its eventual notice.
+		it.each([
+			"deadline",
+			"abort",
+			"fast",
+			"possibly-lost",
+			"clean",
+			"session-replaced",
+		] as const)(
+			"bounds the deferred restore wait and delivers loss once (%s)",
+			async (mode) => {
+				const aRs = path.join(srcDir, "a.rs");
+				const bRs = path.join(srcDir, "b.rs");
+				const started = gate();
+				const proceed = gate();
+				const held = gate();
+				const release = gate();
+				const controller = new AbortController();
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = tmpDir;
+				const retiredScopeId = runtime.sessionScope.scopeId;
+				runtime.deferMutation(mainRs, tmpDir, "edit", tmpDir, "autofix");
+				const notify = vi.fn();
+				fake.clippy = async () => {
+					started.open();
+					await proceed.p;
+					fs.writeFileSync(aRs, TOOL_FIXED);
+					return 0;
+				};
+				await latencyLogger.flushLatencyLog();
+				const logPath = latencyLogger.getLatencyLogPath();
+				const fromByte = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
+				let settled = false;
+				const drain = handleAgentEnd({
+					signal: controller.signal,
+					ctxCwd: tmpDir,
+					getFlag: (name) => name === "no-lsp",
+					notify,
+					dbg: () => {},
+					runtime,
+					cacheManager: new CacheManager(false),
+					biomeClient: {} as never,
+					ruffClient: {} as never,
+					getFormatService: () => ({}) as never,
+				}).then(() => {
+					settled = true;
+				});
+				let holder: Promise<void> | undefined;
+				const previousTestMode = process.env.PI_LENS_TEST_MODE;
+				try {
+					// These assertions read the real sink, suppressed by default in Vitest.
+					process.env.PI_LENS_TEST_MODE = "0";
+					await started.p;
+					const saved = agentEdit(aRs, "let SAVED = 1;");
+					saved.write();
+					await saved.deliver();
+					if (mode !== "clean") {
+						const lost = agentEdit(bRs, "let LOST = 1;");
+						lost.write();
+						if (mode === "possibly-lost") noteAgentMutation(bRs);
+						fs.writeFileSync(bRs, TOOL_FIXED);
+						if (mode !== "possibly-lost") await lost.deliver();
+					}
+					holder = withFileMutationQueue(aRs, async () => {
+						held.open();
+						await release.p;
+					});
+					await held.p;
+					// Fake only the timer APIs. Keep fs and setImmediate real.
+					vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+					proceed.open();
+					// A real queue witness: the drain released its target hold.
+					await withFileMutationQueue(mainRs, async () => {});
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					expect(settled).toBe(false);
+					expect(notify).not.toHaveBeenCalled();
+					expect(activeFixRuns().size).toBeGreaterThan(0);
+					if (mode === "abort") {
+						controller.abort();
+					} else if (mode !== "fast") {
+						await vi.advanceTimersByTimeAsync(
+							HOOK_WALL_BUDGET_MS.agent_settled - 1,
+						);
+						expect(settled).toBe(false);
+						await vi.advanceTimersByTimeAsync(1);
+					}
+					if (mode !== "fast") {
+						await new Promise<void>((resolve) => setImmediate(resolve));
+						// This assertion is RED before the fix, without a test timeout.
+						expect(settled).toBe(true);
+						expect(fs.readFileSync(aRs, "utf8")).toBe(TOOL_FIXED);
+						expect(notify).not.toHaveBeenCalled();
+						expect(activeFixRuns().size).toBeGreaterThan(0);
+					}
+					if (mode === "session-replaced") runtime.resetForSession();
+					vi.useRealTimers();
+					release.open();
+					await holder;
+					await drain;
+					await restoreSettled();
+					expect(fs.readFileSync(aRs, "utf8")).toBe("let SAVED = 1;\n");
+					expect(fs.readFileSync(bRs, "utf8")).toBe(
+						mode === "possibly-lost"
+							? "let LOST = 1;\n"
+							: mode === "clean"
+								? ORIGINAL
+								: TOOL_FIXED,
+					);
+					if (mode === "clean") {
+						expect(notify).not.toHaveBeenCalled();
+					} else {
+						expect(notify).toHaveBeenCalledTimes(1);
+						expect(notify).toHaveBeenCalledWith(
+							expect.stringContaining("b.rs"),
+							"warning",
+						);
+						if (mode === "possibly-lost") {
+							expect(notify).toHaveBeenCalledWith(
+								expect.stringContaining("cannot confirm your edit survived"),
+								"warning",
+							);
+						}
+					}
+					const nudge = consumeAgentNudge(undefined, runtime.sessionScope);
+					if (mode === "clean" || mode === "session-replaced") {
+						expect(nudge).toBeUndefined();
+					} else {
+						expect(nudge?.messages).toHaveLength(1);
+						expect(nudge?.messages[0]?.content).toContain("b.rs");
+						if (mode === "possibly-lost")
+							expect(nudge?.messages[0]?.content).toContain(
+								"cannot confirm your edit survived",
+							);
+					}
+					expect(
+						consumeAgentNudge(undefined, runtime.sessionScope),
+					).toBeUndefined();
+					await latencyLogger.flushLatencyLog();
+					const read = readNdjsonRows(logPath, fromByte);
+					expect(read.skipped).toBe(0);
+					const boundRows = read.rows.filter((row) => {
+						const meta = row.metadata as Record<string, unknown> | undefined;
+						return (
+							row.phase === "degradation_ledger" &&
+							meta?.kind === "hook-await-exceeded" &&
+							meta.subject === "agent_settled:deferred-autofix-restore"
+						);
+					});
+					expect(boundRows).toHaveLength(
+						mode === "abort" || mode === "fast" ? 0 : 1,
+					);
+					if (mode === "session-replaced") {
+						const droppedRows = read.rows.filter((row) => {
+							const meta = row.metadata as Record<string, unknown> | undefined;
+							return (
+								row.phase === "degradation_ledger" &&
+								meta?.kind === "agent-advisory-dropped" &&
+								meta.subject === `scope-retired:${retiredScopeId}`
+							);
+						});
+						expect(droppedRows).toHaveLength(1);
+						expect(
+							getDegradationSummary().find(
+								(group) => group.kind === "agent-advisory-dropped",
+							)?.count,
+						).toBe(1);
+					}
+					const restoreRows = read.rows.filter(
+						(row) => row.phase === "fix_run_restore",
+					);
+					expect(restoreRows).toHaveLength(1);
+					const meta = restoreRows[0]?.metadata as Record<string, unknown>;
+					expect(meta.restored).toBe(mode === "possibly-lost" ? 2 : 1);
+					expect(meta.lost).toBe(
+						mode === "clean" || mode === "possibly-lost" ? 0 : 1,
+					);
+					expect(meta.possiblyLost).toBe(mode === "possibly-lost" ? 1 : 0);
+					expect(activeFixRuns().size).toBe(0);
+				} finally {
+					if (previousTestMode === undefined)
+						delete process.env.PI_LENS_TEST_MODE;
+					else process.env.PI_LENS_TEST_MODE = previousTestMode;
+					vi.useRealTimers();
+					proceed.open();
+					release.open();
+					await holder;
+					await drain;
+					await restoreSettled();
+				}
+			},
+		);
 
 		// Recurrence: `TargetHold` of formal/dispatch-pipeline/SiblingRestore.tla
 		// (#4393). The pipeline takes the target F's queue entry before the

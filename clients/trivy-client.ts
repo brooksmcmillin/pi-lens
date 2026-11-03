@@ -44,11 +44,9 @@
 import type { AnalysedRootSignal } from "./analysed-root.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { mkdtempSync } from "node:fs";
 import { loadPiLensProjectConfig } from "./project-lens-config.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
-import { toPosix } from "./path-utils.js";
-import { scannerReportParentDir } from "./scanner-temp-root.js";
+import { isUnderDir, normalizeMapKey, toPosix } from "./path-utils.js";
 import {
 	getScratchTreeGlobPatterns,
 	nestedWorktreeOffsets,
@@ -159,14 +157,69 @@ const DEPENDENCY_MANIFESTS = [
  * Exported for tests and gate-before-construct callers.
  */
 export function hasAnyDependencyManifest(cwd: string): boolean {
+	return existingDependencyManifests(cwd).length > 0;
+}
+
+/**
+ * #4617: the manifests a `trivy fs` pass at `cwd` reads, as absolute paths —
+ * the DEPENDENCY SURFACE probe (`hasAnyDependencyManifest`) and, at turn end,
+ * the citation fallback for a report whose rows name no target.
+ *
+ * These are the manifests at `cwd` only, which is narrower than the scan: the
+ * walk reads nested manifests too, so a rendered row cites its own `Target`
+ * through `trivyEvidenceFiles` (below) and this list answers only when no
+ * shown row cites one. The one place the manifest list is turned into paths, so
+ * the detection gate and the fallback cannot disagree about which files sit at
+ * the root.
+ */
+export function existingDependencyManifests(cwd: string): string[] {
+	const found: string[] = [];
 	for (const manifest of DEPENDENCY_MANIFESTS) {
 		try {
-			if (fs.existsSync(path.join(cwd, manifest))) return true;
+			const candidate = path.join(cwd, manifest);
+			if (fs.existsSync(candidate)) found.push(candidate);
 		} catch {
 			// non-fatal — keep probing the remaining manifests
 		}
 	}
-	return false;
+	return found;
+}
+
+/**
+ * #4617 review F1: the declarations one rendered trivy report was read from, as
+ * absolute paths — each row's target (a result's `Target`, or a license row's
+ * `FilePath`, which falls back to its result's `Target`) resolved against the
+ * scan root, deduped.
+ *
+ * `trivy fs` walks the whole tree, so the root manifests alone under-covered
+ * the scan: a monorepo package's own lockfile could move on and the CVE row
+ * still read current. A row that names no target, or one the scan root does
+ * not contain (a `..` or an absolute path outside it, review V3), contributes
+ * nothing, and a report whose rows all contribute nothing falls back to
+ * `existingDependencyManifests`
+ * (the same list the opt-in gate probes) so the tier keeps a subject — an
+ * uncited part fails the provenance stamp closed, which would label a live
+ * report historical.
+ *
+ * Bounded by the caller: it is handed the rows the report SHOWS, so a scan with
+ * hundreds of CVE rows never pushes the stamp past its file cap.
+ */
+export function trivyEvidenceFiles(
+	scanRoot: string,
+	targets: readonly (string | undefined)[],
+): string[] {
+	const files = new Set<string>();
+	for (const target of targets) {
+		if (target === undefined || target.trim() === "") continue;
+		const resolved = path.resolve(scanRoot, target);
+		// #4617 review V3: a declaration outside the scan root is not one this
+		// scan read, so it never decides the label.
+		if (!isUnderDir(resolved, scanRoot)) continue;
+		// The set is a map key: two spellings of one lockfile must collapse to one
+		// subject, and the stamp keys by the same derivation (`advisoryPathKey`).
+		files.add(normalizeMapKey(resolved));
+	}
+	return files.size > 0 ? [...files] : existingDependencyManifests(scanRoot);
 }
 
 /**
@@ -325,94 +378,61 @@ export class TrivyClient extends SecurityScanClient<TrivyResult> {
 		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
 	}
 
-	private async runScan(cwd: string): Promise<TrivyResult> {
-		const scannedAt = new Date().toISOString();
+	private runScan(cwd: string): Promise<TrivyResult> {
 		const bin = this.binaryPath ?? "trivy";
 		const severities = resolveSeverityFloor(cwd);
-		const outDir = mkdtempSync(
-			path.join(scannerReportParentDir(), "pi-lens-trivy-"),
-		);
-		const reportPath = path.join(outDir, "trivy-report.json");
-		try {
-			// One filesystem walk covers all three scanners. `--severity` filters
-			// both the vuln and the license results; secret findings are
-			// severity-independent (trivy always emits them) and collapsed
-			// downstream against gitleaks / ast-grep.
-			//
-			// `--skip-dirs` (#1562 class fix): trivy's `fs` scan walks `cwd`
-			// ITSELF (unlike knip/jscpd, which pi-lens's own `EXCLUDED_DIRS`-aware
-			// walker feeds a pre-filtered file list). Without this, its `secret`
-			// scanner is exactly as exposed to `.pi/greedysearch-sources/`-style
-			// scratch trees as gitleaks was — same doublestar-glob patterns
-			// `scratch-tree-policy.ts` derives from the SAME `EXCLUDED_DIRS` list.
-			const result = await safeSpawnAsync(
-				bin,
-				[
-					"fs",
-					"--scanners",
-					"vuln,secret,license",
-					"--severity",
-					severities.join(","),
-					"--format",
-					"json",
-					"--output",
-					reportPath,
-					"--quiet",
-					"--no-progress",
-					...[
-						...getScratchTreeGlobPatterns(),
-						...worktreeSkipDirs(cwd),
-					].flatMap((glob) => ["--skip-dirs", glob]),
-					cwd,
-				],
-				{ cwd, timeout: SCAN_TIMEOUT_MS },
-			);
-
-			if (result.error) {
-				this.log(`Scan error: ${result.error.message}`);
+		return this.runReportScan({
+			spawn: ({ reportPath }) => {
+				// One filesystem walk covers all three scanners. `--severity` filters
+				// both the vuln and the license results; secret findings are
+				// severity-independent (trivy always emits them) and collapsed
+				// downstream against gitleaks / ast-grep.
+				//
+				// `--skip-dirs` (#1562 class fix): trivy's `fs` scan walks `cwd`
+				// ITSELF (unlike knip/jscpd, which pi-lens's own `EXCLUDED_DIRS`-aware
+				// walker feeds a pre-filtered file list). Without this, its `secret`
+				// scanner is exactly as exposed to `.pi/greedysearch-sources/`-style
+				// scratch trees as gitleaks was — same doublestar-glob patterns
+				// `scratch-tree-policy.ts` derives from the SAME `EXCLUDED_DIRS` list.
+				return safeSpawnAsync(
+					bin,
+					[
+						"fs",
+						"--scanners",
+						"vuln,secret,license",
+						"--severity",
+						severities.join(","),
+						"--format",
+						"json",
+						"--output",
+						reportPath,
+						"--quiet",
+						"--no-progress",
+						...[
+							...getScratchTreeGlobPatterns(),
+							...worktreeSkipDirs(cwd),
+						].flatMap((glob) => ["--skip-dirs", glob]),
+						cwd,
+					],
+					{ cwd, timeout: SCAN_TIMEOUT_MS },
+				);
+			},
+			parse: (raw, scannedAt) => {
+				const findings = parseTrivyReport(raw);
+				const secrets = parseTrivySecrets(raw);
+				const licenses = parseTrivyLicenses(raw);
+				// #2154: the one trivy site that parsed a scan of this root.
 				return {
-					...EMPTY_RESULT,
-					scannedAt,
-					summary: result.error.message.slice(0, 200),
-				};
-			}
-
-			if (!fs.existsSync(reportPath)) {
-				return {
-					...EMPTY_RESULT,
 					success: true,
+					analyzed: true,
+					findings,
+					secrets,
+					licenses,
 					scannedAt,
-					summary:
-						(result.stderr ?? "").trim().split("\n")[0] || "no report produced",
 				};
-			}
-
-			const raw = fs.readFileSync(reportPath, "utf-8");
-			const findings = parseTrivyReport(raw);
-			const secrets = parseTrivySecrets(raw);
-			const licenses = parseTrivyLicenses(raw);
-			// #2154: the one trivy site that parsed a scan of this root.
-			return {
-				success: true,
-				analyzed: true,
-				findings,
-				secrets,
-				licenses,
-				scannedAt,
-			};
-		} catch (err) {
-			return {
-				...EMPTY_RESULT,
-				scannedAt,
-				summary: err instanceof Error ? err.message.slice(0, 200) : String(err),
-			};
-		} finally {
-			try {
-				fs.rmSync(outDir, { recursive: true, force: true });
-			} catch {
-				// non-fatal
-			}
-		}
+			},
+			fail: (failure) => ({ ...EMPTY_RESULT, ...failure }),
+		});
 	}
 }
 

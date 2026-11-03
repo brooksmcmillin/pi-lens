@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
@@ -11,7 +12,7 @@ describe("#3613 turn-state durable record corpus", () => {
 			fs.readFileSync(path.join(fixtures, "v1.json"), "utf8"),
 		);
 		const cwd = fs.mkdtempSync(
-			path.join(process.cwd(), ".turn-state-fixture-v1-"),
+			path.join(os.tmpdir(), "pi-lens-turn-state-fixture-v1-"),
 		);
 		try {
 			const dataDir = path.join(cwd, ".pi-lens");
@@ -53,7 +54,7 @@ describe("#3613 turn-state durable record corpus", () => {
 			lastUpdated: "2020-01-01T00:00:00.000Z",
 		};
 		const cwd = fs.mkdtempSync(
-			path.join(process.cwd(), ".turn-state-fixture-"),
+			path.join(os.tmpdir(), "pi-lens-turn-state-fixture-"),
 		);
 		try {
 			const dataDir = path.join(cwd, ".pi-lens");
@@ -88,7 +89,7 @@ describe("#3613 turn-state durable record corpus", () => {
 			]),
 		);
 		const cwd = fs.mkdtempSync(
-			path.join(process.cwd(), ".turn-state-fixture-"),
+			path.join(os.tmpdir(), "pi-lens-turn-state-fixture-"),
 		);
 		try {
 			const dataDir = path.join(cwd, ".pi-lens");
@@ -115,7 +116,7 @@ describe("#3613 turn-state durable record corpus", () => {
 			sessionId: "secondary-b",
 		};
 		const cwd = fs.mkdtempSync(
-			path.join(process.cwd(), ".turn-state-fixture-"),
+			path.join(os.tmpdir(), "pi-lens-turn-state-fixture-"),
 		);
 		try {
 			const dataDir = path.join(cwd, ".pi-lens");

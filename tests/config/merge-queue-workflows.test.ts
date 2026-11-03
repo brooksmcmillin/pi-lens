@@ -2,7 +2,10 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
-import { REQUIRED_CHECKS } from "../../scripts/lib/ci-checks.mjs";
+import {
+	BRANCH_PROTECTION_CONTEXTS,
+	REQUIRED_CHECKS,
+} from "../../scripts/lib/ci-checks.mjs";
 
 // #3754: GitHub's merge queue tests each queued PR on a `merge_group` commit
 // and waits for the required checks to report THERE. A required check whose
@@ -36,13 +39,8 @@ type Workflow = {
 const load = (file: string) =>
 	yaml.load(readFileSync(resolve(ROOT, file), "utf8")) as Workflow;
 
-// The required checks, as branch protection names them on master (read live on
-// 2026-09-30 with `gh api repos/apmantza/pi-lens/branches/master/protection`:
-// Lint & type-check, Unit tests, Install test x3, knip, oxfmt format check,
-// TLA+ models -- 8 contexts).
-// GitHub is the source of truth and is not readable from a test, so this list
-// is the one hand-kept mirror; the REQUIRED_CHECKS subset assertion below
-// keeps it from drifting away from the script-side list.
+// The job that hosts each entry of BRANCH_PROTECTION_CONTEXTS. The install
+// matrix is one row that expands to three contexts.
 const REQUIRED_JOBS = [
 	{
 		file: ".github/workflows/ci.yml",
@@ -66,6 +64,16 @@ const REQUIRED_JOBS = [
 		job: "tla-models",
 		name: "TLA+ models",
 	},
+	{
+		file: ".github/workflows/ci.yml",
+		job: "unit-tests-windows",
+		name: "Unit tests Windows",
+	},
+	{
+		file: ".github/workflows/hot-path-latency.yml",
+		job: "latency",
+		name: "Hot-path latency (advisory)",
+	},
 ];
 const asList = (needs: string | string[] | undefined) =>
 	Array.isArray(needs) ? needs : needs ? [needs] : [];
@@ -80,7 +88,15 @@ const asList = (needs: string | string[] | undefined) =>
 // suite for a merge_group event even for a docs-only file list`). Every row is
 // checked to still be needed at the end of the guard test, so a future fix
 // that removes the need reds here instead of leaving a stale admission.
-const MERGE_GROUP_SAFE_PR_CONTEXT = [".github/workflows/ci.yml#changes"];
+//
+// `install-test` (#5112) is the same case: its classify step passes
+// `github.event.pull_request.number` to the same script, which reads any other
+// event (merge_group included) as install=true and never reads `--pr`. The
+// three legs are required checks, so they must start on the queue's commit.
+const MERGE_GROUP_SAFE_PR_CONTEXT = [
+	".github/workflows/ci.yml#changes",
+	".github/workflows/ci.yml#install-test",
+];
 
 describe("#3754 merge queue workflow contract", () => {
 	// Recurrence it prevents: enabling the queue while a required-check
@@ -105,6 +121,26 @@ describe("#3754 merge queue workflow contract", () => {
 				REQUIRED_JOBS.map((entry) => entry.name),
 				required,
 			).toContain(required);
+		}
+	});
+
+	// Recurrence (#5002): this list, the rollout doc and the live contexts said 8
+	// after master moved to 10, so a reader could not tell what blocks a merge.
+	it("hosts every branch-protection context and names each in the rollout doc", () => {
+		const hosted = REQUIRED_JOBS.flatMap(({ name }) =>
+			name.includes("${{ matrix.os }}")
+				? ["ubuntu-latest", "windows-latest", "macos-latest"].map((os) =>
+						name.replace("${{ matrix.os }}", os),
+					)
+				: [name],
+		);
+		expect([...hosted].sort()).toEqual([...BRANCH_PROTECTION_CONTEXTS].sort());
+		const rollout = readFileSync(
+			resolve(ROOT, "docs/merge-queue-rollout.md"),
+			"utf8",
+		);
+		for (const context of BRANCH_PROTECTION_CONTEXTS) {
+			expect(rollout, context).toContain(`\`${context}\``);
 		}
 	});
 
@@ -135,7 +171,7 @@ describe("#3754 merge queue workflow contract", () => {
 	});
 
 	// Recurrence: the PR-only lanes (PR title/body, changelog fast-fail,
-	// targeted advisory) read `github.event.pull_request`, which is empty on a
+	// changed tests shuffled) read `github.event.pull_request`, which is empty on a
 	// merge_group run. They must be skipped there, by an explicit
 	// `pull_request` guard, never by failing. The short `github.base_ref` /
 	// `github.head_ref` forms are PR-only too (#3765 F4), and a step-level
@@ -255,8 +291,7 @@ describe("#3754 merge queue workflow contract", () => {
 	});
 
 	// Population floor (#3765): an empty or shrunken pin would let every
-	// assertion above pass vacuously. Branch protection currently has 8 required
-	// contexts; the install matrix is one row that expands to three.
+	// assertion above pass vacuously.
 	it("keeps a real required-check population", () => {
 		expect(REQUIRED_JOBS.length).toBeGreaterThanOrEqual(6);
 		expect(MERGE_GROUP_SAFE_PR_CONTEXT.length).toBeGreaterThanOrEqual(1);

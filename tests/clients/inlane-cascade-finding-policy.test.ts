@@ -36,6 +36,10 @@ import type { LSPDiagnostic } from "../../clients/lsp/client.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "../support/lsp-service-seam.js";
 
 /**
  * The filesystem is a process boundary, and the ONE thing a display filter must
@@ -68,7 +72,6 @@ const mocks = vi.hoisted(() => ({
 	computeImpactCascade: vi.fn(),
 	computeTransitiveImpact: vi.fn(),
 	formatImpactCascade: vi.fn(),
-	getLSPService: vi.fn(),
 	logCascade: vi.fn(),
 	logLatency: vi.fn(),
 }));
@@ -84,13 +87,6 @@ vi.mock("../../clients/review-graph/service.js", async (importOriginal) => ({
 	computeImpactCascade: mocks.computeImpactCascade,
 	computeTransitiveImpact: mocks.computeTransitiveImpact,
 	formatImpactCascade: mocks.formatImpactCascade,
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: mocks.getLSPService,
 }));
 
 // `logCascade` no-ops under `isTestMode()`, so spying on it directly is the
@@ -178,7 +174,9 @@ beforeEach(async () => {
 		maxDepthReached: 0,
 	});
 	mocks.formatImpactCascade.mockReset().mockReturnValue("");
-	mocks.getLSPService.mockReset();
+	// No service until a case installs one (`getLSPService: vi.fn()` answered
+	// undefined). After `vi.resetModules()`, so the install evaluates the fresh graph.
+	await installLspServiceDouble(null);
 	mocks.logCascade.mockReset();
 	mocks.logLatency.mockReset();
 	fsReads.byPath.clear();
@@ -242,7 +240,7 @@ async function cascadeFor(
 	options: { cwd?: string; projectRoot?: string } = {},
 ): Promise<string> {
 	mocks.computeImpactCascade.mockReturnValue(impact(primary, neighborPaths));
-	mocks.getLSPService.mockReturnValue(service);
+	installLspService(service);
 	const { computeCascadeForFile } =
 		await import("../../clients/dispatch/integration.js");
 	const run = await computeCascadeForFile(primary, options.cwd ?? env.tmpDir, {
@@ -282,6 +280,90 @@ describe("in-lane cascade neighbour diagnostics take the finding policy (#3157)"
 		// announce "suppressed by disposition: 0 finding(s)".
 		expect(formatted).not.toContain("suppressed by disposition:");
 	});
+
+	// #4532 round 5 (review F3; AGENTS.md shape 71): the cascade read the same
+	// raw rows the per-edit runner demotes and applied no demotion, so the file
+	// the agent edited read "warning" while a neighbour in the same uninstalled
+	// worktree read "blocking". The gap leaves the neighbour's ERROR list; the
+	// real error beside it stays.
+	it("drops a neighbour's environment-gap row in a root with no install (#4532)", async () => {
+		const { hasResolvableNodeModules } =
+			await import("../../clients/lsp/environment-gap.js");
+		expect(hasResolvableNodeModules(env.tmpDir)).toBe(false);
+		const gap =
+			"Cannot find module 'node:crypto' or its corresponding type declarations.";
+		const formatted = await cascadeFor(
+			snapshotService([errorDiag(0, gap, 2307), errorDiag(1, OTHER)]),
+		);
+		expect(formatted).not.toContain("node:crypto");
+		expect(formatted).toContain(OTHER);
+	});
+
+	// #4532 round 6 (review NEW-2; AGENTS.md shape 71): the cascade DISPLAY
+	// dropped the gap, but the cascade's widget writer
+	// (`cascadeReconcilableLspErrors`) read the same raw rows with no demotion
+	// and persisted the gap as a blocking footer entry, so the neighbour stayed
+	// in the blocking sweep while the agent saw nothing about it. Both widget
+	// routes are driven: the passive snapshot and the confirmed active touch.
+	const NODE_GAP =
+		"Cannot find module 'node:crypto' or its corresponding type declarations.";
+	const widgetRoutes: Array<[string, () => Record<string, unknown>]> = [
+		[
+			"the passive snapshot",
+			() => snapshotService([errorDiag(0, NODE_GAP, 2307)]),
+		],
+		[
+			"a confirmed active touch",
+			() => ({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				touchFile: vi
+					.fn()
+					.mockResolvedValue({ diags: [errorDiag(0, NODE_GAP, 2307)] }),
+			}),
+		],
+	];
+	async function widgetAfterCascade(service: Record<string, unknown>) {
+		await cascadeFor(service);
+		const widget = await import("../../clients/widget-state.js");
+		return {
+			gapRows: (widget.getFileDiagnostics(neighbor) ?? []).filter(
+				(d) => d.rule === "typescript:2307",
+			),
+			blockingFiles: widget
+				.getWidgetBlockingFilesForSweep()
+				.map((f) => f.filePath),
+		};
+	}
+
+	it.each(widgetRoutes)(
+		"keeps a neighbour's environment gap out of the footer widget on %s (#4532)",
+		async (_route, makeService) => {
+			const { hasResolvableNodeModules } =
+				await import("../../clients/lsp/environment-gap.js");
+			expect(hasResolvableNodeModules(env.tmpDir)).toBe(false);
+			const { gapRows, blockingFiles } =
+				await widgetAfterCascade(makeService());
+			expect(gapRows).toEqual([]);
+			expect(blockingFiles).toEqual([]);
+		},
+	);
+
+	// The control: with an install the gap is a real missing module and the
+	// same route persists it as blocking, so the cells above cannot pass
+	// because the widget was never written.
+	it.each(widgetRoutes)(
+		"keeps the row blocking in the footer widget on %s once node_modules exists (#4532)",
+		async (_route, makeService) => {
+			fs.mkdirSync(path.join(env.tmpDir, "node_modules"));
+			const { gapRows, blockingFiles } =
+				await widgetAfterCascade(makeService());
+			expect(gapRows.map((d) => d.semantic)).toEqual(["blocking"]);
+			expect(blockingFiles.map((f) => path.basename(f))).toEqual([
+				"neighbor.ts",
+			]);
+		},
+	);
 
 	it("site 1 (passive cold snapshot): drops a neighbour error marked false-positive", async () => {
 		await mark({

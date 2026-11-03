@@ -24,16 +24,12 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency: mocks.logLatency,
 }));
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig: mocks.getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient: mocks.createLSPClient,
 }));
 
 import { LSPService } from "../../../clients/lsp/index.js";
+import { _setServersForFileForTests } from "../../../clients/lsp/config.js";
 
 const FILE = "C:/repo/main.ts";
 
@@ -96,6 +92,7 @@ describe("#2540 concurrent LSP server spawn & auxiliary readiness", () => {
 	let service: LSPService;
 
 	beforeEach(() => {
+		_setServersForFileForTests(mocks.getServersForFileWithConfig);
 		vi.useFakeTimers();
 		service = new LSPService();
 		mocks.logLatency.mockClear();

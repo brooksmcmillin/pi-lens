@@ -33,6 +33,12 @@ import {
 // into `probe-home-state.ts` and read back here instead. See that module's doc
 // comment for the full account.
 import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
+// #4689: path-utils is a dependency leaf below this module, so its identity
+// fallback tally is pulled here at read time, like the sinks above.
+import {
+	getPathIdentityFallbacks,
+	resetPathIdentityFallbacks,
+} from "./path-utils.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
 export { LEDGER_FIELD_MAX, truncateForLedger };
@@ -184,6 +190,14 @@ export type DegradationKind =
 	| "cascade-pending-cap"
 	/** #4487: the pending neighbour-error record reached its cap. */
 	| "cascade-pending-neighbors-evicted"
+	/**
+	 * #5040: a cascade neighbour's only answer was a cache entry published BEFORE
+	 * the run's edit (a push-only server that never republishes a dependent). The
+	 * neighbour is now unconfirmed rather than clean; the subject is
+	 * `<serverId>:<path key>` and the record counts per session, so a repeated
+	 * exporter edit does not need a new kind to be visible.
+	 */
+	| "cascade-pre-edit-answer"
 	| "cascade-tier3-backlog-evicted"
 	/**
 	 * #3511: the change-log lock stayed held past its bounded wait (or its
@@ -236,6 +250,23 @@ export type DegradationKind =
 	 */
 	| "config-notice-suppressed"
 	/**
+	 * #4743: with `--lens-retain-injections` on, a context injection was not
+	 * kept for later requests (`entry-cap`, `byte-cap`, `no-session-id`), or the
+	 * transcript could not be hashed so nothing retained was re-sent
+	 * (`transcript-not-hashable`). The injection still reached its one request.
+	 * Subject is `<reason>:<session id>`; once per session and reason
+	 * (`clients/context-injection-ledger.ts`).
+	 */
+	| "context-injection-retain-declined"
+	/**
+	 * #5020: a row of an inline-blocker record that names ANOTHER file (a
+	 * chart-wide or import-following runner reports one against the written
+	 * file) left the record because the cited file was dispatched clean by the
+	 * runner that raised it, or no longer exists. The reason names which. One
+	 * subject per record file key, counted across the session.
+	 */
+	| "cross-file-row-retired"
+	/**
 	 * A warm-only client lookup (`getWarmClientForFile`) found no live client
 	 * for a file that HAS a language server with a resolvable root (#1934).
 	 * Subject is the candidate `serverId:root` set, so the ledger still answers
@@ -260,6 +291,12 @@ export type DegradationKind =
 	 */
 	| "data_dir_migrated"
 	/**
+	 * A late dead-code scan's baseline write threw (a full or read-only disk, a
+	 * cache path taken by a file). The scan's findings are still delivered; only
+	 * the on-disk baseline is lost. Subject is the client id (review of #4663).
+	 */
+	| "dead-code-baseline-write-failed"
+	/**
 	 * A dead-code scan that missed the turn_end budget finished in the
 	 * background and was NOT used (#4117): its session ended before it settled
 	 * (`session-ended`), or it failed (`scan-failed`; a timeout or kill also
@@ -267,6 +304,8 @@ export type DegradationKind =
 	 * repeats it every turn.
 	 */
 	| "dead-code-late-scan-dropped"
+	/** A deferred autofix scope was already attempted; once per tool/scope per session. */
+	| "deferred-autofix-duplicate-scope"
 	/**
 	 * #3814: the commit gate's pre-check of settled collect-later runner answers
 	 * (`absorbSettledRunnerBlockers`) threw. The gate falls back to the blocker
@@ -289,6 +328,15 @@ export type DegradationKind =
 	 */
 	| "disk-change-append-failed"
 	/**
+	 * #4535 slice 2: a publish that a detector needed an LSP answer from reached
+	 * no LSP subscriber, so no held document was checked for stale bytes
+	 * (`readHeldDocumentsAnswer`, `clients/disk-change-subscribers.ts`). The
+	 * registry is seeded by `ensureDiskChangeSubscribers`, so its absence means a
+	 * second module copy owns the registry or the seed never ran. Subject: the
+	 * normalized project root; one row per root per session.
+	 */
+	| "disk-change-lsp-consumer-missing"
+	/**
 	 * #4535: one publish carried more paths than
 	 * `DISK_CHANGE_MAX_RECORDED_PATHS`, so the tail got no sequence and the
 	 * record is reported as unenumerable (clients/disk-changes.ts). Once per
@@ -296,12 +344,28 @@ export type DegradationKind =
 	 */
 	| "disk-change-paths-truncated"
 	/**
+	 * #4502 (#4612 round 3): one chunk of the recovered set's detached resync
+	 * rejected, so every chunk after it was never published and those paths
+	 * keep whatever view their servers hold (clients/runtime-tool-result.ts).
+	 * The recovery loop records it once with the chunk ordinal and the number
+	 * of paths it dropped. Subject: the normalized root; counted.
+	 */
+	| "disk-change-recovered-drift-failed"
+	/**
 	 * #4535: one disk-change subscriber threw while a publish delivered to it
 	 * (clients/disk-changes.ts). The publish continues to the next subscriber;
 	 * the record names the consumer and the root, once per consumer per session,
 	 * so a broken consumer cannot spam the agent-facing summary.
 	 */
 	| "disk-change-subscriber-failed"
+	/**
+	 * #4742: the exact-URI watched-files events for published paths no client
+	 * holds could not be built or delivered (`notifyUnheldPaths`,
+	 * clients/disk-change-subscribers.ts), so a closed module changed on disk
+	 * may keep its old bytes in a live server. Subject: the normalized root;
+	 * one row per root per session.
+	 */
+	| "disk-change-unheld-notify-failed"
 	| "dispatch-non-absolute-baseline-path"
 	/**
 	 * A server-initiated `workspace/applyEdit` fell back to the mutation
@@ -347,6 +411,14 @@ export type DegradationKind =
 	 * Subject is the tool.
 	 */
 	| "fix-run-agent-edit-overwritten"
+	/**
+	 * #3915: the deferred autofix drain's loss notice threw while reporting a
+	 * restore's loss — the advisory queue, the renderer, or the host `notify` —
+	 * so the notice never reached the session. Recorded instead of letting the
+	 * rejection reach `bounded()`'s boxed handler, which swallows it once the
+	 * deadline has fired. Subject is the drained file; once per file.
+	 */
+	| "fix-run-loss-notice-failed"
 	/** A bounded pre-run call was not carried into a fixer run (#3830). */
 	| "fix-run-pending-call-cap"
 	/**
@@ -420,6 +492,13 @@ export type DegradationKind =
 	 * session; subject is the lock directory.
 	 */
 	| "generation-lock-wait-skipped"
+	/**
+	 * #4921: a concurrent in-process session's write, with no blocker of its
+	 * own, met a commit-gate record another session owns and left it (and the
+	 * process-wide latch) untouched. Subject is the writing session; once per
+	 * session, because each of its clean writes meets the same record.
+	 */
+	| "git-guard-non-owner-write"
 	/**
 	 * Failed-first test state was retired only after ENOENT/ENOTDIR evidence,
 	 * retained when the filesystem probe was indeterminate, or evicted at the
@@ -670,8 +749,32 @@ export type DegradationKind =
 	| "log-sink-truncate-refused"
 	| "log-sink-write-failure"
 	| "lsp-adopted-root-evicted"
+	/**
+	 * #4786: an auxiliary's unversioned EMPTY publication refused because the
+	 * path's stored or pending finding came from the same phase: one rules
+	 * generation (`semgrep/rulesRefreshed` count) and one client send. Opengrep's
+	 * open-documents scan publishes `[]` for every file it ever scanned and did
+	 * not target, which read as a clean file. Subject
+	 * `<serverId>:empty-after-finding:<file>:<phase>`.
+	 */
+	| "lsp-auxiliary-empty-after-finding"
 	| "lsp-breaker"
 	| "lsp-capability-skip"
+	/**
+	 * #4532: one bash `tool_result` found more live primary client roots outside
+	 * the session root than `CLIENT_ROOT_LOOK_CAP`, so the install look only ran
+	 * at the first few (clients/runtime-tool-result.ts). An install in the rest
+	 * reaches no server until a tool call names a file under that root. Subject is
+	 * `cap`; once per session, because the population is the process's, not one
+	 * command's.
+	 */
+	| "lsp-client-root-look-capped"
+	/**
+	 * #4532: the install look at a live client root threw, so nothing is known
+	 * about that root's install and the absence of a publish is not evidence of
+	 * none. Subject is the root; once per root per session.
+	 */
+	| "lsp-client-root-look-failed"
 	/**
 	 * The napi fallback ADMITTED a file — its extension is in the in-process
 	 * language matrix (`clients/dispatch/runners/ast-grep-napi.ts`) — and the
@@ -708,10 +811,18 @@ export type DegradationKind =
 	 */
 	| "lsp-created-import-scan-incomplete"
 	/**
-	 * #4476: the walk of a root's declaration files passed its directory or
-	 * file cap, so a declaration file created, edited or deleted outside
-	 * pi-lens under that root reaches no language server and refuses no
-	 * diagnostics-cache entry (clients/out-of-band-changes.ts). Once per root.
+	 * Two emitters, both in clients/out-of-band-changes.ts.
+	 *
+	 * #4476, the cap: the walk of a root's declaration files passed its
+	 * directory or file cap, so a declaration file created, edited or deleted
+	 * outside pi-lens under that root reaches no language server and refuses no
+	 * diagnostics-cache entry. Subject is the root. Once per root.
+	 *
+	 * #4905, the home ceiling: the root is the home folder or above it
+	 * (compared by real path), so the declaration walk is skipped and a
+	 * declaration file changed outside pi-lens under it is not looked for. The
+	 * install stamp is still read and compared, so an install still publishes.
+	 * Subject is `home-root`. Once per session.
 	 */
 	| "lsp-declaration-look-capped"
 	/**
@@ -796,6 +907,16 @@ export type DegradationKind =
 	 * `incrementDegradationCount` keeps one bounded entry per file.
 	 */
 	| "lsp-edit-stale-content"
+	/**
+	 * #4532: a TypeScript diagnostic was demoted from blocking to warning
+	 * because the file's root resolves no `node_modules`, so its ambient
+	 * declarations (`node:*` module types, the `NodeJS` namespace, `node`'s
+	 * globals) are absent. `clients/lsp/environment-gap.ts` produces it; the
+	 * subject is the admitted TypeScript code (`2307`, `2503`, `2304`), which is
+	 * also the admission key, so the count carries repeats and the ledger holds
+	 * at most three subjects per session. A refusal never records here.
+	 */
+	| "lsp-environment-gap-demoted"
 	/**
 	 * #4320: this process cannot tell when a path was born (the filesystem
 	 * reports no birth time, or Node reports ctime as it without statx), so a
@@ -915,6 +1036,23 @@ export type DegradationKind =
 	 * "hung" server is truly hung or just answering late.
 	 */
 	| "lsp-pull-unconfirmed"
+	/**
+	 * #4801: a read-only command (`runReadOnlyServerCommand`, reached from the
+	 * warm-attach membership probe and the didOpen project-identity probe) hit
+	 * `PROBE_COMMAND_TIMEOUT_MS` and gave up on the answer for good, so its
+	 * request was cancelled on the wire and released locally instead of being
+	 * left pending. Subject is the server id and `recordDegradationOnce` keeps
+	 * it at one row per server per session — never one per probe, which on a
+	 * wedged server would be one row per attach.
+	 *
+	 * This is deliberately NOT `warm-attach-membership-probe-abandoned`: that
+	 * one fires when the CALLER's remaining budget abandons the wait
+	 * (`clients/warm-attach.ts`'s `withinRemaining`), not when the request's own
+	 * ceiling wins, so before this row a release left no record anywhere. The
+	 * row marks a release that happened; a regression that stopped releasing
+	 * never reaches it, so the wire test of the ceiling pins that case.
+	 */
+	| "lsp-readonly-command-released"
 	/** A config registry decision dropped or admitted executable project data. */
 	| "lsp-registry-decision"
 	/** A host-created pi-agent staging root was declined as an LSP root. */
@@ -932,6 +1070,26 @@ export type DegradationKind =
 	 * observes it.
 	 */
 	| "lsp-scanner-coverage-gap"
+	/**
+	 * #4764: a server reported over `window/showMessage` that its own config or
+	 * rules could not be loaded (opengrep offline with `--config auto`: "Fatal
+	 * error: Failed to download config from https://semgrep.dev/c/p/default").
+	 * Subject `<serverId>:message:<digest>` is recorded ONCE per distinct message
+	 * per session (`lsp_server_message`), and `<serverId>:dropped:<file>` counts
+	 * each empty publication that was refused as evidence or retracted because of
+	 * it. Without this kind, a scanner that never evaluated a byte of the project
+	 * left no record at all while its empty publishes read as clean scans.
+	 */
+	| "lsp-server-config-load-failed"
+	/**
+	 * #4764: any other `window/showMessage` text, recorded once per distinct
+	 * message per session (`lsp_server_message`). Subject
+	 * `<serverId>:message:<digest>`, reason the message itself (truncated at the
+	 * ledger field bound). The per-client distinct-text cap
+	 * (`MAX_TRACKED_SERVER_MESSAGES`) keeps a narrating server from flooding the
+	 * sink; past it one `<serverId>:showMessage-cap` counter grows instead.
+	 */
+	| "lsp-server-message"
 	/**
 	 * A `textDocument/diagnostic` or `workspace/diagnostic` pull's per-request
 	 * `withTimeout` abandoned a GENUINELY dispatched request (#1771). Every
@@ -954,8 +1112,19 @@ export type DegradationKind =
 	 * server and file for the same reason every other pull kind does.
 	 */
 	| "lsp-session-root-evicted"
-	/** A sibling LSP notification failed while touching a file. */
+	/**
+	 * A sibling LSP notification failed while touching a file, or a client's
+	 * detached `workspace/didCreateFiles` announcement threw (#4787).
+	 */
 	| "lsp-sibling-announcement"
+	/**
+	 * #4532 gap 13: a module a diagnostics call's target imports, open in no
+	 * server, could not be read to compare its bytes with the ones last seen
+	 * (clients/lsp/index.ts `unheldBytesMoved`). Its stat alone is compared, so
+	 * a rewrite of the same bytes is sent as a change. Subject is the path.
+	 * Once per path per session.
+	 */
+	| "lsp-unheld-dependency-unreadable"
 	/**
 	 * A language-server child process CLOSED without pi-lens having asked it to
 	 * (#1969). `clientShutdown()` sets `state.shutdownRequested`, so evictions
@@ -975,6 +1144,14 @@ export type DegradationKind =
 	 * is a fact about the server rather than a race with the pipe.
 	 */
 	| "lsp-warm-client-missing"
+	/**
+	 * #5131: an empty version-less `publishDiagnostics` followed the client's own
+	 * first-open `workspace/didChangeWatchedFiles` for a document the server had
+	 * already reported on, and was held: the server recompiled from disk on the
+	 * notice and cleared a real finding. Subject is the server id; counted per
+	 * held publish, one latest-reason entry per server.
+	 */
+	| "lsp-watched-echo-held"
 	/**
 	 * A liveness probe (`clientPingLiveness`, `clients/lsp/client.ts`) found no
 	 * request method the server advertises that it could safely probe with, so
@@ -1021,6 +1198,13 @@ export type DegradationKind =
 	| "madge-skip-visibility-unavailable"
 	| "managed-tool-install"
 	| "managed-tool-refresh"
+	/**
+	 * #5119: the markdownlint runner could not lint through markdownlint-cli2's
+	 * exported `main` (module not found beside the command, or it did not load),
+	 * so it spawned the CLI, where a project `"fix": true` can still rewrite the
+	 * file. Subject is the resolved command; once per session.
+	 */
+	| "markdownlint-api-unavailable"
 	/** A complete MCP result exceeded the hard input budget (#2848). */
 	| "mcp-complete-result-budget-exceeded"
 	/**
@@ -1086,7 +1270,8 @@ export type DegradationKind =
 	/** An observed directory mutation exceeded the same-turn analysis fan-out. */
 	| "observed-mutation-dispatch-cap"
 	/**
-	 * #4137: a pending bash baseline was dropped before its `tool_result` took
+	 * #4137: a pending opaque baseline (a bash call's, or since #4732 any other
+	 * captured tool's) was dropped before its `tool_result` took
 	 * it, so that call could not prove it authored its own writes and withheld
 	 * their blockers. Subject `overwrite`: a baseline with the same key was
 	 * replaced (a host with no distinct tool-call ids, or a reused id). Subject
@@ -1096,8 +1281,25 @@ export type DegradationKind =
 	 * retired; a result that still arrives loses its authorship. Counted.
 	 */
 	| "opaque-baseline-lost"
+	/**
+	 * #4732: a tool other than bash was not diffed, or its diff could not
+	 * answer, so the files it wrote were not observed. Subject
+	 * `no-tool-call-id`: the host gave the call no id (a shared slot would take
+	 * a bash call's baseline). Any other subject is the recovery's unknown
+	 * verdict. Once per subject per session.
+	 */
+	| "opaque-capture-refused"
 	/** Opaque mutation was analyzed without granting autonomous writer rights. */
 	| "opaque-mutation-ownership-boundary"
+	/**
+	 * #2050: a bash command named a git checkout that got NO opaque baseline, so
+	 * its writes were not observed. Subject is the normalized root (once per
+	 * root per session), or `cap` when the command named more checkouts than
+	 * `OPAQUE_RECOVERY_ROOT_CAP`. Deliberately not `opaque-baseline-lost`, which
+	 * is a baseline that WAS taken and then dropped: this one was never taken,
+	 * because the root is not a linked worktree of the session's repository.
+	 */
+	| "opaque-recovery-root-refused"
 	/** Opengrep completed with partial parsing warnings (#2943). */
 	| "opengrep-partial-scan"
 	/** Opengrep refused the requested root or reported a scan error (#2943). */
@@ -1131,6 +1333,17 @@ export type DegradationKind =
 	 * be indistinguishable from finding nothing.
 	 */
 	| "path-attribution-orphan-unresolved"
+	/**
+	 * #4689: deriving a path identity (`clients/path-utils.ts`, the realpath of
+	 * the nearest existing ancestor plus the missing tail) met a realpath error
+	 * other than a missing component (an unreadable ancestor, a cyclic link),
+	 * so the key fell back to an ancestor's identity and may differ from the
+	 * key another spelling of the same file derives. Same read-time fold as
+	 * `log-sink-write-failure`: path-utils cannot import this module, so
+	 * `getDegradationSummary()` PULLS its tally. One entry per errno code;
+	 * subject is the code, reason the count and the first refused spelling.
+	 */
+	| "path-identity-fallback"
 	/**
 	 * Same as `orphan-backstop-kill-unverified`, for the registry-driven
 	 * reaper path, which spelled the identical attempt-counted-as-kill defect
@@ -1214,6 +1427,35 @@ export type DegradationKind =
 	 * path for a late result); reason carries the error message.
 	 */
 	| "project-snapshot-stage-reap-failed"
+	/**
+	 * #4687 item 5: the session's SECOND prompt-cache miss with no local cause
+	 * was recorded (the first counts silently; every later one only raises the
+	 * count). One bounded row per session, so a provider-side miss pattern is
+	 * visible in the ledger instead of only as an `unknown` verdict per turn.
+	 * Subject is the session id.
+	 */
+	| "prompt-cache-miss-unexplained"
+	/**
+	 * #4638: jedi compiles with the interpreter it launched, so under a project
+	 * declaration of Python 3.14 or newer its `compile` rows describe a grammar
+	 * the project does not use. Dropped from delivery, never from the cached
+	 * inline set, so a replay re-decides against the declaration current then.
+	 * Subject is the analysed file; the reason and metadata name the declared
+	 * level, its source file, and the dropped count.
+	 */
+	| "python-compile-target-mismatch"
+	/**
+	 * #4638 review: jedi's project-tier launch threw something other than a
+	 * missing tool, so the managed/PATH fallback ran instead. Subject is the
+	 * project root; the reason names the interpreter and the failure.
+	 */
+	| "python-project-launch-failed"
+	/**
+	 * #4638: a Python syntax-level declaration file could not be read (beyond a
+	 * plain absence), so the walk treated it as declaring nothing. Subject is
+	 * the manifest path; reason carries the error message.
+	 */
+	| "python-target-version-unreadable"
 	/**
 	 * The orphan backstop's OWN process-table scanner blew the scan timeout and
 	 * had to be tree-killed (#1864 review F3). Reason carries the kill verdict,
@@ -1455,6 +1697,14 @@ export type DegradationKind =
 	 */
 	| "safe-spawn-signal-reraise-unsupported"
 	/**
+	 * #4502 (#4612 round 3): more working-tree paths were dirty than
+	 * `SAME_HEAD_DIRTY_SET_CAP` when a bash call started
+	 * (clients/opaque-mutation-scan.ts), so a same-HEAD discard that reverts
+	 * one of the rest is not detected for that call. Subject: the normalized
+	 * root; counted, because the cap is per call.
+	 */
+	| "same-head-discard-set-capped"
+	/**
 	 * A project scanner (vulture, jscpd) was started over a root that holds a
 	 * linked worktree it could not be told to leave out (#4117): the project's
 	 * own scanner config could not be read, so passing the exclusion would have
@@ -1464,10 +1714,24 @@ export type DegradationKind =
 	 * root is rescanned every session and turn.
 	 */
 	| "scan-worktree-exclusion-skipped"
+	/**
+	 * A report-file security scanner (gitleaks, trivy) could not produce a result:
+	 * its CLI failed to spawn, exited non-zero without writing its report, or
+	 * the scan threw. Subject is the tool; counted, with the latest message kept.
+	 */
+	| "security-scan-report-failed"
 	/** A duplicate RPC session start was suppressed after its first full pass. */
 	/** A self-drift baseline could not be verified within its available evidence. */
 	| "self-drift-hash-budget-exhausted"
 	| "self-drift-unverifiable"
+	/**
+	 * #4704: an activation's live session was dropped from the process-wide
+	 * membership because pi invalidated its context with no `session_shutdown`
+	 * (`AgentSession.dispose()`, a subagent runner's teardown). It no longer
+	 * holds the shared teardown, and its own end-of-session work never ran.
+	 * Subject `no-shutdown`; once per session.
+	 */
+	| "session-member-disposed"
 	/**
 	 * #3819 r2: a demoted `/fork` or `/reload` start (a row-17 start held the
 	 * primary registration) discarded the hand-off slot left for it, so the
@@ -1488,6 +1752,12 @@ export type DegradationKind =
 	 * start reason.
 	 */
 	| "session-scope-handoff-missed"
+	/**
+	 * #4965: a session-state write named a session with no live scope (never
+	 * started here, or already retired), so it was dropped. Subject: the scope
+	 * cell it targeted (`turn-warnings`, `cache-attribution`). Counted.
+	 */
+	| "session-scope-lookup-missed"
 	/**
 	 * #3611 (#3609 F1, decision A + C): a read-guard write was dropped because
 	 * its session scope retired, and its entry is still on its conversation's
@@ -1711,6 +1981,18 @@ export type DegradationKind =
 	/** A loader request named a configured-disabled tool. */
 	| "tool-disabled"
 	| "tool-result-adopted-project"
+	/**
+	 * An edit in a linked worktree of this repository was analysed with the full
+	 * pipeline. Once per worktree root per session: the row exists so "analysis
+	 * ran and the root was foreign to the session" is never only in `latency.log`
+	 * (#2050 AC3).
+	 */
+	| "tool-result-linked-worktree"
+	/**
+	 * That analysis produced no finding at all, so the agent gets one advisory
+	 * instead of an ambiguous silence. Once per worktree root per session.
+	 */
+	| "tool-result-linked-worktree-clean"
 	/** A project edit was outside the session root and skipped analysis (#4218). */
 	| "tool-result-outside-project-root"
 	/** #3612: a lazy-tool activation arrived before its activation's session scope began. */
@@ -1795,6 +2077,14 @@ export type DegradationKind =
 	 */
 	| "turn-end-advisory-carry-dropped"
 	/**
+	 * #4943 (#4961 review F4): a request found the per-project turn-end message
+	 * addressed to another session (`deliverTo`, or the owner of a gate
+	 * rewrite) and left it for that session. Once per addressee, so a skip
+	 * reads apart from an empty slot without one row per request. Subject is
+	 * the addressee's session id.
+	 */
+	| "turn-end-delivery-addressed-elsewhere"
+	/**
 	 * A turn_end knip scan did not fit the budget in a root that has linked
 	 * worktrees nested under it (#3872): knip walks them as project files
 	 * because the project never ignored them. The subject is the scan root.
@@ -1839,6 +2129,16 @@ export type DegradationKind =
 	 * dogfood summary. See `INFORMATIONAL_DEGRADATION_KINDS` below.
 	 */
 	| "unclassified-mutating-tool"
+	/**
+	 * #4645: the warm incumbent abandoned its inferred-project membership probe
+	 * so the reply could still land before the request's deadline. The reply
+	 * carries the server's raw rows without the verdict, so the attached reader
+	 * renders them at their raw severity (the pre-#4645 answer for that edit)
+	 * while warm attach survives. Subject is the cause: `probe-timeout` (the
+	 * probe ran out its window) or `no-time-left` (the touch left none). Once per
+	 * session per cause.
+	 */
+	| "warm-attach-membership-probe-abandoned"
 	/**
 	 * #3389: an accepted socket on the warm diagnostics server emitted `error`.
 	 * A `net.Socket` with no `error` listener RETHROWS, so before this kind
@@ -2193,6 +2493,21 @@ export function getDegradationSummary(): DegradationGroup[] {
 	// Folded in at read time, not written into `groups` (#1970) — see the
 	// `log-sink-write-failure` doc comment on `DegradationKind` for why this
 	// kind never goes through `recordDegradation`.
+	// #4689, same read-time fold: see the `path-identity-fallback` doc comment.
+	const identityFallbacks = getPathIdentityFallbacks();
+	if (identityFallbacks.length > 0) {
+		summary.push({
+			kind: "path-identity-fallback",
+			count: identityFallbacks.reduce((total, row) => total + row.count, 0),
+			droppedCount: 0,
+			latestReasons: identityFallbacks.map((row) => ({
+				subject: truncateForLedger(row.code),
+				reason: truncateForLedger(
+					`${row.count} fallback(s) to an ancestor identity; first: ${row.firstPath}`,
+				),
+			})),
+		});
+	}
 	const sinkFailures = getSinkWriteFailures();
 	if (sinkFailures.length > 0) {
 		summary.push({
@@ -2344,6 +2659,8 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
  */
 const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	"log-sink-rotated",
+	// Project-scoped autofix dedupe is intentional, not a failed fixer (#4862).
+	"deferred-autofix-duplicate-scope",
 	// #2504 review round 8 (S1): both fire on the ordinary re-edit cadence
 	// (a carry-forward window closing, or a session boundary) and are
 	// self-healing -- the next turn's analysis or deferral re-observes the
@@ -2428,6 +2745,9 @@ export function resetDegradationLedger(): void {
 	// keep crossing the bound), so clearing it costs nothing and a later
 	// session re-observes the fact fresh.
 	resetSinkRotations();
+	// #4689, the same re-arm: an identity fallback recurs on the next key the
+	// kernel refuses, so a later session re-observes it.
+	resetPathIdentityFallbacks();
 	// #2146 review F3: the OTHER pulled source, `getProcessSingletonResets()`,
 	// deliberately does NOT re-arm here, and the difference from its neighbour
 	// above is the point. A sink write failure recurs — new writes fail, so

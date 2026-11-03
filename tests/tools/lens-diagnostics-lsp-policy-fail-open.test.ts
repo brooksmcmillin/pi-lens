@@ -52,6 +52,7 @@ describe("source=lsp finding policy fails open (#3088)", () => {
 	it("still reports the finding, and records one bounded degradation, when the filter throws", async () => {
 		const service = {
 			announceCreatedFiles: vi.fn(),
+			sweepDocumentDrift: vi.fn(async () => undefined),
 			touchFile: vi.fn(async () => ({
 				diags: [
 					{

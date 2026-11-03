@@ -13,20 +13,9 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	>()),
 	logLatency,
 }));
-vi.mock("../../../clients/degradation-ledger.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../../clients/degradation-ledger.js")
-	>()),
-	recordDegradation: vi.fn(),
-}));
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
@@ -59,8 +48,11 @@ describe("lsp_client_unavailable dedupe + recovery re-arm (#1374)", () => {
 	let spawnBehavior: () => Promise<unknown>;
 	const alive = { value: true };
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-08-14T06:00:00Z"));
 		logLatency.mockClear();

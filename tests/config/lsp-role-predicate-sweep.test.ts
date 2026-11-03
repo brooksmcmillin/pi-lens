@@ -45,6 +45,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -172,27 +173,31 @@ const PREDICATE_NEEDLES = [
 describe("#1488 — one auxiliary-role predicate, one vocabulary", () => {
 	// A whole-tree scan: the default 5 s timed out twice on the loaded Windows
 	// advisory runner (#4233, #4307), like the other sweeps that set 30 s.
-	it("finds no inlined role predicate outside the seam", () => {
-		const files = population();
-		assertNonEmptyScan(
-			"role-predicate population",
-			files.length,
-			POPULATION_FLOOR,
-		);
+	it(
+		"finds no inlined role predicate outside the seam",
+		() => {
+			const files = population();
+			assertNonEmptyScan(
+				"role-predicate population",
+				files.length,
+				POPULATION_FLOOR,
+			);
 
-		const scanned = files.flatMap((absolute) => {
-			const relative = relativePosix(REPO_ROOT, absolute);
-			return { relative, findings: scanFile(absolute) };
-		});
-		const governed = scanned.filter((entry) => entry.relative !== OWNER);
+			const scanned = files.flatMap((absolute) => {
+				const relative = relativePosix(REPO_ROOT, absolute);
+				return { relative, findings: scanFile(absolute) };
+			});
+			const governed = scanned.filter((entry) => entry.relative !== OWNER);
 
-		expect(
-			governed.flatMap((entry) => entry.findings),
-			"An inlined auxiliary-role predicate, a second role vocabulary, or a " +
-				"second exhaustive classification reappeared. Ask isAuxiliary() from " +
-				"clients/lsp/server-traits.ts or declare the union there (#1488).",
-		).toEqual([]);
-	}, 30_000);
+			expect(
+				governed.flatMap((entry) => entry.findings),
+				"An inlined auxiliary-role predicate, a second role vocabulary, or a " +
+					"second exhaustive classification reappeared. Ask isAuxiliary() from " +
+					"clients/lsp/server-traits.ts or declare the union there (#1488).",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("detects every spelling of an inlined predicate, including unlisted ones", () => {
 		const POSITIVE_CONTROLS = [

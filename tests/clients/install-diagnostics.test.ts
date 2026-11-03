@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Lang, parse } from "@ast-grep/napi";
 import { describe, expect, it } from "vitest";
 import {
 	collectInstallDiagnostics,
@@ -18,6 +20,51 @@ describe("install-diagnostics", () => {
 		expect(d.deps.map((x) => x.name)).toContain("typescript");
 		// In this repo's flat node_modules everything resolves.
 		expect(d.deps.find((x) => x.name === "typescript")?.resolved).toBe(true);
+	});
+
+	// The module is the report a user pastes when `minimatch` (or another
+	// critical dep) did not resolve (#285/#335), so it must load without it.
+	// `clients/path-utils.ts` imports `minimatch`: routing the `realpathSync` at
+	// the `pkgRealDir` site through `realpathOrResolve` (the #4689 batch 2
+	// proposal) would make this import throw exactly when the report is needed.
+	// It admits only Node built-ins and the dependency-free ladder in
+	// `scripts/lib/`, and refuses every other specifier, relative or bare.
+	it("imports nothing that a missing runtime dependency could take down", () => {
+		const root = path.resolve(
+			path.dirname(fileURLToPath(import.meta.url)),
+			"../..",
+		);
+		const specifiers = (file: string): string[] => {
+			const tree = parse(
+				file.endsWith(".ts") ? Lang.TypeScript : Lang.JavaScript,
+				fs.readFileSync(path.join(root, file), "utf8"),
+			).root();
+			const dynamic = tree
+				.findAll({
+					rule: {
+						kind: "call_expression",
+						has: { field: "function", kind: "import" },
+					},
+				})
+				.map((node) => `dynamic ${node.text()}`);
+			return [
+				...tree.findAll({ rule: { kind: "import_statement" } }),
+				...tree.findAll({ rule: { kind: "export_statement" } }),
+			]
+				.flatMap((node) => {
+					const source = node.field("source")?.text();
+					return source === undefined ? [] : [source.slice(1, -1)];
+				})
+				.concat(dynamic);
+		};
+		const admitted = (spec: string) =>
+			spec.startsWith("node:") ||
+			spec === "../scripts/lib/web-tree-sitter-dir.mjs";
+		const own = specifiers("clients/install-diagnostics.ts");
+		expect(own.length).toBeGreaterThan(0);
+		expect(own.filter((spec) => !admitted(spec))).toEqual([]);
+		const ladder = specifiers("scripts/lib/web-tree-sitter-dir.mjs");
+		expect(ladder.filter((spec) => !spec.startsWith("node:"))).toEqual([]);
 	});
 
 	it("formats a paste-able block with the cause and a report URL", () => {

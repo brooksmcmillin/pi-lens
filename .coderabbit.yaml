@@ -59,10 +59,11 @@ reviews:
   path_instructions:
     - path: "**/*"
       instructions: >-
-        Check the change against the "Recurring defect shapes" section of
-        AGENTS.md (knowledge file, see knowledge_base below). Report only
-        findings that a code path or test can demonstrate; do not comment on
-        style that the lint gates enforce.
+        Check the change against the "Recurring defect shapes" catalog in
+        docs/defect-shapes.md and the invariants in docs/invariants/ (knowledge
+        files, see knowledge_base below). Report only findings that a code path
+        or test can demonstrate; do not comment on style that the lint gates
+        enforce.
     - path: ".github/workflows/**"
       instructions: >-
         CI workflow changes are reviewed against the merge policy: a claimed
@@ -100,6 +101,8 @@ knowledge_base:
     enabled: true # https://docs.coderabbit.ai/reference/configuration
     filePatterns: # https://docs.coderabbit.ai/reference/configuration
       - "AGENTS.md"
+      - "docs/defect-shapes.md"
+      - "docs/invariants/*.md"
       - "docs/pi-lens-*.md"
 
 chat:

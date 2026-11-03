@@ -259,7 +259,9 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 /**
  * Path field, in a fixed order. `path` is pi's spelling; `filePath` and
- * `file_path` are the two spellings third-party edit tools use in practice.
+ * `file_path` are the two spellings third-party edit tools use in practice;
+ * `file` is the alias pi-lens's own single-file tools accept beside `path`
+ * (#5041), so `lsp_navigation {file}` arms and credits like `{path}` (#5047 F4).
  *
  * Exported for #2430: the observational net arms only for a call whose input
  * carries a path-shaped field, and it must ask that question with the SAME
@@ -269,7 +271,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 function resolveMutationPath(
 	input: Record<string, unknown>,
 ): string | undefined {
-	for (const key of ["path", "filePath", "file_path"]) {
+	for (const key of ["path", "filePath", "file_path", "file"]) {
 		const value = input[key];
 		if (typeof value === "string" && value.length > 0) return value;
 	}
@@ -307,8 +309,10 @@ export function readMutationPathField(event: unknown): string | undefined {
  */
 export function readToolResultPathField(event: unknown): string | undefined {
 	const input = asRecord((event as { input?: unknown })?.input);
-	const ownPath = input["path"];
-	if (typeof ownPath === "string" && ownPath.length > 0) return ownPath;
+	for (const key of ["path", "file"]) {
+		const ownPath = input[key];
+		if (typeof ownPath === "string" && ownPath.length > 0) return ownPath;
+	}
 	return classifyMutatingTool(event, { recognizeOnly: true })?.path;
 }
 
@@ -836,6 +840,36 @@ export function isBashDerivedReplay(event: unknown): boolean {
 }
 
 /**
+ * Id prefix pi-cursor-sdk gives the display-only tool calls it replays after
+ * Cursor's own native tools already ran (#5160). pi's `tool_call` and
+ * `tool_result` events carry no replay or display-only marker (`toolCallId`
+ * and `parentToolCallId` are the only identity fields), so the id is the one
+ * signal there is. Keep this list to prefixes a provider extension mints for
+ * calls it replays after the work happened.
+ */
+const PROVIDER_REPLAY_TOOL_CALL_ID_PREFIX = "cursor-replay-";
+
+/**
+ * Whether `event` is a provider's display-only replay of work that already
+ * ran (#5160). Such a call has nothing left to guard: the write happened
+ * before the replay arrived, so an "Edit without read" refusal protects
+ * nothing and only turns the replay card into an error. It must also never
+ * teach tier-4 learning that its tool name mutates, because the learned name
+ * would then misclassify every later replay (and, persisted, every later
+ * session). Three consumers ask here: {@link classifyMutatingTool} skips the
+ * tier-4 learned lookup, and `runtime-tool-call.ts` neither arms the
+ * observational net nor runs the read guard's edit check, for built-in `edit`
+ * replays too. The match is the full prefix at the start of the id: a real
+ * execution of the same provider (`cursor-pi-bridge-*`) is not a replay.
+ */
+export function isProviderReplayCall(event: unknown): boolean {
+	return (
+		readToolCallId(event)?.startsWith(PROVIDER_REPLAY_TOOL_CALL_ID_PREFIX) ===
+		true
+	);
+}
+
+/**
  * Classify an inbound `tool_call` or `tool_result` event.
  *
  * Returns `undefined` for every event that is not a file mutation pi-lens
@@ -930,8 +964,12 @@ export function classifyMutatingTool(
 	//
 	// A path field is required. Without one there is no target to record, and
 	// the settled sweep — not this branch — is the net for that shape.
+	//
+	// A provider's display-only replay is excluded (#5160): it ran before the
+	// replay arrived, and a persisted entry that already names its tool is
+	// ignored here rather than rewritten.
 	const learnedPath = resolveMutationPath(input);
-	if (learnedPath !== undefined) {
+	if (learnedPath !== undefined && !isProviderReplayCall(event)) {
 		const learned = lookupLearnedMutatingTool(toolName);
 		if (learned !== undefined) {
 			return {

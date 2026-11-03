@@ -1,4 +1,3 @@
-// flake-shape: in-process-mock — clients/lsp/capabilities stands in for the language-server process (the LSP double computes diagnostics from the bytes it is handed); every other pi-lens module on the chain is real
 /**
  * #4483 witness (ADR 0007): on a file's first write in a session, a linter
  * error the file already had is not a STOP blocker.
@@ -19,6 +18,9 @@
  *
  * Every write goes through the host order: `tool_call` (the bytes on disk are
  * still the old ones), then the write, then `tool_result`.
+ *
+ * The `--no-delta` cell moved to tier 2 with the real flag, in
+ * `tests/index-4483-no-delta-flag.test.ts` (#4937 L6).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -163,25 +165,6 @@ vi.mock("../clients/safe-spawn.js", async (importOriginal) => ({
 		boundary.isDoubled(command) ? command : null,
 }));
 
-vi.mock("../clients/lsp/capabilities.js", async (importOriginal) => {
-	const original =
-		await importOriginal<typeof import("../clients/lsp/capabilities.js")>();
-	const { makeLspServiceDouble } =
-		await import("./support/lsp-service-double.js");
-	const double = makeLspServiceDouble({
-		supportsLSP: () => boundary.lsp.enabled,
-		hasLSP: async () => boundary.lsp.enabled,
-		touchFile: boundary.lsp.touch,
-	});
-	return {
-		...original,
-		// Always the double: with `enabled` off it supports no file, so no
-		// real language server is ever spawned for the shell cells.
-		getLSPService: () =>
-			double as unknown as ReturnType<typeof original.getLSPService>,
-	};
-});
-
 import extension from "../index.js";
 import { resetDegradationLedger } from "../clients/degradation-ledger.js";
 import {
@@ -202,6 +185,9 @@ import {
 import { removeTempDirSync } from "./clients/test-utils.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { useGlobalConfig } from "./support/global-config.js";
+import { installLspServiceDouble } from "./support/lsp-service-seam.js";
+import { readNdjsonRows } from "./support/ndjson-rows.js";
 
 let tmpDir = "";
 const originalTestMode = process.env.PI_LENS_TEST_MODE;
@@ -212,7 +198,14 @@ beforeAll(() => {
 	);
 });
 afterAll(() => removeTempDirSync(tmpDir));
-beforeEach(() => {
+beforeEach(async () => {
+	// Always the double: with `enabled` off it supports no file, so no real
+	// language server is ever spawned for the shell cells.
+	await installLspServiceDouble({
+		supportsLSP: () => boundary.lsp.enabled,
+		hasLSP: async () => boundary.lsp.enabled,
+		touchFile: boundary.lsp.touch,
+	});
 	process.env.PI_LENS_TEST_MODE = "0";
 	// Each cell is a separate session but shares this temporary project. A
 	// blocker intentionally left by one cell must not become the next cell's
@@ -252,45 +245,42 @@ async function rows(
 	name: string,
 ): Promise<Array<{ result?: string; metadata?: Record<string, unknown> }>> {
 	await flushLatencyLog();
-	return fs
-		.readFileSync(getLatencyLogPath(), "utf8")
-		.split("\n")
-		.filter((line) => line.includes(file) && line.includes(`"${name}"`))
-		.map(
-			(line) =>
-				JSON.parse(line) as {
-					filePath?: string;
-					phase?: string;
-					result?: string;
-					metadata?: Record<string, unknown>;
-				},
-		)
+	const read = readNdjsonRows(getLatencyLogPath());
+	// A row whose write was torn cannot be the row this witness names: red
+	// rather than read a shorter trace as the answer.
+	expect(read.skipped).toBe(0);
+	return read.rows
 		.filter(
 			(r) => r.filePath === file && (r.phase === name || r.result === name),
-		);
+		)
+		.map((r) => ({
+			result: r.result as string | undefined,
+			metadata: r.metadata as Record<string, unknown> | undefined,
+		}));
 }
 
 /**
  * One host session over one file that exists before the session starts.
- * `flags` are the host flags.
+ * `config` is the global config over the lens-guard default.
  */
 async function openSession(
 	name: string,
 	file: string,
 	before: string,
-	flags: Record<string, unknown> = {},
+	config: Record<string, unknown> = {},
 ) {
 	const target = path.join(tmpDir, file);
 	fs.mkdirSync(path.dirname(target), { recursive: true });
 	fs.writeFileSync(target, before);
-	const pi = createPiMock({ "lens-guard": true, ...flags });
+	setGlobalConfig({ guard: { enabled: true }, ...config });
+	const pi = createPiMock();
 	extension(pi.asExtensionAPI());
-	const ctx = () => makeCtx({ cwd: tmpDir });
-	await pi.emit(
-		"session_start",
-		makeSessionStartEvent(),
-		makeCtx({ cwd: tmpDir, sessionId: `pi-lens-4483-${name}` }),
-	);
+	// #4733 r5: every event carries this session's id. A shutdown with no id
+	// left the first cell holding the primary registration, so every later cell
+	// ran as its secondary and inherited the first cell's inline blockers.
+	const sessionId = `pi-lens-4483-${name}`;
+	const ctx = () => makeCtx({ cwd: tmpDir, sessionId });
+	await pi.emit("session_start", makeSessionStartEvent(), ctx());
 	await pi.emit("turn_start", {}, ctx());
 	let call = 0;
 	const read = async () => {
@@ -411,6 +401,8 @@ async function openSession(
 
 const OLD_ERROR = "#!/bin/sh\nBAD_SH\necho a\n";
 
+const setGlobalConfig = useGlobalConfig();
+
 describe("#4483 witness: a linter blocks on the delta at a file's first write", () => {
 	it("does not stop on a linter error the file had before its first edit (acceptance 1)", async () => {
 		const s = await openSession("a1", "scripts/a1.sh", OLD_ERROR);
@@ -418,7 +410,7 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 		expect(out).not.toContain("🔴 STOP");
 		expect(out).not.toMatch(/clean/);
 		expect(out).toMatch(
-			/Pre-existing: 1 linter error .*\(L2\); not blocking\./,
+			/Pre-existing: 1 linter error .*\(L2 SC1072\); not blocking\./,
 		);
 		expect(await s.commitBlocked()).toBe(false);
 		// The capture read the bytes before the edit; the record says so.
@@ -457,7 +449,7 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 		const s = await openSession("a3", "scripts/a3.sh", OLD_ERROR);
 		const out = await s.write("#!/bin/sh\necho first\nBAD_SH\necho a\n");
 		expect(out).not.toContain("🔴 STOP");
-		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L3\)/);
+		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L3\b/);
 		expect(await s.commitBlocked()).toBe(false);
 		await s.end();
 	});
@@ -472,7 +464,7 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 		expect(out).toContain("🔴 STOP — 1 issue(s) must be fixed:");
 		expect(out).toContain("L4: [SC2154]");
 		expect(out).not.toContain("L3: [SC1072]");
-		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L3\)/);
+		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L3\b/);
 		expect(await s.commitBlocked()).toBe(true);
 		await s.write("#!/bin/sh\nBAD_SH\nVAR=1\necho $VAR\n");
 		await s.end();
@@ -505,7 +497,7 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 		expect(await rows(s.target, "pre_edit_capture")).toHaveLength(1);
 		expect(out).not.toContain("🔴 STOP");
 		expect(out).not.toMatch(/Still unfixed/);
-		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L2\)/);
+		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L2\b/);
 		expect(await s.commitBlocked()).toBe(false);
 		await s.end();
 	});
@@ -527,7 +519,7 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 		const s = await openSession("c12", "scripts/c12.sh", OLD_ERROR);
 		const out = await s.edit("echo a", "BAD_SH");
 		expect(out).toContain("🔴 STOP — 1 issue(s) must be fixed:");
-		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L(2|3)\)/);
+		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L(2|3)\b/);
 		expect(await s.commitBlocked()).toBe(true);
 		await s.write("#!/bin/sh\necho a\n");
 		await s.end();
@@ -600,19 +592,6 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 			outcome: "discarded",
 			reason: "already-dispatched",
 		});
-		await s.end();
-	});
-
-	it("captures nothing with --no-delta, where every finding is reported anyway", async () => {
-		const s = await openSession("no-delta", "scripts/no-delta.sh", OLD_ERROR, {
-			"no-delta": true,
-		});
-		const out = await s.edit("echo a", "echo b");
-		expect(out).toContain("🔴 STOP — 1 issue(s) must be fixed:");
-		// No run read the bytes before the edit.
-		expect(boundary.sh.runs).not.toContain(OLD_ERROR);
-		expect(await rows(s.target, "pre_edit_capture")).toEqual([]);
-		await s.write("#!/bin/sh\necho b\n");
 		await s.end();
 	});
 
@@ -902,7 +881,44 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 		await s.edit("echo b", "echo c");
 		const out = await s.edit("echo c", "echo d");
 		expect(out).not.toContain("🔴 STOP");
-		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L2\)/);
+		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L2\b/);
+		await s.end();
+	});
+
+	it("keeps another session's saved section for a linter blocker the seed calls pre-existing (#4733 r5 G3)", async () => {
+		// RECURRENCE GUARDED: #4733 r5 G3. The seed re-classified a blocker the
+		// linter still reports as pre-existing, the write then read as a whole-file
+		// clean verdict, and another session's saved section for that blocker left
+		// the record: the commit ran on a blocker shellcheck still reported.
+		const s = await openSession("g3", "scripts/g3.sh", OLD_ERROR);
+		const section = `${s.target}: 🔴 STOP — 1 issue(s) must be fixed:\n  L2: [shellcheck] SC1072`;
+		new CacheManager(false).writeCache(
+			"turn-end-findings",
+			{
+				content: section,
+				blockerContent: section,
+				blockingFiles: [s.target],
+				hasBlockers: true,
+				affectedFiles: [s.target],
+				sessionId: "an-earlier-session",
+				projectSeqStart: 0,
+				projectSeqEnd: 0,
+				fileSeqByPath: {},
+				fileContentHashes: {},
+				consumed: true,
+			},
+			tmpDir,
+		);
+		const out = await s.edit("echo a", "echo b");
+		expect(out).toMatch(/Pre-existing: 1 linter error .*\(L2\b/);
+		expect(
+			new CacheManager(false).readCache<{ blockerContent?: string }>(
+				"turn-end-findings",
+				tmpDir,
+				Number.POSITIVE_INFINITY,
+			)?.data?.blockerContent ?? "",
+		).toContain(section);
+		expect(await s.commitBlocked()).toBe(true);
 		await s.end();
 	});
 
@@ -917,7 +933,7 @@ describe("#4483 witness: a linter blocks on the delta at a file's first write", 
 		resetDispatchBaselines();
 		const out = await s.edit("#!/bin/sh", "#!/bin/sh -e");
 		expect(out).not.toMatch(/Pre-existing/);
-		expect(out).toMatch(/Still unfixed: 1 blocker reported earlier \(L2\)/);
+		expect(out).toMatch(/Still unfixed: 1 blocker reported earlier \(L2\b/);
 		expect(await s.commitBlocked()).toBe(true);
 		await s.edit("BAD_SH", "echo a");
 		await s.end();

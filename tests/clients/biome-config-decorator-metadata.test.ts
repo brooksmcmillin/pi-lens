@@ -184,6 +184,18 @@ it("real Biome and TypeScript binaries are installed in CI", () => {
 	}
 });
 
+// #4886: biome 2.6 renamed nursery `useSortedClasses`, and the managed
+// installer tracks the latest biome, so the one nursery key in this config made
+// every fallback run exit on a config error. The real-binary case below proves
+// only the pinned devDependency; this keeps keys that churn between minors out.
+it("bundled fallback config names no nursery rules", () => {
+	const config = fs.readFileSync(
+		path.join(REPO_ROOT, "config", "biome", "core.jsonc"),
+		"utf-8",
+	);
+	expect(config).not.toMatch(/"nursery"\s*:/);
+});
+
 // Skipped visibly when the real binaries are absent; the title names them so
 // a skipped report reads as a dependency skip, not a pass.
 describe.skipIf(!BINARIES_PRESENT)(

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { LANGUAGE_TO_GRAMMAR } from "../../clients/grammar-source.js";
 import { gitExecFileSync } from "../support/git-fixture-env.js";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const root = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -68,33 +69,41 @@ function findShadowedTrackedFiles(): string[] {
 }
 
 describe("gitignore does not shadow tracked files (#2250)", () => {
-	it("no git-tracked file is reported ignored by git check-ignore --no-index", () => {
-		const shadowed = findShadowedTrackedFiles();
-		expect(shadowed).toEqual([]);
-	});
+	it(
+		"no git-tracked file is reported ignored by git check-ignore --no-index",
+		() => {
+			const shadowed = findShadowedTrackedFiles();
+			expect(shadowed).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("tracks a grammar-health fixture for every LANGUAGE_TO_GRAMMAR key (#4012)", () => {
-		// Recurrence: PR #4093 r1 committed 26 of 27 fixtures. The root `*.js`
-		// ignore rule hid javascript.js, so a working tree that held the file
-		// passed every local check while CI (which checks out only tracked
-		// files) reported it missing. The index, not the directory, is the
-		// population.
-		const corpus = "tests/fixtures/grammar-health";
-		const tracked = new Set(
-			trackedFiles()
-				.split("\0")
-				.filter((file) => file.startsWith(`${corpus}/`))
-				.map((file) => {
-					const name = file.slice(corpus.length + 1);
-					return name.slice(0, name.indexOf("."));
-				}),
-		);
-		assertNonEmptyScan("tracked grammar corpus fixtures", tracked.size, 20);
-		expect(
-			Object.keys(LANGUAGE_TO_GRAMMAR)
-				.filter((language) => !tracked.has(language))
-				.sort(),
-		).toEqual([]);
-	});
+	it(
+		"tracks a grammar-health fixture for every LANGUAGE_TO_GRAMMAR key (#4012)",
+		() => {
+			// Recurrence: PR #4093 r1 committed 26 of 27 fixtures. The root `*.js`
+			// ignore rule hid javascript.js, so a working tree that held the file
+			// passed every local check while CI (which checks out only tracked
+			// files) reported it missing. The index, not the directory, is the
+			// population.
+			const corpus = "tests/fixtures/grammar-health";
+			const tracked = new Set(
+				trackedFiles()
+					.split("\0")
+					.filter((file) => file.startsWith(`${corpus}/`))
+					.map((file) => {
+						const name = file.slice(corpus.length + 1);
+						return name.slice(0, name.indexOf("."));
+					}),
+			);
+			assertNonEmptyScan("tracked grammar corpus fixtures", tracked.size, 20);
+			expect(
+				Object.keys(LANGUAGE_TO_GRAMMAR)
+					.filter((language) => !tracked.has(language))
+					.sort(),
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 // flake-shape: real-process-spawn — real gitignore rules and index entries decide shadow files outside the test process

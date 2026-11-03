@@ -11,6 +11,7 @@ import {
 	flushLatencyLog,
 	getLatencyLogPath,
 } from "../../clients/latency-logger.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
 import {
 	isExcludedTestTarget,
 	RUNNERS,
@@ -20,15 +21,19 @@ import {
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 import { setProjectTrustState } from "../../clients/project-trust.js";
 
-// Only the resolveExec matrix below (#1098) needs this mocked; every other
-// test in this file never reaches a `findGlobalBinary` call.
-const findGlobalBinary =
-	vi.fn<(command: string) => Promise<string | undefined>>();
+// Host isolation only (#4709 slice 3b round 2): the cases here that reach
+// runTestFileAsync without a local runner would otherwise run the REAL
+// `findGlobalBinary`, which spawns the host's `which`/npm/pnpm/yarn and so
+// depends on what the maintainer's machine has installed. No case in this file
+// asserts on the lookup (the observing cases moved to
+// test-runner-resolve-exec.test.ts, against the PATH-probe stub), so the
+// answer is a constant `undefined`. Recurrence: Greptile P2 on #4754, where
+// dropping this mock leaked 21 host probes per run (npm, pnpm and yarn each).
 vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
 	...(await importOriginal<
 		typeof import("../../clients/package-manager.js")
 	>()),
-	findGlobalBinary: (command: string) => findGlobalBinary(command),
+	findGlobalBinary: async () => undefined,
 }));
 
 const cleanups: Array<() => void> = [];
@@ -1513,6 +1518,108 @@ describe("test-runner-client", () => {
 			});
 		});
 
+		// #4689 batch 2 (clients/test-runner-client.ts `canonicalFailedPath`): the
+		// failed-target maps key by the path identity, so a failure recorded
+		// through a link spelling is retired by a pass through the real spelling.
+		// The cell pins the identity key once the redundant inner realpath is gone;
+		// it passes on master too (`normalizeMapKey` already resolved), so the
+		// mutation row, not a red-first run, is its proof.
+		it("retires a failure recorded through a link spelling when the real spelling passes (#4689)", async (ctx) => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-4689-");
+			const aliasRoot = `${tmpDir}-alias`;
+			try {
+				fs.symlinkSync(
+					tmpDir,
+					aliasRoot,
+					process.platform === "win32" ? "junction" : "dir",
+				);
+			} catch (error) {
+				cleanup();
+				return ctx.skip(`symlinks unavailable: ${String(error)}`);
+			}
+			cleanups.push(
+				() => fs.rmSync(aliasRoot, { recursive: true, force: true }),
+				cleanup,
+			);
+			fs.writeFileSync(path.join(tmpDir, "go.mod"), "module example.com/tmp\n");
+			const sourceFile = path.join(tmpDir, "widget.go");
+			const testFile = path.join(tmpDir, "widget_test.go");
+			fs.writeFileSync(sourceFile, "package widget\n");
+			fs.writeFileSync(testFile, "package widget\n");
+			const passingConfig = {
+				...failingNodeConfig,
+				args: (target: string) => [
+					"-e",
+					"console.log('ok  \texample.com/tmp\t0.001s');",
+					target,
+				],
+			};
+
+			const client = new TestRunnerClient(false);
+			const failed = await client.runTestFileAsync(
+				path.join(aliasRoot, "widget_test.go"),
+				aliasRoot,
+				"go",
+				failingNodeConfig,
+			);
+			expect(failed.failed).toBe(1);
+			expect(client.getTestRunTarget(sourceFile, tmpDir)?.strategy).toBe(
+				"failed-first",
+			);
+
+			const passed = await client.runTestFileAsync(
+				testFile,
+				tmpDir,
+				"go",
+				passingConfig,
+			);
+			expect(passed.failed).toBe(0);
+			expect(client.getTestRunTarget(sourceFile, tmpDir)?.strategy).not.toBe(
+				"failed-first",
+			);
+		});
+
+		// #4689 batch 2 round 2: a project root spelled `proj/lnk/..` (lnk ->
+		// deep/inner) is the kernel's `deep`; `path.resolve` folded it to `proj`
+		// first, so a failure recorded under it was invisible from `deep`. Only the
+		// root reaches `canonicalFailedPath` unfolded (`runTestFileAsync` resolves
+		// its test file first). Recurrence: #4853 F1, the same shape.
+		it("finds a failure recorded under a root spelled with `..` after a link from the kernel's spelling of that root (#4689)", async (ctx) => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-4689-");
+			cleanups.push(cleanup);
+			const proj = path.join(tmpDir, "proj");
+			const deep = path.join(tmpDir, "deep");
+			fs.mkdirSync(proj);
+			fs.mkdirSync(path.join(deep, "inner"), { recursive: true });
+			try {
+				fs.symlinkSync(
+					path.join(deep, "inner"),
+					path.join(proj, "lnk"),
+					process.platform === "win32" ? "junction" : "dir",
+				);
+			} catch (error) {
+				return ctx.skip(`symlinks unavailable: ${String(error)}`);
+			}
+			fs.writeFileSync(path.join(deep, "go.mod"), "module example.com/tmp\n");
+			fs.writeFileSync(path.join(deep, "widget.go"), "package widget\n");
+			fs.writeFileSync(path.join(deep, "x_test.go"), "package widget\n");
+			// not path.join: it folds the `..` lexically, which is the defect
+			const dotDotRoot = [proj, "lnk", ".."].join(path.sep);
+
+			const client = new TestRunnerClient(false);
+			const failed = await client.runTestFileAsync(
+				path.join(deep, "x_test.go"),
+				dotDotRoot,
+				"go",
+				failingNodeConfig,
+			);
+			expect(failed.failed).toBe(1);
+
+			expect(
+				client.getTestRunTarget(path.join(deep, "widget.go"), deep),
+			).toMatchObject({ strategy: "failed-first", runner: "go" });
+		});
+
 		it("retains indeterminate paths and writes bounded real telemetry", async () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-2044-");
 			cleanups.push(cleanup);
@@ -1867,6 +1974,41 @@ describe("test-runner-client", () => {
 		expect(detected?.runner).toBe("pytest");
 	});
 
+	it("anchors a package's runner under a session root spelled through a link (#4689)", (ctx) => {
+		// RECURRENCE GUARDED: review r1 F5. The source file arrives as a path
+		// identity (a dispatch key) while the dispatch root is the session's
+		// link spelling, so the file read as outside the root: detection fell
+		// back to every runner at the root (pytest here) instead of the
+		// package's own runner (#2870's anchoring).
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+		cleanups.push(cleanup);
+		const real = path.join(tmpDir, "mono");
+		const alias = path.join(tmpDir, "mono-alias");
+		const app = path.join(real, "packages", "app");
+		fs.mkdirSync(path.join(app, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(real, "pyproject.toml"),
+			"[tool.pytest.ini_options]\naddopts='-q'\n",
+		);
+		fs.writeFileSync(path.join(app, "package.json"), '{"name":"app"}');
+		fs.writeFileSync(
+			path.join(app, "vitest.config.ts"),
+			"export default {};\n",
+		);
+		fs.writeFileSync(path.join(app, "src", "a.ts"), "export const a = 1;\n");
+		try {
+			fs.symlinkSync("mono", alias, "dir");
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+
+		const client = new TestRunnerClient(false);
+		const sourceKey = normalizeMapKey(
+			path.join(alias, "packages", "app", "src", "a.ts"),
+		);
+		expect(client.detectRunner(alias, sourceKey)?.runner).toBe("vitest");
+	});
+
 	it("does not use global pytest fallback for non-Python files", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);
@@ -1899,6 +2041,64 @@ describe("test-runner-client", () => {
 			const found = client.findTestFile(src, tmpDir);
 			expect(found?.testFile).toBe(testFile);
 		});
+
+		// #2556 RECURRENCE GUARDED: `relativeSourceDir` read `path.relative(...)
+		// .startsWith("..")`, so a source directory named `..gen` (inside cwd) had
+		// no mirrored subdirectory and its test under tests/..gen/ was not found.
+		it("finds a mirrored test for a source under a ..-named directory (#2556)", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
+			const srcDir = path.join(tmpDir, "..gen");
+			fs.mkdirSync(srcDir, { recursive: true });
+			const src = path.join(srcDir, "knip-client.ts");
+			fs.writeFileSync(src, "export const x = 1;\n");
+
+			const testDir = path.join(tmpDir, "tests", "..gen");
+			fs.mkdirSync(testDir, { recursive: true });
+			const testFile = path.join(testDir, "knip-client.test.ts");
+			fs.writeFileSync(testFile, "// test\n");
+
+			const client = new TestRunnerClient(false);
+			expect(client.findTestFile(src, tmpDir)?.testFile).toBe(testFile);
+		});
+
+		// #2556: the other direction of the same guard. A source directory outside
+		// cwd has no mirrored subdirectory, so a file planted where the OUTSIDE
+		// directory's absolute spelling would land under tests/ is not a match.
+		// lane: Unit tests (ubuntu) — joining an absolute segment onto tests/ makes
+		// a path only a POSIX host can create, so the decoy cannot sit there on win32.
+		it.skipIf(process.platform === "win32")(
+			"does not mirror a source directory outside cwd under the tests tree (#2556)",
+			() => {
+				const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+				cleanups.push(cleanup);
+
+				const project = path.join(tmpDir, "proj");
+				const outside = path.join(tmpDir, "outside");
+				fs.mkdirSync(project, { recursive: true });
+				fs.mkdirSync(outside, { recursive: true });
+				fs.writeFileSync(
+					path.join(project, "vitest.config.ts"),
+					"export default {}\n",
+				);
+				const src = path.join(outside, "knip-client.ts");
+				fs.writeFileSync(src, "export const x = 1;\n");
+				const decoyDir = path.join(project, "tests", outside);
+				fs.mkdirSync(decoyDir, { recursive: true });
+				fs.writeFileSync(
+					path.join(decoyDir, "knip-client.test.ts"),
+					"// decoy\n",
+				);
+
+				const client = new TestRunnerClient(false);
+				expect(client.findTestFile(src, project)).toBeNull();
+			},
+		);
 
 		it("finds a mirrored test under __tests__/<subdir>/", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
@@ -3322,223 +3522,6 @@ describe("#2522 — turn-end selection excludes integration/e2e test targets", (
 		expect(result.passed).toBe(0);
 		expect(result.failed).toBe(0);
 		expect(result.error).toContain("aborted before start");
-	});
-});
-
-/**
- * Regression matrix for #1098: `resolveExec` used to drop
- * `config.args(testFile, cwd)[0]` UNCONDITIONALLY whenever local-bin or
- * global-bin resolution succeeded — an npx-wrapper-convention assumption
- * (arg 0 names the binary, like `npx vitest run …`) that only holds for
- * wrapper-style runners (vitest/jest/pytest). For direct runners whose
- * args() leads with a REAL subcommand (`cargo test --no-fail-fast`,
- * `go test -run . ./pkg`, `dotnet test --no-build`, `mvn test -q`,
- * `mix test <file>`), the same unconditional `.slice(1)` silently ate the
- * subcommand — e.g. `cargo test --no-fail-fast` became the argv-invalid
- * `cargo --no-fail-fast` (a clap usage error), which the runner then
- * misreported as "1/1 failed" at turn-end.
- *
- * The fix (`stripWrapperArgs` in clients/test-runner-client.ts) only drops
- * the leading arg(s) when they actually NAME the resolved binary — either
- * `[binName, ...]` (vitest/jest) or `["-m", binName, ...]` (pytest) — and
- * leaves everything else untouched.
- *
- * This asserts the invariant generically by iterating the EXPORTED
- * `RUNNERS` config table (not a hand-copied runner list), across every
- * resolution path `resolveExec` can take:
- *   - local-bin hit  (a real file dropped in node_modules/.bin, or
- *                      vendor/bin for phpunit's Composer convention)
- *   - global-bin hit (findGlobalBinary mocked to resolve)
- *   - fallback       (neither resolves; config.command is used verbatim)
- * so a future runner added to RUNNERS is automatically covered.
- *
- * The expected argv for each case is computed independently of the
- * production `stripWrapperArgs` helper (a local re-statement of the same
- * contract), so a regression that reintroduces unconditional stripping (or
- * any other over/under-stripping) fails this test rather than trivially
- * agreeing with whatever the implementation currently does.
- */
-describe("resolveExec argv preservation matrix (#1098)", () => {
-	const resolveCleanups: Array<() => void> = [];
-
-	beforeEach(() => {
-		findGlobalBinary.mockReset();
-		findGlobalBinary.mockResolvedValue(undefined);
-	});
-
-	afterEach(() => {
-		for (const c of resolveCleanups.splice(0)) c();
-	});
-
-	function expectedStrippedArgs(binName: string, args: string[]): string[] {
-		if (args[0] === binName) return args.slice(1);
-		if (args[0] === "-m" && args[1] === binName) return args.slice(2);
-		return args;
-	}
-
-	function binSuffix(): string {
-		return process.platform === "win32" ? ".cmd" : "";
-	}
-
-	for (const [runnerKey, config] of Object.entries(RUNNERS)) {
-		const binName = config.binName ?? runnerKey;
-
-		describe(`runner: ${runnerKey}`, () => {
-			it("preserves argv on local-bin resolution", () => {
-				const { tmpDir, cleanup } = setupTestEnvironment(
-					"pi-lens-resolve-exec-",
-				);
-				resolveCleanups.push(cleanup);
-				const client = new TestRunnerClient(false) as any;
-
-				let localBinPath: string;
-				if (runnerKey === "phpunit") {
-					const phpSuffix = process.platform === "win32" ? ".bat" : "";
-					localBinPath = path.join(
-						tmpDir,
-						"vendor",
-						"bin",
-						`phpunit${phpSuffix}`,
-					);
-				} else {
-					localBinPath = path.join(
-						tmpDir,
-						"node_modules",
-						".bin",
-						`${binName}${binSuffix()}`,
-					);
-				}
-				fs.mkdirSync(path.dirname(localBinPath), { recursive: true });
-				fs.writeFileSync(localBinPath, "");
-
-				const testFile = path.join(
-					tmpDir,
-					`sample_test${runnerKey === "go" ? ".go" : ".txt"}`,
-				);
-				const rawArgs = config.args(testFile, tmpDir);
-
-				return client
-					.resolveExec(runnerKey, config, testFile, tmpDir)
-					.then((resolved: { command: string; args: string[] }) => {
-						expect(resolved.command).toBe(localBinPath);
-						// phpunit's local (vendor/bin) resolution never strips —
-						// see the dedicated branch in resolveExec.
-						const expected =
-							runnerKey === "phpunit"
-								? rawArgs
-								: expectedStrippedArgs(binName, rawArgs);
-						expect(resolved.args).toEqual(expected);
-					});
-			});
-
-			if (runnerKey !== "phpunit") {
-				// phpunit has no separate global-bin resolution step — its
-				// non-local branch falls straight through to the fallback
-				// (`command: "phpunit"`), so it's covered by the fallback case
-				// below instead of duplicated here.
-				it("preserves argv on global-bin resolution", () => {
-					const { tmpDir, cleanup } = setupTestEnvironment(
-						"pi-lens-resolve-exec-",
-					);
-					resolveCleanups.push(cleanup);
-					const client = new TestRunnerClient(false) as any;
-
-					const globalBinPath = path.join(tmpDir, "global-bin", binName);
-					findGlobalBinary.mockImplementation(async (name: string) =>
-						name === binName ? globalBinPath : undefined,
-					);
-
-					const testFile = path.join(
-						tmpDir,
-						`sample_test${runnerKey === "go" ? ".go" : ".txt"}`,
-					);
-					const rawArgs = config.args(testFile, tmpDir);
-
-					return client
-						.resolveExec(runnerKey, config, testFile, tmpDir)
-						.then((resolved: { command: string; args: string[] }) => {
-							expect(resolved.command).toBe(globalBinPath);
-							expect(resolved.args).toEqual(
-								expectedStrippedArgs(binName, rawArgs),
-							);
-						});
-				});
-			}
-
-			it("preserves argv verbatim on fallback (no local/global bin)", () => {
-				const { tmpDir, cleanup } = setupTestEnvironment(
-					"pi-lens-resolve-exec-",
-				);
-				resolveCleanups.push(cleanup);
-				const client = new TestRunnerClient(false) as any;
-
-				const testFile = path.join(
-					tmpDir,
-					`sample_test${runnerKey === "go" ? ".go" : ".txt"}`,
-				);
-				const rawArgs = config.args(testFile, tmpDir);
-
-				return client
-					.resolveExec(runnerKey, config, testFile, tmpDir)
-					.then((resolved: { command: string; args: string[] }) => {
-						expect(resolved.command).toBe(
-							runnerKey === "phpunit" ? "phpunit" : config.command,
-						);
-						// Fallback never resolves a binary to become the command, so
-						// there is nothing to strip — args() is used verbatim.
-						expect(resolved.args).toEqual(rawArgs);
-					});
-			});
-		});
-	}
-
-	it("cargo's subcommand survives local-bin resolution (the reported #1098 case)", () => {
-		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
-		resolveCleanups.push(cleanup);
-		const client = new TestRunnerClient(false) as any;
-
-		const localBinPath = path.join(
-			tmpDir,
-			"node_modules",
-			".bin",
-			`cargo${binSuffix()}`,
-		);
-		fs.mkdirSync(path.dirname(localBinPath), { recursive: true });
-		fs.writeFileSync(localBinPath, "");
-
-		const testFile = path.join(tmpDir, "src", "lib.rs");
-
-		return client
-			.resolveExec("cargo", RUNNERS.cargo, testFile, tmpDir)
-			.then((resolved: { command: string; args: string[] }) => {
-				expect(resolved.command).toBe(localBinPath);
-				// Pre-fix, this was ["--no-fail-fast"] (the "test" subcommand was
-				// eaten), producing a clap usage error at spawn time.
-				expect(resolved.args).toEqual(["test", "--no-fail-fast"]);
-			});
-	});
-
-	it("rspec resolves the real binary name (bundle), not the runner key", () => {
-		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
-		resolveCleanups.push(cleanup);
-		const client = new TestRunnerClient(false) as any;
-
-		const bundleBinPath = path.join(tmpDir, "global-bin", "bundle");
-		findGlobalBinary.mockImplementation(async (name: string) =>
-			name === "bundle" ? bundleBinPath : undefined,
-		);
-
-		const testFile = path.join(tmpDir, "spec", "foo_spec.rb");
-
-		return client
-			.resolveExec("rspec", RUNNERS.rspec, testFile, tmpDir)
-			.then((resolved: { command: string; args: string[] }) => {
-				expect(resolved.command).toBe(bundleBinPath);
-				// "exec" is a real bundle subcommand, not the binary name — must
-				// survive intact so `bundle exec rspec <file>` reaches bundle.
-				expect(resolved.args).toEqual(["exec", "rspec", testFile]);
-				expect(findGlobalBinary).toHaveBeenCalledWith("bundle");
-			});
 	});
 });
 

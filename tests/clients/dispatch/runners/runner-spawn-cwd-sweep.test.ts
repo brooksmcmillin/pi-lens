@@ -148,7 +148,14 @@ const POPULATION_FILES = [
  * listGitHeadDelta (opaque-mutation-scan.ts, already counted).
  */
 const EXPECTED_FILES = 79;
-const EXPECTED_DIRECT_SITES = 135;
+// 135 -> 134 (#4532 round 3): `findBinaryOnPath` stopped spawning
+// `which`/`where` — the bare-command probe resolved its own binary through the
+// path and cwd it was asked to judge, so a project-supplied `which` ran. It is
+// an in-process PATH scan now, and 134 was the direct-spawn population it left.
+// 133 -> 134 (#4765): `validateOpengrepPack` runs the installed `opengrep`
+// `scan --validate --config <candidate>` before the cached registry pack is
+// swapped in, through this seam. (#4776 landed first and moved the base to 133.)
+const EXPECTED_DIRECT_SITES = 134;
 /**
  * Every same-file spawn-routing wrapper call site the scan discovers. Pinned
  * as a LIST, not a count, because the list is the part round 2 got wrong: it
@@ -197,6 +204,9 @@ const EXPECTED_WRAPPER_SITES = [
 	"clients/knip-client.ts:runAnalyze",
 	"clients/lsp/launch.ts:trySpawn",
 	"clients/lsp/launch.ts:trySpawn",
+	"clients/opaque-mutation-scan.ts:readGitStatusEntries",
+	"clients/opaque-mutation-scan.ts:readGitStatusEntries",
+	"clients/opaque-mutation-scan.ts:readGitStatusEntries",
 	"clients/opengrep-client.ts:runScan",
 	"clients/pipeline.ts:tryEslintFix",
 	"clients/pipeline.ts:analysePipeline",
@@ -236,13 +246,14 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"forwards a caller-supplied SpawnOptions object unchanged; its process-snapshot caller supplies no cwd and its argv does not resolve project configuration",
 	],
 	[
-		"clients/lsp/launch.ts#runStderrGuardedProbe:eedfa033",
-		"execFileSync runs a stderr probe and does not resolve project configuration",
+		"clients/lsp/launch.ts#runStderrGuardedProbe:efa508b2",
+		"safeSpawn runs a stderr-guarded probe (the Windows registry PATH read) and does not resolve project configuration",
 	],
-	[
-		"clients/lsp/launch.ts#findBinaryOnPath:90f3c9a8",
-		"execFileSync runs a PATH lookup and does not resolve project configuration",
-	],
+	// #4532 removed `clients/lsp/launch.ts#findBinaryOnPath:90f3c9a8` ("runs a
+	// PATH lookup and does not resolve project configuration"): round 2 passed
+	// the spawn cwd, and round 3 removed the spawn entirely. The probe is an
+	// in-process PATH scan now, so there is no child whose cwd could come from
+	// anywhere but itself.
 	[
 		"clients/pipeline.ts#runPipeline:6e2471d5",
 		"runPipeline hands its `ctx`, which carries `cwd`, to analysePipeline, its own body split off by #3506 so the queue hold's `finally` wraps it; the argument is named `ctx`, so the wrapper rule reads it as no cwd. The checked site is analysePipeline's runAutofix call",
@@ -260,8 +271,8 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"forwards the caller's SafeSpawnOptions object unchanged before adding safe-spawn defaults; the sole test-runner caller supplies no cwd",
 	],
 	[
-		"clients/metrics-history.ts#getCurrentCommit:021d92f7~df24802d",
-		"execSync runs Git with cwd = spawnDir, an existence walk from path.resolve(startDir) (startDir = path.dirname(filePath)) up to the first directory that exists, not a walk to the repository root; the site passes that cwd, and hasCwd=false here is resolveLocalInitializer failing closed on the reassigned let; this metrics probe does not resolve project configuration from the dispatch cwd",
+		"clients/metrics-history.ts#getCurrentCommit:b46d4221~df24802d",
+		"safeSpawn runs Git with cwd = spawnDir, an existence walk from path.resolve(startDir) (startDir = path.dirname(filePath)) up to the first directory that exists, not a walk to the repository root; the site passes that cwd, and hasCwd=false here is resolveLocalInitializer failing closed on the reassigned let; this metrics probe does not resolve project configuration from the dispatch cwd",
 	],
 	[
 		"clients/instance-reaper.ts#killPidTree:18e7d7ac",
@@ -296,24 +307,16 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"`<execPath> <verificationArgs>` verification that an installed managed binary runs at all",
 	],
 	[
-		"clients/installer/index.ts#getPythonUserBaseCandidates:3fead921",
-		"`python -m site --user-base` — a Python installation query, unrelated to any project",
-	],
-	[
-		"clients/installer/index.ts#installGitHubTool:13e31114~5ede8ca9",
+		"clients/installer/index.ts#installGitHubTool:13e31114~e4877154",
 		"`tar xf <archive> -C <tmpDir>` extraction inside the global pi-lens bin directory (GITHUB_BIN_DIR): the name carries no `cwd`, and the target is not a project",
 	],
 	[
-		"clients/installer/index.ts#installGitHubTool:34276407~5ede8ca9",
+		"clients/installer/index.ts#installGitHubTool:34276407~e4877154",
 		"Windows `Expand-Archive` extraction inside the global pi-lens bin directory",
 	],
 	[
-		"clients/installer/index.ts#installGitHubTool:bd7b7ee6~5ede8ca9",
+		"clients/installer/index.ts#installGitHubTool:bd7b7ee6~e4877154",
 		"`unzip -q -o <archive> -d <tmpDir>` extraction inside the global pi-lens bin directory",
-	],
-	[
-		"clients/installer/index.ts#installPipTool:3042a73f",
-		"`python -m site --user-base` after a pip install, to find where the binary landed",
 	],
 	[
 		"clients/installer/index.ts#installGemTool:94a5faab",
@@ -348,8 +351,8 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"forks the review worker with `process.execPath`; the project it must analyse is passed explicitly as the `--cwd=<dir>` argv flag, so the child's own directory is not the channel",
 	],
 	[
-		"clients/package-manager.ts#probeGlobalBinDirs:bf156997",
-		"`npm config get prefix` / `pnpm bin -g` / `yarn global bin` — global install-location queries",
+		"clients/package-manager.ts#probeGlobalBinDirs:4e67f697",
+		"`npm config get prefix` / `pnpm bin -g` / `yarn global bin` — global install-location queries; under untrusted pi trust they run from HOME (#4530) so a project `.npmrc` cannot redirect them",
 	],
 	[
 		"clients/safe-spawn.ts#safeSpawnAsync.killTree:77f62fd4",
@@ -426,7 +429,7 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 ];
 const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 	[
-		"clients/safe-spawn.ts#safeSpawn:ad6fe3ed~119c1ce6",
+		"clients/safe-spawn.ts#safeSpawn:ad6fe3ed~49fcf1a1",
 		"the synchronous safe-spawn path derives its cwd from its own compatibility options, not the dispatch resolveToolCwd seam",
 	],
 	[
@@ -598,8 +601,8 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes `targetDir` = path.resolve(cwd) from the scan API's own argument; the security clients are driven by the MCP surface, not by dispatch",
 	],
 	[
-		"clients/gitleaks-client.ts#GitleaksClient.runScan:94ae6442~353ea442",
-		"cwd is runScan's own `cwd` parameter, and the scoped gitleaks config is written against it",
+		"clients/gitleaks-client.ts#GitleaksClient.runScan.spawn:937d6f21~353ea442",
+		"cwd is runScan's own `cwd` parameter, captured by the spawn callback it hands the report-scan seam, and the scoped gitleaks config is written against it",
 	],
 	[
 		"clients/govulncheck-client.ts#GovulncheckClient.analyze:c23b1b18~4bd5cc03",
@@ -610,8 +613,12 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"cwd is runScan's own `cwd` parameter; `govulncheck -mode=source ./...` is relative to it by design",
 	],
 	[
-		"clients/installer/index.ts#runCommand:bed06f4a~dbf27697",
+		"clients/installer/index.ts#runCommand:bb1c961f~dbf27697",
 		"cwd is runCommand's own `cwd` parameter; its three call sites in this file are the checked ones",
+	],
+	[
+		"clients/installer/index.ts#probeUserBase:46b6fb79~eef5e504",
+		"`python -m site --user-base`, a Python installation query unrelated to any project, runs from HOME on purpose (#4530): `-m` puts the cwd on sys.path, so a session cwd would let a project's own `site.py` answer",
 	],
 	[
 		"clients/installer/index.ts#installArchiveTool:fb1fa312~a938e107",
@@ -658,7 +665,19 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"cwd is readGitHead's own `root` parameter — `git rev-parse HEAD` names the commit of the worktree at that directory, which is the query's subject (#4493)",
 	],
 	[
-		"clients/opaque-mutation-scan.ts#recoverOpaqueChangesViaGit:dad86fa7~1167a91f",
+		"clients/opaque-mutation-scan.ts#readGitStatusEntries:35a903e1~dbf27697",
+		"cwd is readGitStatusEntries's own `cwd` option — `git status --porcelain` reports the worktree at that directory, which is the query's subject, not a config-resolution start; its three callers below are the checked sites (#2894, #4612)",
+	],
+	[
+		"clients/opaque-mutation-scan.ts#captureGitDirtyPaths:ec85036b~ec85036b",
+		"cwd is captureGitDirtyPaths's own `root` parameter, the opaque prescan root whose pre-command dirty set it records (#4502)",
+	],
+	[
+		"clients/opaque-mutation-scan.ts#readSameHeadDiscards:ec85036b~ec85036b",
+		"cwd is readSameHeadDiscards's own `root` parameter, the same prescan root its baseline's dirty set was read in (#4502)",
+	],
+	[
+		"clients/opaque-mutation-scan.ts#recoverOpaqueChangesViaGit:ec85036b~ec85036b",
 		"cwd is recoverOpaqueChangesViaGit's own `root` parameter — `git status --porcelain` reports the worktree at that root, which is the query's subject, not a config-resolution start (#2894)",
 	],
 	[
@@ -670,16 +689,20 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"cwd is runScan's own `cwd` parameter, from which OpengrepClient.resolveConfig(cwd) already chose the rule config",
 	],
 	[
+		"clients/installer/managed-tool-refresh.ts#validateOpengrepPack:c4cbdb3a~1f7c40b0",
+		"not a project scan: `scan --validate --config <candidate>` only parses a downloaded rule file that lives in the pi-lens cache, so the cwd is that file's own directory (`path.dirname(candidate)`) and no project root exists in the weekly refresh (#4765)",
+	],
+	[
 		"clients/pipeline.ts#tryEslintFix:a8585677~dbf27697",
 		"cwd is tryEslintFix's own `cwd` parameter, used for the eslint `--version` probe; the checked site is runAutofix in this file",
 	],
 	[
-		"clients/pipeline.ts#tryRustClippyFix:3944a385~86686e4d",
-		'cwd is `cargoDir` = findNearestContaining(dirname(filePath), ["Cargo.toml"]): `cargo clippy --fix` must run at the package root',
+		"clients/pipeline.ts#tryRustClippyFix:3944a385~7820af64",
+		'cwd is `cargoDir` = findNearestContaining(dirname(realpathOrResolve(filePath)), ["Cargo.toml"]): `cargo clippy --fix` must run at the root of the package the file lives in (#4689 item 6)',
 	],
 	[
-		"clients/pipeline.ts#tryDartFix:d1ac8a0b~7514b242",
-		'cwd is `pubspecDir` = findNearestContaining(dirname(filePath), ["pubspec.yaml"]): `dart fix --apply` must run at the package root',
+		"clients/pipeline.ts#tryDartFix:d1ac8a0b~84f33121",
+		'cwd is `pubspecDir` = findNearestContaining(dirname(realpathOrResolve(filePath)), ["pubspec.yaml"]): `dart fix --apply` must run at the root of the package the file lives in (#4689 item 6)',
 	],
 	[
 		"clients/pipeline.ts#runAutofix:f63ee33e~f63ee33e",
@@ -690,7 +713,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"analysePipeline forwards its language `cwd` into runAutofix and separately passes the authoritative session root for adopted-writer admission (#4309)",
 	],
 	[
-		"clients/safe-spawn.ts#safeSpawnAsync:f7eca8ca~b4dc9aa5",
+		"clients/safe-spawn.ts#safeSpawnAsync:f7eca8ca~dd6a6e98",
 		"this IS the spawn seam: `spawnCwd` is the cwd its own caller passed in options, so the origin rule applies to the callers, not here",
 	],
 	[
@@ -702,7 +725,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes `targetDir` = path.resolve(cwd) from the scan API's own argument",
 	],
 	[
-		"clients/trivy-client.ts#TrivyClient.runScan:e9ed392e~353ea442",
+		"clients/trivy-client.ts#TrivyClient.runScan.spawn:89fa15ad~353ea442",
 		"cwd is runScan's own `cwd` parameter, the directory `trivy fs` is pointed at",
 	],
 ];

@@ -11,16 +11,11 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const evaluate = vi.fn();
 vi.mock("../../clients/shared-checkout-guard.js", () => ({
 	evaluateSharedCheckoutGuard: (...args: unknown[]) => evaluate(...args),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () => makeLspServiceDouble(),
-	resetLSPService: () => {},
 }));
 
 import { CacheManager } from "../../clients/cache-manager.js";
@@ -47,7 +42,8 @@ function deps(
 }
 
 describe("shared-checkout guard wiring (#2007)", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
+		await installLspServiceDouble();
 		evaluate.mockReset();
 		evaluate.mockResolvedValue({ block: false });
 	});

@@ -27,11 +27,6 @@ const createLSPClient = vi.fn();
 const logLatency = vi.fn();
 const logSessionStart = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -105,8 +100,11 @@ function latencyRecords(phase: string): LatencyRecord[] {
 }
 
 describe("client lifecycle records (#2372 ClientRegistry move)", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();

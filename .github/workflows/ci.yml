@@ -13,6 +13,11 @@ on:
   # carry `if: github.event_name == 'pull_request'` and are skipped there.
   merge_group:
     types: [checks_requested]
+  # #5062: a PR a workflow opens with GITHUB_TOKEN starts no `pull_request` run.
+  # The opening job dispatches this workflow on the bot branch instead; the run
+  # reports the same required check names on the branch head and takes the
+  # push-shaped full-suite path (docs/ci-bot-pr-checks.md).
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -22,20 +27,24 @@ jobs:
   # #3801: classify the diff once. `code` is false ONLY for a pull_request whose
   # every changed path is on the strict docs allowlist (root *.md, docs/**,
   # .changelog/**; scripts/ci-changed-files.mjs), and then the HEAVY ADVISORY
-  # job (CodeQL) does not start. The Unit shards, the Install
-  # tests and every other test job still run for a docs-only diff: a docs edit
-  # can red tests/clients and tests/scripts (docs/public-api-stability.md,
+  # job (CodeQL) does not start. The Unit shards and every other test job
+  # still run for a docs-only diff (the `Install test` legs report without
+  # installing, #5112): a docs edit can red tests/clients and tests/scripts (docs/public-api-stability.md,
   # docs/*_rules_catalog.md are read by them), so the suite is never skipped.
   # `formal` is true when the diff touches formal/ (or what runs it), and then
-  # `TLA+ models` model-checks. Push and any other event
+  # the `tla-shards` matrix model-checks. Push and any other event
   # get code=true formal=true, so master keeps the full suite, and every doubt
   # (unreadable or empty file list, API cap) resolves to the full suite too.
   #
   # `TLA+ models` is a REQUIRED check and never skips at job level: a job `if:`
   # that evaluates false reports `skipped`, which GitHub counts as passing, but
   # ci-verdict demands a literal `success` on a
-  # required row (#2618). It always starts and skips its STEPS. The name ends
-  # in `(advisory)`: this job reports, never gates.
+  # required row (#2618). The aggregate `tla-models` therefore always starts and
+  # reports. The four `tla-shards` MATRIX jobs are not required rows, so they
+  # skip at job level when `formal` is proven 'false' (#5082): a skipped job
+  # takes no runner, where the step-level skip they used before held one of the
+  # 20 concurrent slots for each of four jobs on 72 of 73 pull requests. The
+  # name of this job ends in `(advisory)`: it reports, never gates.
   changes:
     name: Changed files (advisory)
     runs-on: ubuntu-latest
@@ -70,10 +79,16 @@ jobs:
   # uncovered lifecycle script (#4028). Keep this early PR/push signal
   # independent of the required install lanes and make the cache boundary
   # explicit: the job-local directory starts empty and setup-node has no npm
-  # cache input. The exact PR head is checked out because `github.ref` is the
-  # mutable pull-request merge ref and can disappear after the run starts.
+  # cache input.
+  #
+  # #5112: not a pull_request job. It caught nothing in 30 days (1,410 runner
+  # minutes, #3995 slice A) and a pull request that changes the manifests or
+  # the lockfile still runs the same strict install through install-smoke.yml's
+  # `npm-strict` job (package.json and package-lock.json are in its paths).
+  # Master pushes and dispatches keep it.
   strict-install-cold-cache:
     name: Strict install (cold npm cache) (fast-fail)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # refs #3123: this is a single dependency install plus prepare; keep a
     # bounded runner even if the registry or a lifecycle child hangs.
@@ -83,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -176,8 +191,8 @@ jobs:
   # single job reached its 12-minute cap at 514 configs (master 623 s; PR heads
   # cancelled at 736 s, 881 s and 12m15s), because the population outgrew the
   # estimate this comment used to carry. The job id `tla-models` and the check
-  # name `TLA+ models` stay with the aggregate below (CodeQL `needs:` it, and
-  # the ruleset requires that name); the shard jobs are `tla-shards`.
+  # name `TLA+ models` stay with the aggregate below (the ruleset requires that
+  # name); the shard jobs are `tla-shards`.
   # Measured per-shard WALL time on master run 39380875926 (attempt 1):
   # 268 s, 349 s, 494 s and 726 s -- the round-robin split was unbalanced by
   # ~2.7x and shard 4 owned the tail. That shard hit the 12-minute cap TWICE,
@@ -207,8 +222,10 @@ jobs:
     needs: changes
     # #3801 (verify r2 V1): failed classification must not skip the model
     # shards. Empty `formal` output runs every config; only a proven 'false'
-    # skips model-checking steps. The strict aggregate below stays unchanged.
-    if: ${{ !cancelled() }}
+    # skips them. #5082: the skip is at JOB level so the four shards start no
+    # runner when formal/ is unchanged; the `tla-models` aggregate below reports
+    # the required check either way and reds when a shard that ran is red.
+    if: ${{ !cancelled() && needs.changes.outputs.formal != 'false' }}
     runs-on: ubuntu-latest
     strategy:
       # One red shard must not cancel its siblings: the log of every red shard
@@ -244,28 +261,21 @@ jobs:
 
     steps:
       # #3801: the models depend only on formal/ and the checker, so a diff that
-      # touches neither (the `changes` job) skips the model check at STEP level
-      # and this required check still concludes success. `!= 'false'`: only a
-      # proven-unchanged formal/ skips; an unreadable classification runs it.
-      - name: Skip the model check (formal/ unchanged)
-        if: needs.changes.outputs.formal == 'false'
-        run: echo "formal/ and scripts/check-tla-models.mjs are unchanged in this diff; model checking skipped (runs on every formal change and on master pushes)"
-
+      # touches neither (the `changes` job) never reaches these steps (#5082:
+      # the job-level `if` above). `!= 'false'`: only a proven-unchanged
+      # formal/ skips; an unreadable classification runs the full check.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: needs.changes.outputs.formal != 'false'
         with:
           ref: ${{ github.ref }}
           persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: needs.changes.outputs.formal != 'false'
         with:
           node-version: '22'
 
       # The runner image ships a JDK on PATH; the checker downloads the pinned
       # tla2tools.jar and verifies its sha256 before running it.
       - name: Model-check formal/ against each config's expected verdict
-        if: needs.changes.outputs.formal != 'false'
         run: |
           java -version
           node scripts/check-tla-models.mjs --shard ${{ matrix.shard }}/${{ strategy.job-total }}
@@ -284,9 +294,18 @@ jobs:
   # That reading is kept as a pass with a recorded `::warning::`; a shard
   # cancelled BEFORE its model-check step finished stays red, and unreadable
   # evidence fails closed. The reasoning is in the script's header.
+  #
+  # #5082: when `changes` proved formal/ unchanged, the `tla-shards` jobs are
+  # skipped at job level and this aggregate is the ONLY TLA+ job that starts.
+  # It reports success without a checkout or a verdict read, but only when BOTH
+  # facts hold (`formal` is the literal 'false' AND the shard job's result is
+  # `skipped`). Any other pairing -- a shard that ran and failed, an empty
+  # classification, a skipped shard job under a formal change -- reads the
+  # verdict seam, and `skipped` rows without a proven-unchanged formal/ fail
+  # there ("a shard row is missing from the evidence").
   tla-models:
     name: TLA+ models
-    needs: tla-shards
+    needs: [changes, tla-shards]
     if: always()
     runs-on: ubuntu-latest
     # Runs a checkout, one `node` and one API read; 10 min is the repo's floor
@@ -301,11 +320,17 @@ jobs:
     env:
       SHARDS_RESULT: ${{ needs.tla-shards.result }}
     steps:
+      - name: Report that no TLA+ model job was needed (formal/ unchanged)
+        if: needs.changes.outputs.formal == 'false' && needs.tla-shards.result == 'skipped'
+        run: echo "formal/ and scripts/check-tla-models.mjs are unchanged in this diff; the TLA+ shard jobs were not started (they run on every formal change and on master pushes)"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: needs.changes.outputs.formal != 'false' || needs.tla-shards.result != 'skipped'
         with:
           persist-credentials: false
 
       - name: Require every TLA+ models shard to succeed
+        if: needs.changes.outputs.formal != 'false' || needs.tla-shards.result != 'skipped'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -385,6 +410,10 @@ jobs:
       - name: ast-grep rule pair audit
         run: npm run audit:astgrep-rule-pairs
 
+  # #4397: a test file that depends on case order or on a sibling file passes
+  # in CI's file order and reds on a reorder or a shard split (#4390, #4391).
+  # Retain this fork's targeted integration coverage alongside changed-file
+  # shuffle coverage. Both are advisory; required Unit shards remain separate.
   targeted-tests-advisory:
     name: Targeted tests (advisory)
     if: github.event_name == 'pull_request'
@@ -406,7 +435,7 @@ jobs:
 
       # Lockfile-locked and script-free (SonarCloud githubactions:S8543 /
       # S6505 flagged the copied `npm install` here); the one piece of
-      # `prepare` the targeted vitest files need is the grammar download, run
+      # `prepare` the changed vitest files need is the grammar download, run
       # explicitly below. The Unit job keeps `npm install` because its
       # lockfile-in-sync check depends on it.
       - name: Install dependencies
@@ -419,8 +448,8 @@ jobs:
         run: npm run build
 
       # #4003: `--ignore-scripts` above skips `prepare`, so nothing here builds
-      # dist/; the LSP fixture files in the targeted set import it and fail with
-      # a named "run npm run build:dist first" precondition without it.
+      # dist/; a changed LSP fixture file imports it and fails with a named
+      # "run npm run build:dist first" precondition without it.
       - name: Build dist
         run: npm run build:dist
 
@@ -449,9 +478,9 @@ jobs:
       # PR adds run alone first; the time budget is the only bound (#4456).
       # The SHAs reach the script through `env`, never the `run:` text.
       - name: Changed test files, alone and shuffled
-        if: ${{ !cancelled() }}
         timeout-minutes: 8
         env:
+          # The interleaving kit's waitFor budget scales by this (#4437).
           PI_LENS_TEST_TIMEOUT_SCALE: '3'
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -514,9 +543,18 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
+      # #5082: this job restored ~/.npm twice. setup-node auto-caches npm
+      # (package.json names it in `packageManager`) under
+      # `node-cache-Linux-x64-npm-<lockfile hash>`, and the step below restores
+      # the same directory under `npm-Linux-node-22-<hash>`. The setup-node
+      # Linux entry is first-writer-wins and holds 676 bytes in the cache
+      # listing (2026-10-31), against 162 MB for the `npm-` entry, so it
+      # restores nothing. The `npm-` entry, which the push-to-master run saves
+      # and pull requests restore, is the one kept.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          package-manager-cache: false
 
       - name: Cache npm cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -801,26 +839,30 @@ jobs:
   # (about 40 jobs per push against about 20 concurrent slots), and on a head
   # whose required checks are red they were pure waste.
   #
-  # `needs:` reaches the required checks this workflow hosts (`lint-and-typecheck`,
-  # `tla-models`, the `unit-tests` aggregate, and every `install-test` leg); it
-  # cannot reach lint.yml, which hosts `knip` and `oxfmt format check`, so the
-  # script reads those two from the head's check-runs (a cheap poll; both
-  # finish in well under a minute and are long done by the time this job is
-  # reached). If any needed job is red or skipped this job is skipped and so
-  # are its dependents. If the check-runs show a red or never-finished lint.yml
-  # check, the gate step reports `ready=false` and FAILS, so the row is red and a
-  # run that was deferred for that reason is visible and distinguishable from a
-  # dropped one (ci-verdict reads it). The job name ends in `(advisory)` so
-  # ci-verdict never gates on it, red or not. The Windows Vitest subset was
-  # released here until #4518's promotion: it gates now, so it must start on
-  # every event, including the docs-only diff this gate skips.
+  # `needs:` reaches `lint-and-typecheck`, the `unit-tests` aggregate, the
+  # Windows leg, and every `install-test` leg. The script reads the rest from the
+  # head's check-runs (a cheap poll): lint.yml's `knip` and `oxfmt format check`,
+  # which `needs:` cannot reach, and `TLA+ models`, which can still be running on
+  # a formal head, so the poll waits up to 300 s for it. `tla-models` stays out of
+  # `needs:` because implicit success() reads every ancestor: its `tla-shards`
+  # need skips on most pull requests (#5082), and that skipped this gate and
+  # CodeQL with it (#5002).
+  # `Hot-path latency (advisory)` is required but not waited for: a master push
+  # path-filters that workflow, so its row can be absent here.
+  #
+  # If any needed job is red or skipped this job is skipped and so are its
+  # dependents. If the check-runs show a red or never-finished check, the gate
+  # step reports `ready=false` and FAILS, so the row is red and a run that was
+  # deferred for that reason is visible and distinguishable from a dropped one
+  # (ci-verdict reads it). The job name ends in `(advisory)` so ci-verdict never
+  # gates on it, red or not.
   heavy-gate:
     name: Heavy advisory gate (advisory)
     needs:
       - changes
       - lint-and-typecheck
-      - tla-models
       - unit-tests
+      - unit-tests-windows
       - install-test
     # #3801: only a code diff starts the heavy jobs: a docs-only pull request
     # runs every test job but not CodeQL, the one heavy job left behind this
@@ -846,20 +888,19 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
-      - name: Require the lint.yml required checks, then release the heavy advisory jobs
+      - name: Require the checks `needs` cannot prove, then release the heavy advisory jobs
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: node scripts/ci-heavy-gate.mjs --repo "$GITHUB_REPOSITORY" --sha "$HEAD_SHA" --context knip --context "oxfmt format check"
+        run: node scripts/ci-heavy-gate.mjs --repo "$GITHUB_REPOSITORY" --sha "$HEAD_SHA" --context knip --context "oxfmt format check" --context "TLA+ models"
 
   # GATING since #4518 (maintainer decision, 2026-10-17): the Windows unit leg
   # runs the real `win32` gates, and advisory reds were waved through (#4566
   # r14's `.cmd` branch, #4551). It therefore starts on every event like the
   # Unit shards -- never behind `heavy-gate`, whose docs-only skip would leave a
   # required row absent -- and it is not named `(advisory)` any more, so
-  # ci-verdict gates it. Branch protection must still list `Unit tests Windows`
-  # as a required status check; until it does, ci-verdict is the enforcement.
+  # ci-verdict gates it, and branch protection requires it.
   unit-tests-windows:
     name: Unit tests Windows
     runs-on: windows-latest
@@ -1159,8 +1200,24 @@ jobs:
     # install the repo's own tarball), and it made Install the LAST required
     # check in 35 of 37 green runs, landing a median 3.5 minutes after Unit
     # tests. Every required check on this workflow still runs to completion.
+    #
+    # #5112: ALWAYS REPORTS, INSTALLS ONLY WHEN IT CAN CATCH SOMETHING. The three
+    # legs are required contexts (`Install test (ubuntu-latest|windows-latest|
+    # macos-latest)`) and cost 10,875 runner minutes in 30 days for 0 real
+    # catches (#3995 slice A). On a pull request the first step asks
+    # scripts/ci-changed-files.mjs whether the diff touches INSTALL_PATHS
+    # (manifests, install and postinstall scripts, the scripts this job runs,
+    # `bin/`, the install workflows). When it does not, every step after it is
+    # skipped and the leg passes in seconds with the line "no install files
+    # changed". The job is never skipped at job level: a skipped job reports
+    # `skipped`, and ci-verdict demands a literal `success` on a required row
+    # (#2618), the way hot-path-latency.yml reports. A master push, the merge
+    # queue and a dispatch run every step: the script
+    # reads any non-pull_request event as install=true, and so does an
+    # unreadable or empty file list (shape 48, doubt installs).
     permissions:
       contents: read
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
@@ -1176,7 +1233,29 @@ jobs:
         with:
           node-version: '22'
 
+      # `shell: bash` on every leg: the Windows default is pwsh, which does not
+      # expand "$EVENT_NAME". The step has no `if`, so the verdict is written on
+      # every event and a crashed classifier reds the leg instead of passing it.
+      # The steps below test `!= 'false'`: an empty output installs.
+      - name: Classify the changed files
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ci-changed-files.mjs --event "$EVENT_NAME" --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
+
+      - name: No install files changed
+        if: steps.scope.outputs.install == 'false'
+        shell: bash
+        run: |
+          line="no install files changed: nothing to install, passing"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install dependencies
+        if: steps.scope.outputs.install != 'false'
         run: npm install --no-audit --no-fund
 
       # refs #3098: the ONLY case-insensitive POSIX filesystem in CI is this
@@ -1192,7 +1271,7 @@ jobs:
       # on its first outings. Promotion to gating is a separate decision after
       # several green legs (#3159 round 3).
       - name: POSIX case-insensitive anchors (APFS)
-        if: matrix.os == 'macos-latest'
+        if: github.event_name != 'pull_request' && matrix.os == 'macos-latest'
         continue-on-error: true
         shell: bash
         run: |
@@ -1210,8 +1289,16 @@ jobs:
       # counter the promotion decision above reads. 100 is under half of the
       # measured 223: the step exists to catch a run that executed nothing, and
       # a tight margin would red the required leg on a legitimate test removal.
+      #
+      # #5112: not a pull_request step, and neither is the step above. They
+      # share one condition so the floor never outlives its site, and the
+      # evaluated-floors registry admits a comparison of the event name. The
+      # anchors test is advisory and added a macOS build and a Vitest run to a
+      # leg a docs-only pull request now ends after the classify step. Master
+      # pushes keep it, after the merge, and the step is continue-on-error, so a
+      # case-insensitive regression shows as a failed step on a green leg.
       - name: APFS anchors evaluated floor
-        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && matrix.os == 'macos-latest' }}
         shell: bash
         run: |
           set -uo pipefail
@@ -1219,13 +1306,16 @@ jobs:
           node scripts/assert-evaluated.mjs --count "apfs-anchors=${count}" --floor 100
 
       - name: Rule catalog report (non-blocking)
+        if: steps.scope.outputs.install != 'false'
         continue-on-error: true
         run: npm run audit:rule-catalog
 
       - name: Pack tarball
+        if: steps.scope.outputs.install != 'false'
         run: npm pack
 
       - name: Verify required files in tarball
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: |
           TARBALL=$(ls pi-lens-*.tgz)
@@ -1259,6 +1349,7 @@ jobs:
           fi
 
       - name: Verify package.json entry points exist in tarball
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: |
           TARBALL=$(ls pi-lens-*.tgz)
@@ -1328,12 +1419,14 @@ jobs:
 
       # Intentional: this job verifies the package installs like pi installs it.
       - name: Install from tarball (simulates pi install npm:pi-lens)
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: | # zizmor: ignore[adhoc-packages]
           TARBALL=$(ls pi-lens-*.tgz)
           npm install -g "$TARBALL"
 
       - name: Verify bundled core grammars shipped in the tarball
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: |
           # Core grammars ship bundled in pi-lens/grammars (via prepare + files[]);
@@ -1347,6 +1440,7 @@ jobs:
           echo "Bundled core grammar checks passed"
 
       - name: Load each extension entry point (catches missing files)
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: |
           INSTALL_DIR=$(npm root -g)/pi-lens
@@ -1356,6 +1450,7 @@ jobs:
       # runs from the checkout against the GLOBAL install the earlier step made,
       # so it inspects what a real `pi install npm:pi-lens` produces.
       - name: Verify no host-provided package shipped in the tarball (#1926)
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: node scripts/check-prod-install-shape.mjs "$(npm root -g)/pi-lens"
 
@@ -1367,6 +1462,7 @@ jobs:
       # never hardcoded here. The type-only host SDK is deliberately NOT
       # installed (Windows MAX_PATH, #1334 S6).
       - name: Supply host-provided packages the way pi does (#1926)
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: | # zizmor: ignore[adhoc-packages]
           INSTALL_DIR=$(npm root -g)/pi-lens
@@ -1380,6 +1476,7 @@ jobs:
             --prefix "$INSTALL_DIR" "${HOST_PKGS[@]}"
 
       - name: Verify extension entry loads (catches missing node_modules deps)
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: |
           # Build the allowlist BEFORE leaving the checkout: the global install
@@ -1405,6 +1502,7 @@ jobs:
           echo "Extension import check passed"
 
       - name: Startup not weakened — entry loads from precompiled dist (#182)
+        if: steps.scope.outputs.install != 'false'
         shell: bash
         run: |
           # Loading the entry above made pi-lens self-report its load source to
@@ -1625,7 +1723,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
           build-mode: none
@@ -1634,6 +1732,6 @@ jobs:
               - cases
               - tests/fixtures
               - dist
-      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:${{ matrix.language }}"

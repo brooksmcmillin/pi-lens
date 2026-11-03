@@ -20,6 +20,10 @@ export declare function verdictMatches(
 ): boolean;
 export declare function describeVerdict(verdict: TlcVerdict): string;
 export declare function listModelConfigs(root: string): string[];
+export declare function ensureJar(
+	jarArg: string | undefined,
+	root: string,
+): Promise<string>;
 export declare function resolveJarPath(
 	jarArg: string | undefined,
 	root: string,
@@ -50,11 +54,38 @@ export type ModelCosts = {
 	root: string;
 	files: Record<string, number>;
 	max: number;
+	/** The recorded TLC distinct-state counts (#4714); absent before it. */
+	states?: Record<string, number>;
 };
 export declare function loadModelCosts(root: string): {
 	files: Record<string, number>;
 	max: number;
+	states: Record<string, number>;
 };
+/** TLC's distinct-state count from its statistics line, or null (#4714). */
+export declare function parseDistinctStates(output: string): number | null;
+/** How far a config's distinct-state count may grow past its recorded count. */
+export declare const STATE_COUNT_FACTOR: number;
+export type StateCountJump = {
+	id: string;
+	recorded: number;
+	observed: number;
+};
+/** The runs that grew past their recorded count by more than `factor`. */
+export declare function stateCountJumps(
+	outcomes: ReadonlyArray<{ id: string; distinctStates: number | null }>,
+	states: Record<string, number>,
+	factor?: number,
+): StateCountJump[];
+export declare function formatStateJump(
+	jump: StateCountJump,
+	factor?: number,
+): string;
+/** The configs that ran with a count but have no recorded count yet. */
+export declare function unrecordedStateCounts(
+	outcomes: ReadonlyArray<{ id: string; distinctStates: number | null }>,
+	states: Record<string, number>,
+): string[];
 /**
  * The cost table's key for `config`: its path under `root`, always posix.
  * `pathImpl` defaults to the host `path`; pass `path.win32` to dose one

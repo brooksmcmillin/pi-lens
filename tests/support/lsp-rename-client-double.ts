@@ -22,6 +22,10 @@ import { vi } from "vitest";
 import { LSPService } from "../../clients/lsp/index.js";
 import type { RenameTrackedSend } from "../../clients/lsp/edits.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
+import {
+	type ClientNotifyDouble,
+	makeClientNotifyDouble,
+} from "./lsp-client-notify-double.js";
 
 export type RenameClientDouble = {
 	root: string;
@@ -29,10 +33,7 @@ export type RenameClientDouble = {
 	isDocumentOpen: ReturnType<typeof vi.fn>;
 	getDocumentUri: ReturnType<typeof vi.fn>;
 	closeDocument: ReturnType<typeof vi.fn>;
-	notify: {
-		open: ReturnType<typeof vi.fn>;
-		watchedFileChange: ReturnType<typeof vi.fn>;
-	};
+	notify: ClientNotifyDouble;
 	willRenameFiles: ReturnType<typeof vi.fn>;
 	getOperationSupport: ReturnType<typeof vi.fn>;
 	getMalformedFileOperationRegistrations: ReturnType<typeof vi.fn>;
@@ -62,7 +63,7 @@ export function makeRenameClient(
 		isDocumentOpen: vi.fn(() => false),
 		getDocumentUri: vi.fn(() => undefined),
 		closeDocument: vi.fn(async () => undefined),
-		notify: { open: vi.fn(async () => undefined), watchedFileChange: vi.fn() },
+		notify: makeClientNotifyDouble(),
 		willRenameFiles: vi.fn(async () => edit),
 		getOperationSupport: vi.fn(() => ({
 			willRenameFiles: true,

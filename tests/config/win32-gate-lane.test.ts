@@ -18,6 +18,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const TESTS_ROOT = resolve(ROOT, "tests");
@@ -101,57 +102,66 @@ function detectedWin32GateFiles(): string[] {
 }
 
 describe("win32 gate lane governance (#2536)", () => {
-	it("names the lane for every Windows-only declarative gate", () => {
-		const missing: string[] = [];
-		let gateCount = 0;
+	it(
+		"names the lane for every Windows-only declarative gate",
+		() => {
+			const missing: string[] = [];
+			let gateCount = 0;
 
-		for (const { file: absolute, source: raw } of walkedTestSources()) {
-			const stripped = stripSource(raw);
-			for (const match of stripped.matchAll(windowsGatePattern())) {
-				const offset = match.index ?? 0;
-				if (
-					!isWindowsOnlyGate(
-						match[0],
-						raw.slice(offset, offset + match[0].length),
+			for (const { file: absolute, source: raw } of walkedTestSources()) {
+				const stripped = stripSource(raw);
+				for (const match of stripped.matchAll(windowsGatePattern())) {
+					const offset = match.index ?? 0;
+					if (
+						!isWindowsOnlyGate(
+							match[0],
+							raw.slice(offset, offset + match[0].length),
+						)
 					)
-				)
-					continue;
-				gateCount++;
-				const line = raw.slice(0, offset).split("\n").length;
-				const previousLine = raw.split("\n")[line - 2] ?? "";
-				if (!previousLine.trim().startsWith(LANE_HEADER)) {
-					missing.push(`${relativePosix(ROOT, absolute)}:${line}`);
+						continue;
+					gateCount++;
+					const line = raw.slice(0, offset).split("\n").length;
+					const previousLine = raw.split("\n")[line - 2] ?? "";
+					if (!previousLine.trim().startsWith(LANE_HEADER)) {
+						missing.push(`${relativePosix(ROOT, absolute)}:${line}`);
+					}
 				}
 			}
-		}
 
-		assertNonEmptyScan("win32 gate detection", gateCount, 1);
-		expect(missing, "every Windows-only gate must name windows-vitest").toEqual(
-			[],
-		);
-	});
+			assertNonEmptyScan("win32 gate detection", gateCount, 1);
+			expect(
+				missing,
+				"every Windows-only gate must name windows-vitest",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("keeps the workflow population and execution filter wired", () => {
-		const steps = windowsJobSteps();
-		const runner = steps.find(
-			(step) => step.name === "Run Windows Vitest subset",
-		);
-		const runnerRun = runner?.run ?? "";
+	it(
+		"keeps the workflow population and execution filter wired",
+		() => {
+			const steps = windowsJobSteps();
+			const runner = steps.find(
+				(step) => step.name === "Run Windows Vitest subset",
+			);
+			const runnerRun = runner?.run ?? "";
 
-		// Recurrence: #2536's gates can be documented yet omitted from the only
-		// Windows job, leaving the platform-specific assertions unexecuted. The
-		// enumeration step's command is pinned by windows-vitest-workflow.test.ts.
-		const detectedFiles = detectedWin32GateFiles();
-		const population = libraryLaneFiles();
-		expect(population).toContain(
-			"tests/clients/dispatch/runners/go-vet.test.ts",
-		);
-		expect(libraryGates().length).toBeGreaterThan(0);
-		expect(libraryGateFiles()).toEqual(expect.arrayContaining(detectedFiles));
-		expect(population).toEqual(expect.arrayContaining(detectedFiles));
-		expect(runnerRun).toContain('vitest run "${FILES[@]}"');
-		expect(runner?.shell).toBe("bash");
-	}, 60_000);
+			// Recurrence: #2536's gates can be documented yet omitted from the only
+			// Windows job, leaving the platform-specific assertions unexecuted. The
+			// enumeration step's command is pinned by windows-vitest-workflow.test.ts.
+			const detectedFiles = detectedWin32GateFiles();
+			const population = libraryLaneFiles();
+			expect(population).toContain(
+				"tests/clients/dispatch/runners/go-vet.test.ts",
+			);
+			expect(libraryGates().length).toBeGreaterThan(0);
+			expect(libraryGateFiles()).toEqual(expect.arrayContaining(detectedFiles));
+			expect(population).toEqual(expect.arrayContaining(detectedFiles));
+			expect(runnerRun).toContain('vitest run "${FILES[@]}"');
+			expect(runner?.shell).toBe("bash");
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// #3278 made this the SECOND admission: two tests/-tree walks blew vitest's
 	// 5 s default in the nightly Stryker job. Same 60 s budget and the same

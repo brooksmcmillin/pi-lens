@@ -18,12 +18,6 @@ import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(),
-}));
 // The real logger, observed: rows are dropped in test mode after the
 // in-process last-phase ring is updated.
 vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
@@ -36,9 +30,8 @@ import {
 	getLastLoggedPhase,
 	logLatency,
 } from "../../clients/latency-logger.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 type Content = Array<{ type: string; text?: string }>;
 
@@ -197,16 +190,14 @@ function newRuntime(dir: string): RuntimeCoordinator {
 const lines = (n: number, prefix = "line") =>
 	Array.from({ length: n }, (_, i) => `${prefix}${i + 1}`);
 
-beforeEach(() => {
+beforeEach(async () => {
 	vi.mocked(logLatency).mockClear();
-	vi.mocked(getLSPService).mockReturnValue(
-		makeLspServiceDouble({
-			supportsLSP: () => false,
-			hasLSP: async () => false,
-			openFile: async () => {},
-			touchFile: async () => {},
-		}) as never,
-	);
+	await installLspServiceDouble({
+		supportsLSP: () => false,
+		hasLSP: async () => false,
+		openFile: async () => {},
+		touchFile: async () => {},
+	});
 });
 
 describe("#3555: a widened read is labelled", () => {

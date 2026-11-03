@@ -327,14 +327,25 @@ describe("turn-end unresolved inline blockers honor dispositions (#3246)", () =>
 
 			// The next turn touches only the unrelated file — the exact shape the
 			// report describes ("it came back on a turn I never touched it").
+			// #4921: the unmarked two are the same two, already delivered, so the
+			// turn does not hand them to the agent again (it used to, because the
+			// duplicate key held the touched-file set).
 			runtime.beginTurn();
 			registerEdit(cacheManager, cwd, unrelated);
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
-			const second = turnEndText(cacheManager, cwd, runtime);
-			expect(second).toContain("L2: finding 2");
-			expect(second).toContain("L4: finding 4");
-			expect(second).not.toContain("finding 1");
-			expect(second).not.toContain("finding 3");
+			expect(turnEndText(cacheManager, cwd, runtime)).toBe("");
+
+			// They are still held, not dropped: marking one more changes the set,
+			// and the next unrelated-file turn delivers the remaining one alone.
+			markFalsePositive(cwd, diagnostics[1]);
+			runtime.beginTurn();
+			registerEdit(cacheManager, cwd, unrelated);
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+			const third = turnEndText(cacheManager, cwd, runtime);
+			expect(third).toContain("L4: finding 4");
+			expect(third).not.toContain("finding 1");
+			expect(third).not.toContain("finding 2");
+			expect(third).not.toContain("finding 3");
 		} finally {
 			env.cleanup();
 		}
@@ -488,41 +499,31 @@ describe("turn-end unresolved inline blockers honor dispositions (#3246)", () =>
 			expect(text).not.toContain("Unresolved from this turn");
 			expect(text).toContain("alpha is unsafe");
 			expect(text).toContain("stale");
-			// A demoted record renders through the advisory channel, so the policy
-			// never runs on it — countable as such, not as a zero-candidate live
-			// record.
+			// #4990: the demoted arm runs the same policy pass as the live one, so the
+			// stale record now contributes its candidate (which the stale mark did
+			// NOT suppress, because it was anchored to the old line's bytes).
 			expect(inlinePolicyRows()[0]?.metadata).toMatchObject({
 				records: 1,
 				stale: 1,
-				candidates: 0,
+				candidates: 1,
+				kept: 1,
+				dispositionSuppressed: 0,
 			});
 		} finally {
 			env.cleanup();
 		}
 	});
 
-	it("leaves a dependency-drift demotion to its re-run advisory even when every finding is marked", async () => {
-		// THE RULE, stated (review round 2): the policy runs on the LIVE arm
-		// only. A record the freshness sweep demoted for dependency drift keeps
-		// rendering its `[stale — re-run to confirm]` advisory even when every
-		// finding on it is marked `false-positive`, and the bounded record counts
-		// it as stale with ZERO candidates rather than as a suppressed live set.
-		//
-		// Why that is the right arm to leave alone, not an oversight:
-		//   1. The stale advisory is not an assertion that the finding is true —
-		//      it asks for a re-run. Suppressing it would turn "unconfirmed" into
-		//      silence, which reads as "confirmed clean".
-		//   2. The re-run honors the mark at its own source: a fresh dispatch
-		//      filters through `applyDispositions` before it ever builds a
-		//      record, so the mark takes effect the moment the record is
-		//      replaced.
-		//   3. This arm drives #1950's delivery-count commits and #1944's
-		//      one-delivery retirement. Skipping a delivery here would silently
-		//      change cap accounting — a redesign of gates #3246's non-goals put
-		//      out of scope.
-		//   4. It is BOUNDED: the dependency-drift arm retires after
-		//      DEPENDENCY_DRIFT_MAX_DELIVERIES, so a marked-but-stale finding
-		//      cannot reproduce the unbounded session-long replay #3246 reports.
+	it("a dependency-drift demotion honours a mark whose bytes still match (#4990)", async () => {
+		// #4990 reverses the review-round-2 rule this case used to pin. That rule
+		// left the demoted arm outside the policy, reasoning that suppressing an
+		// advisory turns "unconfirmed" into silence. The report shows the cost:
+		// the agent had already judged the finding, and the one surface that kept
+		// re-serving it ignored that decision on every turn end. A stored mark is
+		// the agent's decision about the FINDING, not a claim that the bytes are
+		// clean; the same stack the live arm runs now decides the demoted arm's
+		// body too, and the delivery cap still bounds a record that is never
+		// marked.
 		//
 		// The demotion here is the REAL sweep's: a forward import drifts on disk
 		// after the verdict, with the target's own bytes untouched — so the
@@ -557,17 +558,24 @@ describe("turn-end unresolved inline blockers honor dispositions (#3246)", () =>
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 
 			const text = turnEndText(cacheManager, cwd, runtime);
-			expect(text).toContain("[stale — re-run to confirm]");
+			expect(text).not.toContain("[stale — re-run to confirm]");
+			expect(text).not.toContain("unresolved import");
 			expect(text).not.toContain("Unresolved from this turn");
-			// The marked finding is still named on the advisory arm — the
-			// asymmetry this case exists to pin.
-			expect(text).toContain("unresolved import");
+			// Countable, not silent: the stale record offers its candidate and the
+			// mark removes it. A fully suppressed record leaves the commit gate, as
+			// every other fully suppressed record does (#3248).
 			expect(inlinePolicyRows()[0]?.metadata).toMatchObject({
 				records: 1,
 				stale: 1,
-				candidates: 0,
-				dispositionSuppressed: 0,
+				candidates: 1,
+				kept: 0,
+				dispositionSuppressed: 1,
 			});
+			const snapshot = runtime.getInlineBlockersSnapshot();
+			expect(snapshot).toHaveLength(1);
+			expect(snapshot[0]?.staleReason).toBe("dependency-drift");
+			expect(snapshot[0]?.policySuppressed).toBe(true);
+			expect(runtime.gitGuardHasBlockers).toBe(false);
 		} finally {
 			env.cleanup();
 		}

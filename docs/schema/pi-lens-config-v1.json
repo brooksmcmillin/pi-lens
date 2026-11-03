@@ -139,6 +139,18 @@
     "guard": {
       "x-stability": "stable"
     },
+    "astGrep": {
+      "x-stability": "stable"
+    },
+    "zizmor": {
+      "x-stability": "stable"
+    },
+    "typos": {
+      "x-stability": "stable"
+    },
+    "spotbugs": {
+      "x-stability": "stable"
+    },
     "opengrep": {
       "x-stability": "stable"
     },
@@ -398,6 +410,17 @@
     "turnEnd": {
       "x-stability": "stable"
     },
+    "fallow": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "x-stability": "experimental"
+        }
+      },
+      "x-stability": "stable"
+    },
     "knip": {
       "type": "object",
       "additionalProperties": true,
@@ -479,6 +502,16 @@
       "x-stability": "stable"
     },
     "dispatch": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "disabledRunners": {
+          "type": "array",
+          "items": { "type": "string", "x-stability": "experimental" },
+          "x-deny": "array-union",
+          "x-stability": "experimental"
+        }
+      },
       "x-stability": "stable"
     },
     "widget": {

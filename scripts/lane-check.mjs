@@ -17,10 +17,10 @@ import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import {
 	changedFiles as committedChangedFiles,
 	findStaleDistFiles,
+	resolveBaseRef,
 	worktreeChangedFiles,
 } from "./pre-push-targeted-tests.mjs";
 
-const BASE = "origin/master";
 // Room for a 137-file governance batch: spawnSync's 1 MiB default kills the
 // child and turns a long transcript into a lost verdict.
 const MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
@@ -149,6 +149,8 @@ export function main(argv = process.argv.slice(2)) {
 	}
 	const findings = [];
 	const unproven = (reason) => findings.push({ kind: "unproven", reason });
+	// The hook resolves its base the same way, so both compare one range (#4724).
+	const BASE = resolveBaseRef();
 	const record = { base: BASE, checks: {}, failedFiles: [], redOnBase: null };
 
 	const build = run(root, "npm", ["run", "build"]);

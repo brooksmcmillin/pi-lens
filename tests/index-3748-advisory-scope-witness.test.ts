@@ -27,9 +27,22 @@ import {
 	makeContextWithSystemEvent,
 	makeSessionStartEvent,
 } from "./support/host-event-factory.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 let tmpDir: string;
+
+async function startSession(
+	pi: ReturnType<typeof createPiMock>,
+	cwd: string,
+	sessionId: string,
+): Promise<void> {
+	await pi.emit(
+		"session_start",
+		makeSessionStartEvent(),
+		makeCtx({ cwd, sessionId }),
+	);
+}
 
 beforeEach(() => {
 	// The process primary registration, the advisory queue and the scopes are
@@ -42,7 +55,11 @@ beforeEach(() => {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-3748-advisory-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
+	// #5146: a case whose `tool_result` spawned an ast-grep LSP must end its
+	// sessions first, or the child is still alive here and orphans when the
+	// worker exits. The shared teardown ends them and checks no child remains.
+	await endMockSessions();
 	vi.restoreAllMocks();
 	removeTempDirSync(tmpDir);
 });
@@ -60,11 +77,7 @@ describe("pi context delivers the primary's own queued advisory (#3748)", () => 
 		});
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: tmpDir, sessionId: "pi-3748-advisory-session" }),
-		);
+		await startSession(pi, tmpDir, "pi-3748-advisory-session");
 		const runtime = runtimes[0];
 		expect(runtime).toBeDefined();
 		queueAgentAdvisory("lost edit in a.rs", runtime.captureSessionGeneration());
@@ -85,11 +98,7 @@ describe("pi context delivers the primary's own queued advisory (#3748)", () => 
 
 		// Release the process primary, so the case below starts one of its own
 		// rather than being declined behind a leaked registration.
-		await pi.emit(
-			"session_shutdown",
-			{ reason: "quit" },
-			makeCtx({ cwd: tmpDir, sessionId: "pi-3748-advisory-session" }),
-		);
+		await endMockSessions();
 	});
 
 	it("drains the requesting session's own scope after a concurrent start (#4631 F3)", async () => {
@@ -112,11 +121,7 @@ describe("pi context delivers the primary's own queued advisory (#3748)", () => 
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: tmpDir, sessionId: "pi-3748-primary" }),
-		);
+		await startSession(pi, tmpDir, "pi-3748-primary");
 		const primary = runtimes[0];
 		expect(primary).toBeDefined();
 		queueAgentAdvisory("lost edit in a.rs", primary.captureSessionGeneration());
@@ -130,11 +135,7 @@ describe("pi context delivers the primary's own queued advisory (#3748)", () => 
 		// different scenario (the session really ended).
 		const secondaryCwd = path.join(tmpDir, "secondary-root");
 		fs.mkdirSync(secondaryCwd, { recursive: true });
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: secondaryCwd, sessionId: "pi-3748-secondary" }),
-		);
+		await startSession(pi, secondaryCwd, "pi-3748-secondary");
 		expect(runtimes).toHaveLength(1);
 
 		const injected = (await pi.emit(
@@ -172,11 +173,7 @@ describe("pi context delivers the primary's own queued advisory (#3748)", () => 
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: tmpDir, sessionId: "pi-3748-recorded" }),
-		);
+		await startSession(pi, tmpDir, "pi-3748-recorded");
 		const recorded = runtimes[0];
 		expect(recorded).toBeDefined();
 		queueAgentAdvisory(
@@ -197,5 +194,102 @@ describe("pi context delivers the primary's own queued advisory (#3748)", () => 
 		expect(
 			(injected?.messages ?? []).map((m) => m.content).join("\n"),
 		).toContain("lost edit in b.rs");
+	});
+});
+
+/**
+ * #5108 review F1, the class sweep: `handleToolResult` queued every agent
+ * advisory under the coordinator's scope, which is the PRIMARY's. A concurrent
+ * secondary (#473) shares that coordinator but drains its own member scope, so
+ * a notice about the secondary's edit reached the primary's context and never
+ * the secondary's. Recurrence prevented: any `queueAgentAdvisory` site in the
+ * tool_result path that takes `writeSession` instead of `deps.advisoryScope`.
+ *
+ * Real: the extension, both session starts, the real `tool_result` handler and
+ * its root classification, the advisory queue and the `context_with_system`
+ * drain. The secondary's root sits OUTSIDE the primary's, so the coordinator's
+ * root classifies the secondary's edit.
+ */
+describe("a tool_result advisory reaches the session that made the edit (#5108 F1)", () => {
+	async function twoSessions(secondaryRoot: string) {
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		await startSession(pi, tmpDir, "pi-5108-primary");
+		await startSession(pi, secondaryRoot, "pi-5108-secondary");
+		const contextOf = async (cwd: string, sessionId: string) => {
+			const injected = (await pi.emit(
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
+				makeCtx({ cwd, sessionId }),
+			)) as { messages?: Array<{ content: unknown }> } | undefined;
+			return (injected?.messages ?? [])
+				.map((m) => JSON.stringify(m.content))
+				.join("\n");
+		};
+		return { pi, contextOf };
+	}
+
+	// A sibling of the temp root, not under it and not `pi-lens-`-prefixed: a
+	// pi-owned temp path is the intended-skip class and never notifies (#4560).
+	let outsideRoot: string;
+	beforeEach(() => {
+		outsideRoot = path.join(
+			tmpDir,
+			"..",
+			`capture-5108-${process.pid}-${Math.random().toString(16).slice(2)}`,
+		);
+		fs.mkdirSync(outsideRoot, { recursive: true });
+	});
+	afterEach(() => {
+		fs.rmSync(outsideRoot, { recursive: true, force: true });
+	});
+
+	it("delivers the outside-root notice to the secondary, not the primary", async () => {
+		const file = path.join(outsideRoot, "outside.ts");
+		fs.writeFileSync(file, "export const value = 1;\n");
+		const { pi, contextOf } = await twoSessions(outsideRoot);
+		await pi.emit(
+			"tool_result",
+			{
+				toolName: "edit",
+				toolCallId: "ed-5108-outside",
+				input: { path: file },
+				content: [{ type: "text", text: "ok" }],
+			},
+			makeCtx({ cwd: outsideRoot, sessionId: "pi-5108-secondary" }),
+		);
+
+		const secondary = await contextOf(outsideRoot, "pi-5108-secondary");
+		const primary = await contextOf(tmpDir, "pi-5108-primary");
+		expect(secondary).toContain("outside the session root");
+		expect(secondary).toContain("outside.ts");
+		expect(primary).not.toContain("outside.ts");
+	});
+
+	it("delivers the adopted-project notice to the secondary, not the primary", async () => {
+		// A project marker makes the secondary's root a separate project of the
+		// coordinator's, the `adopted` class.
+		fs.writeFileSync(
+			path.join(outsideRoot, "package.json"),
+			'{"name":"adopted-5108"}\n',
+		);
+		const file = path.join(outsideRoot, "adopted.ts");
+		fs.writeFileSync(file, "export const value = 1;\n");
+		const { pi, contextOf } = await twoSessions(outsideRoot);
+		await pi.emit(
+			"tool_result",
+			{
+				toolName: "edit",
+				toolCallId: "ed-5108-adopted",
+				input: { path: file },
+				content: [{ type: "text", text: "ok" }],
+			},
+			makeCtx({ cwd: outsideRoot, sessionId: "pi-5108-secondary" }),
+		);
+
+		const secondary = await contextOf(outsideRoot, "pi-5108-secondary");
+		const primary = await contextOf(tmpDir, "pi-5108-primary");
+		expect(secondary).toContain("as a separate project");
+		expect(primary).not.toContain("as a separate project");
 	});
 });

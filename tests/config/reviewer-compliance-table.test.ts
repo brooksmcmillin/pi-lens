@@ -25,8 +25,14 @@ const DOC = path.join(REPO_ROOT, "docs/pi-lens-reviewer.md");
 const SECTION = "Compliance pass";
 
 /** Every row carries a rule anchor: a principles section, a catalog shape, or
- * a named AGENTS.md section. */
-const RULE_ANCHOR = [/principles §\d/, /shapes? \d/, /AGENTS "/];
+ * a named section of AGENTS.md or of the invariant file its text moved to
+ * (#4361). */
+const RULE_ANCHOR = [
+	/principles §\d/,
+	/shapes? \d/,
+	/AGENTS "/,
+	/docs\/invariants\/[a-z-]+\.md "|`docs\/invariants\/[a-z-]+\.md` "/,
+];
 
 /** Every row names the recurrence that earned it. */
 const RECURRENCE = /#\d{3,}/;

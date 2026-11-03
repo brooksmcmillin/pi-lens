@@ -186,7 +186,7 @@ describe("formatFile classifies an unavailable tool distinctly from a failure (#
 	 * directory there and `<tmp>/home`'s `node_modules/.bin` is then an ordinary
 	 * project-ancestor install that MUST still resolve.
 	 */
-	it("a HOME spelled with the other drive-letter case still ceilings oxfmt on win32, and stays case-sensitive on POSIX (#2544 F1)", async () => {
+	it("a re-spelled HOME ceilings oxfmt when both spellings identify the planted home (#2544 F1)", async () => {
 		const env = setupTestEnvironment("pi-lens-unavail-oxfmt-drivecase-");
 		const isWin = process.platform === "win32";
 		const realHome = env.tmpDir;
@@ -217,8 +217,8 @@ describe("formatFile classifies an unavailable tool distinctly from a failure (#
 		const homeBin = path.join(homeBinDir, isWin ? "oxfmt.cmd" : "oxfmt");
 
 		// win32: same directory, other drive-letter case + other separator form.
-		// POSIX: no drive letter and case-sensitive paths, so re-casing the last
-		// segment names a genuinely DIFFERENT directory.
+		// POSIX: re-casing names a different directory only on a case-sensitive
+		// filesystem; APFS can resolve both spellings to the planted home.
 		const respelledHome = isWin
 			? realHome
 					.replace(/^([A-Za-z]):/, (_m, d: string) => `${d.toLowerCase()}:`)
@@ -238,7 +238,7 @@ describe("formatFile classifies an unavailable tool distinctly from a failure (#
 			const { formatFile, oxfmtFormatter } = await loadFormatters();
 			const result = await formatFile(filePath, oxfmtFormatter);
 
-			if (isWin) {
+			if (isWin || fs.existsSync(respelledHome)) {
 				expect(result.outcome).toBe("unavailable");
 				expect(result.success).toBe(true);
 				expect(formatSpawns()).toEqual([]);
@@ -400,6 +400,11 @@ describe("runFormatPhase feeds the deferred drain (#2413)", () => {
 			filePath,
 			() => fakeService as never,
 			() => {},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			path.dirname(filePath),
 		);
 
 		// Never a formatter FAILURE, and never listed as a formatter that ran.
@@ -441,6 +446,11 @@ describe("runFormatPhase feeds the deferred drain (#2413)", () => {
 			filePath,
 			() => fakeService as never,
 			() => {},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			path.dirname(filePath),
 		);
 
 		expect(result.formatUnavailable).toEqual([]);

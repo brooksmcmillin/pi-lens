@@ -26,6 +26,7 @@ import {
 	ruleCorpusFingerprintForCycle,
 } from "./custom-rule-locations.js";
 import { compareOrdinal } from "./string-utils.js";
+import { toPosix } from "./path-utils.js";
 
 /**
  * The bundled `rules/tree-sitter-queries` root — the ONE spelling of this
@@ -337,7 +338,7 @@ function str(value: unknown): string | undefined {
 }
 
 export function isDisabledQueryFilePath(filePath: string): boolean {
-	const normalized = filePath.replaceAll("\\", "/");
+	const normalized = toPosix(filePath);
 	const parts = normalized.split("/").filter(Boolean);
 	const parent = parts.length >= 2 ? parts[parts.length - 2] : "";
 	return isDisabledQueryDirectoryName(parent);

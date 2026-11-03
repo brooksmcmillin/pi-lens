@@ -26,6 +26,10 @@ import {
 	isEffectiveFileViewError,
 } from "../../clients/effective-config.js";
 import {
+	registerRunnerId,
+	resetRunnerIdentityForTests,
+} from "../../clients/dispatch/known-runner-ids.js";
+import {
 	explainServersForFile,
 	initLSPConfig,
 	isServerDisabled,
@@ -42,11 +46,14 @@ import {
 // same function the view uses rather than spelled as a literal that would
 // agree with a wrong implementation on one platform.
 import { homeRelativePath } from "../../clients/path-utils.js";
+import { createEffectiveConfigTool } from "../../tools/effective-config.js";
 import { removeTempDirSync } from "./test-utils.js";
 import {
 	resetProjectTrust,
 	setProjectTrustState,
 } from "../../clients/project-trust.js";
+import { useConfigPath } from "../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 // The extension log is an ndjson sink, not the terminal; a fixture that
 // deliberately carries a legacy location would otherwise spray test output.
@@ -113,9 +120,8 @@ async function viewFor(
 	fs.mkdirSync(projectDir, { recursive: true });
 
 	const previousHome = process.env.PI_LENS_HOME;
-	const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
-	process.env.PI_LENS_CONFIG_PATH = path.join(home, ".pi-lens", "config.json");
+	setConfigPath(path.join(home, ".pi-lens", "config.json"));
 
 	resetLSPConfigStateForTests();
 	resetLSPConfigWarnCache();
@@ -131,9 +137,6 @@ async function viewFor(
 	} finally {
 		if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 		else process.env.PI_LENS_HOME = previousHome;
-		if (previousConfigPath === undefined)
-			delete process.env.PI_LENS_CONFIG_PATH;
-		else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	}
 }
 
@@ -260,6 +263,41 @@ describe("effectiveConfig — provenance of the resolution", () => {
 		});
 		expect(view.recordCounts.PILENS_CFG_0002).toBeGreaterThanOrEqual(1);
 	});
+
+	// #5141 (CodeRabbit thread on clients/lsp/config.ts). The loader reports an
+	// unknown `lsp.disabledServers` id as a PILENS_CFG_0005 record, but this query
+	// counted only the resolution's records and the disabled-runner records, so a
+	// config whose only error was that id read as clean. The query now counts the
+	// same pure records the loader builds, without sending a notice.
+	it("counts an unknown lsp.disabledServers id as one PILENS_CFG_0005 record and sends no notice", async () => {
+		const { view } = await viewFor({
+			files: { "proj/.pi-lens.json": denyDoc("no-such-server") },
+			startDir: "proj",
+		});
+		expect(view.recordCounts.PILENS_CFG_0005).toBe(1);
+		expect(
+			logSink.messages.filter((message) => message.includes("no-such-server")),
+		).toEqual([]);
+	});
+
+	// Guard for the same seam: a deny list of valid ids (a built-in id and a
+	// declared custom id) adds no record, so the count stays where it was. Green
+	// before and after the fix by design; it fails if the query starts counting
+	// valid ids as unknown.
+	it("keeps the PILENS_CFG_0005 count unchanged for a deny list of valid ids", async () => {
+		const { view } = await viewFor({
+			files: {
+				"proj/.pi-lens.json": {
+					lsp: {
+						servers: { mysh: sharedServer("mysh-lsp") },
+						disabledServers: ["typescript", "mysh"],
+					},
+				},
+			},
+			startDir: "proj",
+		});
+		expect(view.recordCounts.PILENS_CFG_0005).toBeUndefined();
+	});
 });
 
 describe("effectiveConfig — why is X running (#2415 AC)", () => {
@@ -324,9 +362,8 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		);
 
 		const previousHome = process.env.PI_LENS_HOME;
-		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
-		process.env.PI_LENS_CONFIG_PATH = global;
+		setConfigPath(global);
 		try {
 			resetLSPConfigWarnCache();
 			expect((await loadLSPConfig(projectDir, home)).disabledServers).toEqual([
@@ -335,9 +372,6 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		} finally {
 			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 			else process.env.PI_LENS_HOME = previousHome;
-			if (previousConfigPath === undefined)
-				delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 		}
 	});
 
@@ -456,6 +490,139 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		}
 	});
 
+	// `dispatch.disabledRunners`: the runner-level sibling of
+	// `lsp.disabledServers`. The view reads the same resolution the dispatch
+	// context does, so a denied runner is named with the tier that denied it
+	// rather than vanishing from the plan.
+	describe("dispatch.disabledRunners", () => {
+		const deniedBuild = (view: EffectiveConfigView) =>
+			resolvedFile(view)?.tools.find((tool) => tool.id === "dotnet-build");
+
+		it("reports a globally denied runner as disabled-by-config with its provenance while lsp stays selected", async () => {
+			const { view } = await viewFor(
+				{
+					files: {
+						".pi-lens/config.json": {
+							dispatch: { disabledRunners: ["dotnet-build"] },
+						},
+						"proj/.pi-lens.json": { dispatch: { disabledRunners: [] } },
+					},
+					startDir: "proj",
+				},
+				{ file: "Program.cs" },
+			);
+
+			const build = deniedBuild(view);
+			expect(build?.selected).toBe(false);
+			expect(build?.reason).toBe("disabled-by-config");
+			expect(build?.decidedBy?.tier).toBe("global");
+			expect(build?.decidedBy?.key).toBe("/dispatch/disabledRunners/0");
+			expect(build?.decidedBy?.file).toContain("config.json");
+			const lsp = resolvedFile(view)?.tools.find((tool) => tool.id === "lsp");
+			expect(lsp?.selected).toBe(true);
+			expect(lsp?.reason).toBe("selected");
+			expect(lsp?.decidedBy).toBeUndefined();
+			// The resolution agrees: the leaf is in the provenance listing.
+			expect(
+				view.provenance.some(
+					(entry) => entry.key === "/dispatch/disabledRunners/0",
+				),
+			).toBe(true);
+		});
+
+		it("attributes a project-added denial to the project tier", async () => {
+			const { view } = await viewFor(
+				{
+					files: {
+						".pi-lens/config.json": {
+							dispatch: { disabledRunners: ["javac"] },
+						},
+						"proj/.pi-lens.json": {
+							dispatch: { disabledRunners: ["dotnet-build"] },
+						},
+					},
+					startDir: "proj",
+				},
+				{ file: "Program.cs" },
+			);
+
+			expect(deniedBuild(view)?.reason).toBe("disabled-by-config");
+			expect(deniedBuild(view)?.decidedBy?.tier).toBe("project");
+		});
+
+		it("states the denied runner count in the effective_config summary line", async () => {
+			const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-effcfg-"));
+			tempRoots.push(home);
+			fs.mkdirSync(path.join(home, ".pi-lens"), { recursive: true });
+			fs.writeFileSync(
+				path.join(home, ".pi-lens", "config.json"),
+				JSON.stringify({ dispatch: { disabledRunners: ["dotnet-build"] } }),
+			);
+			const projectDir = path.join(home, "proj");
+			fs.mkdirSync(projectDir, { recursive: true });
+			const previousHome = process.env.PI_LENS_HOME;
+			process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
+			setConfigPath(path.join(home, ".pi-lens", "config.json"));
+			resetLSPConfigStateForTests();
+			resetLSPConfigWarnCache();
+			try {
+				const tool = createEffectiveConfigTool(() => projectDir);
+				const result = await tool.execute(
+					"t",
+					{ file: "Program.cs" },
+					undefined,
+					undefined,
+					{},
+				);
+				expect(result.details.summary).toMatch(
+					/\d+ tool\(s\), 1 denied by config$/,
+				);
+			} finally {
+				if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+				else process.env.PI_LENS_HOME = previousHome;
+			}
+		});
+
+		// PR #5011 round 5, F18 (greptile thread PRRT_kwDORt8rec6yJQYm): the view
+		// dropped the unknown-id record, so a typo'd id appeared nowhere and the
+		// tool row read as if nothing was denied. The pure `disabledRunnersOf`
+		// derives the record; `effective_config` counts it without reporting.
+		it("counts an unknown disabledRunners id as a PILENS_CFG_0005 record and sends no notice", async () => {
+			registerRunnerId("dotnet-build");
+			try {
+				const { view } = await viewFor(
+					{
+						files: {
+							"proj/.pi-lens.json": {
+								dispatch: { disabledRunners: ["dotnet-bild", "dotnet-build"] },
+							},
+						},
+						startDir: "proj",
+					},
+					{ file: "Program.cs" },
+				);
+
+				expect(view.recordCounts.PILENS_CFG_0005).toBe(1);
+				expect(deniedBuild(view)?.reason).toBe("disabled-by-config");
+				expect(
+					logSink.messages.filter((message) => message.includes("dotnet-bild")),
+				).toEqual([]);
+			} finally {
+				resetRunnerIdentityForTests();
+			}
+		});
+
+		it("selects the runner when nothing denies it", async () => {
+			const { view } = await viewFor(
+				{ files: {}, startDir: "proj" },
+				{ file: "Program.cs" },
+			);
+
+			expect(deniedBuild(view)?.reason).toBe("selected");
+			expect(deniedBuild(view)?.decidedBy).toBeUndefined();
+		});
+	});
+
 	// #4636, the reporter's live evidence: `effective_config` printed
 	// `"language": "json"` for a `tsconfig.json`, which is the registry's answer
 	// read back through the query an agent actually asks. The FILE KIND stays
@@ -530,6 +697,38 @@ describe("effectiveConfig — redaction is unconditional", () => {
 		expect(projectDir).toContain("proj");
 	});
 
+	it("renders an argv-array command by its head and counts its tail (#5127)", async () => {
+		// Recurrence: the redacted spec read `command` only when it was a string,
+		// so the documented argv form rendered as a server with NO command and
+		// `argvCount` 0 while the runtime held a launchable row.
+		const { view } = await viewFor(
+			{
+				files: {
+					"proj/.pi-lens.json": {
+						lsp: {
+							servers: {
+								"array-server": {
+									name: "Array",
+									extensions: [".md"],
+									command: ["my-lsp", "--stdio", "--token", "ARGV_SECRET_ZZZ"],
+									args: ["--extra"],
+								},
+							},
+						},
+					},
+				},
+				startDir: "proj",
+			},
+			{ file: "notes.md" },
+		);
+		const custom = resolvedFile(view)?.servers.find(
+			(entry) => entry.id === "array-server",
+		);
+		expect(custom?.spec?.command).toBe("my-lsp");
+		expect(custom?.spec?.argvCount).toBe(5);
+		expect(JSON.stringify(view)).not.toContain("ARGV_SECRET_ZZZ");
+	});
+
 	it("reports a legacy config location as legacy rather than silently reading it", async () => {
 		const { view } = await viewFor({
 			files: { "proj/pi-lsp.json": { disabledServers: ["typos"] } },
@@ -565,21 +764,13 @@ describe("effectiveConfig — asking must not report (#2427 rule 2)", () => {
 		// suppressing by consuming the latch looks identical from inside the
 		// query and is exactly the defect.
 		const previousHome = process.env.PI_LENS_HOME;
-		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 		process.env.PI_LENS_HOME = path.join(result.home, ".pi-lens");
-		process.env.PI_LENS_CONFIG_PATH = path.join(
-			result.home,
-			".pi-lens",
-			"config.json",
-		);
+		setConfigPath(path.join(result.home, ".pi-lens", "config.json"));
 		try {
 			await loadLSPConfig(result.projectDir, result.home);
 		} finally {
 			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 			else process.env.PI_LENS_HOME = previousHome;
-			if (previousConfigPath === undefined)
-				delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 		}
 		expect(logSink.messages.join("\n")).toContain("deprecated");
 	});
@@ -697,17 +888,13 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 		fs.writeFileSync(subConfig, JSON.stringify(subDocument));
 
 		const previousHome = process.env.PI_LENS_HOME;
-		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
-		process.env.PI_LENS_CONFIG_PATH = globalConfig;
+		setConfigPath(globalConfig);
 		resetLSPConfigStateForTests();
 		resetLSPConfigWarnCache();
 		const restore = (): void => {
 			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 			else process.env.PI_LENS_HOME = previousHome;
-			if (previousConfigPath === undefined)
-				delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 			resetLSPConfigStateForTests();
 		};
 		return {
@@ -1056,13 +1243,8 @@ describe("effectiveConfig — a file outside cwd is rejected, not silently resol
 		);
 
 		const previousHome = process.env.PI_LENS_HOME;
-		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
-		process.env.PI_LENS_CONFIG_PATH = path.join(
-			home,
-			".pi-lens",
-			"config.json",
-		);
+		setConfigPath(path.join(home, ".pi-lens", "config.json"));
 		resetLSPConfigStateForTests();
 		resetLSPConfigWarnCache();
 		try {
@@ -1086,9 +1268,6 @@ describe("effectiveConfig — a file outside cwd is rejected, not silently resol
 		} finally {
 			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 			else process.env.PI_LENS_HOME = previousHome;
-			if (previousConfigPath === undefined)
-				delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 			resetLSPConfigStateForTests();
 		}
 	});

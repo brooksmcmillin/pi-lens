@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { htmlCommentEnd } from "./lib/defect-shapes.mjs";
+import { blankMarkdown as blankMarkdownShared } from "./lib/defect-shapes.mjs";
+import { markdownHeadings } from "./lib/markdown-lexer.mjs";
 
 const MAX_WORDS = 30;
 const FILLER_PATTERNS = [
@@ -16,70 +17,51 @@ const PASSIVE_RE =
 	/\b(?:is|are|was|were|been|being)\s+(?:\w+ly\s+)?\w+(?:ed|en)\b/gi;
 const ABBREVIATIONS = /\b(?:e\.g|i\.e|etc|vs|cf|mr|mrs|dr|no)\./i;
 
+// Trailers, fences, comments and code spans come out first, so the prose
+// rules read only text a reader sees. Fences, comments and code spans are the
+// shared lexer's (`blankMarkdown`), not a second copy (#4717: this masker
+// treated any `<!--` as an opener, so a body quoting the syntax skipped every
+// later section of prose instead of judging it).
 function blankMarkdown(text) {
-	const lines = String(text ?? "").split(/\r?\n/);
+	const raw = String(text ?? "").split(/\r?\n/);
 	const trailerPattern =
 		/^\s*(?:Co-Authored-By|Signed-off-by|Refs|Closes):\s+/i;
-	let lastContent = lines.length - 1;
-	while (lastContent >= 0 && !lines[lastContent].trim()) lastContent -= 1;
+	let lastContent = raw.length - 1;
+	while (lastContent >= 0 && !raw[lastContent].trim()) lastContent -= 1;
 	const trailerLines = new Set();
 	for (let index = lastContent; index >= 0; index -= 1) {
-		if (!lines[index].trim()) {
+		if (!raw[index].trim()) {
 			trailerLines.add(index);
 			continue;
 		}
-		if (!trailerPattern.test(lines[index])) break;
+		if (!trailerPattern.test(raw[index])) break;
 		trailerLines.add(index);
 	}
-	let fence = null;
-	let inComment = false;
-	return lines
+	// The line filters read the line as written; the prose rules read it with
+	// its code spans blanked, so a line opening with one is not taken for a
+	// stack frame (`at …`) or a command.
+	const masked = blankMarkdownShared(String(text ?? ""), {
+		indentedCode: false,
+		codeSpans: true,
+	}).split(/\r?\n/);
+	return blankMarkdownShared(String(text ?? ""), { indentedCode: false })
+		.split(/\r?\n/)
 		.map((line, lineIndex) => {
 			if (trailerLines.has(lineIndex)) return "";
 			if (/^\s*🤖 Generated with \[Claude Code\]\([^)]*\)\s*$/u.test(line))
 				return "";
-			const marker = line.match(/^\s*(`{3,}|~{3,})/)?.[1];
-			if (marker) {
-				if (!fence) fence = marker;
-				else if (marker[0] === fence[0] && marker.length >= fence.length)
-					fence = null;
-				return "";
-			}
-			if (fence || /^\s*>/.test(line) || /^\s*\|/.test(line)) return "";
+			if (/^\s*>/.test(line) || /^\s*\|/.test(line)) return "";
 			if (
 				/^\s*(?:\$\s|npm\s|yarn\s|pnpm\s|(?:FAIL|PASS|Tests:|Test Files:|AssertionError|Error:|at\s))/.test(
 					line,
 				)
 			)
 				return "";
-			let masked = "";
-			for (let index = 0; index < line.length;) {
-				if (inComment) {
-					const end = htmlCommentEnd(line, index);
-					if (end === -1) break;
-					inComment = false;
-					index = end;
-					continue;
-				}
-				const start = line.indexOf("<!--", index);
-				if (start === -1) {
-					masked += line.slice(index);
-					break;
-				}
-				masked += line.slice(index, start);
-				inComment = true;
-				index = start + 4;
-			}
-			return masked
+			return masked[lineIndex]
 				.replace(/https?:\/\/\S+/gi, " ")
-				.replace(/(`+)[\s\S]*?\1/g, " ")
 				.replace(/(^|\s)(?:["'])([^"']+)(?:["'])(?=\s|$)/g, "$1 ");
 		})
 		.join("\n");
-}
-
-function isHeading(line) {
-	return /^\s*#{1,6}\s+(.+?)\s*$/.exec(line);
 }
 
 function sentenceEnd(text, index) {
@@ -123,14 +105,23 @@ export function checkProse(text = "", options = {}) {
 	const errors = [];
 	const warnings = [];
 	const lines = proseLines(text);
+	// Headings are the lexer's (#4717 N2): a setext underline and an indented
+	// ATX heading are headings, and a `#` line in a comment or code is not.
+	const headingAt = new Map();
+	for (const heading of markdownHeadings(text))
+		for (let line = heading.line; line < heading.contentLine; line += 1)
+			headingAt.set(line, line === heading.line ? heading : null);
+	// #5110: only heading case blocks. Sentence length, filler and passive
+	// voice warn, so wording alone never fails the PR-body lint.
 	const addBlock = (message) => {
 		(mode === "warn" ? warnings : errors).push(message);
 	};
 	for (let index = 0; index < lines.length; index += 1) {
 		const raw = lines[index];
-		const heading = isHeading(raw);
-		if (heading) {
-			const title = heading[1].trim();
+		if (headingAt.has(index)) {
+			const heading = headingAt.get(index);
+			if (!heading) continue;
+			const title = heading.text;
 			if (
 				/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/.test(title) ||
 				/\b(?:WHY|SUMMARY|NOTES|TESTS)\b/.test(title)
@@ -148,7 +139,7 @@ export function checkProse(text = "", options = {}) {
 			: splitSentences(source);
 		for (const unit of units) {
 			if (wordCount(unit) > MAX_WORDS)
-				addBlock(
+				warnings.push(
 					finding(
 						"sentence-length",
 						`use ${MAX_WORDS} words or fewer (found ${wordCount(unit)})`,
@@ -160,13 +151,13 @@ export function checkProse(text = "", options = {}) {
 			if (
 				new RegExp(`\\b${filler.replaceAll(" ", "\\s+")}\\b`, "i").test(source)
 			)
-				addBlock(finding("filler", `remove "${filler}"`, index + 1));
+				warnings.push(finding("filler", `remove "${filler}"`, index + 1));
 		}
 		for (const match of source.matchAll(PASSIVE_RE))
 			warnings.push(
 				finding(
 					"passive-voice",
-					`prefer active voice near "${match[0]}"`,
+					`prefer active voice near "${match[0].replace(/\s+/g, " ")}"`,
 					index + 1,
 				),
 			);
@@ -174,20 +165,29 @@ export function checkProse(text = "", options = {}) {
 	return { valid: errors.length === 0, errors, warnings };
 }
 
+/**
+ * The prose sections of a PR body (Why, Notes for the reviewer, Summary) with
+ * their headings, each up to the next heading of any level. The boundaries are
+ * the lexer's (#4717 N2): a setext or indented ATX `Tests` ends `## Summary`,
+ * so its prose is not judged as Summary prose.
+ */
 export function proseSections(body = "") {
 	const lines = String(body ?? "").split(/\r?\n/);
 	const wanted = new Set(["why", "notes for the reviewer", "summary"]);
-	const sections = [];
-	let current = null;
-	for (const line of lines) {
-		const heading = /^#{2,4}\s+(.+?)\s*$/.exec(line);
-		if (heading) {
-			if (current) sections.push(current);
-			current = wanted.has(heading[1].trim().toLowerCase()) ? [line] : null;
-		} else if (current) current.push(line);
-	}
-	if (current) sections.push(current);
-	return sections.map((section) => section.join("\n")).join("\n\n");
+	const headings = markdownHeadings(body);
+	return headings
+		.flatMap((heading, index) =>
+			heading.depth >= 2 &&
+			heading.depth <= 4 &&
+			wanted.has(heading.text.toLowerCase())
+				? [
+						lines
+							.slice(heading.line, headings[index + 1]?.line ?? lines.length)
+							.join("\n"),
+					]
+				: [],
+		)
+		.join("\n\n");
 }
 
 export { FILLER_PATTERNS };

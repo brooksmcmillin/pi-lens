@@ -129,6 +129,7 @@ verifies).
 | `features/review-graph.md` | `review-graph` (`mcp-create-after-build`, `builder-incremental`) |
 | `features/formatter.md` | `formatter` (`python-ruff`) |
 | `features/did-save.md` | `lsp-did-save` (`analyze`) |
+| `features/fallow-lsp.md` | `fallow-lsp` (`off`, `config`, `flag`, `bad`) |
 
 Each file has the sections Sub-features, How to get to it (user POV), Driving it
 with the harness, and Gotchas. Add a feature file when a seam has no recipe, and

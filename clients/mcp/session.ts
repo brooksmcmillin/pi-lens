@@ -101,6 +101,15 @@ export function _resetMcpSessionContext(): void {
 
 const noop = (): void => {};
 
+/**
+ * #4943: the address an MCP turn end stages its message to (`deliverTo`), the
+ * same for every server process, so a restarted server still reads what the
+ * last one staged. It is never a pi session id (a host uuid, or the
+ * coordinator's `lens-<hex>-<n>`), so a pi session's staged message is not the
+ * MCP host's and an MCP message is no pi session's.
+ */
+export const MCP_DELIVERY_ADDRESS = "mcp-host";
+
 function joinMessages(
 	consumed: { messages: Array<{ content: string }> } | undefined,
 ): string | undefined {
@@ -357,12 +366,21 @@ async function runTurnEndNowImpl(
 		owner,
 		resetLSPService,
 		resetFormatService,
+		deliveryAddress: MCP_DELIVERY_ADDRESS,
 	});
+	const reader = ctx.runtime.telemetrySessionId;
 
 	const outcome: TurnEndOutcome = deferredDelivery
 		? {
 				turnEnd: joinMessages(
-					peekTurnEndFindings(ctx.cacheManager, cwd, ctx.runtime, true),
+					peekTurnEndFindings(
+						ctx.cacheManager,
+						cwd,
+						ctx.runtime,
+						true,
+						reader,
+						MCP_DELIVERY_ADDRESS,
+					),
 				),
 				tests: joinMessages(
 					peekTestFindings(ctx.cacheManager, cwd, ctx.runtime, true),
@@ -371,7 +389,13 @@ async function runTurnEndNowImpl(
 			}
 		: {
 				turnEnd: joinMessages(
-					consumeTurnEndFindings(ctx.cacheManager, cwd, ctx.runtime),
+					consumeTurnEndFindings(
+						ctx.cacheManager,
+						cwd,
+						ctx.runtime,
+						reader,
+						MCP_DELIVERY_ADDRESS,
+					),
 				),
 				tests: joinMessages(
 					consumeTestFindings(ctx.cacheManager, cwd, ctx.runtime),
@@ -383,7 +407,12 @@ async function runTurnEndNowImpl(
 		outcome,
 		commit: () => {
 			if (!deferredDelivery) return;
-			acknowledgeTurnEndFindings(ctx.cacheManager, cwd);
+			acknowledgeTurnEndFindings(
+				ctx.cacheManager,
+				cwd,
+				reader,
+				MCP_DELIVERY_ADDRESS,
+			);
 			acknowledgeTestFindings(ctx.cacheManager, cwd);
 		},
 	};
@@ -477,9 +506,17 @@ function runTurnEndForIpcNow(cwd: string): Promise<TurnEndDelivery> {
 		}
 
 		const ctx = await getMcpSessionContext();
+		const reader = ctx.runtime.telemetrySessionId;
 		const cachedOutcome: TurnEndOutcome = {
 			turnEnd: joinMessages(
-				peekTurnEndFindings(ctx.cacheManager, cwd, ctx.runtime, true),
+				peekTurnEndFindings(
+					ctx.cacheManager,
+					cwd,
+					ctx.runtime,
+					true,
+					reader,
+					MCP_DELIVERY_ADDRESS,
+				),
 			),
 			tests: joinMessages(
 				peekTestFindings(ctx.cacheManager, cwd, ctx.runtime, true),
@@ -490,7 +527,12 @@ function runTurnEndForIpcNow(cwd: string): Promise<TurnEndDelivery> {
 			? {
 					outcome: cachedOutcome,
 					commit: () => {
-						acknowledgeTurnEndFindings(ctx.cacheManager, cwd);
+						acknowledgeTurnEndFindings(
+							ctx.cacheManager,
+							cwd,
+							reader,
+							MCP_DELIVERY_ADDRESS,
+						);
 						acknowledgeTestFindings(ctx.cacheManager, cwd);
 					},
 				}

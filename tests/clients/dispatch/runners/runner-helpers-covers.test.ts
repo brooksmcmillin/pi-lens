@@ -15,17 +15,11 @@
  * is covered over the real registry and real config in
  * `runner-helpers.test.ts` — this file must never widen to assert those.
  */
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { _setServersForFileForTests } from "../../../../clients/lsp/config.js";
 
 const { getServersForFileWithConfig } = vi.hoisted(() => ({
 	getServersForFileWithConfig: vi.fn(),
-}));
-
-vi.mock("../../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../../../clients/lsp/config.js")
-	>()),
-	getServersForFileWithConfig,
 }));
 
 async function seam() {
@@ -249,4 +243,8 @@ describe("runner coverage seam — claim provenance by row, never by id (#3968 F
 			claimSource: "builtin-fact",
 		});
 	});
+});
+
+beforeEach(() => {
+	_setServersForFileForTests(getServersForFileWithConfig);
 });

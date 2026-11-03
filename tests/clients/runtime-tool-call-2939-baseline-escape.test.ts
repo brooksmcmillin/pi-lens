@@ -72,21 +72,6 @@ const LOADED_CLIENTS = {
 	metricsClient: {},
 };
 
-// Partial mock (#2281 sweep): every real export stays, only the two accessors
-// `handleToolCall` reaches for are replaced, so nothing here spins up a real
-// LSP client for an auto-touch this case does not measure.
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/lsp/capabilities.js")>();
-	const { makeLspServiceDouble } =
-		await import("../support/lsp-service-double.js");
-	return {
-		...actual,
-		getLSPService: () => makeLspServiceDouble({}),
-		resetLSPService: () => {},
-	};
-});
-
 vi.mock("../../clients/bootstrap.js", async () => {
 	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
 	return bootstrapSeamMock(
@@ -103,12 +88,16 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 let env: ReturnType<typeof setupTestEnvironment>;
 let runtime: RuntimeCoordinator;
 let filePath: string;
 
-beforeEach(() => {
+// Nothing here spins up a real LSP client for an auto-touch this case does not
+// measure: `handleToolCall` reaches the double (#2281 sweep).
+beforeEach(async () => {
+	await installLspServiceDouble();
 	pendingLoad.resolve = undefined;
 	pendingLoad.onStart = undefined;
 	analyzedPaths.length = 0;
@@ -138,7 +127,6 @@ function deps(signal: AbortSignal) {
 		cacheManager: new CacheManager(false),
 		ensureLSPConfigInitialized: async () => {},
 		updateLspStatus: () => {},
-		resetLSPService: () => {},
 	} as unknown as Parameters<typeof handleToolCall>[0];
 }
 

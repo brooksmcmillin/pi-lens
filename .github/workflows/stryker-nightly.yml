@@ -142,6 +142,12 @@ jobs:
           WINDOW: ${{ needs.prepare.outputs.window }}
         run: |
           set -uo pipefail
+          # `npm run` puts node_modules/.bin on PATH; a bare `node` does not.
+          # The ast-grep and formatter tests a shard's mutations run look their
+          # CLI up on PATH and red "not installed" under CI without it
+          # (nightly triage 2026-10-29, #4171; the export
+          # shuffle-census-nightly.yml's census step carries).
+          export PATH="$GITHUB_WORKSPACE/node_modules/.bin:$PATH"
           rc=0
           ARGS=(--base "$BASE" --max-files 12 --total-max-files 24 --shard-index "${{ matrix.shard }}" --shard-count 2 --runtime-only --max-dry-run-seconds 240 --head-sha "$HEAD_SHA")
           if [ -s "$RUNNER_TEMP/stryker-nightly-pending.txt" ]; then

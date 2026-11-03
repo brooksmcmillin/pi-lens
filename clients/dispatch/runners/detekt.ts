@@ -102,7 +102,11 @@ export function findDetektConfig(cwd: string): string | undefined {
 	return undefined;
 }
 
-// detekt text output: /path/file.kt:10:5: error: Message [RuleId]
+// detekt text output: /path/file.kt:10:5: Message [RuleId] — no severity token
+//
+// The level is therefore optional, and a finding that carries none is a warning
+// (#4522). The comment here is the one place the shape is stated; the captured
+// replay (`detekt/real`) is what proves it.
 function parseDetektOutput(
 	raw: string,
 	filePath: string,
@@ -110,7 +114,7 @@ function parseDetektOutput(
 ): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	const pattern =
-		/^(.+?):(\d+):(\d+): (error|warning): (.+?)(?:\s+\[([^\]]+)\])?$/gm;
+		/^(.+?):(\d+):(\d+): (?:(error|warning): )?(.+?)(?:\s+\[([^\]]+)\])?$/gm;
 
 	const absTarget = path.resolve(cwd, filePath);
 	for (const match of raw.matchAll(pattern)) {
@@ -185,10 +189,16 @@ const detektRunner: RunnerDefinition = {
 			{
 				result,
 				output: raw,
-				// EXIT TABLE (detekt 1.23 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				// EXIT TABLE (detekt 1.23.8 captured fixtures): 0 clean; 2 findings on stdout with empty stderr.
+				// Exit 1 is a tool error with NO findings (captured broken-config run: an invalid detekt.yml
+				// prints InvalidConfigurationError on stderr), and also can follow printed findings (captured
+				// findings-then-exit1 run: a non-numeric build.weights value fails after the report). Exit 1 is
+				// therefore admitted, and skipWhenParsedNothing skips it only when the parser read no finding,
+				// so a printed finding is kept. Any other nonzero exit is rejected.
 				exitCodes: { ran: [1, 2] },
 			},
 			(out) => parseDetektOutput(out, ctx.filePath, cwd),
+			{ skipWhenParsedNothing: true },
 		);
 		if (run.skipped) return run.skipped;
 
@@ -199,10 +209,19 @@ const detektRunner: RunnerDefinition = {
 		}
 
 		const hasErrors = diagnostics.some((d) => d.severity === "error");
-		return findingsResult(diagnostics, {
+		const verdict = findingsResult(diagnostics, {
 			status: hasErrors ? "failed" : "succeeded",
 			semantic: hasErrors ? "blocking" : "warning",
 		});
+		// #4522 T1: exit 1 is a tool error, and detekt can print findings before it.
+		// Those findings are kept, but the read is incomplete, so the run is flagged
+		// `inconclusive` (the existing "reached no verdict" shape, as tree-sitter's
+		// query-run-threw path). Exit 2 is the complete findings class and is not flagged.
+		// #4522 F2: here `inconclusive` sits beside failureKind `blocking_diagnostics`,
+		// a pairing the RunnerResult field doc does not name, and hasUsableResult still
+		// counts this run as usable coverage. It is inert for detekt today (no
+		// primary-group consumer reads it); this is a documented gap, not a behaviour.
+		return result.status === 1 ? { ...verdict, inconclusive: true } : verdict;
 	},
 };
 

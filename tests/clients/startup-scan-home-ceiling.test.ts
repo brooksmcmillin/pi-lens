@@ -150,3 +150,52 @@ describe("resolveStartupScanContextAsync home ceiling (#296)", () => {
 		expect(ctx.sourceFileCount).toBe(1);
 	});
 });
+
+describe("startup-scan home ceiling through a link (#4911)", () => {
+	// RECURRENCE GUARDED: #4911. Both verdicts compared spellings, so a HOME or
+	// a cwd spelled through a link read as a project under the home, the scan
+	// warmed caches over the whole home tree, and the context cache (keyed by
+	// the home's real path) then answered for the spelled-alike call too. Each
+	// cell uses a real directory link, in both directions, through the sync and
+	// the async entry: the marker AT the home (the project-root verdict) and no
+	// marker anywhere (the cwd verdict).
+	const resolvers = [
+		[
+			"sync",
+			async (cwd: string, homeDir: string) =>
+				resolveStartupScanContext(cwd, { homeDir }),
+		],
+		[
+			"async",
+			(cwd: string, homeDir: string) =>
+				resolveStartupScanContextAsync(cwd, { homeDir }),
+		],
+	] as const;
+	const cells = resolvers.flatMap(([entry, resolve]) =>
+		(["home-link", "root-link"] as const).flatMap((kind) =>
+			(["marker-at-home", "no-marker"] as const).map(
+				(layout) => [entry, kind, layout, resolve] as const,
+			),
+		),
+	);
+
+	it.each(cells)(
+		"%s: refuses to warm when the %s spelling names the home (%s)",
+		async (_entry, kind, layout, resolve) => {
+			const home = path.join(tmpDir, "home");
+			fs.mkdirSync(path.join(home, "proj"), { recursive: true });
+			fs.writeFileSync(path.join(home, "index.ts"), "export const x = 1;\n");
+			if (layout === "marker-at-home")
+				fs.mkdirSync(path.join(home, ".git"), { recursive: true });
+			const link = path.join(tmpDir, "link");
+			fs.symlinkSync(home, link, "junction");
+			const root = kind === "root-link" ? link : home;
+			const cwd = layout === "marker-at-home" ? path.join(root, "proj") : root;
+
+			const ctx = await resolve(cwd, kind === "home-link" ? link : home);
+
+			expect(ctx.canWarmCaches).toBe(false);
+			expect(ctx.reason).toBe("home-dir");
+		},
+	);
+});

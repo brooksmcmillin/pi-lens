@@ -19,23 +19,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifyToolBinary } from "../../../clients/installer/index.js";
 import { safeSpawnAsync } from "../../../clients/safe-spawn.js";
+import { writeStandIn } from "../../support/path-probe-stub.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 let binDir = "";
-
-function writeShim(name: string, body: string): string {
-	const isWin = process.platform === "win32";
-	const file = path.join(binDir, isWin ? `${name}.cmd` : name);
-	if (isWin) {
-		fs.writeFileSync(file, `@echo off\r\n${body}\r\n`, "utf8");
-	} else {
-		fs.writeFileSync(file, `#!/bin/sh\n${body}\n`, {
-			encoding: "utf8",
-			mode: 0o755,
-		});
-	}
-	return file;
-}
 
 beforeEach(() => {
 	binDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-verify-2015-"));
@@ -47,7 +34,8 @@ afterEach(() => {
 
 describe("verifyToolBinary (#2015)", () => {
 	it("exit 0 verifies and forwards version output", async () => {
-		const bin = writeShim(
+		const bin = writeStandIn(
+			binDir,
 			"ok-tool",
 			process.platform === "win32" ? "echo v1.2.3" : 'echo "v1.2.3"',
 		);
@@ -61,7 +49,8 @@ describe("verifyToolBinary (#2015)", () => {
 	});
 
 	it("nonzero exit is a real verdict: false, NOT transient", async () => {
-		const bin = writeShim(
+		const bin = writeStandIn(
+			binDir,
 			"broken-tool",
 			process.platform === "win32" ? "exit /b 3" : "exit 3",
 		);
@@ -102,7 +91,7 @@ describe("verifyToolBinary (#2015)", () => {
 			process.platform === "win32"
 				? `start "" /b node "${safeWriter}"\r\nping -n 4 127.0.0.1 >nul`
 				: `node "${safeWriter}" &\nsleep 3`;
-		const bin = writeShim("slow-tool", body);
+		const bin = writeStandIn(binDir, "slow-tool", body);
 		const transient = vi.fn();
 		const started = Date.now();
 		await expect(
@@ -131,7 +120,7 @@ describe("verifyToolBinary (#2015)", () => {
 			"utf8",
 		);
 		const safeWriter = writer.replace(/[^A-Za-z0-9_\\/. :-]/g, "_");
-		const bin = writeShim("late-rescue", `node "${safeWriter}"`);
+		const bin = writeStandIn(binDir, "late-rescue", `node "${safeWriter}"`);
 		await expect(
 			verifyToolBinary(bin, undefined, undefined, 10_000, ["--version"]),
 		).resolves.toBe(true);
@@ -200,7 +189,7 @@ describe("verifyToolBinary (#2015)", () => {
 				"}, 2000);",
 			"utf8",
 		);
-		const bin = writeShim("evicted-rescue", `node "${writer}"`);
+		const bin = writeStandIn(binDir, "evicted-rescue", `node "${writer}"`);
 		await expect(
 			verifyToolBinary(bin, undefined, undefined, 10_000, ["--version"]),
 		).resolves.toBe(true);

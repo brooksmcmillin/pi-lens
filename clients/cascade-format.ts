@@ -8,7 +8,7 @@ import type {
 import { retagAuxiliaryDiagnostics } from "./dispatch/auxiliary-lsp.js";
 import {
 	applyFindingPolicy,
-	loadProjectRulePolicyMap,
+	loadProjectRulePolicy,
 	renderedRuleIdentities,
 } from "./dispatch/finding-policy.js";
 import { detectFileRole } from "./file-role.js";
@@ -18,6 +18,7 @@ import { formatCacheAgeLabel } from "./finding-delivery-gate.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { normalizeMapKey } from "./path-utils.js";
 import type { LSPDiagnostic } from "./lsp/client.js";
+import { demoteEnvironmentGapDiagnostics } from "./lsp/environment-gap.js";
 import {
 	PRIMARY_UNAVAILABLE_CAUSE,
 	type PrimaryUnavailableCause,
@@ -192,7 +193,7 @@ export function buildResolvedFoundCascadeRun(
 			policyRoot: cwd,
 			filePath,
 		});
-	// One bounded record per RUN, never one per finding (AGENTS.md "bounded
+	// One bounded record per RUN, never one per finding (docs/engineering-principles.md "Every new failure path gets bounded
 	// observability"). This is a PUSH surface: silence after a mark is the mark
 	// working, not a clean verdict, so the count is recorded here rather than
 	// re-announced to the agent on every reconcile. `durationMs` covers the
@@ -347,16 +348,24 @@ export function applyCascadeDisplayPolicy(
 		 * unmarked errors sat below the cap — a false clean, and worse than the
 		 * unfiltered behaviour for that input). It also has to stay after
 		 * `retagAuxiliaryDiagnostics`, which needs `converted` index-aligned 1:1
-		 * with `errors`. Omitted → no display cap, which is the quiet-window
+		 * with its input. Omitted → no display cap, which is the quiet-window
 		 * lane's single-neighbour case.
 		 */
 		displayCap?: number;
 	},
 ): CascadeDisplayPolicyResult {
-	if (errors.length === 0) {
+	const { cwd, policyRoot, filePath } = options;
+	// #4532 round 5 (review F3; AGENTS.md shape 71): the environment-gap rule of
+	// `demoteLanguageServerRows`, run here because both cascade lanes reach this
+	// seam and it is synchronous (#3157), so the pipeline's async membership
+	// probe stays out. A demoted row is a warning, and a cascade renders ERRORs
+	// only, so it leaves the neighbour's list as any warning row does.
+	const live = demoteEnvironmentGapDiagnostics(errors, { filePath }).filter(
+		(d) => d.severity === 1,
+	);
+	if (live.length === 0) {
 		return { diagnostics: [], suppressed: 0, auxSuppressed: 0, total: 0 };
 	}
-	const { cwd, policyRoot, filePath } = options;
 	// `undefined` → the fail-open empty string: inline suppression becomes a
 	// no-op and a STRICT `false-positive` anchor hashes an empty line, so a
 	// finding is never hidden by an I/O error (AGENTS.md shape 48).
@@ -381,10 +390,10 @@ export function applyCascadeDisplayPolicy(
 	// quiet-window builder's synchronous callback to become async for no
 	// measurable gain.
 	const content = options.content ?? readFileContent(filePath);
-	const converted = convertLspDiagnostics(errors, filePath);
+	const converted = convertLspDiagnostics(live, filePath);
 	// #692/#3046: identity comes from the ONE shared derivation every other
 	// surface anchors a mark against — never a hardcoded `tool: "lsp"`.
-	const retained = retagAuxiliaryDiagnostics(converted, errors, content ?? "", {
+	const retained = retagAuxiliaryDiagnostics(converted, live, content ?? "", {
 		cwd,
 		fileRole: detectFileRole(filePath, content),
 	});
@@ -392,7 +401,7 @@ export function applyCascadeDisplayPolicy(
 		cwd: policyRoot,
 		filePath,
 		content: content ?? "",
-		policyMap: loadProjectRulePolicyMap(policyRoot),
+		policyMap: loadProjectRulePolicy(policyRoot),
 		identities: renderedRuleIdentities,
 	});
 	return {
@@ -544,13 +553,16 @@ export function splitCascadeUnansweredPrimaries(
 		if (
 			group.serverIds.every((id) => cascadeUnansweredPrimariesDelivered.has(id))
 		) {
-			dropped.push(...group.neighbors);
+			// #5014 r2 (F2): the line is said once, the findings every run. A
+			// fallback's findings stay visible; only an empty neighbour drops.
+			for (const neighbor of group.neighbors)
+				(neighbor.diagnostics.length > 0 ? unanswered : dropped).push(neighbor);
 			continue;
 		}
 		unanswered.push(...group.neighbors);
 		notes.push({
 			serverIds: group.serverIds,
-			line: `⚠️ Cascade: no language server answered for neighbor files of ${group.serverIds.join(", ")} (${PRIMARY_UNAVAILABLE_CAUSE[group.cause]}), so their cross-file errors were not checked (not a clean result).`,
+			line: `⚠️ Cascade: no primary language server answered for neighbor files of ${group.serverIds.join(", ")} (${PRIMARY_UNAVAILABLE_CAUSE[group.cause]}), so their cross-file errors were not confirmed (not a clean result).`,
 		});
 	}
 	return { answered, unanswered, dropped, notes };

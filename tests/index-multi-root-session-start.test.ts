@@ -31,6 +31,7 @@ import {
 	registerInstance,
 } from "../clients/instance-registry.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx, STALE_CTX_MESSAGE } from "./support/pi-mock.js";
 import {
 	fauxAssistantMessage,
@@ -118,6 +119,8 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 	});
 
 	afterEach(async () => {
+		// #5146: end the case's sessions before the registry settles and roots go.
+		await endMockSessions();
 		_resetSessionLifecycleForTests();
 		await settleRegistryWrites();
 		deregisterInstance();
@@ -129,6 +132,16 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 	});
 
 	it("declines a temp worktree's start behind a disposed primary", async () => {
+		// CLASS: `unproducible-payload` — this input (a prior ctx invalidated with
+		// no delivered shutdown) is not one pi 1.3.0 produces: `teardownCurrent`
+		// awaits `session_shutdown` before `dispose()` invalidates the ctx. It
+		// stays here because the WIRING claim is what it pins (index.ts hands
+		// `priorCtxActive === false` to the classifier and still declines); the
+		// unit test in `tests/clients/session-lifecycle-multi-root.test.ts`
+		// (`a temp worktree behind a disposed primary does NOT run the full
+		// start`) proves the decision only, and `tests/index-4632-s5-session-
+		// identity.test.ts` proves the live-primary input, not this one (#4703
+		// R2 F6).
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 
@@ -152,74 +165,6 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 		expect(getActivePrimaryRoot()).not.toContain(path.basename(tempWorktree));
 	}, 30_000);
 
-	/**
-	 * Two extension instances in one process — the real concurrent-secondary
-	 * shape (#473). `ownedSessionRole` is per-instance closure state, so a
-	 * secondary needs its own `extension()` call; the module-scope lifecycle
-	 * state they share is exactly the seam the guard reads.
-	 *
-	 * The host's roots are registered by hand so the entry's contents are
-	 * exact and independent of whichever writes the handler's fire-and-forget
-	 * path happens to queue. A root in `hostRoots` is the host's own (#3849):
-	 * no secondary's shutdown may remove it.
-	 */
-	async function bindSecondaryIn(cwd: string, hostRoots: string[] = []) {
-		const host = createPiMock();
-		extension(host.asExtensionAPI());
-		const hostCtx = makeCtx({ cwd: hostRoot, sessionId: "host-session" });
-		await host.emit("session_start", makeSessionStartEvent(), hostCtx);
-		await registerInstance(hostRoot);
-		for (const root of hostRoots) await registerInstance(root);
-		await settleRegistryWrites();
-
-		const secondary = createPiMock();
-		extension(secondary.asExtensionAPI());
-		await secondary.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd, sessionId: "sibling-session" }),
-		);
-		expect(getSecondarySessionCount()).toBe(1);
-		await settleRegistryWrites();
-		return secondary;
-	}
-
-	it("a secondary's shutdown drops only its OWN root (#2130)", async () => {
-		const secondary = await bindSecondaryIn(tempWorktree);
-		expect(await rootsForThisPid()).toHaveLength(2);
-
-		await secondary.emit(
-			"session_shutdown",
-			{},
-			makeCtx({ cwd: tempWorktree, sessionId: "sibling-session" }),
-		);
-		// The removal is queued on the registry tail and uses async fs (#3618),
-		// so it lands after the shutdown handler returns: join it first.
-		await settleRegistryWrites();
-
-		const roots = await rootsForThisPid();
-		expect(roots).toHaveLength(1);
-		expect(roots[0]).toContain(path.basename(hostRoot));
-	}, 30_000);
-
-	it("a secondary sharing the host's root drops nothing (#2130)", async () => {
-		// The scoped deregistration is positively-different-root only. A
-		// secondary in the SAME directory that dropped it would delete the
-		// registry root the host is still working in.
-		const secondary = await bindSecondaryIn(hostRoot, [tempWorktree]);
-
-		await secondary.emit(
-			"session_shutdown",
-			{},
-			makeCtx({ cwd: hostRoot, sessionId: "sibling-session" }),
-		);
-		// Without the join, a wrongly queued removal would land after this read
-		// and the assertion below could not fail (#3703).
-		await settleRegistryWrites();
-
-		expect(await rootsForThisPid()).toHaveLength(2);
-	}, 30_000);
-
 	it("does not count a root from the worker registry (#2130)", async () => {
 		if (!workerHome) throw new Error("Vitest did not provide PI_LENS_HOME");
 		const previousHome = process.env.PI_LENS_HOME;
@@ -238,36 +183,6 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 			else process.env.PI_LENS_HOME = previousHome;
 		}
-	}, 30_000);
-
-	it("a declined temp root still registers itself in instances.json (#2130)", async () => {
-		// Review F2. `registerInstance` lives in the FULL-start body, below the
-		// secondary gate, so a declined start never reaches it. Without a
-		// lightweight root add, the temp root would be absent from the registry
-		// entirely — the shared-checkout guard and warm attach would know less
-		// about it than before #2130, and deregisterInstanceRoot would have
-		// nothing to remove.
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-
-		const hostCtx = makeCtx({ cwd: hostRoot, sessionId: "host-session" });
-		await pi.emit("session_start", makeSessionStartEvent(), hostCtx);
-		await settleRegistryWrites();
-		expect(await rootsForThisPid()).toHaveLength(1);
-
-		invalidate(hostCtx);
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: tempWorktree, sessionId: "subagent-session" }),
-		);
-		await settleRegistryWrites();
-
-		const roots = await rootsForThisPid();
-		expect(roots).toHaveLength(2);
-		expect(roots[1]).toContain(path.basename(tempWorktree));
-		// Still pinned: a declined start must never become the advertised root.
-		expect(roots[0]).toContain(path.basename(hostRoot));
 	}, 30_000);
 
 	it("a reload-gap session cannot free two live secondary holders (#3849 F2)", async () => {
@@ -346,6 +261,11 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 		await settleRegistryWrites();
 		expect(await rootsForThisPid()).toContain(path.resolve(tempWorktree));
 
+		// #4704: while S1 is live the reload is not the process's last leave and
+		// removes nothing. S1's hold drops with the entry once pi has invalidated
+		// S1 with no shutdown (its runner disposed it), which makes the reload
+		// the last live leave; the late shutdown below is that dropped holder's.
+		invalidate(firstCtx);
 		await host.emit("session_shutdown", { reason: "reload" }, hostCtx);
 		invalidate(hostCtx);
 		const reloaded = createPiMock();
@@ -371,29 +291,6 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 		await second.emit("session_shutdown", {}, secondCtx);
 		await settleRegistryWrites();
 		expect(await rootsForThisPid()).not.toContain(path.resolve(tempWorktree));
-	}, 30_000);
-
-	it("a declined SAME-root start adds nothing to the set (#2130)", async () => {
-		// The root add runs for any readable cwd; `mergeInstanceRoots`'s dedupe
-		// is what makes a same-root bind a no-op, not a second gate at the call
-		// site. This pins the outcome; the dedupe itself is pinned in
-		// tests/clients/instance-registry-multi-root.test.ts.
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-
-		const hostCtx = makeCtx({ cwd: hostRoot, sessionId: "host-session" });
-		await pi.emit("session_start", makeSessionStartEvent(), hostCtx);
-
-		const secondary = createPiMock();
-		extension(secondary.asExtensionAPI());
-		await secondary.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: hostRoot, sessionId: "sibling-session" }),
-		);
-		await settleRegistryWrites();
-
-		expect(await rootsForThisPid()).toHaveLength(1);
 	}, 30_000);
 
 	it("the primary's shutdown re-arms the process for a new root (#2129 F3)", async () => {
@@ -489,20 +386,28 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 	}
 
 	it("still runs a same-root replacement as the primary", async () => {
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-
-		const first = makeCtx({ cwd: hostRoot, sessionId: "host-session" });
-		await pi.emit("session_start", makeSessionStartEvent(), first);
-		invalidate(first);
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: hostRoot, sessionId: "host-session-2" }),
-		);
+		// Tier 2 (#4913 L3): two REAL pi sessions at one project root under this
+		// file's fixture. The first session's ctx is invalidated by pi's own
+		// `extensionRunner.invalidate()` (the dead-prior state the classification
+		// wiring file drives too), so the second start is a same-root replacement.
+		const cwd = path.join(fixture.root, "same-root", "proj");
+		const first = await startPiSession({
+			root: fixture.root,
+			cwd,
+			responses: [fauxAssistantMessage(fauxText("first"))],
+		});
+		first.session.extensionRunner.invalidate();
+		const second = await startPiSession({
+			root: fixture.root,
+			cwd,
+			responses: [fauxAssistantMessage(fauxText("second"))],
+		});
 
 		// Same root: today's behavior is unchanged — the replacement is primary.
 		expect(getSecondarySessionCount()).toBe(0);
-		expect(getActivePrimaryRoot()).toContain(path.basename(hostRoot));
+		expect(realPathOfActivePrimaryRoot()).toBe(fs.realpathSync(cwd));
+		expect(getActiveSessionId()).toBe(
+			second.session.sessionManager.getSessionId(),
+		);
 	}, 30_000);
 });

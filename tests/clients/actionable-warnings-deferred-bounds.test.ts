@@ -137,6 +137,12 @@ const fakeService = makeLspServiceDouble({
 	getLastKnownDiagnostics,
 });
 
+// Stays a module mock (#4709): the session_shutdown cases below call the REAL
+// `resetLSPService`, and what retires the deferred loop is production's
+// lifecycle `beforeReset` (`abortDeferredLspWork`, clients/lsp/index.ts). The
+// seam installs its own lifecycle with a no-op `beforeReset`, so the loop never
+// aborts there (3 cases stay `pending`); copying production's hook into the
+// test would assert the copy.
 vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => {
 	const actual =
 		await importOriginal<typeof import("../../clients/lsp/capabilities.js")>();

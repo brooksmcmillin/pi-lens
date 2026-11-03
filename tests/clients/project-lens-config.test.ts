@@ -16,6 +16,7 @@ import {
 } from "../../clients/degradation-ledger.js";
 import { resolveLensToolEnabled } from "../../clients/tool-config.js";
 import { removeTempDirSync } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
 
 // #1333: these config/telemetry warnings no longer reach the terminal — pi owns
 // it — they go to the ndjson sink in `clients/extension-log.ts`. The sink mock
@@ -582,11 +583,15 @@ describe("loadPiLensProjectConfig", () => {
 			expect(warnedFor("not honored in a project")).toBe(true);
 			expect(warnedFor('"delta"')).toBe(true);
 			expect(warnedFor('"tests"')).toBe(true);
-			expect(warnedFor('"dispatch"')).toBe(true);
+			// `dispatch` is mixed-scope now (`dispatch.disabledRunners` is honored
+			// at project scope), so the notice names the dotted global-only key.
+			expect(warnedFor('"dispatch.runnerTimeoutFloorMs"')).toBe(true);
 			expect(warnedFor('"widget"')).toBe(true);
 			const deltaNotice = noticeFor('"delta" is a global-only');
 			const testsNotice = noticeFor('"tests" is a global-only');
-			const dispatchNotice = noticeFor('"dispatch" is a global-only');
+			const dispatchNotice = noticeFor(
+				'"dispatch.runnerTimeoutFloorMs" is a global-only',
+			);
 			const widgetNotice = noticeFor('"widget" is a global-only');
 			expect(deltaNotice).toBeDefined();
 			expect(testsNotice).toBeDefined();
@@ -1008,15 +1013,7 @@ describe("the config-deprecated ledger row survives a warm cache across sessions
 });
 
 describe("a global-only setting's notice names the file the resolver actually reads (#2426 review round 3, S1)", () => {
-	const originalConfigPath = process.env.PI_LENS_CONFIG_PATH;
-
-	afterEach(() => {
-		if (originalConfigPath === undefined) {
-			delete process.env.PI_LENS_CONFIG_PATH;
-		} else {
-			process.env.PI_LENS_CONFIG_PATH = originalConfigPath;
-		}
-	});
+	const setConfigPath = useConfigPath();
 
 	function warnedFor(substring: string): boolean {
 		return (console.error as ReturnType<typeof vi.fn>).mock.calls
@@ -1033,7 +1030,7 @@ describe("a global-only setting's notice names the file the resolver actually re
 			// homedir-anchored: PI_LENS_HOME does not participate (the #2457
 			// split-brain stays a separate issue), and vitest-setup neutralizes the
 			// agent-dir env the resolution does read.
-			delete process.env.PI_LENS_CONFIG_PATH;
+			setConfigPath(undefined);
 			resetGlobalConfigLocationCache();
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
@@ -1052,7 +1049,7 @@ describe("a global-only setting's notice names the file the resolver actually re
 		// round 3, S1; the sibling defect the F1 test in
 		// `config-notice-ownership.test.ts` pins for the migration-notice path).
 		const relocated = path.join(tmpDir, "elsewhere", "pi-lens-config.json");
-		process.env.PI_LENS_CONFIG_PATH = relocated;
+		setConfigPath(relocated);
 
 		fs.writeFileSync(
 			path.join(tmpDir, ".pi-lens.json"),
@@ -1280,5 +1277,51 @@ describe("non-flag global-only key inside a mixed-scope section (#3131)", () => 
 		loadPiLensProjectConfig(tmpDir);
 		expect(warnCountFor("actionableWarnings.autoFix.maxFixes")).toBe(1);
 		expect(warnCountFor('"delta" is a global-only')).toBe(1);
+	});
+});
+
+describe("dispatch.disabledRunners at project scope", () => {
+	function warnedFor(substring: string): boolean {
+		return (console.error as ReturnType<typeof vi.fn>).mock.calls
+			.flat()
+			.some((arg) => typeof arg === "string" && arg.includes(substring));
+	}
+
+	it("is honored silently: no typo notice and no global-only notice", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ dispatch: { disabledRunners: ["dotnet-build"] } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor("global-only")).toBe(false);
+		expect(warnedFor("unknown key")).toBe(false);
+		expect(console.error).not.toHaveBeenCalled();
+	});
+
+	it("still tells the project that dispatch.runnerTimeoutFloorMs does nothing there", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({
+				dispatch: {
+					disabledRunners: ["dotnet-build"],
+					runnerTimeoutFloorMs: 180_000,
+				},
+			}),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor('"dispatch.runnerTimeoutFloorMs" is a global-only')).toBe(
+			true,
+		);
+		expect(warnedFor('"dispatch.disabledRunners"')).toBe(false);
+	});
+
+	it("reports a mistyped dispatch sub-key as a typo, not as global-only", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ dispatch: { disabledRunner: ["dotnet-build"] } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor('unknown key "dispatch.disabledRunner"')).toBe(true);
+		expect(warnedFor("global-only")).toBe(false);
 	});
 });

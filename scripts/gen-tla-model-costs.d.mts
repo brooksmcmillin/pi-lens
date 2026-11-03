@@ -3,6 +3,8 @@
 // them to the .mjs exports).
 export type ModelCostTable = {
 	files: Record<string, number>;
+	/** The median TLC distinct-state count per config (#4714). */
+	states: Record<string, number>;
 	sources: string[];
 	perShardShares: Record<string, number>;
 };
@@ -12,6 +14,11 @@ export type ModelCostTable = {
  * `ok|FAIL formal/<family>/<Model>.cfg: ... (Ns)` lines the checker prints.
  */
 export declare function costsFromLog(
+	text: string | null | undefined,
+): Map<string, number>;
+
+/** Per-config TLC distinct-state counts from one log (#4714); absent when unprinted. */
+export declare function statesFromLog(
 	text: string | null | undefined,
 ): Map<string, number>;
 

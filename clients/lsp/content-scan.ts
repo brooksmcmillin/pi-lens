@@ -53,6 +53,20 @@ function walkLfLines(content: string): {
 }
 
 /**
+ * The last `\n` walk this module made, so the two consumers of the SAME bytes
+ * pay one (#2066 round 3).
+ *
+ * A send is preceded by the sync bound (`exceedsLspSyncLimits`), which counts
+ * this document's `\n` to compare it against the line limit. The send then
+ * asked for the same number again. A JS string is immutable, so an equal value
+ * proves equal bytes — a hit returns the count of exactly this content, from
+ * whichever spelling of it was walked, and different bytes miss and are walked
+ * again. One entry, replaced on every miss and never read across documents, so
+ * it holds at most one document's text.
+ */
+let lastNewlineWalk: { content: string; lfNewlineCount: number } | undefined;
+
+/**
  * The document's `\n` count — the answer a bound check or a record asks for,
  * on its own (#2066).
  *
@@ -63,9 +77,27 @@ function walkLfLines(content: string): {
  * `\r` branch runs a per-character loop for `lastLine`, and paying it to
  * answer a count made `exceedsLspSyncLimits` 4.6x to 5.5x slower on any
  * document holding a `\r` (review F1: 0.06 -> 0.31 ms at 196 KB).
+ *
+ * #2066 round 3: the answer is kept for the guard below, because the send that
+ * follows this bound check asks for it again.
  */
 export function countLfNewlines(content: string): number {
-	return walkLfLines(content).lfNewlineCount;
+	const lfNewlineCount = walkLfLines(content).lfNewlineCount;
+	lastNewlineWalk = { content, lfNewlineCount };
+	return lfNewlineCount;
+}
+
+/** The `\n` count `walkLfLines` just made for THIS content, if it made one. */
+function reusedNewlineCount(content: string): number | undefined {
+	return lastNewlineWalk?.content === content
+		? lastNewlineWalk.lfNewlineCount
+		: undefined;
+}
+
+/** Where the last `\n` leaves the final line, without a walk (#2066 round 3). */
+function lastLfLineStart(content: string): number {
+	const lastNewline = content.lastIndexOf("\n");
+	return lastNewline === -1 ? 0 : lastNewline + 1;
 }
 
 /**
@@ -84,17 +116,28 @@ export function countLfNewlines(content: string): number {
  * terminators went uncounted computes a range ending mid-document.
  */
 export function scanDocumentContent(content: string): DocumentContentScan {
-	// The count is the native one on every document; the per-character loop
-	// below is the ONLY cost a `\r` adds, and it computes `lastLine` alone.
-	const { lfNewlineCount, lastStart } = walkLfLines(content);
+	// #2066 round 3: the sync bound may have counted these exact bytes already.
+	// A hit costs no walk at all — see `lastNewlineWalk`.
+	const reused = reusedNewlineCount(content);
 	// A document with no `\r` (the common case) has exactly one terminator
-	// kind, so `lastLine` starts right after the last `\n`.
+	// kind, so `lastLine` starts right after the last `\n` and its index is the
+	// `\n` count itself.
 	if (content.indexOf("\r") === -1) {
+		if (reused !== undefined) {
+			return {
+				lfNewlineCount: reused,
+				lastLine: { index: reused, start: lastLfLineStart(content) },
+			};
+		}
+		const { lfNewlineCount, lastStart } = walkLfLines(content);
 		return {
 			lfNewlineCount,
 			lastLine: { index: lfNewlineCount, start: lastStart },
 		};
 	}
+	// The count is the native one on every document; the per-character loop
+	// below is the ONLY cost a `\r` adds, and it computes `lastLine` alone.
+	const lfNewlineCount = reused ?? walkLfLines(content).lfNewlineCount;
 	let index = 0;
 	let start = 0;
 	// `charCodeAt`, not `codePointAt` (typescript:S7758, accepted): both are

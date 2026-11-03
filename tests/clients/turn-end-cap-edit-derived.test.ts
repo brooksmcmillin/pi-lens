@@ -19,27 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beginScope } from "../../clients/session-scope.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
-
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => makeLspServiceDouble({}),
-}));
-
-const logLatency = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/latency-logger.js")>();
-	return {
-		...actual,
-		logLatency: (entry: Parameters<typeof actual.logLatency>[0]) => {
-			logLatency(entry);
-			actual.logLatency(entry);
-		},
-	};
-});
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 import { resetBoundedTelemetry } from "../../clients/bounded-telemetry.js";
 import { CacheManager } from "../../clients/cache-manager.js";
@@ -238,7 +218,8 @@ function ledgerCount(kind: string): number {
 		.reduce((sum, entry) => sum + entry.count, 0);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble();
 	_resetStateCacheForTests();
 	resetDegradationLedger();
 	resetBoundedTelemetry();
@@ -246,7 +227,6 @@ beforeEach(() => {
 
 afterEach(() => {
 	cancelLSPIdleReset();
-	logLatency.mockClear();
 	resetDegradationLedger();
 	resetBoundedTelemetry();
 });

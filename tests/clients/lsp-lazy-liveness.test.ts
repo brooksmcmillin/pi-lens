@@ -1,10 +1,20 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createPiMock, makeCtx } from "../support/pi-mock.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
-import { removeTempDirSync } from "./test-utils.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
+import {
+	endTurn,
+	readTarget,
+	step,
+	toolResults,
+} from "../support/pi-session-commit-gate.js";
+import {
+	fauxToolCall,
+	piSessionFixture,
+	startPiSession,
+} from "../support/pi-session.js";
+
+const fixture = piSessionFixture();
 
 describe("LSP session warm/first-use liveness (#1394)", () => {
 	afterEach(() => vi.resetModules());
@@ -12,14 +22,6 @@ describe("LSP session warm/first-use liveness (#1394)", () => {
 	it("session_start -> first edit services the LSP and produces pipeline output", async () => {
 		vi.resetModules();
 		const touchFile = vi.fn(async () => []);
-		const service = makeLspServiceDouble({
-			touchFile,
-			supportsLSP: () => true,
-		});
-		vi.doMock("../../clients/lsp/capabilities.js", () => ({
-			getLSPService: () => service,
-			resetLSPService: () => {},
-		}));
 		vi.doMock(
 			"../../clients/dispatch/integration.js",
 			async (importOriginal) => ({
@@ -53,6 +55,7 @@ describe("LSP session warm/first-use liveness (#1394)", () => {
 				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
+				deadCodeClients: [],
 				testRunnerClient: { detectRunner: () => null },
 				goClient: { isGoAvailableAsync: async () => false },
 				rustClient: { isAvailableAsync: async () => false },
@@ -66,29 +69,48 @@ describe("LSP session warm/first-use liveness (#1394)", () => {
 				},
 			}));
 		});
-		const { default: registerExtension } = await import("../../index.js");
-		const pi = createPiMock({ "no-autoformat": true });
-		registerExtension(pi.asExtensionAPI());
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-live-"));
+		// Installed AFTER every doMock above and BEFORE the entry import:
+		// `vi.resetModules()` re-evaluates `clients/lsp/index.ts`, whose import-time
+		// configure replaces the lifecycle (tests/support/lsp-service-seam.ts, step 2).
+		await installLspServiceDouble({
+			touchFile,
+			supportsLSP: () => true,
+		});
+		// Tier 2 (#4937 L6): a real pi session over the factory this test imported
+		// after the doMocks above. `no-lsp` is a default of the tier, so the case
+		// turns it off: the claim is that the first edit after a start reaches the
+		// language-server seam.
+		const cwd = path.join(fixture.root, "proj");
 		const filePath = path.join(cwd, "live.ts");
+		fs.mkdirSync(cwd, { recursive: true });
 		fs.writeFileSync(filePath, "export const live = 1;\n");
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			await pi.emit("turn_start", {}, makeCtx({ cwd }));
-			const result = await pi.emit(
-				"tool_result",
-				{
-					toolName: "edit",
-					input: { path: filePath },
-					details: { diff: "+ 1 export const live = 2;" },
-					content: [{ type: "text", text: "ok" }],
-				},
-				makeCtx({ cwd }),
-			);
-			expect(touchFile).toHaveBeenCalled();
-			expect(JSON.stringify(result)).toContain("lsp pipeline output");
-		} finally {
-			removeTempDirSync(cwd);
-		}
+		const handle = await startPiSession({
+			root: fixture.root,
+			cwd,
+			flags: new Map([["no-lsp", false]]),
+			inlineFactory: async () => (await import("../../index.js")).default,
+			responses: [
+				step(readTarget(filePath)),
+				step(
+					fauxToolCall("edit", {
+						path: filePath,
+						edits: [
+							{
+								oldText: "export const live = 1;",
+								newText: "export const live = 2;",
+							},
+						],
+					}),
+				),
+				endTurn(),
+			],
+		});
+		await handle.prompt("edit it");
+
+		expect(handle.errors).toEqual([]);
+		expect(touchFile).toHaveBeenCalled();
+		const edits = toolResults(handle.requests.at(-1) ?? [], "edit");
+		expect(edits).toHaveLength(1);
+		expect(edits[0]?.text).toContain("lsp pipeline output");
 	}, 30_000);
 });

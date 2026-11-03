@@ -23,6 +23,10 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../clients/project-trust.js";
 import { setupTestEnvironment, useTrackedTempDirs } from "./test-utils.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -92,6 +96,7 @@ useTrackedTempDirs("pi-lens-graph-stamp-");
 afterEach(() => {
 	if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 	else process.env.PILENS_DATA_DIR = previousDataDir;
+	resetProjectTrust();
 	vi.restoreAllMocks();
 });
 
@@ -105,6 +110,11 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		// counting, so this case counts only the build's own walks. `statSync`
 		// is already the module mock, so the spy inherits its history: clear it.
 		getProjectDataDir(cwd);
+		// #4530: under untrusted pi trust every spawn's admission walks its
+		// search path for `.git` (once per directory, per spawn), which is the
+		// spawn seam's cost, not the build's; trust is adopted so this counts
+		// the build's own walks only.
+		setProjectTrustState("trusted");
 		const stat = vi.spyOn(fs, "statSync");
 		stat.mockClear();
 

@@ -520,7 +520,8 @@ const MEMBERS: Member[] = [
 			);
 		},
 		output: (reported) => ({
-			status: 1,
+			// #4522: detekt's measured findings exit is 2 (captured real.captured.json).
+			status: 2,
 			stdout: `${reported}:4:5: error: This expression contains a magic number (${MARKER}) [MagicNumber]\n`,
 		}),
 	},
@@ -1085,8 +1086,9 @@ describe("gleam-check reported-path attribution (#3285)", () => {
 		expect(observed.diagnostics[0]).toMatchObject({
 			id: "gleam-check-nonzero-no-diagnostics",
 			message: "error: Could not find a package required by this project",
-			severity: "error",
-			semantic: "blocking",
+			severity: "warning",
+			semantic: "warning",
+			runnerFault: true,
 		});
 		expect(observed.diagnostics[0]?.line).toBeUndefined();
 		expect(observed.diagnostics[0]?.column).toBeUndefined();

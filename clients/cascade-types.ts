@@ -57,14 +57,30 @@ export interface CascadeSectionLayout {
 }
 
 /**
- * #4485: the selected neighbours a run touched but got no answer for within
- * its bound, grouped by the server that was asked. Bounded by the selected
- * slice (`CASCADE_NEIGHBOUR_BUDGET`); turn_end caps the paths it shows.
+ * #4485/#5040: WHY a run does not cover a selected neighbour. One value per
+ * shape of absence, so a reader never words one cause's paths with the other's
+ * sentence (defect shape 24: the second writer names its kind before composing
+ * branches).
+ *
+ * - `no-answer` (#4485): the touch's bounded wait lapsed and the server said
+ *   nothing.
+ * - `pre-edit-answer` (#5040): the touch did answer, but with a cache entry the
+ *   run's own edit predates — nothing has re-asked the server since the exporter
+ *   changed, so a clean verdict would cover a dependent nobody re-checked.
+ */
+export type CascadeUnconfirmedReason = "no-answer" | "pre-edit-answer";
+
+/**
+ * #4485: the selected neighbours a run touched but does not cover, grouped by
+ * the server that was asked and the reason. Bounded by the selected slice
+ * (`CASCADE_NEIGHBOUR_BUDGET`); turn_end caps the paths it shows.
  */
 export interface CascadeUnconfirmed {
 	count: number;
 	servers: Array<{
 		serverId: string;
+		/** #5040: which shape of absence this group is. Absent reads `no-answer`. */
+		reason: CascadeUnconfirmedReason;
 		/** The wait the touch was given, for the pending line's wording. */
 		waitMs: number;
 		paths: string[];

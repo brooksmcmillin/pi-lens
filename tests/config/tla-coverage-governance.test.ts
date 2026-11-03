@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	changedHookAnchors,
 	evaluateTlaCoverage,
@@ -11,12 +11,28 @@ import {
 	matchGlob,
 	parseChangedFiles,
 	validateCoverageMap,
+	withoutDeclaredFamilies,
 } from "../../scripts/lib/tla-coverage.mjs";
 import {
 	lintLocalPrBody,
 	lintTlaCoverage,
 	parseRuntimeHunks,
 } from "../../scripts/check-pr-body.mjs";
+
+// #3902: the PR-body lint cases inject a fake git, so none may spawn a real
+// one. The child-process boundary records every `execFileSync` spawn and
+// refuses it; a case asserts the record stayed empty. It does not see the
+// `execSync` form, which `check-pr-body.mjs` does not import today (a p3
+// residual in the PR body). A real spawn plus a lex of every matching runtime
+// file took 235 ms solo and over 5 s on a loaded Windows runner.
+const realGit = vi.hoisted(() => ({ calls: [] as string[][] }));
+vi.mock("node:child_process", async (importOriginal) => ({
+	...(await importOriginal<typeof import("node:child_process")>()),
+	execFileSync: (_file: string, args: string[]) => {
+		realGit.calls.push(args);
+		throw new Error("a real git spawn in a fake-git lint case (#3902)");
+	},
+}));
 
 // #3802 rule 2: a PR that changes a mapped runtime file must move its model
 // (a .tla/.cfg under the family) or say "TLA+ unaffected: <family> — <reason>".
@@ -55,13 +71,16 @@ const BASE_BODY = [
 	"The coverage rule keeps a model tied to the code it models.",
 	"",
 	"## Notes for the reviewer",
-	"None.",
+	"- None.",
 	"",
 	"## Change outline",
 	"- clients/read-guard.ts",
 	"",
 	"## Summary",
 	"Extend the read guard.",
+	"",
+	"## Proof and checks",
+	"The proof sections follow.",
 	"",
 	"## Tests",
 	"Targeted tests pass.",
@@ -71,6 +90,10 @@ const BASE_BODY = [
 	"",
 	"## Class sweep",
 	"Defect shape: a mapped runtime file changed without its model. Search: `rg -n read-guard formal`. Verdict: none outside this fixture.",
+	"Alignment: none: this fixture touches no family.",
+	"",
+	"## Fold check",
+	"#4711 folded: the same body-lint seam, so the section lands here. Closes #4711.",
 	"",
 	"## Observability",
 	"No new failure path; no record added.",
@@ -404,6 +427,10 @@ describe("TLA+ coverage rule", () => {
 	});
 });
 
+beforeEach(() => {
+	realGit.calls.length = 0;
+});
+
 describe("TLA+ coverage in the PR-body lint (#3802)", () => {
 	it("fails a mapped runtime change with no model change and no body line", () => {
 		const git = (args: string[]) =>
@@ -415,18 +442,75 @@ describe("TLA+ coverage in the PR-body lint (#3802)", () => {
 		});
 		expect(result.valid).toBe(false);
 		expect(result.errors.join(" ")).toContain("formal/read-guard/");
+		expect(realGit.calls).toEqual([]);
 	});
 
+	// #3902: the declarations end the body, under "## Observability". Their
+	// family names are not record mentions, so no runtime-tree `git grep` and
+	// lex runs for them.
+	const DECLARATIONS =
+		"TLA+ unaffected: read-guard — only a local helper moved.\nTLA+ unaffected: session-lifecycle — the change does not touch session state.";
+
+	const spyGit = (calls: string[][]) => (args: string[]) => {
+		calls.push(args);
+		return args.includes("--name-only")
+			? "clients/read-guard.ts\n"
+			: READ_GUARD_DIFF;
+	};
+
 	it("passes the same diff when the body carries the unaffected line", () => {
-		const git = (args: string[]) =>
-			args.includes("--name-only")
-				? "clients/read-guard.ts\n"
-				: READ_GUARD_DIFF;
-		const body = `${BASE_BODY}\n\nTLA+ unaffected: read-guard — only a local helper moved.\nTLA+ unaffected: session-lifecycle — the change does not touch session state.`;
-		const result = lintLocalPrBody(body, REPO_ROOT, git as never, {
+		const calls: string[][] = [];
+		const body = `${BASE_BODY}\n\n${DECLARATIONS}`;
+		const result = lintLocalPrBody(body, REPO_ROOT, spyGit(calls) as never, {
 			headFiles: READ_GUARD_HEAD_FILES,
 		});
 		expect(result.valid).toBe(true);
+		expect(calls.filter((args) => args[0] === "grep")).toEqual([]);
+		expect(realGit.calls).toEqual([]);
+	});
+
+	it("still harvests a real record named in the same section", () => {
+		const calls: string[][] = [];
+		const body = `${BASE_BODY}\n\nSee \`tool-cwd-resolution\`.\n${DECLARATIONS}`;
+		lintLocalPrBody(body, REPO_ROOT, spyGit(calls) as never, {
+			headFiles: READ_GUARD_HEAD_FILES,
+		});
+		const grep = calls.find((args) => args[0] === "grep") ?? [];
+		expect(grep).toContain("tool-cwd-resolution");
+		expect(grep).not.toContain("read-guard");
+		expect(grep).not.toContain("session-lifecycle");
+		expect(realGit.calls).toEqual([]);
+	});
+});
+
+describe("withoutDeclaredFamilies (#3902)", () => {
+	const FAMILIES = ["read-guard", "session-lifecycle"];
+
+	it("drops the family token of a declaration and keeps its reason", () => {
+		expect(
+			withoutDeclaredFamilies(
+				"- **TLA+ unaffected: read-guard — emits `tool-cwd-resolution`.",
+				FAMILIES,
+			),
+		).toBe("- **TLA+ unaffected:  — emits `tool-cwd-resolution`.");
+		expect(
+			withoutDeclaredFamilies(
+				"TLA+ unaffected: read-guard — a.\nSee read-guard and `kind-one`.",
+				FAMILIES,
+			),
+		).toBe("TLA+ unaffected:  — a.\nSee read-guard and `kind-one`.");
+	});
+
+	// F1 (#3902 review, round 1): only a known family is a declared slot. A
+	// malformed declaration, or a token that merely starts with a family name,
+	// keeps its token so the #4597 read-back still sees it.
+	it("keeps the token of a declaration that names no known family", () => {
+		expect(
+			withoutDeclaredFamilies("TLA+ unaffected: probe-kind-3902", FAMILIES),
+		).toBe("TLA+ unaffected: probe-kind-3902");
+		expect(
+			withoutDeclaredFamilies("TLA+ unaffected: read-guard-foo — a.", FAMILIES),
+		).toBe("TLA+ unaffected: read-guard-foo — a.");
 	});
 });
 
@@ -472,6 +556,7 @@ describe("lintTlaCoverage seam (#3802)", () => {
 			expect(warn.mock.calls.flat().join("\n")).toContain(
 				"TLA+ note: clients/lsp/client.ts",
 			);
+			expect(realGit.calls).toEqual([]);
 		} finally {
 			warn.mockRestore();
 		}
@@ -596,6 +681,8 @@ describe("index.ts hook anchors (#3878)", () => {
 			context: ["on"],
 			// #4631: the pi 0.87+ request hook, an inline registration like `context`.
 			context_with_system: ["on"],
+			// #4687: the model-switch re-plan of the lazy-tools posture.
+			model_select: ["on"],
 		});
 	});
 

@@ -51,6 +51,7 @@ import {
 	makeContextWithSystemEvent,
 	makeSessionStartEvent,
 } from "./support/host-event-factory.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 const SESSION_ID = "pi-1892-witness-session";
@@ -78,7 +79,11 @@ beforeEach(() => {
 	);
 });
 
-afterEach(() => removeTempDirSync(tmpDir));
+afterEach(async () => {
+	// #5146: end the sessions the case started before the fixture root goes.
+	await endMockSessions();
+	removeTempDirSync(tmpDir);
+});
 
 function writeAt(relative: string, mtimeMs: number): string {
 	const file = path.join(tmpDir, relative);
@@ -162,12 +167,12 @@ describe("#1892 witness: pi turn_end → context, scanner freshness", () => {
 
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: tmpDir, sessionId: SESSION_ID }),
-		);
-		await pi.emit("turn_start", {}, makeCtx({ cwd: tmpDir }));
+		// One ctx for the whole session, as pi hands each event its session's
+		// own ctx. A turn ctx with no session id named a session nobody started,
+		// so its turn-end write was dropped and counted (#4965).
+		const ctx = makeCtx({ cwd: tmpDir, sessionId: SESSION_ID });
+		await pi.emit("session_start", makeSessionStartEvent(), ctx);
+		await pi.emit("turn_start", {}, ctx);
 		await pi.emit(
 			"tool_result",
 			{
@@ -176,13 +181,13 @@ describe("#1892 witness: pi turn_end → context, scanner freshness", () => {
 				details: { diff: "+  1 alpha();" },
 				content: [{ type: "text", text: "base" }],
 			},
-			makeCtx({ cwd: tmpDir }),
+			ctx,
 		);
-		await pi.emit("turn_end", {}, makeCtx({ cwd: tmpDir }));
+		await pi.emit("turn_end", {}, ctx);
 		const injected = (await pi.emit(
 			"context_with_system",
 			makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
-			makeCtx({ cwd: tmpDir }),
+			ctx,
 		)) as { messages?: Array<{ role?: string; content: string }> } | undefined;
 
 		// #4631 round 5 (F2): the transcript leads with the host's system head, so the
@@ -203,7 +208,21 @@ describe("#1892 witness: pi turn_end → context, scanner freshness", () => {
 			...freshnessRows().map((row) => row.replaceAll(tmpDir, "<PROJECT>")),
 			"",
 			"=== degradation ledger ===",
-			...getDegradationSummary().map((row) => row.kind),
+			...getDegradationSummary()
+				// #4530: npm and npx put the checkout's own `node_modules/.bin` on
+				// the runner's PATH, and under untrusted trust the spawn seam drops
+				// that entry with one record. That row describes how vitest was
+				// launched, not this flow, so the golden leaves it out.
+				.filter(
+					(row) =>
+						!(
+							row.kind === "trust-refusal" &&
+							row.latestReasons.every((entry) =>
+								entry.subject.startsWith("project-path-entry:"),
+							)
+						),
+				)
+				.map((row) => row.kind),
 			"",
 		].join("\n");
 

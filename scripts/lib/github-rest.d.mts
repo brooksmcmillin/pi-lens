@@ -8,3 +8,6 @@ export declare function githubHeaders(
 export declare function githubFetcher(
 	token: string,
 ): (url: string, init?: RequestInit) => Promise<Response>;
+export declare function parseOwnerRepoFromGitRemote(
+	remoteUrl: string | null | undefined,
+): string | null;

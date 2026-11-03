@@ -1,0 +1,744 @@
+{
+ "about": "Raw publish/notification order of the auxiliary LSP servers, measured 2026-10-22 with a throwaway raw JSON-RPC driver (initialize, initialized, then didOpen, didChange, didClose+didOpen, didSave on a python/javascript/yaml/markdown file the driver also wrote to disk). Pinned by tests/clients/lsp/opengrep-pre-rules-publish-4763.test.ts. atMs is relative to the step's first message sent. A `publishedCount` event is one publishDiagnostics for the target document. Only events for the target document are kept.",
+ "command": "PROBE_CFG='{bin,args,root,home,file,lang,init,steps}' node probe.mjs, one server per run, HOME and TMPDIR pinned to a probe directory, stdin/stdout JSON-RPC (see #4763 for the driver and the raw run files)",
+ "runs": [
+  {
+   "id": "auto-cold-1",
+   "server": "opengrep 1.30.0",
+   "config": "--config auto (online)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 11,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 814,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 1216,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 376,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 784,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 892,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 504,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 366,
+       "publishedCount": 1,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "auto-cold-2",
+   "server": "opengrep 1.30.0",
+   "config": "--config auto (online)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 18,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 774,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 1252,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 341,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 575,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 700,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 416,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 332,
+       "publishedCount": 1,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "auto-cold-3",
+   "server": "opengrep 1.30.0",
+   "config": "--config auto (online)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 16,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 997,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 1482,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 336,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 585,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 724,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 333,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 412,
+       "publishedCount": 1,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "auto-cold-1.32-1",
+   "server": "opengrep 1.32.0",
+   "config": "--config auto (online)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 11,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 726,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 980,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 251,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 312,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 434,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 243,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 240,
+       "publishedCount": 1,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "auto-cold-1.32-2",
+   "server": "opengrep 1.32.0",
+   "config": "--config auto (online)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 15,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 995,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 1323,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 285,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 371,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 480,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 292,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 247,
+       "publishedCount": 1,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "auto-clean",
+   "server": "opengrep 1.30.0",
+   "config": "--config auto (online), clean file",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 8,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 656,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 905,
+       "publishedCount": 0,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 285,
+       "publishedCount": 0,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 474,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 620,
+       "publishedCount": 0,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 336,
+       "publishedCount": 0,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 270,
+       "publishedCount": 0,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "local-1",
+   "server": "opengrep 1.30.0",
+   "config": "local rule file (notification first)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 1,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 34,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 37,
+       "publishedCount": 0,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 8,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 9,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 10,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 5,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 9,
+       "publishedCount": 1,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "local-race",
+   "server": "opengrep 1.30.0",
+   "config": "local rule file (empty publish first, race)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 2,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 2,
+       "notification": "semgrep/rulesRefreshed"
+      },
+      {
+       "atMs": 14,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen (edit1, comment only)",
+     "events": [
+      {
+       "atMs": 7,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen+save (edit2)",
+     "events": [
+      {
+       "atMs": 6,
+       "publishedCount": 2,
+       "version": null
+      },
+      {
+       "atMs": 8,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm save only",
+     "events": [
+      {
+       "atMs": 13,
+       "publishedCount": 2,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (edit3, removes shell=True)",
+     "events": []
+    },
+    {
+     "label": "warm reopen (edit4, removes shell=True)",
+     "events": [
+      {
+       "atMs": 5,
+       "publishedCount": 1,
+       "version": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "ast-grep-cold",
+   "server": "ast-grep 0.51.0",
+   "config": "sgconfig ruleDirs = rules/ast-grep-rules/rules",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 34,
+       "logMessage": "Rules reloaded successfully using CLI logic"
+      },
+      {
+       "atMs": 35,
+       "publishedCount": 3,
+       "version": 0
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (comment edit)",
+     "events": [
+      {
+       "atMs": 2,
+       "publishedCount": 3,
+       "version": 1
+      }
+     ]
+    },
+    {
+     "label": "warm save",
+     "events": []
+    },
+    {
+     "label": "warm reopen",
+     "events": [
+      {
+       "atMs": 1,
+       "publishedCount": 3,
+       "version": 2
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "zizmor-cold",
+   "server": "zizmor 1.30.1",
+   "config": "offline (no token)",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 3,
+       "publishedCount": 4,
+       "version": 0
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (comment edit)",
+     "events": [
+      {
+       "atMs": 2,
+       "publishedCount": 4,
+       "version": 1
+      }
+     ]
+    },
+    {
+     "label": "warm save",
+     "events": [
+      {
+       "atMs": 1,
+       "publishedCount": 4,
+       "version": null
+      }
+     ]
+    },
+    {
+     "label": "warm reopen",
+     "events": [
+      {
+       "atMs": 2,
+       "publishedCount": 4,
+       "version": 2
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "typos-cold",
+   "server": "typos-lsp",
+   "config": "pi-lens default config",
+   "steps": [
+    {
+     "label": "cold didOpen",
+     "events": [
+      {
+       "atMs": 1,
+       "publishedCount": 2,
+       "version": 0
+      }
+     ]
+    },
+    {
+     "label": "warm didChange (comment edit)",
+     "events": [
+      {
+       "atMs": 1,
+       "publishedCount": 2,
+       "version": 1
+      }
+     ]
+    },
+    {
+     "label": "warm save",
+     "events": []
+    },
+    {
+     "label": "warm reopen",
+     "events": [
+      {
+       "atMs": 1,
+       "publishedCount": 0,
+       "version": null
+      },
+      {
+       "atMs": 1,
+       "publishedCount": 2,
+       "version": 2
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -32,6 +32,7 @@ import { describe, expect, it } from "vitest";
 import {
 	extractTomlTableSection,
 	hasCargoWorkspaceTable,
+	parseTomlScalarString,
 	parseTomlStringArray,
 	readCargoWorkspaceExclude,
 	readCargoWorkspaceMembers,
@@ -102,6 +103,36 @@ describe("parseTomlStringArray comment stripping (review round 2, F1)", () => {
 		expect(parseTomlStringArray(content, "members")).toEqual([
 			"crates/foo#bar",
 		]);
+	});
+});
+
+// #4638 r3 (N7). Recurrence: the reader accepted only the one-line `"..."` and
+// `'...'` spellings, so a legal TOML `"""..."""` / `\'\'\'...\'\'\'` value read as the
+// empty string (the regex stopped at the second quote) and the declaration the
+// Python syntax-level reader depends on was silently absent.
+describe("parseTomlScalarString string forms (#4638 r3 N7)", () => {
+	const forms: Array<[string, string]> = [
+		["basic", 'requires-python = ">=3.14"'],
+		["literal", "requires-python = '>=3.14'"],
+		["triple basic", 'requires-python = """>=3.14"""'],
+		["triple literal", "requires-python = \'\'\'>=3.14\'\'\'"],
+		[
+			"triple basic, value on the next line",
+			'requires-python = """\n>=3.14"""',
+		],
+	];
+	for (const [label, line] of forms) {
+		it(`reads the ${label} form`, () => {
+			expect(parseTomlScalarString(`${line}\n`, "requires-python")).toBe(
+				">=3.14",
+			);
+		});
+	}
+
+	it("keeps an empty one-line string empty beside a triple-quoted neighbour", () => {
+		const content = 'a = ""\nb = """y"""\n';
+		expect(parseTomlScalarString(content, "a")).toBe("");
+		expect(parseTomlScalarString(content, "b")).toBe("y");
 	});
 });
 
@@ -246,7 +277,7 @@ describe("no hand-rolled [workspace]-table regex outside cargo-manifest.ts (#249
 	 *   M3: no regex at all — `content.includes("[workspace]")`, a bare
 	 *       substring test. True for a COMMENTED-OUT `# [workspace]` heading
 	 *       too, which is exactly why `workspace-modules.ts`'s pre-#2473
-	 *       `detectWorkspaceType` reading this way was a defect (AGENTS.md,
+	 *       `detectWorkspaceType` reading this way was a defect (HISTORY.md,
 	 *       "the one Cargo.toml reader" entry) — and the original detector
 	 *       missed this spelling too, having no backslashes at all.
 	 *

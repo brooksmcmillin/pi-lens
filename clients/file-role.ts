@@ -8,7 +8,7 @@
 
 import { basename, dirname, win32 } from "node:path";
 import { isGeneratedOrArtifact } from "./generated-artifacts.js";
-import { isWindowsPath } from "./path-utils.js";
+import { isWindowsPath, toPosix } from "./path-utils.js";
 
 // --- Types ---
 
@@ -104,9 +104,9 @@ export function detectFileRole(filePath: string, content?: string): FileRole {
 	const windowsShaped = isWindowsPath(filePath);
 	const rawBase = windowsShaped ? win32.basename(filePath) : basename(filePath);
 	const base = rawBase.toLowerCase();
-	const dir = (windowsShaped ? win32.dirname(filePath) : dirname(filePath))
-		.replace(/\\/g, "/")
-		.toLowerCase();
+	const dir = toPosix(
+		windowsShaped ? win32.dirname(filePath) : dirname(filePath),
+	).toLowerCase();
 
 	// --- Test ---
 	// #2928: dirname has no trailing slash; match direct __tests__ children too.
@@ -130,12 +130,11 @@ export function detectFileRole(filePath: string, content?: string): FileRole {
 	}
 
 	// --- Migrations ---
-	// Normalize separators before regex so the pattern works on Windows too
-	const forwardDir = dir.replace(/\\/g, "/");
+	// `dir` is already separator-folded above, so the pattern works on Windows too
 	if (
-		forwardDir.includes("/migrations/") ||
-		forwardDir.includes("/migration/") ||
-		/\/\d{4,}_[a-z]/.test(forwardDir + "/" + base)
+		dir.includes("/migrations/") ||
+		dir.includes("/migration/") ||
+		/\/\d{4,}_[a-z]/.test(dir + "/" + base)
 	)
 		return "migration";
 

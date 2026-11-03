@@ -15,7 +15,15 @@ import {
 	type LspMutationContext,
 } from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
-import { resolveHostToolPath, uriToPath } from "../clients/path-utils.js";
+import {
+	isLspRequestTimeoutError,
+	type LspRequestTimeoutError,
+} from "../clients/lsp/request-timeout-error.js";
+import {
+	resolveHostToolPath,
+	toPosix,
+	uriToPath,
+} from "../clients/path-utils.js";
 import { escapeRegExp } from "../clients/string-utils.js";
 import { isRecordableProjectPath } from "../clients/file-utils.js";
 import { compactRenderResult } from "./render-compact.js";
@@ -39,6 +47,9 @@ import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
 import {
 	applyProbeFindingPolicy,
 	describePrimaryUnavailable,
+	mergeWithheld,
+	withheldCompileNote,
+	type PythonCompileWithheld,
 } from "./lsp-diagnostics.js";
 import {
 	dispositionSuppressedLine,
@@ -46,7 +57,13 @@ import {
 } from "../clients/finding-delivery-gate.js";
 import { disabledPrimaries } from "../clients/lsp/session-roots.js";
 import { SYMBOL_KIND_NAMES } from "../clients/lsp-document-symbols.js";
-
+import {
+	detectPythonTargetVersion,
+	isJediCompileVerdict,
+	PYTHON_DECLARATION_CONCURRENCY,
+} from "../clients/python-environment.js";
+import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
+import { readFilePath } from "./shared.js";
 const VALID_OPERATIONS = [
 	"definition",
 	"typeDefinition",
@@ -89,6 +106,54 @@ function normalizeOperation(value: unknown): string {
 
 function isValidOperation(value: string): value is LspNavigationOperation {
 	return (VALID_OPERATIONS as readonly string[]).includes(value);
+}
+
+/** Why `value` is not an LSP `Range`, as a field-path suffix, or undefined. */
+function rangeProblem(value: unknown): string | undefined {
+	if (!value || typeof value !== "object") return " must be a range object";
+	for (const end of ["start", "end"] as const) {
+		const position = (value as Record<string, unknown>)[end];
+		if (!position || typeof position !== "object")
+			return `.${end} must be a position object`;
+		for (const axis of ["line", "character"] as const) {
+			if (typeof (position as Record<string, unknown>)[axis] !== "number")
+				return `.${end}.${axis} must be a number`;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * #4687: the schema carries `callHierarchyItem` as an opaque object, so the
+ * shape the LSP `CallHierarchyItem` requires is checked here, before any server
+ * call, on pi and on MCP alike (MCP never validates a schema). Fails closed: a
+ * missing or malformed field is named; extra fields (`detail`, `tags`, `data`)
+ * pass through unchanged, since a server may need `data` back.
+ */
+function checkCallHierarchyItem(
+	value: unknown,
+): { item: LSPCallHierarchyItem } | { problem: string } {
+	if (value === undefined || value === null)
+		return { problem: "callHierarchyItem parameter required" };
+	if (typeof value !== "object" || Array.isArray(value))
+		return {
+			problem:
+				"callHierarchyItem must be the object prepareCallHierarchy returned",
+		};
+	const item = value as Record<string, unknown>;
+	for (const [field, type] of [
+		["name", "string"],
+		["kind", "number"],
+		["uri", "string"],
+	] as const) {
+		if (typeof item[field] !== type)
+			return { problem: `callHierarchyItem.${field} must be a ${type}` };
+	}
+	for (const field of ["range", "selectionRange"] as const) {
+		const problem = rangeProblem(item[field]);
+		if (problem) return { problem: `callHierarchyItem.${field}${problem}` };
+	}
+	return { item: value as LSPCallHierarchyItem };
 }
 
 function operationSupportStatus(
@@ -773,7 +838,17 @@ export function createLspNavigationTool(
 	mutationDeps?: Pick<
 		LspMutationContext,
 		"runtime" | "cacheManager" | "readGuard" | "dbg"
-	>,
+	> & {
+		/**
+		 * #4942: the guard of the session that makes the call. `readGuard` is
+		 * the one captured at activation (the coordinator's), kept for hosts
+		 * with no session lookup; a concurrent secondary's write must not
+		 * credit it.
+		 */
+		readGuardFor?: (
+			sessionId: string | undefined,
+		) => LspMutationContext["readGuard"];
+	},
 ) {
 	return {
 		name: "lsp_navigation" as const,
@@ -801,13 +876,17 @@ export function createLspNavigationTool(
 		}),
 		parameters: Type.Object({
 			operation: Type.String({
-				description:
-					"LSP operation to perform. Valid values: definition, typeDefinition, declaration, references, hover, signatureHelp, documentSymbol, findSymbol, workspaceSymbol, codeAction, rename, rename_file, implementation, prepareCallHierarchy, incomingCalls, outgoingCalls, executeCommand, workspaceDiagnostics, capabilities.",
+				enum: [...VALID_OPERATIONS],
+				description: "LSP operation.",
 			}),
 			path: Type.Optional(
 				Type.String({
 					description: "Target file path.",
 				}),
+			),
+			file: Type.Optional(Type.String({ description: "Alias for `path`." })),
+			filePath: Type.Optional(
+				Type.String({ description: "Alias for `path`." }),
 			),
 			line: Type.Optional(
 				Type.Number({
@@ -884,34 +963,15 @@ export function createLspNavigationTool(
 					description: "Maximum symbol matches.",
 				}),
 			),
+			// #4687: opaque on the wire (the nested schema was 817 bytes per
+			// request); `checkCallHierarchyItem` checks the shape at execute.
 			callHierarchyItem: Type.Optional(
 				Type.Object(
-					{
-						name: Type.String(),
-						kind: Type.Number(),
-						uri: Type.String(),
-						range: Type.Object({
-							start: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-							end: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-						}),
-						selectionRange: Type.Object({
-							start: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-							end: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-						}),
-					},
 					{},
+					{
+						description:
+							"An item prepareCallHierarchy returned, passed back unchanged.",
+					},
 				),
 			),
 		}),
@@ -971,7 +1031,7 @@ export function createLspNavigationTool(
 				) {
 					recordLspMutationOutcome(mutationContext, "failed");
 				}
-				const normalizedFilePath = meta.filePath.replace(/\\/g, "/");
+				const normalizedFilePath = toPosix(meta.filePath);
 				logLatency({
 					type: "phase",
 					phase: "lsp_navigation_result",
@@ -1038,6 +1098,27 @@ export function createLspNavigationTool(
 					},
 				);
 			}
+
+			// #5041: `path` is canonical; `file` and `filePath` stay accepted, so a
+			// caller written against either spelling reaches the same file. A
+			// conflicting pair, a non-string or a blank value is refused rather than
+			// guessed at.
+			const pathRead = readFilePath(params);
+			if (pathRead.refusal) {
+				return finalize(
+					{
+						content: [{ type: "text" as const, text: pathRead.refusal }],
+						isError: true,
+					},
+					{
+						operation: String(params.operation ?? "lsp"),
+						filePath: "(workspace)",
+						failureKind: "invalid_path",
+						resultCount: 0,
+					},
+				);
+			}
+			if (pathRead.path) params = { ...params, path: pathRead.path };
 
 			const {
 				operation: rawOperation,
@@ -1131,7 +1212,9 @@ export function createLspNavigationTool(
 					session,
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined
-						: mutationDeps?.readGuard,
+						: (mutationDeps?.readGuardFor?.(
+								ctx.sessionManager?.getSessionId?.(),
+							) ?? mutationDeps?.readGuard),
 					// #2450 review round 2 (F4)/round 3 (F2, F4): the SAME gate
 					// `registerMutationBridge` applies internally in `index.ts`, so
 					// this directly-threaded path and the bridge fallback
@@ -1274,6 +1357,9 @@ export function createLspNavigationTool(
 					const excludeServerIds = configDisabledAuxiliaryLspServerIds((name) =>
 						getFlag(name, ctx.cwd),
 					);
+					// #4532 gap 13: the same forced drift sweep `lsp_diagnostics` runs, so
+					// a held file changed outside pi is re-pushed before this read.
+					await lspService.sweepDocumentDrift({ force: true, full: true });
 					// #1634: the content the diagnostics below answer for is the
 					// content the policy's inline and strict-anchor checks read.
 					const openedContent = await openFileBestEffort(
@@ -1285,6 +1371,9 @@ export function createLspNavigationTool(
 					// #1634: the same finding policy (stored dispositions, `.pi-lens.json`
 					// rule policy, inline `pi-lens-ignore`) the `lens_diagnostics
 					// source=lsp` probe applies to the same server answer.
+					// #4638: the project's declared Python syntax level, so jedi's own
+					// `compile` verdict cannot outrank it on this route either.
+					const pythonCompileTarget = await detectPythonTargetVersion(filePath);
 					const policy = applyProbeFindingPolicy(
 						filePath,
 						await lspService.getDiagnostics(
@@ -1296,9 +1385,13 @@ export function createLspNavigationTool(
 						openedContent,
 						"all",
 						"lsp_navigation",
+						pythonCompileTarget,
 					);
 					const diagnostics = policy.kept;
 					const suppressedLine = dispositionSuppressedLine(policy.suppressed);
+					// #4638 r3 (N2): a row the declaration withheld is named on this route
+					// too, so an empty answer cannot read as "no findings published".
+					const withheldLine = withheldCompileNote(policy.withheld);
 					// #4403: #4322's rule on this route. When no language server
 					// answered, the read's health record names it, and an empty
 					// answer is not 0 diagnostics.
@@ -1327,7 +1420,7 @@ export function createLspNavigationTool(
 							content: [
 								{
 									type: "text" as const,
-									text: `${note}\n${JSON.stringify(result)}${primaryUnavailable ? `\nNote: ${primaryUnavailable}` : ""}${suppressedLine ? `\nNote: ${suppressedLine}` : ""}`,
+									text: `${note}\n${JSON.stringify(result)}${primaryUnavailable ? `\nNote: ${primaryUnavailable}` : ""}${suppressedLine ? `\nNote: ${suppressedLine}` : ""}${withheldLine ? `\nNote: ${withheldLine}` : ""}`,
 								},
 							],
 							details: {
@@ -1337,6 +1430,9 @@ export function createLspNavigationTool(
 								coverage: "requested-file",
 								...(policy.suppressed > 0 && {
 									dispositionSuppressed: policy.suppressed,
+								}),
+								...(policy.withheld && {
+									withheldCompile: policy.withheld,
 								}),
 								...(primaryUnavailable !== undefined && {
 									unconfirmed: true,
@@ -1361,7 +1457,33 @@ export function createLspNavigationTool(
 				// #1634: a tracked snapshot replays what each client last published,
 				// so every row passes the same finding policy as the path read and
 				// carries its age: nothing here re-checks the file.
+				// #4638 review (F10): only a file carrying a python-jedi `compile` row
+				// can be outranked, so only those pay for the declaration walk, and the
+				// reads go through the shared bounded pool instead of one unbounded
+				// Promise.all over the whole snapshot.
+				const compileVerdictFiles: string[] = [];
+				for (const [trackedFile, entry] of allDiagnostics) {
+					if (entry.diags.some(isJediCompileVerdict)) {
+						compileVerdictFiles.push(trackedFile);
+					}
+				}
+				const compileVerdictTargets = await mapWithConcurrency(
+					compileVerdictFiles,
+					PYTHON_DECLARATION_CONCURRENCY,
+					async (trackedFile) => ({
+						trackedFile,
+						target: await detectPythonTargetVersion(trackedFile),
+					}),
+				);
+				const pythonCompileTargets = new Map(
+					compileVerdictTargets.map(
+						(entry) => [entry.trackedFile, entry.target] as const,
+					),
+				);
 				let snapshotSuppressed = 0;
+				const snapshotWithheldEntries: Array<
+					PythonCompileWithheld | undefined
+				> = [];
 				const result = Array.from(allDiagnostics.entries()).map(
 					([trackedFile, { diags, ts }]) => {
 						let kept = diags;
@@ -1373,8 +1495,12 @@ export function createLspNavigationTool(
 								readFileContent(trackedFile),
 								"all",
 								"lsp_navigation",
+								pythonCompileTargets.get(trackedFile),
 							);
 							snapshotSuppressed += policy.suppressed;
+							// #4638 review (F10): the snapshot is model-facing too, so a
+							// withheld row is named on its text rather than left to the ledger.
+							snapshotWithheldEntries.push(policy.withheld);
 							kept = policy.kept;
 						}
 						return {
@@ -1387,6 +1513,8 @@ export function createLspNavigationTool(
 				);
 				const snapshotSuppressedLine =
 					dispositionSuppressedLine(snapshotSuppressed);
+				const snapshotWithheld = mergeWithheld(snapshotWithheldEntries);
+				const snapshotWithheldLine = withheldCompileNote(snapshotWithheld);
 				const noteMap2: Record<string, string> = {
 					"push-only":
 						"Note: push-only tracked diagnostics snapshot (not full workspace pull diagnostics).",
@@ -1400,7 +1528,7 @@ export function createLspNavigationTool(
 						content: [
 							{
 								type: "text" as const,
-								text: `${note}\n${JSON.stringify(result)}${snapshotSuppressedLine ? `\nNote: ${snapshotSuppressedLine}` : ""}`,
+								text: `${note}\n${JSON.stringify(result)}${snapshotSuppressedLine ? `\nNote: ${snapshotSuppressedLine}` : ""}${snapshotWithheldLine ? `\nNote: ${snapshotWithheldLine}` : ""}`,
 							},
 						],
 						details: {
@@ -1410,6 +1538,9 @@ export function createLspNavigationTool(
 							coverage: "tracked-open-files",
 							...(snapshotSuppressed > 0 && {
 								dispositionSuppressed: snapshotSuppressed,
+							}),
+							...(snapshotWithheld && {
+								withheldCompile: snapshotWithheld,
 							}),
 						},
 					},
@@ -1767,9 +1898,10 @@ export function createLspNavigationTool(
 								);
 					}
 					case "incomingCalls": {
-						if (!callHierarchyItem) {
+						const checked = checkCallHierarchyItem(callHierarchyItem);
+						if ("problem" in checked) {
 							throw new Error(
-								"__BADINPUT__ callHierarchyItem parameter required for incomingCalls",
+								`__BADINPUT__ ${checked.problem} for incomingCalls`,
 							);
 						}
 						// #1803 fix-round F1: needsFilePath is false for call-hierarchy
@@ -1786,36 +1918,33 @@ export function createLspNavigationTool(
 						// every other capability-gated operation already reports.
 						supported = operationSupportStatus(
 							operation,
-							await lspService.getOperationSupport(
-								uriToPath(callHierarchyItem.uri),
-							),
+							await lspService.getOperationSupport(uriToPath(checked.item.uri)),
 						);
 						if (supported === false) {
 							throw new Error(
 								"__UNSUPPORTED__ Active LSP server does not advertise support for incomingCalls",
 							);
 						}
-						return lspService.incomingCalls(callHierarchyItem);
+						return lspService.incomingCalls(checked.item);
 					}
 					case "outgoingCalls": {
-						if (!callHierarchyItem) {
+						const checked = checkCallHierarchyItem(callHierarchyItem);
+						if ("problem" in checked) {
 							throw new Error(
-								"__BADINPUT__ callHierarchyItem parameter required for outgoingCalls",
+								`__BADINPUT__ ${checked.problem} for outgoingCalls`,
 							);
 						}
 						// #1803 fix-round F1: same pre-check as incomingCalls above.
 						supported = operationSupportStatus(
 							operation,
-							await lspService.getOperationSupport(
-								uriToPath(callHierarchyItem.uri),
-							),
+							await lspService.getOperationSupport(uriToPath(checked.item.uri)),
 						);
 						if (supported === false) {
 							throw new Error(
 								"__UNSUPPORTED__ Active LSP server does not advertise support for outgoingCalls",
 							);
 						}
-						return lspService.outgoingCalls(callHierarchyItem);
+						return lspService.outgoingCalls(checked.item);
 					}
 					default:
 						return [];
@@ -1824,56 +1953,76 @@ export function createLspNavigationTool(
 
 			let result: unknown;
 			let usedDocumentSymbolFallback = false;
+			let definitionTimeout: LspRequestTimeoutError | undefined;
 			try {
-				result = await runOperation();
-				const isEmptyInitial =
-					!result || (Array.isArray(result) && result.length === 0);
-				const shouldRetryOnEmpty =
-					isEmptyInitial &&
-					needsFilePath &&
-					[
-						"definition",
-						"typeDefinition",
-						"declaration",
-						"references",
-						"hover",
-						"signatureHelp",
-						"codeAction",
-						"rename",
-						"implementation",
-					].includes(operation);
-				if (shouldRetryOnEmpty) {
-					openedFileContent = await openFileBestEffort(
-						lspService,
-						filePath,
-						true,
-					);
+				try {
 					result = await runOperation();
+					const isEmptyInitial =
+						!result || (Array.isArray(result) && result.length === 0);
+					const shouldRetryOnEmpty =
+						isEmptyInitial &&
+						needsFilePath &&
+						[
+							"definition",
+							"typeDefinition",
+							"declaration",
+							"references",
+							"hover",
+							"signatureHelp",
+							"codeAction",
+							"rename",
+							"implementation",
+						].includes(operation);
+					if (shouldRetryOnEmpty) {
+						openedFileContent = await openFileBestEffort(
+							lspService,
+							filePath,
+							true,
+						);
+						result = await runOperation();
+					}
+				} catch (err) {
+					if (
+						needsFilePath &&
+						operation === "definition" &&
+						isLspRequestTimeoutError(err)
+					) {
+						definitionTimeout = err;
+					} else {
+						throw err;
+					}
 				}
 
 				const stillEmpty =
 					!result || (Array.isArray(result) && result.length === 0);
-				if (stillEmpty && needsFilePath && operation === "definition") {
-					const content = nodeFs.readFileSync(filePath, "utf-8");
-					const token =
-						line && character
-							? tokenAtPosition(content, line, character)
-							: undefined;
-					if (token) {
-						const docSymbols = (await lspService.documentSymbol(
-							filePath,
-						)) as SymbolNode[];
-						const locations = pickLocalSymbolLocation(
-							docSymbols,
-							token,
-							filePath,
-						);
-						if (locations.length > 0) {
-							result = locations;
-							usedDocumentSymbolFallback = true;
+				try {
+					if (stillEmpty && needsFilePath && operation === "definition") {
+						const content = nodeFs.readFileSync(filePath, "utf-8");
+						const token =
+							line && character
+								? tokenAtPosition(content, line, character)
+								: undefined;
+						if (token) {
+							const docSymbols = (await lspService.documentSymbol(
+								filePath,
+							)) as SymbolNode[];
+							const locations = pickLocalSymbolLocation(
+								docSymbols,
+								token,
+								filePath,
+							);
+							if (locations.length > 0) {
+								result = locations;
+								usedDocumentSymbolFallback = true;
+							}
 						}
 					}
+				} catch (err) {
+					throw definitionTimeout ?? err;
 				}
+				if (definitionTimeout && !usedDocumentSymbolFallback)
+					throw definitionTimeout;
+
 				if (
 					mutationContext &&
 					requestedApply &&
@@ -1931,6 +2080,20 @@ export function createLspNavigationTool(
 						{ operation, filePath, failureKind: "bad_input", resultCount: 0 },
 					);
 				}
+				if (isLspRequestTimeoutError(err)) {
+					return finalize(
+						{
+							content: [{ type: "text" as const, text: err.message }],
+							isError: true,
+							details: {
+								method: err.method,
+								timeoutMs: err.timeoutMs,
+								elapsedMs: err.elapsedMs,
+							},
+						},
+						{ operation, filePath, failureKind: "timeout", resultCount: 0 },
+					);
+				}
 				return finalize(
 					{
 						content: [
@@ -1973,8 +2136,9 @@ export function createLspNavigationTool(
 					"\nHint: provide path to scope workspaceSymbol to the active language server/root.";
 			}
 			if (usedDocumentSymbolFallback) {
-				output +=
-					"\nNote: served from documentSymbol fallback due to empty primary result.";
+				output += definitionTimeout
+					? "\nNote: served from documentSymbol fallback; definition timed out."
+					: "\nNote: served from documentSymbol fallback due to empty primary result.";
 			}
 			if (
 				operation === "references" &&

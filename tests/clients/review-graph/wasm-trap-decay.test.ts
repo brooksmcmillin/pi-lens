@@ -20,7 +20,10 @@ import {
 	getGraphBuildInfoForGraph,
 } from "../../../clients/review-graph/builder.js";
 import { TreeSitterSymbolExtractor } from "../../../clients/tree-sitter-symbol-extractor.js";
-import { getSharedTreeSitterClient } from "../../../clients/tree-sitter-shared.js";
+import {
+	_resetSharedTreeSitterClientForTests,
+	getSharedTreeSitterClient,
+} from "../../../clients/tree-sitter-shared.js";
 import { createTempFile, setupTestEnvironment } from "../test-utils.js";
 
 vi.mock("../../../clients/lsp-document-symbols.js", async (importOriginal) => ({
@@ -45,6 +48,9 @@ afterEach(() => {
 	flushReviewGraphPersistsForTests();
 	clearReviewGraphWorkspaceCache();
 	while (cleanups.length) cleanups.pop()?.();
+	// The shared client holds the trap registry; a case's charge must not reach
+	// the next case (#4561 L5).
+	_resetSharedTreeSitterClientForTests();
 });
 
 describe("a one-off trap's entry decays after a healthy parse (#3678 F-A)", () => {

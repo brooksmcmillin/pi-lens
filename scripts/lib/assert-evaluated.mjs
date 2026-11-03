@@ -15,13 +15,7 @@
 // the docs and fails a dedicated step that is NOT continue-on-error.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import {
-	elapsedDays,
-	FIRST_PUBLISH_EXPIRY_DAYS,
-	MEASURED_CLEAN_BEHAVIORS,
-	parseRefreshState,
-	parseTable,
-} from "./md-matrix.mjs";
+import { MEASURED_CLEAN_BEHAVIORS, parseTable } from "./md-matrix.mjs";
 
 /**
  * A run may fall this far below HEAD's count before the delta check fails. It
@@ -42,9 +36,9 @@ const isClassified = (cell) =>
 
 /**
  * The matrix doc is merged, never blanked, so its only honest per-run signal is
- * the `first-publish` column the 5-day expiry turns to `unknown` (the #4338
- * shape: five false `unknown` cells). `matrixCells` reads that column keyed by
- * `lang|server`; `matrixClassifiedCount` counts the classified ones.
+ * the `first-publish` column going `unknown` (the #4338 shape: five false
+ * `unknown` cells). `matrixCells` reads that column keyed by `lang|server`;
+ * `matrixClassifiedCount` counts the classified ones.
  */
 export function matrixCells(text) {
 	const table = parseTable(text, "| lang | server |");
@@ -64,23 +58,19 @@ function matrixClassifiedCount(text) {
  * Cells classified at HEAD that the regeneration turned `unknown`, as
  * `lang|server` keys. A 20% margin on the count lets five of 28 cells flip
  * (17.9%), exactly the #4338 shape, so the matrix is compared cell by cell.
- * A HEAD firstMissed stamp at the expiry threshold justifies the loss (#4537).
- * A row absent from the regeneration is the count floor's business, not a lost
- * measurement of its own.
+ * No loss is justified since #4512: a missed probe keeps the last known value
+ * and marks it stale, so the refresh never writes `unknown` over a classified
+ * cell and any such loss is a regression or a hand edit (#4537 admitted a loss
+ * a HEAD `firstMissed` stamp justified; that expiry is gone). A row absent from
+ * the regeneration is the count floor's business, not a lost measurement of its
+ * own.
  */
 export function lostClassifiedCells(headText, text) {
-	const state = parseRefreshState(headText)["first-publish"];
-	const today = new Date().toISOString().slice(0, 10);
 	const head = matrixCells(headText);
 	const now = matrixCells(text);
 	if (!head || !now) return [];
 	return [...head]
 		.filter(([key, cell]) => isClassified(cell) && now.get(key) === "unknown")
-		.filter(([key]) => {
-			const lang = key.split("|")[0];
-			const elapsed = elapsedDays(state?.[lang]?.firstMissed, today);
-			return elapsed === null || elapsed < FIRST_PUBLISH_EXPIRY_DAYS;
-		})
 		.map(([key]) => key);
 }
 

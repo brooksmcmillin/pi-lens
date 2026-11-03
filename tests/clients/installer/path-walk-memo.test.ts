@@ -13,11 +13,19 @@ import {
 	isSpawnableCommand,
 	resetPathWalkMemo,
 } from "../../../clients/installer/index.js";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../../clients/project-trust.js";
 
 const savedPath = process.env.PATH;
 
 describe("bare-command PATH availability memo", () => {
 	beforeEach(() => {
+		// #4530: the walk's trust judgment reads the filesystem too (this file
+		// counts statSync calls); the memo is the axis here, so the session's
+		// trust is adopted. The judgment is pinned in session-repository-trust-4530.
+		setProjectTrustState("trusted");
 		process.env.PATH = "memo-path";
 		resetPathWalkMemo();
 		statSyncMock.mockReset();
@@ -28,6 +36,7 @@ describe("bare-command PATH availability memo", () => {
 		if (savedPath === undefined) delete process.env.PATH;
 		else process.env.PATH = savedPath;
 		resetPathWalkMemo();
+		resetProjectTrust();
 	});
 
 	it("memoizes PATH walk: N hits = 1 statSync call", async () => {

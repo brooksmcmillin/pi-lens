@@ -1,5 +1,4 @@
 import { vi } from "vitest";
-import { makeLspServiceDouble } from "./lsp-service-double.js";
 
 /**
  * Shared seams for the LSP status-repaint cases (#281, #3099).
@@ -13,20 +12,21 @@ import { makeLspServiceDouble } from "./lsp-service-double.js";
  */
 
 /**
- * Alive-server holder + the reset double that empties it. `service` is the
- * `getLSPService` factory to install through the test's own `vi.doMock`.
+ * Alive-server holder + the reset spy that empties it. `overrides` are the
+ * alive-set members for `installLspServiceDouble`, and `resetLSPService` goes in
+ * as its `beforeReset` hook, so the real `resetLSPService(options)` the
+ * extension calls reaches the spy with the same options (#4709).
  */
 export function aliveServerHolder(initialAliveIds: string[] = ["typescript"]) {
 	let aliveIds = initialAliveIds;
-	const resetLSPService = vi.fn(() => {
+	const resetLSPService = vi.fn((_options?: unknown) => {
 		aliveIds = [];
 	});
-	const service = () =>
-		makeLspServiceDouble({
-			getAliveClientCount: () => aliveIds.length,
-			getAliveServerIds: () => aliveIds,
-		});
-	return { resetLSPService, service };
+	const overrides = {
+		getAliveClientCount: () => aliveIds.length,
+		getAliveServerIds: () => aliveIds,
+	};
+	return { resetLSPService, overrides };
 }
 
 /**

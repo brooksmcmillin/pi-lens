@@ -34,6 +34,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -116,33 +117,37 @@ describe("process-table seam (#2443)", () => {
 		).toBe(false);
 	});
 
-	it("keeps the platform process-table query in exactly one file", () => {
-		const files = scannedFiles();
-		const flagged = files.filter((file) => fragmentsIn(file).length > 0);
+	it(
+		"keeps the platform process-table query in exactly one file",
+		() => {
+			const files = scannedFiles();
+			const flagged = files.filter((file) => fragmentsIn(file).length > 0);
 
-		const audit = auditRegistry({
-			sweepName: "process-table seam",
-			flagged,
-			registered: [SEAM],
-			scannedCount: files.length,
-			// Calibration: 900+ source files across clients/, commands/, mcp/,
-			// tools/, scripts/ and index.ts on 2026-09-02. The floor is set well
-			// under that so it survives ordinary churn while still failing loud
-			// if the walk ever resolves to nothing (defect shape 10).
-			minScanned: 300,
-			minFlagged: 1,
-			remediation:
-				`Build the query through ${SEAM} (buildProcessQuery/snapshotProcesses, ` +
-				"or clients/process-snapshot.ts for the clients-side spawn rails) " +
-				"instead of spelling Get-CimInstance/ps -eo again. Five copies of " +
-				"this listing meant PR #2438's exit-code hardening reached one of " +
-				"them and not the rest.",
-		});
+			const audit = auditRegistry({
+				sweepName: "process-table seam",
+				flagged,
+				registered: [SEAM],
+				scannedCount: files.length,
+				// Calibration: 900+ source files across clients/, commands/, mcp/,
+				// tools/, scripts/ and index.ts on 2026-09-02. The floor is set well
+				// under that so it survives ordinary churn while still failing loud
+				// if the walk ever resolves to nothing (defect shape 10).
+				minScanned: 300,
+				minFlagged: 1,
+				remediation:
+					`Build the query through ${SEAM} (buildProcessQuery/snapshotProcesses, ` +
+					"or clients/process-snapshot.ts for the clients-side spawn rails) " +
+					"instead of spelling Get-CimInstance/ps -eo again. Five copies of " +
+					"this listing meant PR #2438's exit-code hardening reached one of " +
+					"them and not the rest.",
+			});
 
-		expect(audit.problems).toEqual([]);
-		expect(
-			flagged.filter((file) => file !== SEAM),
-			`files spelling a process-table query outside ${SEAM}`,
-		).toEqual([]);
-	});
+			expect(audit.problems).toEqual([]);
+			expect(
+				flagged.filter((file) => file !== SEAM),
+				`files spelling a process-table query outside ${SEAM}`,
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });

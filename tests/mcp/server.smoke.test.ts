@@ -580,14 +580,48 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 			name: "pilens_ast_grep_search",
 			arguments: {
 				pattern: "getLSPService()",
-				lang: "ts",
+				lang: "typescript",
 				paths: [path.join(repoRoot, "clients", "mcp")],
 			},
 		});
-		const result = res.result as { content: { type: string; text: string }[] };
+		const result = res.result as {
+			content: { type: string; text: string }[];
+			isError?: boolean;
+		};
+		expect(result.isError).toBeFalsy();
 		expect(result.content[0].type).toBe("text");
 		expect(typeof result.content[0].text).toBe("string");
 	}, 45_000);
+
+	// #4723 F4: the MCP route hands execute the client's JSON without schema
+	// validation, so `lang` can be any JSON value. Recurrence: replace threw a
+	// TypeError on a number (`"pi-lens tool ... failed"`) and search called it
+	// "lang is required"; both must answer the refusal that names the ids.
+	it.each([
+		["pilens_ast_grep_search", 3],
+		["pilens_ast_grep_search", null],
+		["pilens_ast_grep_replace", 3],
+		["pilens_ast_grep_replace", { id: "typescript" }],
+	] as const)(
+		"refuses %s with lang %j over the wire",
+		async (name, lang) => {
+			const res = await harness.request(4723, "tools/call", {
+				name,
+				arguments:
+					name === "pilens_ast_grep_replace"
+						? { pattern: "foo($X)", rewrite: "bar($X)", lang }
+						: { pattern: "foo($X)", lang },
+			});
+			const result = res.result as {
+				content: { type: string; text: string }[];
+				isError?: boolean;
+			};
+			expect(result.isError).toBe(true);
+			expect(result.content[0]?.text).toContain("lang must be a string");
+			expect(result.content[0]?.text).toContain("valid ids: bash");
+		},
+		25_000,
+	);
 
 	it("answers tools/call pilens_lsp_navigation (documentSymbol)", async () => {
 		const res = await harness.request(9, "tools/call", {
@@ -710,18 +744,57 @@ describe("pi-lens MCP result bounds", { retry: 2 }, () => {
 // The dispatcher now checks every tool's arguments against the schema it
 // advertises. Own harness, so the degradation ledger these tests read starts
 // empty.
-// The reviewed sweep output (#3809 re-pin): all 273 refusals of 4813 probes over
-// the live tools/list schemas, every one a declared parameter the call did not
-// send, written with another case, a plural `s`, or a leading word that does not
-// retarget it (`filePath`, `dir_path`, `Paths`, `kind` for `kinds`; not
-// `cwdPath`, `maxFiles`). A new tool or key that adds a pair must be read and
-// added here on purpose.
+// The reviewed sweep output (#3809 re-pin, #5041 re-pin): all 429 refusals of
+// 4813 probes over the live tools/list schemas, every one a declared parameter
+// the call did not send, written with another case, a plural `s`, or a leading
+// word that does not retarget it (`filePath`, `dir_path`, `Paths` -> `path`,
+// `kind` for `kinds`; not `cwdPath`, `maxFiles`). A new tool or key that adds a
+// pair must be read and added here on purpose.
+//
+// #5041 grew this list from 273 for one reason: six single-file tools now declare
+// `path` ALONGSIDE `file` and `filePath` (`pilens_analyze`,
+// `pilens_module_report`, `pilens_read_symbol`, `pilens_read_enclosing`,
+// `pilens_effective_config`, plus the folded `pilens_diagnostics` /
+// `pilens_lsp_navigation` schemas). Each new declared spelling retires the
+// `{filePath} -> path` rows it used to refuse and adds `{Path} -> path` /
+// `{files} -> file` / `{filepath} -> filePath` rows in their place; `pilens_analyze`
+// also stops declaring a `required` key, because any one of the three spellings
+// now satisfies it, and a probe that sends no spelling refuses on the others.
 const PINNED_REFUSALS: string[] = [
 	"pilens_analyze {Cwd} -> cwd",
+	"pilens_analyze {FILE} -> file",
+	"pilens_analyze {FilePath} -> filePath",
+	"pilens_analyze {Filepath} -> filePath",
+	"pilens_analyze {File} -> file",
 	"pilens_analyze {Flags} -> flags",
 	"pilens_analyze {Mode} -> mode",
+	"pilens_analyze {PATH} -> path",
+	"pilens_analyze {Path} -> path",
+	"pilens_analyze {absPath} -> path",
+	"pilens_analyze {configPath} -> path",
 	"pilens_analyze {cwds} -> cwd",
+	"pilens_analyze {dirPath} -> path",
+	"pilens_analyze {dir_path} -> path",
+	"pilens_analyze {filePaths} -> filePath",
+	"pilens_analyze {file_path} -> filePath",
+	"pilens_analyze {filepaths} -> filePath",
+	"pilens_analyze {filepath} -> filePath",
+	"pilens_analyze {files} -> file",
+	"pilens_analyze {hasFiles} -> file",
 	"pilens_analyze {modes} -> mode",
+	"pilens_analyze {namePath} -> path",
+	"pilens_analyze {name_path} -> path",
+	"pilens_analyze {newFile} -> file",
+	"pilens_analyze {paths} -> path",
+	"pilens_analyze {projectPath} -> path",
+	"pilens_analyze {rootPath} -> path",
+	"pilens_analyze {sourcePath} -> path",
+	"pilens_analyze {source_path} -> path",
+	"pilens_analyze {symbolPath} -> path",
+	"pilens_analyze {symbol_path} -> path",
+	"pilens_analyze {targetPath} -> path",
+	"pilens_analyze {target_path} -> path",
+	"pilens_analyze {workspacePath} -> path",
 	"pilens_ast_grep_replace {Apply} -> apply",
 	"pilens_ast_grep_replace {Cwd} -> cwd",
 	"pilens_ast_grep_replace {Follows} -> follows",
@@ -810,6 +883,10 @@ const PINNED_REFUSALS: string[] = [
 	"pilens_diagnostics {AnalysisRoot} -> analysisRoot",
 	"pilens_diagnostics {Concurrency} -> concurrency",
 	"pilens_diagnostics {Cwd} -> cwd",
+	"pilens_diagnostics {FILE} -> file",
+	"pilens_diagnostics {FilePath} -> filePath",
+	"pilens_diagnostics {Filepath} -> filePath",
+	"pilens_diagnostics {File} -> file",
 	"pilens_diagnostics {IncludeGenerated} -> includeGenerated",
 	"pilens_diagnostics {MaxLspFiles} -> maxLspFiles",
 	"pilens_diagnostics {MaxProjectFiles} -> maxProjectFiles",
@@ -831,12 +908,17 @@ const PINNED_REFUSALS: string[] = [
 	"pilens_diagnostics {cwds} -> cwd",
 	"pilens_diagnostics {dirPath} -> path",
 	"pilens_diagnostics {dir_path} -> path",
-	"pilens_diagnostics {filePath} -> path",
-	"pilens_diagnostics {file_path} -> path",
+	"pilens_diagnostics {filePaths} -> filePath",
+	"pilens_diagnostics {file_path} -> filePath",
+	"pilens_diagnostics {filepaths} -> filePath",
+	"pilens_diagnostics {filepath} -> filePath",
+	"pilens_diagnostics {files} -> file",
+	"pilens_diagnostics {hasFiles} -> file",
 	"pilens_diagnostics {includeGenerateds} -> includeGenerated",
 	"pilens_diagnostics {modes} -> mode",
 	"pilens_diagnostics {namePath} -> path",
 	"pilens_diagnostics {name_path} -> path",
+	"pilens_diagnostics {newFile} -> file",
 	"pilens_diagnostics {projectPath} -> path",
 	"pilens_diagnostics {rootPath} -> path",
 	"pilens_diagnostics {scopes} -> scope",
@@ -850,11 +932,35 @@ const PINNED_REFUSALS: string[] = [
 	"pilens_diagnostics {workspacePath} -> path",
 	"pilens_effective_config {Cwd} -> cwd",
 	"pilens_effective_config {FILE} -> file",
+	"pilens_effective_config {FilePath} -> filePath",
+	"pilens_effective_config {Filepath} -> filePath",
 	"pilens_effective_config {File} -> file",
+	"pilens_effective_config {PATH} -> path",
+	"pilens_effective_config {Path} -> path",
+	"pilens_effective_config {absPath} -> path",
+	"pilens_effective_config {configPath} -> path",
 	"pilens_effective_config {cwds} -> cwd",
+	"pilens_effective_config {dirPath} -> path",
+	"pilens_effective_config {dir_path} -> path",
+	"pilens_effective_config {filePaths} -> filePath",
+	"pilens_effective_config {file_path} -> filePath",
+	"pilens_effective_config {filepaths} -> filePath",
+	"pilens_effective_config {filepath} -> filePath",
 	"pilens_effective_config {files} -> file",
 	"pilens_effective_config {hasFiles} -> file",
+	"pilens_effective_config {namePath} -> path",
+	"pilens_effective_config {name_path} -> path",
 	"pilens_effective_config {newFile} -> file",
+	"pilens_effective_config {paths} -> path",
+	"pilens_effective_config {projectPath} -> path",
+	"pilens_effective_config {rootPath} -> path",
+	"pilens_effective_config {sourcePath} -> path",
+	"pilens_effective_config {source_path} -> path",
+	"pilens_effective_config {symbolPath} -> path",
+	"pilens_effective_config {symbol_path} -> path",
+	"pilens_effective_config {targetPath} -> path",
+	"pilens_effective_config {target_path} -> path",
+	"pilens_effective_config {workspacePath} -> path",
 	"pilens_latency {FILE} -> file",
 	"pilens_latency {File} -> file",
 	"pilens_latency {Limit} -> limit",
@@ -871,6 +977,10 @@ const PINNED_REFUSALS: string[] = [
 	"pilens_lsp_navigation {EndCharacter} -> endCharacter",
 	"pilens_lsp_navigation {EndLine} -> endLine",
 	"pilens_lsp_navigation {ExactMatch} -> exactMatch",
+	"pilens_lsp_navigation {FILE} -> file",
+	"pilens_lsp_navigation {FilePath} -> filePath",
+	"pilens_lsp_navigation {Filepath} -> filePath",
+	"pilens_lsp_navigation {File} -> file",
 	"pilens_lsp_navigation {Kinds} -> kinds",
 	"pilens_lsp_navigation {Kind} -> kinds",
 	"pilens_lsp_navigation {Line} -> line",
@@ -895,13 +1005,18 @@ const PINNED_REFUSALS: string[] = [
 	"pilens_lsp_navigation {endCharacters} -> endCharacter",
 	"pilens_lsp_navigation {endLines} -> endLine",
 	"pilens_lsp_navigation {exactMatchs} -> exactMatch", // spellchecker:disable-line
-	"pilens_lsp_navigation {filePath} -> path",
-	"pilens_lsp_navigation {file_path} -> path",
+	"pilens_lsp_navigation {filePaths} -> filePath",
+	"pilens_lsp_navigation {file_path} -> filePath",
+	"pilens_lsp_navigation {filepaths} -> filePath",
+	"pilens_lsp_navigation {filepath} -> filePath",
+	"pilens_lsp_navigation {files} -> file",
+	"pilens_lsp_navigation {hasFiles} -> file",
 	"pilens_lsp_navigation {kind} -> kinds",
 	"pilens_lsp_navigation {lines} -> line",
 	"pilens_lsp_navigation {namePath} -> path",
 	"pilens_lsp_navigation {name_path} -> path",
 	"pilens_lsp_navigation {newFilePaths} -> newFilePath",
+	"pilens_lsp_navigation {newFile} -> file",
 	"pilens_lsp_navigation {newNames} -> newName",
 	"pilens_lsp_navigation {paths} -> path",
 	"pilens_lsp_navigation {projectPath} -> path",
@@ -918,15 +1033,44 @@ const PINNED_REFUSALS: string[] = [
 	"pilens_module_report {BlastRadius} -> blastRadius",
 	"pilens_module_report {CallGraph} -> callGraph",
 	"pilens_module_report {Cwd} -> cwd",
+	"pilens_module_report {FILE} -> file",
+	"pilens_module_report {FilePath} -> filePath",
+	"pilens_module_report {Filepath} -> filePath",
+	"pilens_module_report {File} -> file",
 	"pilens_module_report {Focus} -> focus",
 	"pilens_module_report {MaxCallGraphEntries} -> maxCallGraphEntries",
 	"pilens_module_report {MaxRefsPerSymbol} -> maxRefsPerSymbol",
+	"pilens_module_report {PATH} -> path",
+	"pilens_module_report {Path} -> path",
 	"pilens_module_report {View} -> view",
+	"pilens_module_report {absPath} -> path",
 	"pilens_module_report {blastRadiusDepths} -> blastRadiusDepth",
 	"pilens_module_report {callGraphs} -> callGraph",
+	"pilens_module_report {configPath} -> path",
 	"pilens_module_report {cwds} -> cwd",
+	"pilens_module_report {dirPath} -> path",
+	"pilens_module_report {dir_path} -> path",
+	"pilens_module_report {filePaths} -> filePath",
+	"pilens_module_report {file_path} -> filePath",
+	"pilens_module_report {filepaths} -> filePath",
+	"pilens_module_report {filepath} -> filePath",
+	"pilens_module_report {files} -> file",
+	"pilens_module_report {hasFiles} -> file",
 	"pilens_module_report {maxRefsPerSymbols} -> maxRefsPerSymbol",
+	"pilens_module_report {namePath} -> path",
+	"pilens_module_report {name_path} -> path",
+	"pilens_module_report {newFile} -> file",
+	"pilens_module_report {paths} -> path",
+	"pilens_module_report {projectPath} -> path",
+	"pilens_module_report {rootPath} -> path",
+	"pilens_module_report {sourcePath} -> path",
+	"pilens_module_report {source_path} -> path",
+	"pilens_module_report {symbolPath} -> path",
+	"pilens_module_report {symbol_path} -> path",
+	"pilens_module_report {targetPath} -> path",
+	"pilens_module_report {target_path} -> path",
 	"pilens_module_report {views} -> view",
+	"pilens_module_report {workspacePath} -> path",
 	"pilens_project_report {Cwd} -> cwd",
 	"pilens_project_report {Focus} -> focus",
 	"pilens_project_report {Limit} -> limit",
@@ -941,18 +1085,74 @@ const PINNED_REFUSALS: string[] = [
 	"pilens_project_scan {includeGenerateds} -> includeGenerated",
 	"pilens_read_enclosing {AroundLine} -> aroundLine",
 	"pilens_read_enclosing {Cwd} -> cwd",
+	"pilens_read_enclosing {FILE} -> file",
+	"pilens_read_enclosing {FilePath} -> filePath",
+	"pilens_read_enclosing {Filepath} -> filePath",
+	"pilens_read_enclosing {File} -> file",
 	"pilens_read_enclosing {Kinds} -> kinds",
 	"pilens_read_enclosing {Kind} -> kinds",
 	"pilens_read_enclosing {MaxLines} -> maxLines",
 	"pilens_read_enclosing {OnOversize} -> onOversize",
+	"pilens_read_enclosing {PATH} -> path",
+	"pilens_read_enclosing {Path} -> path",
+	"pilens_read_enclosing {absPath} -> path",
 	"pilens_read_enclosing {aroundLines} -> aroundLine",
+	"pilens_read_enclosing {configPath} -> path",
 	"pilens_read_enclosing {cwds} -> cwd",
+	"pilens_read_enclosing {dirPath} -> path",
+	"pilens_read_enclosing {dir_path} -> path",
+	"pilens_read_enclosing {filePaths} -> filePath",
+	"pilens_read_enclosing {file_path} -> filePath",
+	"pilens_read_enclosing {filepaths} -> filePath",
+	"pilens_read_enclosing {filepath} -> filePath",
+	"pilens_read_enclosing {files} -> file",
+	"pilens_read_enclosing {hasFiles} -> file",
 	"pilens_read_enclosing {kind} -> kinds",
+	"pilens_read_enclosing {namePath} -> path",
+	"pilens_read_enclosing {name_path} -> path",
+	"pilens_read_enclosing {newFile} -> file",
 	"pilens_read_enclosing {onOversizes} -> onOversize",
+	"pilens_read_enclosing {paths} -> path",
+	"pilens_read_enclosing {projectPath} -> path",
+	"pilens_read_enclosing {rootPath} -> path",
+	"pilens_read_enclosing {sourcePath} -> path",
+	"pilens_read_enclosing {source_path} -> path",
+	"pilens_read_enclosing {symbolPath} -> path",
+	"pilens_read_enclosing {symbol_path} -> path",
+	"pilens_read_enclosing {targetPath} -> path",
+	"pilens_read_enclosing {target_path} -> path",
+	"pilens_read_enclosing {workspacePath} -> path",
 	"pilens_read_symbol {Cwd} -> cwd",
+	"pilens_read_symbol {FILE} -> file",
+	"pilens_read_symbol {FilePath} -> filePath",
+	"pilens_read_symbol {Filepath} -> filePath",
+	"pilens_read_symbol {File} -> file",
 	"pilens_read_symbol {Kind} -> kind",
+	"pilens_read_symbol {PATH} -> path",
+	"pilens_read_symbol {Path} -> path",
+	"pilens_read_symbol {absPath} -> path",
+	"pilens_read_symbol {configPath} -> path",
 	"pilens_read_symbol {cwds} -> cwd",
+	"pilens_read_symbol {dirPath} -> path",
+	"pilens_read_symbol {dir_path} -> path",
+	"pilens_read_symbol {filePaths} -> filePath",
+	"pilens_read_symbol {file_path} -> filePath",
+	"pilens_read_symbol {filepaths} -> filePath",
+	"pilens_read_symbol {filepath} -> filePath",
+	"pilens_read_symbol {files} -> file",
+	"pilens_read_symbol {hasFiles} -> file",
 	"pilens_read_symbol {kinds} -> kind",
+	"pilens_read_symbol {namePath} -> path",
+	"pilens_read_symbol {name_path} -> path",
+	"pilens_read_symbol {newFile} -> file",
+	"pilens_read_symbol {paths} -> path",
+	"pilens_read_symbol {projectPath} -> path",
+	"pilens_read_symbol {rootPath} -> path",
+	"pilens_read_symbol {sourcePath} -> path",
+	"pilens_read_symbol {source_path} -> path",
+	"pilens_read_symbol {targetPath} -> path",
+	"pilens_read_symbol {target_path} -> path",
+	"pilens_read_symbol {workspacePath} -> path",
 	"pilens_session_start {Cwd} -> cwd",
 	"pilens_session_start {cwds} -> cwd",
 	"pilens_symbol_search {Cwd} -> cwd",
@@ -1035,36 +1235,31 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 	// pilens_diagnostics, yet `filePath` is plainly a mistyped `path` that was
 	// not sent, so running on the session default and answering "No issues"
 	// would read as a clean file.
-	it("refuses the reporter's mistyped diagnostics key instead of answering No issues", async () => {
+	//
+	// #5041 superseded the refusal: `filePath` is now a DECLARED alias of `path`
+	// on every single-file tool, so the call runs — and it must run SCOPED, which
+	// is the half of the report that a warning alone never fixed.
+	it("runs the reporter's `filePath` call scoped to that file, not on the default scope", async () => {
 		const result = await call("pilens_diagnostics", {
 			filePath: "/tmp/x/bad.ts",
 		});
-		expect(result.isError).toBe(true);
-		expect(firstLine(result)).toBe(
-			"Ignored unknown argument(s) for pilens_diagnostics: `filePath` (did you mean `path`?). They had no effect on this call.",
-		);
+		expect(result.isError).not.toBe(true);
+		expect(firstLine(result)).not.toContain("Ignored unknown argument");
 		expect(result.content[0]?.text).toContain(
-			"Not run: `filePath` looks like a mistyped `path`, which was not sent.",
+			"paths restricts this to cached findings",
 		);
-		expect(result.content[0]?.text).not.toContain("No issues");
-		expect(result.structuredContent).toEqual({
-			ignoredArguments: ["filePath"],
-			ignoredArgumentCount: 1,
-		});
-		expect(result.content[0]?.text).toMatch(
-			/result error\nusage tokens=\d+ elapsed-ms=\d+ bytes=\d+ truncated=false$/,
-		);
+		expect(result.structuredContent).toBeUndefined();
 	}, 25_000);
 
-	it("keeps a warning and runs when the near match was also sent", async () => {
+	it("keeps a warning for a spelling that is not a declared alias", async () => {
 		const result = await call("pilens_diagnostics", {
-			filePath: "/tmp/x/bad.ts",
-			path: "/tmp/x/bad.ts",
+			file_path: "/tmp/x/bad.ts",
 		});
-		expect(result.isError).toBe(false);
+		expect(result.isError).toBe(true);
 		expect(firstLine(result)).toContain("Ignored unknown argument(s)");
-		expect(result.content[0]?.text).toContain("No issues");
-		expect(result.content[0]?.text).not.toContain("Not run");
+		expect(result.content[0]?.text).toContain(
+			"Not run: `file_path` looks like a mistyped `filePath`, which was not sent.",
+		);
 	}, 25_000);
 
 	it("keeps a warning for cwd on a tool whose handler never reads it", async () => {
@@ -1077,15 +1272,17 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 	}, 25_000);
 
 	it("turns an ignored key that leaves a required input missing into an error", async () => {
-		const result = await call("pilens_analyze", { filePath: "/tmp/x/bad.ts" });
+		const result = await call("pilens_ast_grep_search", {
+			langs: "typescript",
+		});
 		expect(result.isError).toBe(true);
 		expect(firstLine(result)).toBe(
-			"Ignored unknown argument(s) for pilens_analyze: `filePath` (did you mean `file`?). They had no effect on this call.",
+			"Ignored unknown argument(s) for pilens_ast_grep_search: `langs` (did you mean `lang`?). They had no effect on this call.",
 		);
 		expect(result.content[0]?.text).toContain(
-			"Not run: required argument(s) `file` missing.",
+			"Not run: required argument(s) `lang` missing",
 		);
-		expect(result.structuredContent?.ignoredArguments).toEqual(["filePath"]);
+		expect(result.structuredContent?.ignoredArguments).toEqual(["langs"]);
 		// The refusal still goes through the result-footer gate.
 		expect(result.content[0]?.text).toMatch(
 			/result error\nusage tokens=\d+ elapsed-ms=\d+ bytes=\d+ truncated=false$/,
@@ -1098,7 +1295,7 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 			bogus: true,
 		});
 		expect(firstLine(result)).toContain("Ignored unknown argument(s)");
-		expect(result.content[0]?.text).toContain("No module report for");
+		expect(result.content[0]?.text).toContain("missing.ts — unavailable");
 		expect(result.content[0]?.text).not.toContain("Not run");
 	}, 25_000);
 
@@ -1111,7 +1308,7 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 	it("keeps the tool's own message when a required key is missing and nothing is ignored", async () => {
 		const result = await call("pilens_analyze", {});
 		expect(result.content[0]?.text).toContain(
-			"pilens_analyze requires a 'file' string.",
+			"pilens_analyze requires a `path` string.",
 		);
 		expect(result.content[0]?.text).not.toContain("Ignored unknown");
 	}, 25_000);
@@ -1126,12 +1323,19 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 			"Ignored unknown argument(s) for pilens_lsp_diagnostics: `pth` (did you mean `path`?). They had no effect on this call.",
 		);
 		expect(warned.content[0]?.text).toContain("Checks not confirmed");
-		// `filePath` with neither `path` nor `paths` sent is refused, as on
-		// `pilens_diagnostics`.
-		const refused = await call("pilens_lsp_diagnostics", { filePath: "x.ts" });
+		// #5041: `filePath` is now a declared alias of `path`, so this call runs
+		// scoped; a spelling that is not declared still refuses.
+		const aliased = await call("pilens_lsp_diagnostics", { filePath: "x.ts" });
+		// The retired name's contract forwards `path` to the LSP probe, so an
+		// absent file is "Path not found" — which is itself proof the alias was
+		// read as the file parameter rather than reported and dropped.
+		expect(aliased.content[0]?.text).toContain("Path not found");
+		expect(aliased.content[0]?.text).toContain("x.ts");
+		expect(aliased.content[0]?.text).not.toContain("Ignored unknown");
+		const refused = await call("pilens_lsp_diagnostics", { file_path: "x.ts" });
 		expect(refused.isError).toBe(true);
 		expect(refused.content[0]?.text).toContain(
-			"Not run: `filePath` looks like a mistyped `path`, which was not sent.",
+			"Not run: `file_path` looks like a mistyped `filePath`, which was not sent.",
 		);
 	}, 25_000);
 
@@ -1230,16 +1434,21 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 	it("refuses a file-like key only where a declared parameter matches as a whole token", async () => {
 		// [tool, extra required args, key, refused?, named parameter]
 		const rows: [string, Record<string, unknown>, string, string | null][] = [
-			["pilens_lsp_navigation", { operation: "hover" }, "filePath", "path"],
-			["pilens_lsp_navigation", { operation: "hover" }, "file_path", "path"],
+			["pilens_lsp_navigation", { operation: "hover" }, "filePath", null],
+			[
+				"pilens_lsp_navigation",
+				{ operation: "hover" },
+				"file_path",
+				"filePath",
+			],
 			["pilens_lsp_navigation", { operation: "hover" }, "file", null],
-			["pilens_lsp_navigation", { operation: "hover" }, "files", null],
-			["pilens_lsp_navigation", { operation: "hover" }, "File", null],
-			["pilens_diagnostics", {}, "filePath", "path"],
-			["pilens_diagnostics", {}, "file_path", "path"],
+			["pilens_lsp_navigation", { operation: "hover" }, "files", "file"],
+			["pilens_lsp_navigation", { operation: "hover" }, "File", "file"],
+			["pilens_diagnostics", {}, "filePath", null],
+			["pilens_diagnostics", {}, "file_path", "filePath"],
 			["pilens_diagnostics", {}, "file", null],
-			["pilens_diagnostics", {}, "files", null],
-			["pilens_diagnostics", {}, "File", null],
+			["pilens_diagnostics", {}, "files", "file"],
+			["pilens_diagnostics", {}, "File", "file"],
 			["pilens_diagnostics", {}, "Path", "path"],
 			["pilens_ast_grep_search", { lang: "typescript" }, "filePath", "paths"],
 			["pilens_ast_grep_search", { lang: "typescript" }, "file_path", "paths"],
@@ -1513,6 +1722,174 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 // PI_LENS_HOME, and failed the recursive removal. A preload makes the server
 // spawn exactly that writer at startup; the removal of its directory succeeds
 // only when dispose() killed the whole tree.
+// #5041: `path` is the canonical single-file parameter, and `file` /
+// `filePath` stay accepted as aliases so no caller breaks (#2418). Before this
+// change `pilens_module_report {path}` was REFUSED and `pilens_diagnostics
+// {file}` ran on the default scope with only a warning — the answer looked
+// real. These cases drive the real stdio server: the schema census reads
+// `tools/list`, and each call proves the alias is the one the handler used.
+describe("pi-lens MCP canonical `path` parameter (#5041)", { retry: 2 }, () => {
+	type WireResult = {
+		isError?: boolean;
+		content: { text: string }[];
+		structuredContent?: unknown;
+	};
+	let harness: McpHarness;
+	let workspace: ReturnType<typeof setupTestEnvironment>;
+	let nextId = 504_100;
+	const call = async (
+		name: string,
+		args: Record<string, unknown>,
+	): Promise<WireResult> => {
+		const response = await harness.request(nextId++, "tools/call", {
+			name,
+			arguments: args,
+		});
+		expect(response.error).toBeUndefined();
+		return response.result as WireResult;
+	};
+	const text = (result: WireResult): string =>
+		result.content.map((part) => part.text).join("\n");
+
+	beforeAll(async () => {
+		workspace = setupTestEnvironment("pi-lens-mcp-5041-");
+		harness = new McpHarness({ cwd: workspace.tmpDir });
+		await harness.request(504_099, "initialize", {
+			protocolVersion: "2025-06-18",
+			capabilities: {},
+			clientInfo: { name: "canonical-path", version: "0" },
+		});
+		harness.notify("notifications/initialized");
+	}, 25_000);
+
+	afterAll(async () => {
+		harness.dispose();
+		workspace.cleanup();
+	});
+
+	it("declares `path` plus both aliases on every single-file tool", async () => {
+		const listed = (await harness.request(504_098, "tools/list")).result as {
+			tools: {
+				name: string;
+				inputSchema: { properties?: Record<string, unknown> };
+			}[];
+		};
+		const singleFile = [
+			"pilens_analyze",
+			"pilens_module_report",
+			"pilens_read_symbol",
+			"pilens_read_enclosing",
+			"pilens_effective_config",
+			"pilens_diagnostics",
+			"pilens_lsp_navigation",
+		];
+		for (const name of singleFile) {
+			const tool = listed.tools.find((candidate) => candidate.name === name);
+			expect(tool, `missing ${name}`).toBeDefined();
+			const keys = Object.keys(tool?.inputSchema.properties ?? {});
+			// A tool that only declares its old spelling sends an agent reading
+			// another tool's schema to a refused or silently-dropped key.
+			expect(keys, name).toContain("path");
+			expect(keys, name).toContain("file");
+			expect(keys, name).toContain("filePath");
+		}
+	}, 30_000);
+
+	it("runs pilens_module_report through the canonical `path`", async () => {
+		const result = await call("pilens_module_report", { path: "missing.ts" });
+		// A missing file is its own answer; the point is that the argument was
+		// READ (pre-fix this call was refused as an unknown `path` key).
+		expect(text(result)).toContain("missing.ts — unavailable");
+		expect(text(result)).not.toContain("Not run:");
+		expect(text(result)).not.toContain("Ignored unknown");
+	}, 30_000);
+
+	it("runs pilens_read_symbol and pilens_read_enclosing through `path`", async () => {
+		const file = path.join(workspace.tmpDir, "app.ts");
+		fs.writeFileSync(
+			file,
+			"export function greet(name: string) {\n  return `hi ${name}`;\n}\n",
+		);
+		const symbol = await call("pilens_read_symbol", {
+			path: "app.ts",
+			symbol: "greet",
+		});
+		expect(symbol.isError).toBeFalsy();
+		expect(text(symbol)).toContain("greet");
+		const enclosing = await call("pilens_read_enclosing", {
+			path: "app.ts",
+			line: 2,
+		});
+		expect(enclosing.isError).toBeFalsy();
+		expect(text(enclosing)).toContain("greet");
+	}, 30_000);
+
+	it("runs pilens_effective_config through `path`, as through `file`", async () => {
+		const file = path.join(workspace.tmpDir, "app.ts");
+		fs.writeFileSync(file, "export const value = 1;\n");
+		const canonical = await call("pilens_effective_config", { path: "app.ts" });
+		const older = await call("pilens_effective_config", { file: "app.ts" });
+		expect(canonical.isError, text(canonical)).toBeFalsy();
+		expect(text(canonical)).toContain(`File: ${file}`);
+		expect(text(older)).toContain(`File: ${file}`);
+	}, 30_000);
+
+	it("runs pilens_analyze through `path` instead of asking for `file`", async () => {
+		const target = path.join(workspace.tmpDir, "analyzed-5041.ts");
+		fs.writeFileSync(target, "export const analyzed = 1;\n");
+		const result = await call("pilens_analyze", {
+			path: target,
+			mode: "warm",
+			flags: { "no-lsp": true },
+		});
+		// Pre-fix the call was refused as `required argument(s) \`file\` missing`;
+		// an answer that names the analyzed file proves `path` was read.
+		expect(result.isError, text(result)).toBeFalsy();
+		expect(text(result)).not.toContain("Not run:");
+		expect(text(result)).toContain("[warm]");
+		expect(text(result)).toContain("analyzed-5041.ts");
+	}, 60_000);
+
+	// RECURRENCE GUARDED (#5047 r1 F3): a call that names its file through one
+	// declared spelling and adds an UNDECLARED near-miss of a different spelling
+	// was refused with "looks like a mistyped `filePath`, which was not sent",
+	// although the file was sent. The extra key is still reported, never refused.
+	it("runs a call that names its file and adds a mistyped sibling spelling", async () => {
+		const diagnostics = await call("pilens_diagnostics", {
+			path: "src/app.ts",
+			file_path: "src/app.ts",
+		});
+		expect(diagnostics.isError, text(diagnostics)).not.toBe(true);
+		expect(text(diagnostics)).not.toContain("Not run:");
+		expect(text(diagnostics)).toContain("Ignored unknown argument");
+		expect(text(diagnostics)).toContain("file_path");
+		const analyze = await call("pilens_analyze", {
+			file: path.join(workspace.tmpDir, "analyzed-5041.ts"),
+			sourcePath: "ignored",
+			mode: "warm",
+			flags: { "no-lsp": true },
+		});
+		expect(analyze.isError, text(analyze)).not.toBe(true);
+		expect(text(analyze)).not.toContain("Not run:");
+		expect(text(analyze)).toContain("Ignored unknown argument");
+	}, 60_000);
+
+	it("scopes pilens_diagnostics to the file an alias names", async () => {
+		const result = await call("pilens_diagnostics", { file: "src/app.ts" });
+		expect(result.isError).not.toBe(true);
+		expect(text(result)).toContain("paths restricts this to cached findings");
+	}, 30_000);
+
+	it("refuses two spellings that name different files", async () => {
+		const result = await call("pilens_module_report", {
+			path: "a.ts",
+			file: "b.ts",
+		});
+		expect(result.isError).toBe(true);
+		expect(text(result)).toContain("name different files");
+	}, 30_000);
+});
+
 describe("McpHarness.dispose tears down the server's process tree", () => {
 	it.skipIf(process.platform === "win32")(
 		"kills a detached descendant and removes the home it writes into",

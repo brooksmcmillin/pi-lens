@@ -26,17 +26,13 @@ import { LSPService } from "../../../clients/lsp/index.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { removeTempDirSync } from "../test-utils.js";
 import { createMockState } from "./mock-client-state.js";
+import { _setServersForFileForTests } from "../../../clients/lsp/config.js";
 
 const { getServersForFileWithConfig, createLSPClient } = vi.hoisted(() => ({
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
 }));
 
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -190,6 +186,16 @@ const DISPATCH = {
 	clientScope: "primary" as const,
 	source: "dispatch",
 };
+
+// #4709: the setter is module state. It is armed per case at file scope and
+// dropped after each case, so no describe reads a list an earlier describe
+// armed (a shuffled run orders the describes freely).
+beforeEach(() => {
+	_setServersForFileForTests(getServersForFileWithConfig);
+});
+afterEach(() => {
+	_setServersForFileForTests(undefined);
+});
 
 describe("#3501 — a touch-debounce entry does not outlive its client", () => {
 	let tmp: string;

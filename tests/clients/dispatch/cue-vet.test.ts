@@ -428,6 +428,49 @@ describe("cue-vet run() — real binary output shapes, mocked spawn", () => {
 		const result = await cueVetRunner.run(createCtx(cueFile, cueCwd));
 		expect(result.status).toBe("skipped");
 		expect(result.diagnostics).toEqual([]);
+		// #4130: the spawn failed after cue resolved, so the skip names the fault.
+		expect(result.skipFault).toBe("did-not-run");
+	});
+
+	// RECURRENCE THIS PREVENTS: #4130 round 2 (PR #4971 thread on cue-vet). A
+	// `cue vet` killed after it printed errors reached `findingsResult`
+	// (`blocking_diagnostics`), and one whose printed errors all belonged to
+	// sibling files returned `succeeded`: smoke rendered both as a pass.
+	it("keeps the touched file's errors from a killed vet, as a fault and not as coverage", async () => {
+		safeSpawnAsync.mockResolvedValue({
+			status: null,
+			signal: "SIGKILL",
+			stdout:
+				"myField: conflicting values 5 and string (mismatched types int and string):\n    .\\values.cue:3:11\n",
+			stderr: "",
+		});
+		const cueVetRunner = (
+			await import("../../../clients/dispatch/runners/cue-vet.js")
+		).default;
+		const { hasUsableResult } =
+			await import("../../../clients/dispatch/types.js");
+		const result = await cueVetRunner.run(createCtx(valuesFile, cueCwd));
+		expect(result.status).toBe("failed");
+		expect(result.failureKind).toBe("did-not-run");
+		expect(result.diagnostics).toHaveLength(1);
+		expect(result.diagnostics[0].line).toBe(3);
+		expect(hasUsableResult(result)).toBe(false);
+	});
+
+	it("never reads a killed vet whose printed errors are all a sibling's as clean", async () => {
+		safeSpawnAsync.mockResolvedValue({
+			status: null,
+			signal: "SIGKILL",
+			stdout:
+				"other: conflicting values 5 and string (mismatched types int and string):\n    .\\schema.cue:4:8\n",
+			stderr: "",
+		});
+		const cueVetRunner = (
+			await import("../../../clients/dispatch/runners/cue-vet.js")
+		).default;
+		const result = await cueVetRunner.run(createCtx(valuesFile, cueCwd));
+		expect(result.status).toBe("skipped");
+		expect(result.skipFault).toBe("did-not-run");
 	});
 
 	// F5 (review round 2, HIGH): a package-less standalone file used to block

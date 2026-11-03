@@ -38,21 +38,13 @@ vi.mock("../../clients/dispatch/integration.js", () => ({
 	dispatchLintWithResult: vi.fn(),
 	computeCascadeForFile: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(),
-	resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
-}));
 vi.mock("../../clients/recent-touches.js", () => ({
 	appendRecentTouches: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const ATTACHMENT_PREFIX = "pi-lens applied autofix to ";
 const ATTACHED_CLAIM = "is authoritative after autofix";
@@ -151,17 +143,16 @@ function changeLogEntries(cwd: string): ProjectChangeEntry[] {
 }
 
 describe("#1590 post-autofix instruction has one author", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		logLatency.mockClear();
-		vi.mocked(getLSPService).mockReturnValue(
-			makeLspServiceDouble({
-				supportsLSP: () => false,
-				hasLSP: async () => false,
-				openFile: async () => {},
-				touchFile: async () => {},
-				getAllDiagnostics: async () => new Map(),
-			}) as never,
-		);
+		await installLspServiceDouble({
+			resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
+			supportsLSP: () => false,
+			hasLSP: async () => false,
+			openFile: async () => {},
+			touchFile: async () => {},
+			getAllDiagnostics: async () => new Map(),
+		});
 		vi.mocked(dispatchLintWithResult).mockReset();
 		vi.mocked(dispatchLintWithResult).mockResolvedValue({
 			diagnostics: [],

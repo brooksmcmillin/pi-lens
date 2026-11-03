@@ -66,9 +66,15 @@ const spawnRouter = vi.hoisted(() => {
 	/** Every command this witness's chain tried to run, in order. */
 	const calls: Array<{ command: string; args: string[] }> = [];
 	/** Set per cell: the `helm lint` stdout that cell's chart produces. */
-	const state = { helmLintStdout: "" };
+	const state = { helmLintStdout: "", mypyStdout: "" };
 	const isHelm = (command: string): boolean =>
 		/(^|[\\/])helm(\.exe)?$/i.test(command);
+	/** #5020: the non-helm cross-file runner (mypy follows imports and names
+	 *  the module a regression lands in). */
+	const isMypy = (command: string): boolean =>
+		/(^|[\\/])mypy(\.exe)?$/i.test(command);
+	const isDoubled = (command: string): boolean =>
+		isHelm(command) || isMypy(command);
 	function run(
 		command: string,
 		args: readonly string[] = [],
@@ -80,9 +86,17 @@ const spawnRouter = vi.hoisted(() => {
 		spawnFailure?: { kind: "tool-not-found" };
 	} {
 		calls.push({ command, args: [...args] });
-		// Every binary except helm is simply not on this host, which is how the
-		// runners that do not matter here skip without inventing failures the
-		// golden would then have to carry.
+		if (isMypy(command))
+			return args.includes("--show-column-numbers")
+				? {
+						stdout: state.mypyStdout,
+						stderr: "",
+						status: state.mypyStdout ? 1 : 0,
+					}
+				: { stdout: "mypy 1.11.0", stderr: "", status: 0 };
+		// Every binary except helm and mypy is simply not on this host, which is
+		// how the runners that do not matter here skip without inventing
+		// failures the golden would then have to carry.
 		if (!isHelm(command))
 			return {
 				stdout: "",
@@ -94,8 +108,10 @@ const spawnRouter = vi.hoisted(() => {
 		if (args[0] === "lint")
 			return {
 				stdout: state.helmLintStdout,
-				stderr: "Error: 1 chart(s) linted, 1 chart(s) failed",
-				status: 1,
+				stderr: state.helmLintStdout
+					? "Error: 1 chart(s) linted, 1 chart(s) failed"
+					: "",
+				status: state.helmLintStdout ? 1 : 0,
 			};
 		return {
 			stdout: 'version.BuildInfo{Version:"v3.16.2"}',
@@ -103,7 +119,7 @@ const spawnRouter = vi.hoisted(() => {
 			status: 0,
 		};
 	}
-	return { calls, state, isHelm, run };
+	return { calls, state, isHelm, isDoubled, run };
 });
 
 /** The ONE double: the process boundary. */
@@ -112,22 +128,29 @@ vi.mock("../clients/safe-spawn.js", async (importOriginal) => ({
 	safeSpawn: spawnRouter.run,
 	safeSpawnAsync: async (command: string, args: readonly string[] = []) =>
 		spawnRouter.run(command, args),
-	isCommandAvailable: spawnRouter.isHelm,
+	isCommandAvailable: spawnRouter.isDoubled,
 	isCommandAvailableAsync: async (command: string) =>
-		spawnRouter.isHelm(command),
+		spawnRouter.isDoubled(command),
 	findCommand: (command: string) =>
-		spawnRouter.isHelm(command) ? "helm" : null,
+		spawnRouter.isDoubled(command) ? command : null,
 	findCommandAsync: async (command: string) =>
-		spawnRouter.isHelm(command) ? "helm" : null,
+		spawnRouter.isDoubled(command) ? command : null,
 }));
 
 import extension from "../index.js";
+import { getDegradationSummary } from "../clients/degradation-ledger.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
+import {
+	flushLatencyLog,
+	getLatencyLogPath,
+} from "../clients/latency-logger.js";
+import { readNdjsonRows } from "./support/ndjson-rows.js";
 import {
 	makeContextWithSystemEvent,
 	makeSessionStartEvent,
 } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { useGlobalConfig } from "./support/global-config.js";
 
 const GOLDEN_DIR = path.join(
 	import.meta.dirname,
@@ -146,17 +169,12 @@ async function readNewDiagnosticRows(
 	offset: number,
 ): Promise<Array<Record<string, unknown>>> {
 	await getDiagnosticLogger().flush();
-	const file = diagnosticLogPath();
-	if (!fs.existsSync(file)) return [];
-	// `offset` is a byte count: slice the bytes, then decode (#4484 review F3).
-	return fs
-		.readFileSync(file)
-		.subarray(offset)
-		.toString("utf8")
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => JSON.parse(line) as Record<string, unknown>);
+	// `offset` is a byte count: the reader slices the bytes before decoding
+	// (#4484 review F3). A line it cannot parse would lower the step count this
+	// witness reads, so it is a red, named by its count.
+	const read = readNdjsonRows(diagnosticLogPath(), offset);
+	expect(read.skipped).toBe(0);
+	return read.rows;
 }
 
 beforeEach(() => {
@@ -179,6 +197,7 @@ beforeEach(() => {
 	);
 	spawnRouter.calls.length = 0;
 	spawnRouter.state.helmLintStdout = "";
+	spawnRouter.state.mypyStdout = "";
 });
 
 afterEach(() => {
@@ -270,7 +289,7 @@ async function witnessTurn(
 	spawnRouter.state.helmLintStdout = HELM_LINT_OUTPUT;
 	if (deleteValues) fs.rmSync(values);
 
-	const pi = createPiMock({ "no-lsp": true });
+	const pi = createPiMock();
 	extension(pi.asExtensionAPI());
 	await pi.emit(
 		"session_start",
@@ -299,6 +318,15 @@ async function witnessTurn(
 	// golden records the messages pi-lens APPENDED. The assertion pins that the
 	// head is still at index 0: losing it would shift this golden.
 	expect((injected?.messages ?? [])[0]?.role).toBe("system");
+	// Each turn is its own host session and shuts down when it ends. Left live,
+	// the first turn's session kept the process registration, so a case that ran
+	// afterwards started as a declined secondary and delivered nothing (#4483's
+	// teardown carries the same rule).
+	await pi.emit(
+		"session_shutdown",
+		{ type: "session_shutdown", reason: "quit" },
+		makeCtx({ cwd: tmpDir, sessionId: "pi-lens-3190-witness" }),
+	);
 	return {
 		chartRoot,
 		toolResult:
@@ -392,5 +420,443 @@ describe("#3190 witness: a retracted deleted-path blocker through pi", () => {
 				intact.turnEnd,
 			].join("\n"),
 		);
+	});
+
+	/**
+	 * #5008 review round 3 (F6): the count ending the `Still unfixed` line splits
+	 * its causes. A chart-wide runner reports a blocking row for ANOTHER file in
+	 * the chart (`values.yaml`, while the edited template is the file the write
+	 * is about). That row has a line, just not in these bytes, so it is the cause
+	 * the `; N with no line in this file` clause owns. The other clause names a
+	 * same-file stale carry, guarded in
+	 * `tests/index-4484-unfixed-blocker-witness.test.ts` (rows 34/35 and the
+	 * acceptance-3 count cell).
+	 *
+	 * Recurrence: the round-2 wording called every unplaced blocker `with no line
+	 * in this file`, which is false for the same-file carry those rows hold and
+	 * true only for this one.
+	 */
+	it("counts another file's blocker row as having no line in this file (#5008 review r3)", async () => {
+		const { template } = createChart("foreign-row");
+		spawnRouter.state.helmLintStdout = [
+			"==> Linting .",
+			"[ERROR] values.yaml:1: replicas must be an integer, got string",
+		].join("\n");
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		const ctx = () =>
+			makeCtx({ cwd: tmpDir, sessionId: "pi-lens-3190-foreign-row" });
+		await pi.emit("session_start", makeSessionStartEvent(), ctx());
+		await pi.emit("turn_start", {}, ctx());
+		const write = async (content: string): Promise<string> => {
+			fs.writeFileSync(template, content);
+			const returned = (await pi.emit(
+				"tool_result",
+				{
+					toolName: "write",
+					input: { path: template, content },
+					content: [{ type: "text", text: "wrote" }],
+				},
+				ctx(),
+			)) as { content?: Array<{ text?: string }> } | undefined;
+			return scrub(
+				(returned?.content ?? []).map((part) => part.text ?? "").join("\n"),
+			);
+		};
+		const before = fs.readFileSync(template, "utf8");
+		expect(await write(`${before}# note one\n`)).toContain("🔴 STOP");
+		const second = await write(`${before}# note two\n`);
+		expect(second).toMatch(
+			/Still unfixed: 1 blocker reported earlier; 1 with no line in this file\./,
+		);
+		expect(second).not.toMatch(/could not be re-placed in these bytes/);
+		await pi.emit(
+			"session_shutdown",
+			{ type: "session_shutdown", reason: "quit" },
+			ctx(),
+		);
+	});
+});
+
+// --- #5020 ---
+const setGlobalConfig = useGlobalConfig();
+
+type Tool = {
+	execute: (...a: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
+};
+
+/** The chart: `deploy-a.yaml` is the file the agent writes, `other-b.yaml` the
+ *  file the chart-wide runner cites. */
+function createTwoFileChart(name: string) {
+	const chartRoot = path.join(tmpDir, "charts", name);
+	fs.mkdirSync(path.join(chartRoot, "templates"), { recursive: true });
+	fs.writeFileSync(
+		path.join(chartRoot, "Chart.yaml"),
+		"apiVersion: v2\nname: witness\nversion: 0.1.0\n",
+	);
+	fs.writeFileSync(path.join(chartRoot, "values.yaml"), "replicas: 2\n");
+	const body = (kind: string) =>
+		`apiVersion: apps/v1\nkind: ${kind}\nspec:\n  replicas: 1\n`;
+	const a = path.join(chartRoot, "templates", "deploy-a.yaml");
+	const b = path.join(chartRoot, "templates", "other-b.yaml");
+	fs.writeFileSync(a, body("Deployment"));
+	fs.writeFileSync(b, body("Deployment"));
+	return { chartRoot, a, b, body };
+}
+
+const ROW_B = [
+	"==> Linting .",
+	"[ERROR] templates/other-b.yaml:2: nil pointer evaluating interface {}.image",
+].join("\n");
+
+/**
+ * What the ledger holds for `chart`'s `cross-file-row-retired` retire: the
+ * durable row the real latency.log sink received (flushed first, no other
+ * await between) and the reason the in-memory summary kept.
+ */
+async function retiredRow(
+	chart: string,
+): Promise<{ durableRows: number; reasons: string[] }> {
+	await flushLatencyLog();
+	const read = readNdjsonRows(getLatencyLogPath());
+	// The ledger rows ARE the trace under test; a skipped line would shorten it.
+	expect(read.skipped).toBe(0);
+	const named = (subject: unknown) =>
+		String(subject ?? "").includes(`charts/${chart}/`);
+	return {
+		durableRows: read.rows.filter((row) => {
+			const metadata = row.metadata as Record<string, unknown> | undefined;
+			return (
+				row.phase === "degradation_ledger" &&
+				metadata?.kind === "cross-file-row-retired" &&
+				named(metadata.subject)
+			);
+		}).length,
+		reasons: (
+			getDegradationSummary().find((c) => c.kind === "cross-file-row-retired")
+				?.latestReasons ?? []
+		).flatMap((r) => (named(r.subject) ? [r.reason] : [])),
+	};
+}
+
+/** A cell that fails before its own shutdown must not leave the process-wide
+ *  registration to the next cell (the second session would be declined). */
+let liveSession: { shutdown(): Promise<void> } | undefined;
+afterEach(async () => {
+	const live = liveSession;
+	liveSession = undefined;
+	await live?.shutdown().catch(() => {});
+});
+
+async function openSession(name: string) {
+	setGlobalConfig({ guard: { enabled: true } });
+	const pi = createPiMock();
+	extension(pi.asExtensionAPI());
+	const ctx = () => makeCtx({ cwd: tmpDir, sessionId: `pi-lens-5020-${name}` });
+	await pi.emit("session_start", makeSessionStartEvent(), ctx());
+	await pi.emit("turn_start", {}, ctx());
+	const session = {
+		/** A command the host ran that changed `file` without naming it: the
+		 *  `bash` tool_call (baseline), the change, then the tool_result. The
+		 *  recovered write is opaque evidence, an unauthored run. */
+		async opaqueWrite(file: string, content: string): Promise<void> {
+			const toolCallId = `5020-opaque-${Date.now()}`;
+			const input = { command: "node scripts/regen.mjs" };
+			await pi.emit(
+				"tool_call",
+				{ toolName: "bash", toolCallId, input },
+				ctx(),
+			);
+			fs.writeFileSync(file, content);
+			await pi.emit(
+				"tool_result",
+				{
+					toolName: "bash",
+					toolCallId,
+					input,
+					isError: false,
+					content: [{ type: "text", text: "ok" }],
+				},
+				ctx(),
+			);
+		},
+		async write(file: string, content: string): Promise<string> {
+			fs.writeFileSync(file, content);
+			const r = (await pi.emit(
+				"tool_result",
+				{
+					toolName: "write",
+					input: { path: file, content },
+					content: [{ type: "text", text: "wrote" }],
+				},
+				ctx(),
+			)) as { content?: Array<{ text?: string }> } | undefined;
+			return scrub((r?.content ?? []).map((p) => p.text ?? "").join("\n"));
+		},
+		async commitBlocked(): Promise<boolean> {
+			const v = ((await pi.emit(
+				"tool_call",
+				{ toolName: "bash", input: { command: 'git commit -m "wip"' } },
+				ctx(),
+			)) ?? {}) as { block?: boolean };
+			return v.block === true;
+		},
+		async endTurn(): Promise<string> {
+			await pi.emit("turn_end", {}, ctx());
+			const injected = (await pi.emit(
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
+				ctx(),
+			)) as { messages?: Array<{ content: string }> } | undefined;
+			await pi.emit("turn_start", {}, ctx());
+			return scrub(
+				(injected?.messages ?? []).map((m) => m.content).join("\n\n"),
+			);
+		},
+		async sessionDiagnostics(): Promise<string> {
+			const lens = pi.tools.get("lens_diagnostics") as Tool;
+			const out = await lens.execute(
+				`zz-${name}`,
+				{ source: "session", mode: "all" },
+				undefined,
+				null,
+				{ cwd: tmpDir },
+			);
+			return scrub((out.content ?? []).map((p) => p.text ?? "").join("\n"));
+		},
+		async shutdown() {
+			await pi.emit(
+				"session_shutdown",
+				{ type: "session_shutdown", reason: "quit" },
+				ctx(),
+			);
+		},
+	};
+	liveSession = session;
+	return session;
+}
+
+/**
+ * The mypy cells write three or four files through the real dispatch chain,
+ * so they exceed vitest's 5000 ms default under a loaded host (5021 ms and
+ * 5330 ms measured at load 27, round 3). They assert no elapsed time, so the
+ * call site carries the timeout, as the #2512 note in vitest.config.ts says.
+ */
+const MYPY_CELL_TIMEOUT_MS = 20_000;
+
+describe("#5020 witness: a cross-file row retires once its cited file is clean or gone", () => {
+	/**
+	 * Both write 1 and write 2 land on `deploy-a.yaml` while helm-lint cites
+	 * `other-b.yaml`, so the row is recorded against the file the agent wrote.
+	 */
+	async function recordRowAgainstA(name: string) {
+		const chart = createTwoFileChart(name);
+		const s = await openSession(name);
+		spawnRouter.state.helmLintStdout = ROW_B;
+		expect(
+			await s.write(chart.a, `${chart.body("Deployment")}# one\n`),
+		).toContain("🔴 STOP");
+		expect(
+			await s.write(chart.a, `${chart.body("Deployment")}# two\n`),
+		).toMatch(
+			/Still unfixed: 1 blocker reported earlier; 1 with no line in this file\./,
+		);
+		expect(await s.commitBlocked()).toBe(true);
+		return { ...chart, s };
+	}
+
+	/**
+	 * Recurrence (#5020): the agent fixes the file the row cites (here by
+	 * writing it), and the record keyed on the OTHER file kept the row, so the
+	 * commit gate stayed shut with nothing left to fix.
+	 */
+	it("opens the gate when the cited file is written clean", async () => {
+		const { b, body, s } = await recordRowAgainstA("fixed-b");
+		spawnRouter.state.helmLintStdout = "";
+		await s.write(b, body("Service"));
+		expect(await s.commitBlocked()).toBe(false);
+		const end = await s.endTurn();
+		expect(end).not.toContain("Unresolved from this turn");
+		expect(end).toMatch(
+			/Resolved this turn: charts\/fixed-b\/templates\/deploy-a\.yaml/,
+		);
+		// The retire is never silent: one ledger row, naming the clean verdict.
+		expect(await retiredRow("fixed-b")).toEqual({
+			durableRows: 1,
+			reasons: [expect.stringContaining("reported nothing on it")],
+		});
+		// The declared p3 residual (#5020): the widget store is a second writer
+		// and its rows carry no cited file, so it still lists the row against the
+		// WRITTEN file until that file is next dispatched. This pins the residual,
+		// not the fix: a lane that retires it here deletes this assertion with its
+		// own red.
+		expect(await s.sessionDiagnostics()).toContain("other-b.yaml");
+		await s.shutdown();
+	});
+
+	/**
+	 * Recurrence (#5020): the cited file is deleted and nothing rewrites the
+	 * file the row was recorded against, so no dispatch ever re-took its verdict.
+	 */
+	it("opens the gate when the cited file is deleted", async () => {
+		const { b, s } = await recordRowAgainstA("deleted-b");
+		fs.rmSync(b);
+		const end = await s.endTurn();
+		expect(end).not.toContain("Unresolved from this turn");
+		// A deletion is not a clean verdict, so no file is reported "Resolved".
+		expect(end).not.toContain("Resolved this turn");
+		expect(await s.commitBlocked()).toBe(false);
+		expect(await retiredRow("deleted-b")).toEqual({
+			durableRows: 1,
+			reasons: [expect.stringContaining("no longer exists")],
+		});
+		await s.shutdown();
+	});
+
+	/**
+	 * Recurrence (#5020): the agent deletes the cited file and commits in the
+	 * SAME turn, so no turn end has run to sweep. The commit gate is the read
+	 * that matters, so it retires the row itself before it judges.
+	 */
+	it("opens the gate for a commit right after the cited file is deleted", async () => {
+		const { b, s } = await recordRowAgainstA("commit-after-delete");
+		fs.rmSync(b);
+		expect(await s.commitBlocked()).toBe(false);
+		await s.shutdown();
+	});
+
+	/**
+	 * The issue's literal sequence: the cited file is deleted and the recorded
+	 * file is rewritten clean. This cleared on master already (the premise is
+	 * partially confirmed); it stays as the guard that the rewrite path keeps
+	 * clearing.
+	 */
+	it("opens the gate when the cited file is deleted and the written file is rewritten clean", async () => {
+		const { a, b, body, s } = await recordRowAgainstA("rewritten-a");
+		fs.rmSync(b);
+		spawnRouter.state.helmLintStdout = "";
+		await s.write(a, `${body("Deployment")}# three\n`);
+		const end = await s.endTurn();
+		expect(end).not.toContain("Unresolved from this turn");
+		expect(await s.commitBlocked()).toBe(false);
+		await s.shutdown();
+	});
+
+	/**
+	 * Recurrence (#5020), for a runner that is not helm: mypy follows imports
+	 * and names the module a regression lands in (`mypy.ts`, #265 A2), so its
+	 * row for `b.py` is recorded against the written `a.py` the same way, and
+	 * writing `b.py` clean must retire it by the same rule.
+	 */
+	it(
+		"opens the gate when the file another runner cites is written clean",
+		{ timeout: MYPY_CELL_TIMEOUT_MS },
+		async () => {
+			const root = path.join(tmpDir, "pyproj");
+			fs.mkdirSync(root, { recursive: true });
+			fs.writeFileSync(
+				path.join(tmpDir, "mypy.ini"),
+				"[mypy]\nstrict = True\n",
+			);
+			const a = path.join(root, "a.py");
+			const b = path.join(root, "b.py");
+			fs.writeFileSync(a, "import b\n");
+			fs.writeFileSync(b, "x: int = 1\n");
+			const s = await openSession("mypy-cross-file");
+			spawnRouter.state.mypyStdout = `${b}:1:10: error: Incompatible types in assignment [assignment]`;
+			expect(await s.write(a, "import b\n# one\n")).toContain("🔴 STOP");
+			expect(await s.write(a, "import b\n# two\n")).toMatch(/Still unfixed/);
+			expect(await s.commitBlocked()).toBe(true);
+			spawnRouter.state.mypyStdout = "";
+			await s.write(b, "x: int = 2\n");
+			expect(await s.commitBlocked()).toBe(false);
+			expect(await s.endTurn()).not.toContain("Unresolved from this turn");
+			await s.shutdown();
+		},
+	);
+
+	/**
+	 * Recurrence (PR #5033 round 3, CodeRabbit and Greptile on
+	 * `verdictRunnerIds`): a runner that answers the cited file and fails on
+	 * findings in ANOTHER module reports `failed` with `blocking_diagnostics`.
+	 * That is a completed check (`hasUsableResult`), but the retire read only
+	 * `succeeded`, so the row naming `b.py` outlived its cause and the commit
+	 * stayed refused after every file was clean. The run still holds no blocker
+	 * of its own on `b.py` (`stillReported`), which is what lets it speak.
+	 */
+	it(
+		"opens the gate when the cited file's runner answers it while failing on another module",
+		{ timeout: MYPY_CELL_TIMEOUT_MS },
+		async () => {
+			const root = path.join(tmpDir, "pyproj-failing");
+			fs.mkdirSync(root, { recursive: true });
+			fs.writeFileSync(
+				path.join(tmpDir, "mypy.ini"),
+				"[mypy]\nstrict = True\n",
+			);
+			const a = path.join(root, "a.py");
+			const b = path.join(root, "b.py");
+			const c = path.join(root, "c.py");
+			fs.writeFileSync(a, "import b\n");
+			fs.writeFileSync(b, "import c\nx: int = 1\n");
+			fs.writeFileSync(c, "y: int = 1\n");
+			const s = await openSession("mypy-failing-elsewhere");
+			spawnRouter.state.mypyStdout = `${b}:2:10: error: Incompatible types in assignment [assignment]`;
+			expect(await s.write(a, "import b\n# one\n")).toContain("🔴 STOP");
+			expect(await s.write(a, "import b\n# two\n")).toMatch(/Still unfixed/);
+			// mypy answers b.py and reports only c.py: `failed`, `blocking_diagnostics`.
+			spawnRouter.state.mypyStdout = `${c}:1:10: error: Incompatible types in assignment [assignment]`;
+			await s.write(b, "import c\nx: int = 2\n");
+			// c.py's row now sits in b.py's record, so the gate is still shut here.
+			expect(await s.commitBlocked()).toBe(true);
+			spawnRouter.state.mypyStdout = "";
+			await s.write(c, "y: int = 2\n");
+			expect(await s.commitBlocked()).toBe(false);
+			expect(await s.endTurn()).not.toContain("Unresolved from this turn");
+			await s.shutdown();
+		},
+	);
+
+	/**
+	 * Negative (#4137 rule): a run without authorship withholds the blocker
+	 * channel, so its empty observation is no evidence the cited file is clean.
+	 * A command that regenerated `other-b.yaml` is opaque evidence, and it must
+	 * not retire the row the way an authored write does.
+	 */
+	it("keeps the row when the cited file is changed by a command, not authored", async () => {
+		const { b, body, s } = await recordRowAgainstA("opaque-b");
+		spawnRouter.state.helmLintStdout = "";
+		await s.opaqueWrite(b, `${body("Service")}# regenerated\n`);
+		expect(await s.commitBlocked()).toBe(true);
+		await s.shutdown();
+	});
+
+	/**
+	 * Negative: the raising runner reached no verdict on the cited file's write
+	 * (helm failed), so "no blocker reported" is not a clean answer.
+	 */
+	it("keeps the row when the runner that raised it did not answer on the cited file", async () => {
+		const { b, body, s } = await recordRowAgainstA("failed-b");
+		spawnRouter.state.helmLintStdout = "Error: could not load chart";
+		await s.write(b, body("Service"));
+		expect(await s.commitBlocked()).toBe(true);
+		await s.shutdown();
+	});
+
+	/**
+	 * Negative: the cited file is written but helm still reports it, so the
+	 * runner's verdict on it is not clean. The row stays in the record of the
+	 * file it was recorded against, which turn end still lists beside the
+	 * cited file's own record (the gate alone would stay shut on the latter).
+	 */
+	it("keeps the row while the cited file is still reported", async () => {
+		const { b, body, s } = await recordRowAgainstA("still-bad-b");
+		await s.write(b, `${body("Service")}# edit\n`);
+		expect(await s.commitBlocked()).toBe(true);
+		const end = await s.endTurn();
+		expect(end).toContain(
+			"Unresolved from this turn \u2014 charts/still-bad-b/templates/deploy-a.yaml",
+		);
+		await s.shutdown();
 	});
 });

@@ -157,34 +157,4 @@ describe("runners treat a nonzero exit with no output as skipped", () => {
 			env.cleanup();
 		}
 	});
-
-	it("detekt still parses findings that arrive on stderr with a nonzero exit", async () => {
-		const env = setupTestEnvironment("pi-lens-detekt-");
-		try {
-			fs.writeFileSync(
-				path.join(env.tmpDir, "detekt.yml"),
-				"build:\n  maxIssues: 0\n",
-			);
-			const filePath = path.join(env.tmpDir, "Main.kt");
-			fs.writeFileSync(filePath, 'fun main() { println("hi") }\n');
-			safeSpawnAsync.mockResolvedValue({
-				status: 1,
-				stdout: "",
-				stderr: `${filePath}:1:1: warning: This expression contains a magic number [MagicNumber]\n`,
-			});
-
-			const runner = (
-				await import("../../../../clients/dispatch/runners/detekt.js")
-			).default;
-
-			const result = await runner.run(
-				createCtx("kotlin", filePath, env.tmpDir) as never,
-			);
-
-			expect(result.status).not.toBe("skipped");
-			expect(result.diagnostics.length).toBeGreaterThan(0);
-		} finally {
-			env.cleanup();
-		}
-	});
 });

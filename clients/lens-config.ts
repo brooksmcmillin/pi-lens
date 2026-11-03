@@ -5,7 +5,6 @@ import {
 } from "./config-warn.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { errorClassName } from "./error-class.js";
-import * as path from "node:path";
 import {
 	assignFlagConfigSection,
 	flagConfigSectionKeys,
@@ -13,7 +12,9 @@ import {
 	getLensFlagSpec,
 	GLOBAL_NON_FLAG_CONFIG_SECTIONS,
 	LENS_FLAGS,
+	PROJECT_NON_FLAG_CONFIG_SECTIONS,
 	readFlagConfigValue,
+	readLazyToolsSetting,
 } from "./lens-flag-registry.js";
 import {
 	type ConfigLocation,
@@ -45,6 +46,7 @@ import {
 	findNestedProjectMutationValue,
 	type PiLensProjectConfig,
 } from "./project-lens-config.js";
+import { pathsEqual } from "./path-utils.js";
 import { readToolConfig } from "./tool-config.js";
 
 /**
@@ -108,6 +110,14 @@ export interface PiLensGlobalConfig {
 	guard?: PiLensToggleConfig;
 	/** Whether the Opengrep auxiliary LSP attaches (`--no-opengrep`). */
 	opengrep?: PiLensToggleConfig;
+	/** Whether the ast-grep auxiliary LSP attaches (`--no-ast-grep`). */
+	astGrep?: PiLensToggleConfig;
+	/** Whether the zizmor auxiliary LSP attaches (`--no-zizmor`). */
+	zizmor?: PiLensToggleConfig;
+	/** Whether the typos auxiliary LSP attaches (`--no-typos`). */
+	typos?: PiLensToggleConfig;
+	/** Whether SpotBugs runs on Java and Kotlin files (`--lens-spotbugs`; opt-in). */
+	spotbugs?: PiLensToggleConfig;
 	/** Whether the read-before-edit behavior monitor runs (`--no-read-guard`). */
 	readGuard?: PiLensToggleConfig;
 	format?: {
@@ -318,7 +328,7 @@ export function loadPiLensGlobalConfig(
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 			// The other half of the same silence: a file that PARSES but is a list
 			// or a scalar is not a config either, and was dropped without a word.
-			note("top-level value must be an object");
+			note("top-level value must be an object", "PILENS_CFG_0001");
 			return undefined;
 		}
 
@@ -347,6 +357,19 @@ export function loadPiLensGlobalConfig(
 		const config: Record<string, unknown> = {};
 		const toolConfig = readToolConfig(raw, warnInvalid);
 		if (toolConfig) config.tools = toolConfig;
+		// #4687 item 7: `tools.lazy` is "auto" | true | false. Its registry row
+		// reads it through `readGlobal`, so the boolean copy below skips it and
+		// this is where an invalid value is reported, never silently dropped.
+		const toolsSection = asConfigObject(raw.tools);
+		if (toolsSection && "lazy" in toolsSection) {
+			const lazy = readLazyToolsSetting(raw);
+			if (lazy === undefined)
+				warnInvalid(
+					'tools.lazy must be "auto", true, or false',
+					"PILENS_CFG_0005",
+				);
+			else config.tools = { ...(config.tools as object), lazy };
+		}
 
 		for (const spec of LENS_FLAGS) {
 			if (spec.readGlobal) continue;
@@ -366,12 +389,18 @@ export function loadPiLensGlobalConfig(
 			if (mode === "quick" || mode === "full" || mode === "minimal")
 				startupConfig.mode = mode;
 			else if ("mode" in startup)
-				warnInvalid('startup.mode must be "quick", "full", or "minimal"');
+				warnInvalid(
+					'startup.mode must be "quick", "full", or "minimal"',
+					"PILENS_CFG_0005",
+				);
 			if (scans) {
 				if (typeof scans.enabled === "boolean") {
 					startupConfig.scans = { enabled: scans.enabled };
 				} else if ("enabled" in scans)
-					warnInvalid("startup.scans.enabled must be a boolean");
+					warnInvalid(
+						"startup.scans.enabled must be a boolean",
+						"PILENS_CFG_0005",
+					);
 			}
 			if (startupConfig.mode !== undefined || startupConfig.scans !== undefined)
 				config.startup = startupConfig;
@@ -389,6 +418,7 @@ export function loadPiLensGlobalConfig(
 				if ("runnerTimeoutFloorMs" in dispatch) {
 					warnInvalid(
 						"dispatch.runnerTimeoutFloorMs must be a positive finite number",
+						"PILENS_CFG_0005",
 					);
 				}
 				config.dispatch = { runnerTimeoutFloorMs: undefined };
@@ -413,6 +443,7 @@ export function loadPiLensGlobalConfig(
 			} else {
 				warnInvalid(
 					"actionableWarnings.autoFix.maxFixes must be a non-negative finite number",
+					"PILENS_CFG_0005",
 				);
 			}
 		}
@@ -430,6 +461,7 @@ export function loadPiLensGlobalConfig(
 			} else {
 				warnInvalid(
 					"contextInjection.requirePreExistingFixes must be a boolean",
+					"PILENS_CFG_0005",
 				);
 			}
 		}
@@ -441,7 +473,7 @@ export function loadPiLensGlobalConfig(
 			} else {
 				// #533: present-but-wrong-type warns; absent stays silent.
 				if ("visible" in widget) {
-					warnInvalid("widget.visible must be a boolean");
+					warnInvalid("widget.visible must be a boolean", "PILENS_CFG_0005");
 				}
 				config.widget = { visible: undefined };
 			}
@@ -457,7 +489,10 @@ export function loadPiLensGlobalConfig(
 				// #533: a present-but-invalid mode (e.g. "immedaite") warns and // spellchecker:disable-line
 				// falls back; an absent mode stays silent.
 				if ("mode" in format) {
-					warnInvalid('format.mode must be "immediate" or "deferred"');
+					warnInvalid(
+						'format.mode must be "immediate" or "deferred"',
+						"PILENS_CFG_0005",
+					);
 				}
 				formatSection.mode = undefined;
 			}
@@ -491,7 +526,10 @@ export function loadPiLensGlobalConfig(
 		for (const key of Object.keys(raw)) {
 			if (!knownGlobalConfigKeys.has(key)) {
 				warnInvalid(
-					`unknown key "${key}" is not a recognized pi-lens setting (check for a typo); ignored`,
+					PROJECT_NON_FLAG_CONFIG_SECTIONS.includes(key)
+						? `"${key}" is a project-scoped pi-lens setting; set it in <project>/.pi-lens.json, not in the global config; ignored`
+						: `unknown key "${key}" is not a recognized pi-lens setting (check for a typo); ignored`,
+					"PILENS_CFG_0004",
 				);
 			}
 		}
@@ -600,10 +638,9 @@ export function resolvePiLensFlagWithSource(
 		if (nested) {
 			return {
 				value: flagValueFromConfig(spec, nested.value),
-				source:
-					path.resolve(nested.dir) === path.resolve(projectRoot as string)
-						? "project"
-						: (`nested-project:${nested.dir}` as const),
+				source: pathsEqual(nested.dir, projectRoot as string)
+					? "project"
+					: (`nested-project:${nested.dir}` as const),
 			};
 		}
 		const projectValue = readFlagConfigValue(projectConfig, spec.configKey);

@@ -1,0 +1,16 @@
+{
+	"content": "🔴 STOP — 1 issue(s) must be fixed:\n  L1: alpha is unsafe",
+	"affectedFiles": [],
+	"affectedFilesTruncated": false,
+	"provenance": {
+		"revision": {
+			"sessionId": "v4-4-4-session",
+			"projectSeq": 1,
+			"turnIndex": 1,
+			"generation": 0,
+			"capturedAt": 1760000000000
+		},
+		"files": [],
+		"truncated": false
+	}
+}

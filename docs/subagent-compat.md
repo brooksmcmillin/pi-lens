@@ -111,7 +111,7 @@ mechanism `.github/workflows/install-smoke.yml` already uses) and drives
 needed, matching `scripts/rpc-load-check.mjs`'s no-model-required design.
 
 **Every invocation sets `PI_LENS_STARTUP_MODE=full`.** pi-lens's
-cold-start-quick optimization (see AGENTS.md "Session-start critical path")
+cold-start-quick optimization (see HISTORY.md "Session-start critical path")
 forces the *first* `session_start` of any process onto the fast "quick"
 path regardless of `--print` — that path returns before the subagent-light
 -mode check (and the heavyweight-scan skip it gates) ever runs. This was

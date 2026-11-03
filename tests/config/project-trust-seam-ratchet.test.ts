@@ -14,6 +14,7 @@ import {
 	readWalkedFiles,
 } from "../support/sweep-kit.js";
 import type { SgNode } from "../../clients/deps/ast-grep-napi.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 import {
 	isViMockCall,
 	mockSpecifier,
@@ -46,6 +47,8 @@ const ADMITTED_DATA: Record<string, string> = {
 		"the PR smoke path filter list names the source file as a repo path",
 	'tests/config/glossary-synonym-sweep.test.ts: "clients/project-trust.ts": 1,':
 		"a per-file glossary baseline count keyed by repo path",
+	'tests/scripts/astgrep-self-scan.test.ts: "clients/project-trust.js",':
+		"a fixture's list of compiled modules it links into a scratch tree (#4530): a repo path, never a mock specifier",
 	'tests/config/project-trust-seam-ratchet.test.ts: module: "clients/project-trust.js",':
 		"this ratchet's own SEAM_MODULES row names the module it scans for",
 	'tests/config/project-trust-seam-ratchet.test.ts: "clients/project-trust.js": 1,':
@@ -407,17 +410,25 @@ async function counts(): Promise<{
 }
 
 describe("project-trust real seam ratchet (#4281)", () => {
-	it("keeps every seam module's whole-module mock population at or below baseline", async () => {
-		const live = await counts();
-		for (const { module } of SEAM_MODULES) {
-			expect(live.counts[module]).toBeLessThanOrEqual(BASELINE[module]);
-		}
-		// Recurrence: #4411 review F3, a population scanner that skipped
-		// spellings it did not recognise and passed (#4429).
-		expect(live.unclassified).toEqual([]);
-		// Recurrence: #4457 verify G3, a skip of this file hid a real doMock.
-		expect(live.selfSites).toBe(SELF_SITES);
-	});
+	it(
+		"keeps every seam module's whole-module mock population at or below baseline",
+		async () => {
+			const live = await counts();
+			for (const { module } of SEAM_MODULES) {
+				expect(live.counts[module]).toBeLessThanOrEqual(BASELINE[module]);
+			}
+			// Recurrence: #4411 review F3, a population scanner that skipped
+			// spellings it did not recognise and passed (#4429).
+			expect(live.unclassified).toEqual([]);
+			// Recurrence: #4457 verify G3, a skip of this file hid a real doMock.
+			expect(live.selfSites).toBe(SELF_SITES);
+			// Budget: this case walks the whole tests/ tree, so it takes the same
+			// explicit, lane-scaled budget as its sibling tree scans instead of
+			// vitest's 5000 ms default. Recurrence: the Windows timeout on master
+			// run 39953813640 (#4799), "Test timed out in 5000ms" at this case.
+		},
+		scaledTestTimeout(30_000),
+	);
 
 	// Liveness: a detector that silently counts zero would pass the shrink-only
 	// assertion above, so the known sites are pinned here. The comment and the

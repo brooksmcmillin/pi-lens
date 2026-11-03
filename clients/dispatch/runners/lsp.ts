@@ -17,11 +17,20 @@ import { getLspCapableKinds } from "../../language-policy.js";
 import { exceedsLspSyncLimits } from "../../lsp/content-limits.js";
 import {
 	primaryUnavailableCause,
+	readBoundToCurrentDisk,
+	touchCompletedConfirmationPolicy,
 	touchCoverageGap,
+	warmAnswerBinding,
 } from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/capabilities.js";
 import { disabledPrimaries } from "../../lsp/session-roots.js";
 import { LSP_SERVERS } from "../../lsp/server.js";
+import {
+	describePythonCompileWithheld,
+	detectPythonTargetVersion,
+	partitionOutrankedPythonCompileVerdicts,
+	recordPythonCompileVerdictDrop,
+} from "../../python-environment.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
 import { PRIORITY } from "../priorities.js";
 import { resolveRunnerPath } from "../runner-context.js";
@@ -31,10 +40,17 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult, spanOverlapsModifiedRanges } from "../types.js";
-import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
-import { demoteInferredProjectDiagnostics } from "../../lsp/inferred-project.js";
 import {
+	faultResult,
+	findingsResult,
+	spanOverlapsModifiedRanges,
+} from "../types.js";
+import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
+import { demoteLanguageServerRows } from "../../lsp/inferred-project.js";
+import type { TsserverProjectIdentity } from "../../lsp/tsserver-sync.js";
+import {
+	configDisabledAuxiliaryLspServerIds,
+	dropExcludedServers,
 	enabledAuxiliaryLspServerIds,
 	retagAuxiliaryDiagnostics,
 } from "../auxiliary-lsp.js";
@@ -187,7 +203,29 @@ const lspRunner: RunnerDefinition = {
 		// diagnostics means clean".
 		let unconfirmedServerIds: readonly string[] = [];
 		let deferredServerIds: readonly string[] = [];
+		// #5008: did the PRIMARY answer these bytes? A collecting touch says so by
+		// completing its confirmation policy (`confirmed`, or `partial` when only
+		// an auxiliary went missing) — the one owner of that question. Only that
+		// verdict retires a recorded blocker of the primary's; an unconfirmed
+		// auxiliary withdraws the claim of full coverage, not the primary's answer.
+		// A touch that says neither (`inconclusive` names the negative evidence,
+		// handled below) keeps the pre-#5008 reading.
+		let primaryAnswered = false;
+		// #5008 review r2 (F4): `confirmation` says the primary ANSWERED;
+		// `binding` says whether that answer was computed for THESE bytes. They
+		// are attached independently (`clients/lsp/index.ts` sets both under the
+		// same `collected !== undefined`), so a version-less primary whose publish
+		// describes the previous revision produces `confirmation: "partial"`
+		// beside `boundToCurrentDisk: false`. An answer for other bytes is not an
+		// observation of these — the contributor filter below withholds its rows
+		// (#4231, #5017) — so it withholds the verdict: `keepUnobserved`
+		// otherwise retires a live recorded blocker on it. Absent or "unknown"
+		// keeps the pre-r2 reading; only an explicit `false` withholds it.
+		let primaryAnswerStale = false;
 		let usedWarmAttach = false;
+		// #4645: the warm incumbent's answer to the membership probe this runner
+		// may not send itself; it stands in for that probe below.
+		let incumbentProjectIdentity: TsserverProjectIdentity | undefined;
 		let failureReason = "";
 		// #3481: when the synced bytes were read, for the notify queue's order.
 		const readStamp = performance.now();
@@ -217,6 +255,9 @@ const lspRunner: RunnerDefinition = {
 				Math.max(LSP_SPAWN_BUDGET_MS, LSP_DIAGNOSTICS_WAIT_MS),
 			);
 			usedWarmAttach = attached?.available === true;
+			if (attached?.available) {
+				incumbentProjectIdentity = attached.response.projectIdentity;
+			}
 			// #1179 (shape-5 structural fix): both branches normalize to the
 			// `touchFile` wrapper shape. The warm-attach IPC branch resolves a plain
 			// diagnostics array — `available` no longer implies a fully confirmed
@@ -230,12 +271,32 @@ const lspRunner: RunnerDefinition = {
 			// workspace sweep wrapper) and `tools/lsp-diagnostics.ts` (the tool
 			// consumer); wrap it as `{ diags }`; the incumbent branch already
 			// returns the wrapper.
-			const touched = attached?.available
+			// #4944: the incumbent answers every auxiliary; a switched-off one's
+			// rows and coverage-gap name are not this process's answer.
+			const answer = attached?.available
+				? dropExcludedServers(
+						attached.response,
+						configDisabledAuxiliaryLspServerIds((f) => ctx.pi.getFlag(f)),
+					)
+				: undefined;
+			const touched = answer
 				? {
-						diags: attached.response.diagnostics,
-						...(attached.response.unconfirmedServerIds !== undefined && {
-							unconfirmedServerIds: attached.response.unconfirmedServerIds,
+						diags: answer.diagnostics,
+						// #5008: `confirmation` is what says the PRIMARY answered
+						// (`primaryAnswered` below). The incumbent's DTO carries it for
+						// exactly this reason, and dropping it here would read every warm
+						// answer as a primary that never completed its policy — the #1179
+						// side-channel loss class, one field further on.
+						...(answer.confirmation !== undefined && {
+							confirmation: answer.confirmation,
 						}),
+						...(answer.unconfirmedServerIds !== undefined && {
+							unconfirmedServerIds: answer.unconfirmedServerIds,
+						}),
+						// #5030: the incumbent's content binding, so a stale-bound answer
+						// takes the same withholding below as a local one. An incumbent
+						// that sends none reads as not current (`warmAnswerBinding`).
+						binding: warmAnswerBinding(answer),
 					}
 				: await lspService.touchFile(ctx.filePath, content, {
 						diagnostics: "document",
@@ -276,20 +337,37 @@ const lspRunner: RunnerDefinition = {
 					]),
 				];
 				deferredServerIds = touched.deferredServerIds ?? [];
-				if (
-					diagnosticsInconclusive &&
-					touched.binding?.boundToCurrentDisk === false
-				) {
-					// #4231: an inconclusive primary may contribute its last-known
-					// diagnostics while the current notify/diagnostics wait is wedged.
-					// The service already attributes each diagnostic and names the
-					// unconfirmed servers; retain only answered contributors. Without
-					// both pieces of provenance, fail closed rather than publish a
-					// stale blocking finding from the aggregate binding.
+				// #5051: the cascade's confirmed-touch display reads the same
+				// verdict through the same reader.
+				primaryAnswerStale = readBoundToCurrentDisk(touched) === false;
+				primaryAnswered =
+					touchCompletedConfirmationPolicy(touched) && !primaryAnswerStale;
+				if (primaryAnswerStale) {
+					// #4231, #5017: a stale-bound answer is not an observation of these
+					// bytes, so a row stays only with provenance that its server
+					// answered them. An inconclusive touch names the servers that did
+					// not (#4231: an inconclusive primary may contribute its last-known
+					// diagnostics while its wait is wedged), and the service attributes
+					// each row, so the other attributed rows stand. A touch that
+					// completed its policy against older bytes names none, so no row
+					// has that provenance and every row is withheld: the run then takes
+					// the no-rows arm below, which reaches no verdict. Without both
+					// pieces of provenance, fail closed rather than publish a stale
+					// finding from the aggregate binding (#5017: `hasErrors` read such
+					// rows as a `failed` verdict, and `keepUnobserved` retired a live
+					// recorded blocker on findings about other bytes).
+					// #5034 r3 (F7): a `primary-unavailable` touch names primaries that
+					// were never acquired (`resolveTouchVerdict` keeps no wait or notify
+					// id), so they contributed no row and no binding: the stale binding
+					// is a fallback's or an auxiliary's, and no row has the provenance.
+					const namesStaleContributor =
+						diagnosticsInconclusive &&
+						touched.inconclusiveReason !== "primary-unavailable";
 					const unconfirmed = new Set(unconfirmedServerIds);
 					const currentContentDiags: typeof lspDiags = [];
 					for (const diagnostic of lspDiags) {
 						if (
+							namesStaleContributor &&
 							diagnostic.serverId !== undefined &&
 							!unconfirmed.has(diagnostic.serverId)
 						) {
@@ -316,25 +394,40 @@ const lspRunner: RunnerDefinition = {
 			}
 		}
 
+		// #4638: the project's declared syntax level outranks jedi's own `compile`
+		// verdict on this lane exactly as it does on the probe. The rule and its
+		// record belong to the declaration's owner, so the two lanes cannot disagree
+		// about which rows are evidence.
+		// The drop is disclosed on this lane (#4638 r3 N2): with the only row
+		// withheld the result would otherwise be `succeeded` with no diagnostics, an
+		// edit that reads clean while the ledger alone knows better. The dispatcher
+		// renders the sentence inline beside the blocker output.
+		let withheldNotice: string | undefined;
+		if (lspDiags.length > 0) {
+			const declared = await detectPythonTargetVersion(diagnosticPath);
+			const { kept, dropped } = partitionOutrankedPythonCompileVerdicts(
+				lspDiags,
+				declared,
+			);
+			if (dropped > 0 && declared) {
+				recordPythonCompileVerdictDrop(diagnosticPath, declared, dropped);
+				lspDiags = kept;
+				withheldNotice = describePythonCompileWithheld(dropped, declared);
+			}
+		}
+
 		if (serverFailed) {
-			return {
-				status: "failed",
-				failureKind: "server_error",
-				failureMessage: failureReason.slice(0, 200),
-				diagnostics: [
-					{
-						id: `lsp:server-error:0`,
-						message: `LSP server failed: ${failureReason}`,
-						filePath: diagnosticPath,
-						line: 1,
-						column: 1,
-						severity: "error",
-						semantic: "warning", // Don't block - fallback to other runners
-						tool: "lsp",
-					},
-				],
-				semantic: "warning",
-			};
+			return faultResult(
+				{ kind: "server_error", failureMessage: failureReason },
+				{
+					id: `lsp:server-error:0`,
+					message: `LSP server failed: ${failureReason}`,
+					filePath: diagnosticPath,
+					line: 1,
+					column: 1,
+					tool: "lsp",
+				},
+			);
 		}
 
 		if (!lspClientReady) {
@@ -371,9 +464,13 @@ const lspRunner: RunnerDefinition = {
 		}
 
 		if (lspDiags.length === 0) {
+			// #5008: the primary's empty answer is a verdict about ITS blockers even
+			// while an auxiliary is unconfirmed or deferred. The named ids are what
+			// withdraws the claim of FULL coverage (the coverage notice) and keeps
+			// that auxiliary's own recorded blockers.
 			if (deferredServerIds.length > 0) {
 				return {
-					status: "deferred",
+					status: primaryAnswered ? "succeeded" : "deferred",
 					diagnostics: [],
 					semantic: "none",
 					unconfirmedServerIds: [...unconfirmedServerIds],
@@ -385,17 +482,32 @@ const lspRunner: RunnerDefinition = {
 				// timer, or silent with nothing published for this content — so this
 				// empty merged result is missing whatever that scanner would have said.
 				// A hung OR silent opengrep must not read as a clean bill of health on
-				// the security lane. The empty result remains skipped, while the correlated
-				// server ids let the coverage notice name the missing scanners once. Nothing
-				// is thrown away: the primary answered with zero findings, so there is nothing to
-				// report; when it DOES have findings the branches below still report
-				// them (see the non-empty path), which is how a trustworthy primary
-				// stays trustworthy under an auxiliary that never reported.
+				// the security lane. The correlated server ids therefore keep the run
+				// from claiming FULL coverage (the coverage notice names them), and the
+				// result stays `skipped` unless the touch says the primary completed its
+				// policy (#5008) — a silent scanner withdraws the coverage claim, never
+				// the primary's answer. Nothing is thrown away either way: the primary
+				// answered with zero findings, so there is nothing to report; when it
+				// DOES have findings the branch below still reports them, which is how a
+				// trustworthy primary stays trustworthy under a silent scanner.
+				return {
+					status: primaryAnswered ? "succeeded" : "skipped",
+					diagnostics: [],
+					semantic: "none",
+					unconfirmedServerIds: [...unconfirmedServerIds],
+				};
+			}
+			if (primaryAnswerStale) {
+				// #5008 review r2 (F4): nothing is unconfirmed and no scanner is
+				// deferred, so no id names the gap — only the binding says the answer
+				// describes other bytes. `skipped` is this runner's no-verdict status
+				// (`reachedNoVerdict`), which is what keeps the primary's recorded
+				// blockers pending instead of retiring them on a clean claim. A
+				// stale-bound findings run lands here too, its rows withheld (#5017).
 				return {
 					status: "skipped",
 					diagnostics: [],
 					semantic: "none",
-					unconfirmedServerIds: [...unconfirmedServerIds],
 				};
 			}
 			return {
@@ -403,6 +515,7 @@ const lspRunner: RunnerDefinition = {
 				diagnostics: [],
 				semantic: "none",
 				rawOutput: "no-diagnostics",
+				...(withheldNotice !== undefined && { withheldNotice }),
 			};
 		}
 
@@ -416,23 +529,36 @@ const lspRunner: RunnerDefinition = {
 		// request, and only when the file already has a TypeScript ERROR — an edit
 		// that type-checks clean pays nothing.
 		//
-		// #1645 review F2: NOT under warm attach. There, diagnostics came from an
-		// already-running remote session over IPC and no local client exists — so
-		// the probe would have to spawn a whole tsserver fleet to answer, breaking
-		// this branch's spawn-free contract (see the comment below), and the
-		// answer it spawned for would be the NEW server's project resolution, not
-		// the warm session's. A meaningless answer bought with a process is worse
-		// than no answer, so the warm-attach path keeps pre-#1640 rendering. This
-		// is a known gap, recorded on the issue rather than papered over with an
-		// "unverified" label that would fire on every warm-attach file including
-		// the properly configured majority.
-		const validLspDiags = usedWarmAttach
-			? rawValidLspDiags
-			: await demoteInferredProjectDiagnostics(rawValidLspDiags, {
-					filePath: diagnosticPath,
-					cwd: ctx.cwd,
-					service: lspService,
-				});
+		// #1645 review F2: this runner does NOT probe under warm attach. There,
+		// diagnostics came from an already-running remote session over IPC and no
+		// local client exists — so the probe would have to spawn a whole tsserver
+		// fleet to answer, breaking this branch's spawn-free contract (see the
+		// comment below), and the answer it spawned for would be the NEW server's
+		// project resolution, not the warm session's. A meaningless answer bought
+		// with a process is worse than no answer.
+		// #4645: the probe is asked where the answer lives instead. The incumbent
+		// owns the live client, sends its `projectIdentity` beside the server's
+		// raw rows, and this reader seeds the pipeline's identity memo with it, so
+		// the one pipeline runs here exactly as on a local read: the environment
+		// rule first, then membership. This reader still passes no `service`.
+		// Against an incumbent built before #4645 no answer arrives and the rows
+		// render as they did before #1640 (the mixed-build gap).
+		// #4532: the environment-gap rule rides the same pipeline and is NOT
+		// gated on warm attach: it asks one filesystem question about the file's
+		// own directory, needs nothing from the remote session, and left behind
+		// `usedWarmAttach` it kept the reported `🔴 STOP` on this route (round 4).
+		// `demoteLanguageServerRows` runs it on every route and the membership
+		// probe only where a local client may answer (round 5, review F3).
+		const validLspDiags = (
+			await demoteLanguageServerRows(rawValidLspDiags, {
+				filePath: diagnosticPath,
+				cwd: ctx.cwd,
+				...(!usedWarmAttach && { service: lspService }),
+				...(incumbentProjectIdentity !== undefined && {
+					identityCache: new Map([[diagnosticPath, incumbentProjectIdentity]]),
+				}),
+			})
+		).rows;
 		const fixSuggestionByIndex = new Map<number, string>();
 
 		// #1640: read severity off the RAW list. A demoted diagnostic is still
@@ -552,11 +678,21 @@ const lspRunner: RunnerDefinition = {
 			...findingsResult(keptDiagnostics, {
 				status: hasErrors
 					? "failed"
-					: deferredServerIds.length > 0
+					: deferredServerIds.length > 0 && !primaryAnswered
 						? "deferred"
 						: "succeeded",
 				semantic: resultSemantic,
 			}),
+			// #5008: findings a run DOES report do not make it a verdict about the
+			// primary's own recorded blockers when the primary did not answer. A
+			// `failed` run with its own findings is `hasUsableResult`, so without
+			// this flag it would retire them (the inverse cell of the state table),
+			// and a settled collect-later run would too. `inconclusive` is the
+			// touch's own positive evidence that a primary deadline lapsed or no
+			// primary was acquired — a touch that says neither keeps the pre-#5008
+			// reading (a diagnostics-unsupported primary, an incumbent built before the
+			// confirmation field), which is today's behaviour.
+			...(diagnosticsInconclusive && { inconclusive: true as const }),
 			...(unconfirmedServerIds.length > 0 && {
 				unconfirmedServerIds: [...unconfirmedServerIds],
 			}),
@@ -564,6 +700,7 @@ const lspRunner: RunnerDefinition = {
 				deferredServerIds: [...deferredServerIds],
 			}),
 			...(outOfEditScope.length > 0 && { outOfEditScope }),
+			...(withheldNotice !== undefined && { withheldNotice }),
 		};
 	},
 };

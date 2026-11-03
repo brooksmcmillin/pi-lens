@@ -1,0 +1,15 @@
+id: turn-count-wait
+language: TypeScript
+severity: error
+message: >-
+  Turn-count wait (shape 86): this loop awaits a fixed number of turns or polls
+  and then reads its condition. The count holds on an idle host and runs out on
+  a loaded CI runner. Wait with waitFor (tests/clients/interleaving-kit.ts),
+  which reads a real-clock deadline scaled by PI_LENS_TEST_TIMEOUT_SCALE.
+note: >-
+  Exempt a loop only with `// ast-grep-ignore: turn-count-wait -- <reason>`,
+  or record it in scripts/governance-rules/baseline.json with a reason.
+files:
+  - "tests/**"
+rule:
+  matches: turn-count-loop

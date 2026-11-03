@@ -10,15 +10,36 @@
  *
  * Typed against the pinned `@earendil-works/pi-coding-agent` types only
  * (type-only import — no runtime dependency, per AGENTS.md install constraints).
+ *
+ * LAZY-TOOLS POSTURE (#4687, #4723 F5). Both harnesses start the situational
+ * tools INACTIVE by default, because pi-lens's default `tools.lazy` is `true`
+ * on every model; the one decision table is `lazyToolsApply` in
+ * `clients/tool-set-policy.ts`. `makeCtx` names no model, which an opted-in
+ * `tools.lazy: "auto"` treats as lazy too (the configured default, never
+ * eager); a per-model case belongs on tier 2 (`pi-session.ts`, `modelCompat`).
  */
 
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach } from "vitest";
+import { afterEach, expect } from "vitest";
 import { withTimeout } from "../../clients/deadline-utils.js";
 import { runHandlerExpectingNoThrow } from "./handler-verdict.js";
+import {
+	failOnOpenMockSessions,
+	trackSessionEvent,
+} from "./mock-session-teardown.js";
+import { piMockAdmission } from "./pi-mock-importers.js";
+
+/**
+ * Admit-list gate (#4632, recurrence #4631): this double is the wrong seam for
+ * host-semantics cases, and the list of test files still allowed to load it only
+ * shrinks. The check runs at module load, on the test file vitest is running, so
+ * it sees every importer however the specifier was spelled or reached.
+ */
+const admissionRefusal = piMockAdmission(expect.getState().testPath);
+if (admissionRefusal !== undefined) throw new Error(admissionRefusal);
 
 /**
  * #3855: the session manager is pi's, not the ctx's. pi 1.0.4 hands a /reload
@@ -55,6 +76,12 @@ let managerHandOver:
 	| undefined;
 afterEach(() => {
 	managerHandOver = undefined;
+});
+// #5146: registered first, so it runs last, after every `afterEach` the file
+// declared: a case that ends with a session still open reds here, however the
+// session was started (see `failOnOpenMockSessions`).
+afterEach(async () => {
+	await failOnOpenMockSessions();
 });
 
 function mockManagerOf(ctx: unknown): MockSessionManager | undefined {
@@ -206,7 +233,13 @@ export interface PiMock {
 	}): void;
 
 	// ── test helpers ─────────────────────────────────────────────────────────
-	/** Pre-set a flag value (read back via getFlag); call before `extension(pi)`. */
+	/**
+	 * Set a flag value (read back via getFlag) once the factory has registered
+	 * the flag. A value set before registration is refused (#4913 part D): pi
+	 * applies command-line flag values after every factory, so no pre-set path
+	 * exists. A flag a test is ABOUT goes to tier 2 (`pi-session.ts`); a quiet
+	 * flag goes to the global config (`PI_LENS_CONFIG_PATH`, `useGlobalConfig`).
+	 */
 	setFlag(name: string, value: boolean | string): void;
 	getHandlers(event: string): Hook[];
 	/** First handler for an event, or throw if none registered. */
@@ -254,18 +287,14 @@ export interface PiMockOptions {
 	supportsActiveTools?: boolean;
 }
 
-export function createPiMock(
-	initialFlags: Record<string, boolean | string> = {},
-	options: PiMockOptions = {},
-): PiMock {
+export function createPiMock(options: PiMockOptions = {}): PiMock {
 	const supportsActiveTools = options.supportsActiveTools ?? true;
 	const flags = new Map<string, RecordedFlag>();
 	const commands = new Map<string, RecordedCommand>();
 	const tools = new Map<string, unknown>();
 	const handlers = new Map<string, Hook[]>();
-	const flagValues = new Map<string, boolean | string>(
-		Object.entries(initialFlags),
-	);
+	// No flag value exists before the factory registers its flag (#4913 part D).
+	const flagValues = new Map<string, boolean | string>();
 	const messageRenderers = new Map<string, unknown>();
 	const sentMessages: CapturedMessage[] = [];
 	const activeTools = new Set<string>();
@@ -308,14 +337,26 @@ export function createPiMock(
 			// (`emit`, `getHandlers`, `getHandlerOrThrow`, `handlers`) runs
 			// through the checker: a swallowed throw fails the awaiting test
 			// instead of reading as "no opinion" (#3518, recurrence #4182).
+			//
+			// #5146: the session events are reported to `trackSessionEvent` here,
+			// not in `emit`, so a route that never calls `emit` (a handler picked
+			// out of `getHandlers`, a loop over `handlers`, a computed or aliased
+			// emit) is observed all the same.
 			const boundedHandler: Hook =
 				event === "session_start"
-					? (payload, ctx) =>
-							runSessionStartWithBudget(() => handler(payload, ctx))
-					: event === "tool_call"
-						? (payload, ctx) =>
-								runHandlerExpectingNoThrow(() => handler(payload, ctx))
-						: handler;
+					? (payload, ctx) => {
+							trackSessionEvent(mock, event, ctx);
+							return runSessionStartWithBudget(() => handler(payload, ctx));
+						}
+					: event === "session_shutdown"
+						? (payload, ctx) => {
+								trackSessionEvent(mock, event, ctx);
+								return handler(payload, ctx);
+							}
+						: event === "tool_call"
+							? (payload, ctx) =>
+									runHandlerExpectingNoThrow(() => handler(payload, ctx))
+							: handler;
 			const list = handlers.get(event) ?? [];
 			list.push(boundedHandler);
 			handlers.set(event, list);
@@ -336,6 +377,13 @@ export function createPiMock(
 		},
 
 		setFlag(name, value) {
+			// Refuses the pre-set path (#4913 part D): a value set before the factory
+			// registers its flag is read by no factory-time reader in real pi.
+			if (!flags.has(name)) {
+				throw new Error(
+					`setFlag(${name}): the factory has not registered this flag yet; set it after the factory runs (pi applies flag values after every factory)`,
+				);
+			}
 			flagValues.set(name, value);
 		},
 		getHandlers(event) {
@@ -529,59 +577,7 @@ export function makeCtx(
 	return ctx as unknown as MockCtx;
 }
 
-/**
- * The exact message the pi SDK's `assertActive()` throws from every accessor
- * on a context invalidated by `ctx.newSession()`, `ctx.fork()`,
- * `ctx.switchSession()`, or `ctx.reload()`
- * (`core/extensions/loader.js` in the installed
- * `@earendil-works/pi-coding-agent`).
- */
-export const STALE_CTX_MESSAGE =
-	"This extension ctx is stale after session replacement or reload. " +
-	"Do not use a captured pi or command ctx after ctx.newSession(), " +
-	"ctx.fork(), ctx.switchSession(), or ctx.reload().";
-
-/**
- * A context the SDK has invalidated (#1925). Every accessor pi wraps in
- * `assertActive()` throws `STALE_CTX_MESSAGE`; nothing else is defined, so a
- * handler that reads any of them without a guard rejects exactly the way it
- * does in production after a session replacement.
- *
- * Modelled as throwing GETTERS rather than a throw-everything Proxy on
- * purpose: the real ctx is a class instance, so an undeclared property
- * (`then`, `Symbol.toPrimitive`) reads `undefined` instead of throwing, and a
- * Proxy would make `await`ing or interpolating the object throw in ways the
- * SDK never does.
- */
-export function makeStaleCtx(): MockCtx {
-	const ctx = {} as Record<string | symbol, unknown>;
-	// Every `assertActive()`-wrapped accessor on ExtensionContext.
-	const guarded = [
-		"ui",
-		"cwd",
-		"mode",
-		"hasUI",
-		"signal",
-		"sessionManager",
-		"model",
-		"isProjectTrusted",
-		"isIdle",
-		"hasPendingMessages",
-		"abort",
-		"shutdown",
-		"getContextUsage",
-		"compact",
-		"getSystemPrompt",
-		"waitForIdle",
-	];
-	for (const name of guarded) {
-		Object.defineProperty(ctx, name, {
-			configurable: true,
-			enumerable: true,
-			get() {
-				throw new Error(STALE_CTX_MESSAGE);
-			},
-		});
-	}
-	return ctx as unknown as MockCtx;
-}
+// The stale-context stub lives in its own file, so a test that needs only the
+// stub does not load this double (#4913 L1). Re-exported for the files that
+// still import it from here.
+export { makeStaleCtx, STALE_CTX_MESSAGE } from "./stale-ctx.js";

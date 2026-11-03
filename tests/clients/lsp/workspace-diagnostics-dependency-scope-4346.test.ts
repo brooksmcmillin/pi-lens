@@ -291,6 +291,36 @@ describe("finding entries: the import scope", () => {
 		).toBeUndefined();
 	});
 
+	// Recurrence (#4689 review r1 F5): the root a creation was sent at is the
+	// client's spelling, and the entry is looked up by its file's path
+	// identity. Under a root reached through a link the containment check
+	// compared the two on different axes, so the creation never counted and a
+	// stale finding was served.
+	it("counts a creation a client rooted at a link spelling sent (#4689)", (ctx) => {
+		const alias = `${tmp}-alias`;
+		try {
+			fs.symlinkSync(tmp, alias, "dir");
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+		try {
+			const user = write("user.ts", "export {};\n");
+			seed([{ file: user, serverId: "typescript" }]);
+			noteWorkspaceFileCreated(
+				"typescript",
+				alias,
+				[cacheKeyFor(write("unrelated.ts", "export const u = 1;\n"))],
+				sessionStart + 10,
+			);
+
+			expect(
+				createWorkspaceDiagnosticsCacheContext(tmp).lookup(user, SCOPE),
+			).toBeUndefined();
+		} finally {
+			fs.unlinkSync(alias);
+		}
+	});
+
 	it("refuses it on any creation when an unresolved source names nothing", () => {
 		const user = write("user.ts", 'import ".";\n');
 		seed([{ file: user, serverId: "typescript" }]);

@@ -47,7 +47,6 @@
  * - GitHub releases (platform-specific binaries → ~/.pi-lens/bin/)
  */
 
-import { spawn } from "node:child_process";
 import {
 	existsSync,
 	readFileSync,
@@ -62,13 +61,24 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { writeFileAtomicAsync } from "../atomic-write.js";
+import { registerBackgroundWriteDrain } from "../background-write-drains.js";
 import { BoundedLruCache } from "../bounded-cache.js";
+import { findCommandOnPath } from "../command-path.js";
 import { logExtension } from "../extension-log.js";
-import { isFullyQualified } from "../path-utils.js";
+import {
+	isFullyQualified,
+	isUnderDir,
+	realpathOrResolve,
+} from "../path-utils.js";
 import {
 	assertInstallAllowed,
+	getProjectTrustGeneration,
 	projectTrustDenialReason,
 } from "../project-trust.js";
+import {
+	isUntrustedProjectPath,
+	recordProjectCommandRefusal,
+} from "../session-repository.js";
 
 const _installerRequire = createRequire(import.meta.url);
 
@@ -93,6 +103,7 @@ import {
 	startGenerationHeartbeat,
 	tryAcquireGeneration,
 } from "../generation-lock.js";
+import { windowsExe } from "../process-snapshot.js";
 import { resolveToolCwd } from "../tool-cwd.js";
 import {
 	allAvailableGlobalBinDirs,
@@ -102,19 +113,24 @@ import {
 } from "../package-manager.js";
 import {
 	resetSafeSpawnWindowsCommandCache,
+	type SpawnResult,
 	safeSpawnAsync,
 } from "../safe-spawn.js";
-import {
-	type BoundedOutputSink,
-	createBoundedOutputSink,
-	DEFAULT_MAX_OUTPUT_BYTES,
-} from "../spawn-output-cap.js";
 import { probeToolAsync } from "../tool-probe.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import { resolveGitHubToken } from "../zizmor-config.js";
 
 // Global installation directory for pi-lens tools
 const TOOLS_DIR = path.join(getGlobalPiLensDir(), "tools");
+
+/**
+ * #4530: bounds for the probes that moved onto the spawn seam. Both were raw
+ * `spawn` calls with no timeout: an interpreter whose `site` import stalls
+ * parked the installer's promise forever. 5 s matches the other interpreter
+ * probes; 120 s matches the install budget a cold, large archive needs.
+ */
+const USER_BASE_PROBE_TIMEOUT_MS = 5_000;
+const ARCHIVE_COMMAND_TIMEOUT_MS = 120_000;
 const INSTALL_LOCK_PATH = path.join(TOOLS_DIR, ".install.lock");
 const INSTALL_LOCK_GENERATIONS = `${INSTALL_LOCK_PATH}s`;
 const activeInstallLocks = new Set<InstallLockHold>();
@@ -345,7 +361,36 @@ async function acquireInstallLock(): Promise<{
 }
 
 // Directory for GitHub-downloaded binaries
-const GITHUB_BIN_DIR = path.join(getGlobalPiLensDir(), "bin");
+const GLOBAL_HOME_DIR = getGlobalPiLensDir();
+const GITHUB_BIN_DIR = path.join(GLOBAL_HOME_DIR, "bin");
+// Whether PI_LENS_HOME named the home GITHUB_BIN_DIR derives from. Read at the
+// same moment as the directory itself, so the answer cannot drift from it.
+const GITHUB_BIN_DIR_PINNED = Boolean(process.env.PI_LENS_HOME?.trim());
+
+/**
+ * Refuse a managed bin directory that leaves a PINNED home (#4789). A probe or
+ * test worker pins `PI_LENS_HOME`; a `bin` there that is a link to a directory
+ * outside it lets every write below land in the target, and the #4780 lane probe
+ * overwrote the maintainer's real `~/.pi-lens/bin/opengrep` that way (a symlinked
+ * FILE is replaced by the atomic writer's rename and never written through).
+ * Called after each `mkdir(GITHUB_BIN_DIR)`, so the link resolves. Throws, so
+ * each caller's existing install-failed catch reports it; the refusal is
+ * recorded once per tool. The default home is the user's own, so a link there
+ * (dotfiles) stays honored.
+ */
+function assertManagedBinDirInsidePinnedHome(toolId: string): void {
+	if (!GITHUB_BIN_DIR_PINNED) return;
+	const home = realpathOrResolve(GLOBAL_HOME_DIR);
+	const bin = realpathOrResolve(GITHUB_BIN_DIR);
+	if (isUnderDir(bin, home)) return;
+	const reason = `bin directory escapes the pinned PI_LENS_HOME: ${GITHUB_BIN_DIR} resolves to ${bin}, outside ${home}; refusing to write through the link`;
+	recordDegradationOnce({
+		kind: "managed-tool-install",
+		subject: `${toolId}:bin-dir-escape`,
+		reason,
+	});
+	throw new Error(reason);
+}
 
 // Debug flag - set via PI_LENS_DEBUG=1 or --debug
 const DEBUG =
@@ -465,9 +510,11 @@ export interface ArchiveSpec {
 	 * For a tree bundle (no launcher), a path relative to the extract dir that must
 	 * exist after extraction to confirm success, e.g.
 	 * "PowerShellEditorServices/Start-EditorServices.ps1". Used in place of the
-	 * launcher-existence check.
+	 * launcher-existence check. A resolver `(platform) => path` is for a flat
+	 * bundle whose one marker file is spelled per platform (`fallow-lsp` against
+	 * `fallow-lsp.exe`, #4929).
 	 */
-	treeMarker?: string;
+	treeMarker?: string | ((platform: string) => string);
 	/**
 	 * Lowercase-hex sha256 of every archive this spec can resolve, KEYED BY THE
 	 * RESOLVED URL (#3400). An archive install has no `--version` verdict, so the
@@ -853,7 +900,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "jscpd",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "jscpd@5.4.1", // v5.4.1 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
+		packageName: "jscpd@5.4.2", // v5.4.2 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
 		binaryName: "jscpd",
 	},
 	// Structural search and dead code detection
@@ -1613,6 +1660,67 @@ export const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		// fallow-lsp (#4929): the TS/JS dead-code, duplication and cycle analyzer's
+		// LSP server, an OPT-IN language-scoped auxiliary (`--lens-fallow`). One
+		// release archive per target holds four sibling binaries (`fallow`,
+		// `fallow-lsp`, `fallow-mcp`, `fallow-similar-code`) at the archive root
+		// (verified on the 3.37.0 tar.gz and zip listings), so this is a native TREE
+		// BUNDLE like clangd and FallowServer launches `<bundle>/fallow-lsp`. The
+		// version is pinned and every archive is checked against its sha256 before
+		// extraction (a mismatch or an unpinned URL refuses the install). The
+		// release's `SHA256SUMS` lists only the VS Code extension files, so the pins
+		// are the per-asset digests GitHub publishes (`gh api
+		// repos/fallow-rs/fallow/releases/tags/v3.37.0 --jq
+		// '.assets[]|[.name,.digest]|@tsv'`), each re-computed here from the
+		// downloaded bytes. The tree marker is the `fallow-lsp` binary itself
+		// (`fallow-lsp.exe` on Windows). Linux uses the gnu build (needs glibc 2.30);
+		// Windows arm64 has its own build.
+		id: "fallow-lsp",
+		name: "fallow-lsp",
+		checkCommand: "fallow-lsp",
+		checkArgs: ["--version"],
+		installStrategy: "archive",
+		binaryName: "fallow-lsp",
+		archive: {
+			url: (platform, arch) => {
+				const base =
+					"https://github.com/fallow-rs/fallow/releases/download/v3.37.0";
+				if (arch !== "x64" && arch !== "arm64") return undefined;
+				if (platform === "linux")
+					return arch === "arm64"
+						? `${base}/fallow-aarch64-unknown-linux-gnu.tar.gz`
+						: `${base}/fallow-x86_64-unknown-linux-gnu.tar.gz`;
+				if (platform === "darwin")
+					return arch === "arm64"
+						? `${base}/fallow-aarch64-apple-darwin.tar.gz`
+						: `${base}/fallow-x86_64-apple-darwin.tar.gz`;
+				if (platform === "win32")
+					return arch === "arm64"
+						? `${base}/fallow-aarch64-pc-windows-msvc.zip`
+						: `${base}/fallow-x86_64-pc-windows-msvc.zip`;
+				return undefined;
+			},
+			kind: (platform) => (platform === "win32" ? "zip" : "tgz"),
+			stripComponents: 0,
+			treeMarker: (platform) =>
+				platform === "win32" ? "fallow-lsp.exe" : "fallow-lsp",
+			sha256: {
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-unknown-linux-gnu.tar.gz":
+					"cbbf98681687fd2f43be852f15aab8ad34fb51cf6f7e354d3bdc1a9b7cba9c5a",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-unknown-linux-gnu.tar.gz":
+					"7c09d9b7812be030951f75ebfdd98a4e23ecaee6260c34d7e7f3a6c28a0c3cf0",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-apple-darwin.tar.gz":
+					"02caed6d3da52ea5ffff84b8619bc399a9302c5c6748633177db64005895a159",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-apple-darwin.tar.gz":
+					"abf1897d6521dbd8fbfb01a4add5070538fdb7cde049090f991780fd3576acc6",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-pc-windows-msvc.zip":
+					"26529ecf3a031c01d13adbdbf831ba627c20cf5e4ff95000a1b6ec1497513c83",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-pc-windows-msvc.zip":
+					"f20ad53eb2190e9ab04288a58068f568699757744fccf5adca216a5250789134",
+			},
+		},
+	},
+	{
 		id: "tflint",
 		name: "tflint",
 		checkCommand: "tflint",
@@ -2369,6 +2477,28 @@ export async function flushProbeCache(): Promise<ProbeCacheFlushResult> {
 	}
 }
 
+/**
+ * Test-only strict form of {@link flushProbeCache}: a flush that fails or is
+ * deferred behind another process's lock arms a retry timer, and that retry
+ * would write after a fixture root was removed. Settled only on a flush that
+ * left nothing pending; otherwise cancel the retry and report it.
+ */
+async function settleProbeCacheForTests(): Promise<string | undefined> {
+	const result = await flushProbeCache();
+	if (result === "idle" || result === "written") return undefined;
+	if (_probeCacheFlushTimer !== null) {
+		clearTimeout(_probeCacheFlushTimer);
+		_probeCacheFlushTimer = null;
+	}
+	return `probe-cache flush did not land (${result})`;
+}
+
+// #4937: the debounced flush timer above lives in this evaluation of the module;
+// the tier-2 harness's loaded extension copy owns one the test's own import
+// cannot reach, so its write lands after the fixture root is removed. The
+// harness joins it through the registry (`clients/background-write-drains.ts`).
+registerBackgroundWriteDrain(settleProbeCacheForTests);
+
 function isAstGrepVersionOutput(output: string): boolean {
 	return /\bast[- ]grep\b/i.test(output);
 }
@@ -2525,42 +2655,14 @@ export function resetPathWalkMemo(): void {
 
 /**
  * Check if a command is available in PATH by walking PATH entries and
- * verifying each candidate is a real file with non-zero size.
- * Catches broken symlinks (stat throws ENOENT or returns size 0) without
- * spawning a process — ~μs per candidate vs ~50ms for which/where.
+ * verifying each candidate is a real file with non-zero size
+ * (`findCommandOnPath`, shared with the markdownlint API loader, #5119).
  */
 export async function isCommandAvailable(
 	command: string,
 	_args?: string[],
 ): Promise<boolean> {
-	const isWindows = installerPlatform() === "win32";
-	const pathEnv =
-		process.env.PATH || process.env.Path || process.env.path || "";
-	const dirs = pathEnv.split(path.delimiter);
-
-	// On Windows, probe .exe, .cmd, and .bat extensions in addition to bare name.
-	// On Unix, probe bare name and extensionless (scripts, symlinks).
-	const names = isWindows
-		? [command, `${command}.exe`, `${command}.cmd`, `${command}.bat`]
-		: [command];
-
-	for (const dir of dirs) {
-		if (!dir) continue;
-		for (const name of names) {
-			const candidate = path.join(dir, name);
-			try {
-				const stat = statSync(candidate);
-				// isFile() returns false for broken symlinks (target missing)
-				if (stat.isFile() && stat.size > 0) {
-					return true;
-				}
-			} catch {
-				// ENOENT or permission denied — skip this candidate
-			}
-		}
-	}
-
-	return false;
+	return findCommandOnPath(command, installerPlatform() === "win32") !== null;
 }
 
 /**
@@ -2569,7 +2671,13 @@ export async function isCommandAvailable(
  * probe that is guaranteed to fail with a full spawn round-trip.
  */
 export async function isSpawnableCommand(command: string): Promise<boolean> {
-	if (/[\\/]/.test(command)) {
+	// The platform's separators (#4776): on POSIX a backslash is a name
+	// character, so such a name is a search-path lookup, not a file to stat.
+	const namesPath =
+		installerPlatform() === "win32"
+			? /[\\/]/.test(command)
+			: command.includes("/");
+	if (namesPath) {
 		try {
 			const stat = statSync(command);
 			return stat.isFile() && stat.size > 0;
@@ -2577,7 +2685,8 @@ export async function isSpawnableCommand(command: string): Promise<boolean> {
 			return false;
 		}
 	}
-	const memoKey = `${command}:${hashSync(process.env.PATH || "")}`;
+	// #4530: the walk's answer depends on project trust as well as PATH.
+	const memoKey = `${getProjectTrustGeneration()}:${command}:${hashSync(process.env.PATH || "")}`;
 	if (pathWalkMemo.has(memoKey)) return pathWalkMemo.get(memoKey) ?? false;
 	const isSpawnable = await isCommandAvailable(command);
 	pathWalkMemo.set(memoKey, isSpawnable);
@@ -2947,12 +3056,17 @@ export interface ToolStatus {
 }
 
 /**
- * Get detailed status for all tools
+ * Get detailed status for all tools, or for the tool ids named in `toolIds`
+ * (the nightly's per-row provenance reads only the servers it drives, #4512).
  */
-export async function getAllToolStatuses(): Promise<ToolStatus[]> {
+export async function getAllToolStatuses(
+	toolIds?: readonly string[],
+): Promise<ToolStatus[]> {
 	const statuses: ToolStatus[] = [];
 
+	const only = toolIds ? new Set(toolIds) : undefined;
 	for (const tool of TOOLS) {
+		if (only && !only.has(tool.id)) continue;
 		const status: ToolStatus = {
 			id: tool.id,
 			name: tool.name,
@@ -3114,8 +3228,9 @@ async function getArchiveTreeBundlePath(
 		return undefined;
 	}
 	const extractDir = path.join(TOOLS_DIR, tool.id);
-	const marker = tool.archive?.treeMarker
-		? path.join(extractDir, ...tool.archive.treeMarker.split("/"))
+	const treeMarker = tool.archive && resolveTreeMarker(tool.archive);
+	const marker = treeMarker
+		? path.join(extractDir, ...treeMarker.split("/"))
 		: extractDir;
 	try {
 		await fs.access(marker);
@@ -3589,6 +3704,12 @@ async function findNpmGlobalToolPath(
 		for (const candidate of candidates) {
 			try {
 				await fs.access(candidate);
+				// #4530 (#4776): a global bin dir can hold a link into the
+				// project, and the verification below starts the candidate.
+				if (isUntrustedProjectPath(candidate)) {
+					recordProjectCommandRefusal(candidate);
+					continue;
+				}
 				if (
 					await verifyToolBinary(
 						candidate,
@@ -3685,6 +3806,12 @@ async function findPipUserToolPath(
 			for (const candidate of candidates) {
 				try {
 					await fs.access(candidate);
+					// #4530 (#4776): the Python user base is an interpreter's
+					// answer, and its scripts dir can link into the project.
+					if (isUntrustedProjectPath(candidate)) {
+						recordProjectCommandRefusal(candidate);
+						continue;
+					}
 					if (
 						await verifyToolBinary(
 							candidate,
@@ -3707,41 +3834,39 @@ async function findPipUserToolPath(
 }
 
 /**
- * The verdict of one `<interpreter> -m site --user-base` probe (#3383).
+ * The verdict of one `<interpreter> -m site --user-base` probe (#3383): the
+ * trimmed path on a clean exit, else empty. A TRUNCATED probe resolves EMPTY
+ * rather than trimming a prefix, because the prefix of a path is a different
+ * path: `addBinToPath` would put a plausible-looking wrong directory on PATH.
+ * Empty is the value a missing interpreter resolves too, and every caller
+ * handles it. The spawn seam bounds the output and records the cap trip.
  *
- * Both probes accumulate through {@link createBoundedOutputSink} instead of
- * `stdout += data`: the concatenation ran inside a `data` handler, where V8's
- * `RangeError: Invalid string length` is an uncaught exception rather than this
- * promise's value, and nothing bounded an interpreter that decides to write
- * forever. A TRUNCATED probe resolves EMPTY rather than trimming a prefix,
- * because the prefix of a path is a different path: `addBinToPath` would put a
- * plausible-looking wrong directory on PATH. Empty is the value both probes
- * already resolve when an interpreter is missing, and every caller handles it.
- *
- * Exported for `tests/clients/off-seam-output-bounds.test.ts`: both `data`
- * handlers that feed it sit inside module-private probe loops that only a real
- * `python3` on PATH can drive, so this is the seam the bound is pinned at.
+ * Exported for `tests/clients/off-seam-output-bounds.test.ts`.
  */
 export function userBaseProbeResult(
-	command: string,
-	code: number | null,
-	stdout: BoundedOutputSink,
+	result: Pick<SpawnResult, "status" | "error" | "stdout" | "outputTruncated">,
 ): string {
-	if (stdout.truncated) {
-		recordDegradationOnce({
-			kind: "spawn-output-cap-truncated",
-			subject: `user-base-probe:${command}`,
-			reason: `\`${command} -m site --user-base\` reached the ${DEFAULT_MAX_OUTPUT_BYTES}-byte default cap after ${stdout.observedBytes} bytes; the probed user base is unusable`,
-			metadata: {
-				capBytes: DEFAULT_MAX_OUTPUT_BYTES,
-				capSource: "default",
-				observedBytes: stdout.observedBytes,
-				killed: false,
-			},
-		});
-		return "";
-	}
-	return code === 0 ? stdout.text.trim() : "";
+	if (result.outputTruncated || result.error || result.status !== 0) return "";
+	return result.stdout.trim();
+}
+
+/**
+ * Ask `command` where Python keeps user installs (#4530). It starts through the
+ * spawn seam, so a bare interpreter name is a lookup judged against project
+ * trust like every other; the raw `spawn` this replaces (with `shell: true` on
+ * Windows, which searches the cwd first) skipped that judgment and had no
+ * timeout. It runs from HOME: `-m` puts the cwd on `sys.path`, so a project's
+ * own `site.py` would answer from the session cwd.
+ */
+async function probeUserBase(command: string): Promise<string> {
+	return userBaseProbeResult(
+		await safeSpawnAsync(command, ["-m", "site", "--user-base"], {
+			timeout: USER_BASE_PROBE_TIMEOUT_MS,
+			cwd: os.homedir(),
+			ignoreAmbientSignal: true,
+			lifetimeCoupled: true,
+		}),
+	);
 }
 
 async function getPythonUserBaseCandidates(): Promise<string[]> {
@@ -3773,32 +3898,7 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
 				];
 
 	for (const probe of probes) {
-		const userBase = await new Promise<string>((resolve) => {
-			const isWin = process.platform === "win32";
-			// Bake args into command string when shell:true on Windows to avoid DEP0190.
-			const spawnCmd = isWin
-				? [probe.command, ...probe.args].join(" ")
-				: probe.command;
-			let proc: ReturnType<typeof spawn>;
-			try {
-				proc = spawn(spawnCmd, isWin ? [] : probe.args, {
-					stdio: ["ignore", "pipe", "pipe"],
-					shell: isWin,
-				});
-			} catch {
-				// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
-				// pidusage bug class, #533) — best-effort probe, resolve empty.
-				resolve("");
-				return;
-			}
-
-			const stdout = createBoundedOutputSink();
-			proc.stdout?.on("data", (data: Buffer | string) => stdout.append(data));
-			proc.on("exit", (code) =>
-				resolve(userBaseProbeResult(probe.command, code, stdout)),
-			);
-			proc.on("error", () => resolve(""));
-		});
+		const userBase = await probeUserBase(probe.command);
 		add(userBase);
 	}
 
@@ -3971,30 +4071,22 @@ async function httpsGet(
 }
 
 /**
- * Run a shell command and return true on exit code 0.
+ * Run an archive utility and return true on exit code 0. #4530: through the
+ * spawn seam, so the bare utility name is a lookup judged against project
+ * trust, and the run is bounded; the raw `spawn` this replaces had neither.
  */
-function runCommand(
+async function runCommand(
 	command: string,
 	args: string[],
 	cwd: string,
 ): Promise<boolean> {
-	return new Promise((resolve) => {
-		let proc: ReturnType<typeof spawn>;
-		try {
-			proc = spawn(command, args, {
-				cwd,
-				stdio: "ignore",
-				shell: process.platform === "win32",
-			});
-		} catch {
-			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
-			// bug class, #533) — resolve false rather than reject/crash.
-			resolve(false);
-			return;
-		}
-		proc.on("exit", (code) => resolve(code === 0));
-		proc.on("error", () => resolve(false));
+	const result = await safeSpawnAsync(command, args, {
+		cwd,
+		timeout: ARCHIVE_COMMAND_TIMEOUT_MS,
+		ignoreAmbientSignal: true,
+		lifetimeCoupled: true,
 	});
+	return !result.error && result.status === 0;
 }
 
 /**
@@ -4131,6 +4223,7 @@ async function installGitHubTool(
 	}
 
 	try {
+		assertManagedBinDirInsidePinnedHome(tool.id);
 		if (launcherRuntime) {
 			const assetPath = path.join(
 				GITHUB_BIN_DIR,
@@ -5139,6 +5232,7 @@ async function installMavenTool(
 
 	try {
 		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
+		assertManagedBinDirInsidePinnedHome(tool.id);
 		const jarPath = path.join(GITHUB_BIN_DIR, `${tool.id}.jar`);
 		await writeFileAtomicAsync(jarPath, jarBuffer, { bestEffort: false });
 
@@ -5191,6 +5285,16 @@ export function resolveArchiveUrl(
 	arch: string = process.arch,
 ): string | undefined {
 	return typeof spec.url === "function" ? spec.url(platform, arch) : spec.url;
+}
+
+/** The tree-bundle marker path for a platform, or undefined when the spec declares none. */
+function resolveTreeMarker(
+	spec: ArchiveSpec,
+	platform: string = installerPlatform(),
+): string | undefined {
+	return typeof spec.treeMarker === "function"
+		? spec.treeMarker(platform)
+		: spec.treeMarker;
 }
 
 /** Resolve the archive format independently from the extractor implementation. */
@@ -5458,11 +5562,11 @@ async function installArchiveTool(
 		// bare (consistent with every other tool spawn).
 		const extractor =
 			archiveKind === "zip" && isWindows
-				? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+				? windowsExe("WindowsPowerShell\\v1.0\\powershell.exe")
 				: archiveKind === "zip"
 					? "unzip"
 					: isWindows
-						? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
+						? windowsExe("tar.exe")
 						: "tar";
 		const extractionResult = await safeSpawnAsync(extractor, extractionArgs, {
 			cwd: TOOLS_DIR,
@@ -5517,8 +5621,9 @@ async function installArchiveTool(
 		// consuming server launches a runtime against a bootstrap inside it (e.g.
 		// PSES via pwsh).
 		if (!spec.launcher) {
-			const tmpMarker = spec.treeMarker
-				? path.join(tmpExtractDir, ...spec.treeMarker.split("/"))
+			const treeMarker = resolveTreeMarker(spec, platform);
+			const tmpMarker = treeMarker
+				? path.join(tmpExtractDir, ...treeMarker.split("/"))
 				: tmpExtractDir;
 			try {
 				await fs.access(tmpMarker);
@@ -5593,6 +5698,13 @@ async function installArchiveTool(
 			return undefined;
 		}
 
+		// The managed bin directory is created and checked BEFORE the swap
+		// (#4789): the guard throws for a pinned home whose `bin` links out, and a
+		// refusal after the swap would already have replaced the installed tree
+		// while the failure log says "keeping installed version". A throw from the
+		// shim write below still lands after the swap and reports the same words.
+		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
+		assertManagedBinDirInsidePinnedHome(tool.id);
 		await swapExtractedDir(tool.id, tmpExtractDir, extractDir);
 
 		// The launcher path inside `extractDir` — stable across every install and
@@ -5604,7 +5716,6 @@ async function installArchiveTool(
 		// Thin shim in the managed bin so discovery (findGitHubToolPath) resolves
 		// it like any other managed tool. `call`/`exec` preserves the real
 		// launcher's own %~dp0/$0 so it still finds its sibling lib/.
-		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
 		const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
 		const shimPath = path.join(GITHUB_BIN_DIR, launcherName);
 		if (isWindows) {
@@ -6222,24 +6333,7 @@ async function installPipTool(
 			const result = await run(candidate.command, args);
 			const error = (result.error?.message ?? result.stderr).trim();
 			if (result.status === 0) {
-				const base = await new Promise<string>((resolve) => {
-					let probe: ReturnType<typeof spawn>;
-					try {
-						probe = spawn(candidate.command, ["-m", "site", "--user-base"], {
-							stdio: ["ignore", "pipe", "pipe"],
-							shell: isWindows,
-						});
-					} catch {
-						resolve("");
-						return;
-					}
-					const stdout = createBoundedOutputSink();
-					probe.stdout?.on("data", (data) => stdout.append(data));
-					probe.on("exit", (code) =>
-						resolve(userBaseProbeResult(candidate.command, code, stdout)),
-					);
-					probe.on("error", () => resolve(""));
-				});
+				const base = await probeUserBase(candidate.command);
 				const binaryPath = base
 					? await addBinToPath(pipScriptsDir(base, installerPlatform()))
 					: undefined;

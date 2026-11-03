@@ -13,12 +13,14 @@ logging one `lsp-diagnostics-compatibility` degradation per session. Callers
 should move to `pilens_diagnostics`.
 
 
-**Dynamic tooling.** Five tools stay always-active: `lens_diagnostics`,
-	`module_report`, `read_symbol`, `read_enclosing`,
-`symbol_search`. Five situational tools — `ast_grep_search`, `ast_grep_replace`,
+**Dynamic tooling.** Seven tools stay always-active on pi unless
+`tools.<name>.enabled: false` turns one off: `lens_diagnostics`,
+`module_report`, `project_report`, `read_symbol`, `read_enclosing`,
+`symbol_search`, `effective_config`. Five situational tools — `ast_grep_search`, `ast_grep_replace`,
 `ast_grep_outline`, `lsp_navigation`, `lens_diagnostic_mark` —
 are registered but
-inactive by default; the model activates the ones it needs via the always-active
+inactive by default under pi's lazy posture (`tools.lazy: false`, or a host
+without the dynamic-tool API, keeps them active); the model activates the ones it needs via the always-active
 loader tool `pi_lens_activate_tools`, per pi's dynamic-tool-loading API
 (`pi.setActiveTools`/`pi.getActiveTools`). The loader explicitly reports
 "Available starting next turn"; do not retry the tool in the same turn.
@@ -56,12 +58,15 @@ object argument such as `callHierarchyItem`, `rule` or `flags` are not checked):
 - when an ignored key leaves the call without something it needed, the tool
   does not run and the result is an error whose first line is the same
   sentence, followed by `Not run: ...`. That is the case when a
-  schema-`required` input is missing (``Not run: required argument(s) `file`
+  schema-`required` input is missing (``Not run: required argument(s) `lang`
   missing.``), or when the ignored key is a declared parameter the call did not
-  send, written another way: a case or punctuation variant, a plural, or a key
-  whose last word is the parameter (`filePath`, `file_path` and `Path` for the
-  optional `path` of `pilens_diagnostics`: ``Not run: `filePath` looks like a
-  mistyped `path`, which was not sent.``). The exact predicate is named in
+  send, written another way: a case or punctuation variant (`Path` for `path`),
+  a plural (`paths` for `path`), or a key whose last word is a declared
+  parameter (`file_path` for the declared `filePath`). The single-file
+  parameter is `path`, and the MCP tools declare `file` and `filePath` beside it
+  as accepted aliases since #5041, so those spellings run instead of being
+  reported (``Not run: `Path` looks like a mistyped `path`, which was not
+  sent.``). The exact predicate is named in
   [public-api-stability.md](public-api-stability.md). Anything looser (a typo,
   an abbreviation, `files` for `maxLspFiles`, or a count, flag or output key
   such as `maxFiles`, `includeFiles`, `outFile` or `cwdPath` where `cwd` is
@@ -156,8 +161,10 @@ and `[]` mean no arguments.
 - **`ast_grep_outline`** — Syntax-only code structure (symbols, imports, exports,
   members) for files or directories via `ast-grep outline`. Fast, local, no
   index/LSP/cross-file semantics. Supports `items`/`view`/`type`/`match`/
-  `pubMembers`/`globs`; returns per-file `items[]` (nested `members[]`) with
-  ready `read` args. Prefer `module_report` for pi-lens-aware navigation; reach
+  `pubMembers`/`globs`; returns a compact text tree, one
+  `start-end [import|export ]kind name[ — signature]` line per symbol (members
+  indented, files sorted by path, a visible line when files or items were cut);
+  read a range with `offset=start`, `limit=end-start+1`. Prefer `module_report` for pi-lens-aware navigation; reach
   for this when the syntax tree's own view is enough or pi-lens's extractor is
   weak for a language.
 
@@ -170,9 +177,33 @@ and `[]` mean no arguments.
   `module_report` explains one, `read_symbol` reads its body. Complements
   `grep` (raw substrings) and `lsp_navigation` (exact references). Returns
   `available: false` with a retry hint when the index isn't built yet — it
-  self-builds in the background and never blocks the call. See
+  self-builds in the background and never blocks the call. The answer is one
+  ranked table: a row per file with its path, best-matching line, score, hit
+  count and any graph annotations, then a footer with index coverage and a
+  next-step line naming the top-ranked hit (`module_report <path>`) — read that
+  line with `offset=<line>, limit=1`. Both surfaces render it through
+  `renderCompactSymbolSearch`, so no JSON payload rides along. See
   [docs/word-index.md](word-index.md) for how the index is built and kept
   warm.
+- **`project_report`** — Project orientation from the cached review graph, the
+  top of the discovery funnel (`project_report` → `module_report` →
+  `read_symbol`). Returns ranked hubs (top fan-in files), entry points,
+  subsystem cycles and layering violations, risk hotspots, and low-confidence
+  dead weight. `limit` scales every section's cap (default 10), `focus` re-ranks
+  toward a task hint without widening scope. Returns a line-oriented TEXT
+  report by default; pass `view: "json"` for the full JSON payload. Read-only:
+  a cold cache returns
+  `available: false` with a retry hint and starts a non-blocking background
+  build. On a project over `maxProjectFiles` that first build records a
+  size-skip verdict; later calls name the cap and start no build, so raise it
+  in `.pi-lens.json` instead of retrying.
+- **`effective_config`** — Explains the resolved configuration and its
+  provenance. Pass `file` to add that file's language and the per-server and
+  per-runner selection decisions. The result holds no environment values and
+  no command arguments beyond the binary, and it shows paths under the home
+  folder home-relative (a path outside it stays absolute). `file` must resolve
+  inside `cwd`. See
+  [configuration.md](configuration.md#asking-what-is-actually-in-effect).
 - **`module_report`** — Navigable outline of a file: every symbol's name/kind/
   startLine/endLine/signature, exported vs internal split, class/interface
   member nesting, who-uses-this, fanout/complexity risk flags, and a
@@ -186,8 +217,14 @@ and `[]` mean no arguments.
   tree-sitter's conventional `comment` node — JS/TS is the primary target;
   languages sharing that node shape (confirmed: Python, and any grammar whose
   comment nodes are plain preceding siblings) get it for free with no
-  per-grammar query work. `exported` stays a boolean field only — it is NOT
-  also repeated inside `flags` (#512); `flags` carries only non-derivable
+  per-grammar query work. A Python def or class also reads its docstring (a
+  plain, `r` or `u` string that is the first statement of the body); when
+  both a `#` comment above the def and a docstring exist, a docstring with text
+  wins; an empty docstring falls back to the comment.
+  When a file has syntax errors, tree-sitter recovers and drops the
+  declarations it cannot parse, so the report carries a `warnings` entry saying
+  the symbol list may be incomplete. `exported` stays a boolean field only — it
+  is NOT also repeated inside `flags` (#512); `flags` carries only non-derivable
   signals (`async`, `high fanout`, `high complexity`, `boundary wrapper`).
   Each entry carries a `decorators[]` array — the declaration's
   decorators/attributes/annotations (`@app.get("/x")`, `#[tokio::main]`,
@@ -203,16 +240,24 @@ and `[]` mean no arguments.
   spawn/move-closure, Swift weak/strong-self capture, C++ by-reference-
   capture, Kotlin coroutine-builder, Java thread/executor/listener, and C#
   Task.Run/event-`+=` slices); named symbols span all tree-sitter
-  `SYMBOL_QUERIES` languages. Pass `view: "summary"` for a smaller orientation
-  payload (top-level entries + recommendations, heavy callback/usedBy/
-  blast-radius payloads omitted); pass `view: "compact"` for a line-oriented
-  TEXT rendering of the full report (cheapest option — roughly a quarter of
-  the JSON cost, same underlying data). Reports section-level `provenance`
+  `SYMBOL_QUERIES` languages. `view` selects an output preset, projection ×
+  format: `"summary-text"` (default) = metrics off (no `usedBy`, `fanout`,
+  `complexity`), text; `"summary-json"` = same fields, JSON; `"full-text"`
+  = every field, text; `"full-json"` = every field, JSON. The text cell is
+  lossless against its JSON payload (metrics as a `cx:`/`fan:` suffix, each
+  flag in its own bracket, `used-by:` continuation lines, plus
+  `IMPORTS:`/`CALL GRAPH:`/`BLAST RADIUS:` blocks and a `PROVENANCE:` footer),
+  so the default text preset leaves out `usedBy`, `fanout` and `complexity`
+  and runs at roughly half the byte
+  size of JSON. A `maxRefsPerSymbol` argument promotes the projection to
+  `full` and keeps the format. Reports section-level `provenance`
   for syntax, cached-graph, and heuristic sections. Pass `blastRadius: true`
   for cross-file transitive dependents (read-only over the cached graph).
 - **`read_symbol`** — One symbol's verbatim source body, by name or by a
   `module_report` callback handle. Returned body is recorded as genuine
-  read-guard coverage for that symbol/callback's line range.
+  read-guard coverage for that symbol/callback's line range. In a file with
+  syntax errors a miss carries the same incomplete-symbol-list warning, so a
+  miss is not proof the symbol is absent.
 - **`read_enclosing`** — Maps a `path` + `line` (from `ast_grep_search`,
   diagnostics, or LSP locations) to the verbatim body of the smallest enclosing
   symbol or callback. Tree-sitter only — no LSP or graph build. Optional `kinds`
@@ -224,9 +269,10 @@ and `[]` mean no arguments.
 
 ## Session
 
-- **`lens_health`** — Runtime health, latency telemetry, and current LSP
-  status.
-- **`lens_project_scan`** — Cheap project-wide scans (knip, jscpd, duplicates).
+- **Health, latency and the cheap project scan are not pi tools.** pi has the
+  `/lens-health` slash command ([tools.md](tools.md)); the MCP mirror alone
+  exposes `pilens_health`, `pilens_latency` and `pilens_project_scan`
+  ([mcp.md](mcp.md)).
 - **`lens_diagnostics mode=full`** — full project-wide review: LSP + the cached
   heavyweight analyzers (jscpd, madge, gitleaks, govulncheck, trivy, dead-code)
   folded in via `refreshRunners`.

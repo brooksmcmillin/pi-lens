@@ -42,6 +42,7 @@ import {
 	normalizeMapKey,
 } from "../path-utils.js";
 import { loadPiLensProjectConfig } from "../project-lens-config.js";
+import { withBudget } from "../deadline-utils.js";
 import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { probeToolAsync } from "../tool-probe.js";
 import { classifyDiagnostic } from "./diagnostic-taxonomy.js";
@@ -57,9 +58,8 @@ import {
 } from "./runners/utils/runner-helpers.js";
 import { createAvailabilityProbeFlight } from "../availability-probe-flight.js";
 import type { FactStore } from "./fact-store.js";
-import { applyDispositions } from "../diagnostic-dispositions.js";
 import { linesOfRanges, rangesOfLines } from "../line-alignment.js";
-import { applyInlineSuppressions } from "./inline-suppressions.js";
+import { applyFindingPolicyByOwner } from "./finding-policy.js";
 import { getToolPlan } from "./plan.js";
 import { resolveRunnerPath } from "./runner-context.js";
 import {
@@ -77,14 +77,20 @@ import { laneCopyStandsFor, semanticRank } from "./lane-copies.js";
 import { normalizeRuleId } from "./rule-id-normalize.js";
 import {
 	applyRulePolicy,
-	resolvedRulePolicyMap,
-	rulePolicyMapFromConfig,
+	projectRulePolicy,
+	resolveDispatchPolicyConfigForFile,
+	rulePolicyMapFromResolution,
 } from "./rule-policy.js";
+import {
+	DISABLED_BY_CONFIG_SKIP_REASON,
+	disabledRunnerIdsFor,
+} from "./disabled-runners.js";
 import { getToolProfile } from "./tool-profile.js";
 import { classifyPreExisting, preEditSeedFactKey } from "./pre-edit-seed.js";
 import {
 	hasUsableResult,
 	isRunnerClaimSource,
+	isNotApplicableSkipReason,
 	isRunnerSkipReason,
 	reachedNoVerdict,
 } from "./types.js";
@@ -395,7 +401,17 @@ export function createDispatchContext(
 				})
 			: undefined;
 	const projectConfig = loadPiLensProjectConfig(normalizedCwd);
-	const rulePolicy = resolvedRulePolicyMap(normalizedProjectRoot);
+	// One resolution from the file's config owner, read by both policy keys,
+	// so a nested `.pi-lens.json` governs its own files' rules and denials.
+	const policyConfig = resolveDispatchPolicyConfigForFile(
+		absoluteFilePath,
+		normalizedProjectRoot,
+	);
+	const rulePolicy = rulePolicyMapFromResolution(
+		policyConfig,
+		normalizedProjectRoot,
+	);
+	const disabledRunnerIds = disabledRunnerIdsFor(policyConfig);
 
 	return {
 		filePath: normalizedFilePath,
@@ -412,6 +428,7 @@ export function createDispatchContext(
 		facts,
 		projectConfig,
 		rulePolicy,
+		...(disabledRunnerIds !== undefined && { disabledRunnerIds }),
 		blockingOnly,
 		modifiedRanges,
 		writeIndex,
@@ -619,6 +636,9 @@ function isUnusedValueDiagnostic(d: Diagnostic): boolean {
 
 function promoteDeltaUnusedToBlockers(diagnostics: Diagnostic[]): Diagnostic[] {
 	return diagnostics.map((d) => {
+		// #4130: a runner fault is never a finding about the code, so it never
+		// becomes a blocker, whatever its message says (`faultResult`).
+		if (d.runnerFault === true) return d;
 		if (!isUnusedValueDiagnostic(d)) return d;
 		if (d.semantic === "blocking" || d.severity === "error") return d;
 		return {
@@ -672,6 +692,8 @@ export interface RunnerLatency {
 	primaryUnavailableCause?: PrimaryUnavailableCause;
 	/** #4403: the runner's own `disabledPrimaryServerIds`. */
 	disabledPrimaryServerIds?: readonly string[];
+	/** #4638 r3 (N2): the runner's own `withheldNotice`, rendered inline. */
+	withheldNotice?: string;
 }
 
 export interface DispatchLatencyReport {
@@ -705,11 +727,17 @@ function buildCoverageNotice(
 	ctx: DispatchContext,
 	runnerLatencies: RunnerLatency[],
 	dedupe: boolean,
-): { notice?: Diagnostic; unconfirmedStatus?: string } {
+): Pick<
+	DispatchResult,
+	"unconfirmedStatus" | "coverage" | "primaryLspChecked"
+> & {
+	notice?: Diagnostic;
+} {
 	if (!ctx.kind) return {};
 	const lspEnabled = !ctx.pi.getFlag("no-lsp");
 	const primary = getPrimaryDispatchGroup(ctx.kind, lspEnabled);
-	if (!primary || primary.runnerIds.length === 0) return {};
+	if (!primary || primary.runnerIds.length === 0)
+		return { coverage: "unconfigured" };
 
 	const relevant = runnerLatencies.filter((r) =>
 		primary.runnerIds.includes(r.runnerId),
@@ -760,8 +788,25 @@ function buildCoverageNotice(
 		// scanner that recovered a delivery path (or lost one) kept the stale
 		// wording for the rest of the session.
 		const onceKey = `${ctx.kind}:${ctx.filePath}:${dedupeSet(silentServerIds)}|${dedupeSet(deferredServerIds)}`;
+		// #5008 review r2 (F1): the latch suppresses the NOTICE, never the CLAIM.
+		// This block is one of the rule's "found no full coverage" answers, so it
+		// carries `unconfirmedStatus` on BOTH returns exactly as the no-coverage
+		// paths below do (`types.ts` says the field is set whenever the rule finds
+		// no coverage). Without it, write 2..N on the same file with the same
+		// silent scanner hit the dedupe key and `buildAllClearOutput` rendered
+		// `\u2713 <lang> clean` — the reporter's 133-write session claimed a clean
+		// security lane on every edit after the first. On the notice return the
+		// field is redundant TODAY (the notice is output, so the all-clear line is
+		// unreachable there) and it is spelled anyway, so the rule's answer never
+		// depends on which write paid the latch.
+		const statusParts: string[] = [];
+		if (deferredServerIds.length > 0)
+			statusParts.push(`${markerFor(deferredServerIds)} deferred`);
+		if (silentServerIds.length > 0)
+			statusParts.push(`${markerFor(silentServerIds)} silent`);
+		const unconfirmedStatus = `${statusParts.join(", ")} (diagnostics are incomplete)`;
 		if (dedupe) {
-			if (coverageNoticeSeen.has(onceKey)) return {};
+			if (coverageNoticeSeen.has(onceKey)) return { unconfirmedStatus };
 			coverageNoticeSeen.add(onceKey);
 		}
 		const coverageParts: string[] = [];
@@ -784,6 +829,7 @@ function buildCoverageNotice(
 				semantic: "warning",
 				tool: "pi-lens",
 			},
+			unconfirmedStatus,
 		};
 	}
 
@@ -793,7 +839,18 @@ function buildCoverageNotice(
 	// primary produced no usable result and must not suppress the notice
 	// (#3867). `hasUsableResult` owns that rule in dispatch/types.ts.
 	const primaryHasCoverage = relevant.some(hasUsableResult);
-	if (primaryHasCoverage) return {};
+	// #4734 r3: the one return where a language server checked these bytes, so
+	// the only one that may say so (`DispatchResult.primaryLspChecked`). A CLI
+	// primary (pyright under --no-lsp) or a fallback linter is coverage, not an
+	// answer from a language server.
+	if (primaryHasCoverage) {
+		return {
+			coverage: "primary",
+			...(relevant.some((r) => r.runnerId === "lsp" && hasUsableResult(r)) && {
+				primaryLspChecked: true,
+			}),
+		};
+	}
 
 	// A primary still in flight (collect-later) may deliver findings at turn
 	// end, so it withholds the notice. A skipped or broken primary produced
@@ -801,7 +858,7 @@ function buildCoverageNotice(
 	const primaryStillInFlight = relevant.some(
 		(r) => r.status === "pending" || r.status === "deferred",
 	);
-	if (primaryStillInFlight) return {};
+	if (primaryStillInFlight) return { coverage: "in_flight" };
 
 	const plan = getToolPlan(ctx.kind);
 	const fallbackRunnerIds = new Set(
@@ -837,18 +894,47 @@ function buildCoverageNotice(
 			(!plan?.capabilities.includes("types") ||
 				TYPE_CAPABLE_FALLBACK_RUNNERS.has(r.runnerId)),
 	);
-	if (anyFallbackHasCoverage) return {};
+	if (anyFallbackHasCoverage) return { coverage: "fallback" };
 
 	// #4403: no primary checked this file. When the runner knows why, the
 	// status line says it; otherwise it says what the notice says.
 	const cause = combinePrimaryUnavailableCauses(
 		relevant.flatMap((r) => r.primaryUnavailableCause ?? []),
 	);
+	// `dispatch.disabledRunners` denials are skipped by the dispatch loop with
+	// a stated reason; they name their own key, not the LSP's.
+	const deniedRunnerIds = relevant
+		.filter((r) => r.skipReason === DISABLED_BY_CONFIG_SKIP_REASON)
+		.map((r) => r.runnerId);
+	const deniedNote = `${deniedRunnerIds.join(", ")} disabled in config by dispatch.disabledRunners`;
+	// A row that is not a tool failure: one the operator switched off (a runner
+	// denial, or a primary LSP `lsp.disabledServers` turned off, with or without
+	// its fallback), or one that skipped with a stated not-applicable reason
+	// (nothing for it to check). The config-only wording holds only when every
+	// row is one; any other row is a tool that is missing, timed out, or failed
+	// (a skip that states no listed reason included), and the notice must still
+	// say so rather than let the denial hide it.
+	const onlySwitchedOff = relevant.every(
+		(r) =>
+			r.skipReason === DISABLED_BY_CONFIG_SKIP_REASON ||
+			isNotApplicableSkipReason(r.skipReason) ||
+			r.primaryUnavailableCause === "disabled" ||
+			r.primaryUnavailableCause === "disabledFallback",
+	);
 	const unconfirmedStatus = cause
-		? `no language server answered (${PRIMARY_UNAVAILABLE_CAUSE[cause]})`
-		: "not fully checked (a language tool is missing, timed out, or failed to run)";
+		? `no primary language server answered (${PRIMARY_UNAVAILABLE_CAUSE[cause]})${deniedRunnerIds.length > 0 ? `; ${deniedNote}` : ""}`
+		: deniedRunnerIds.length > 0
+			? onlySwitchedOff
+				? `not checked (${deniedNote})`
+				: `not fully checked (a language tool is missing, timed out, or failed to run; ${deniedNote})`
+			: "not fully checked (a language tool is missing, timed out, or failed to run)";
 
-	if (cause === "disabled" || cause === "disabledFallback") {
+	if (
+		onlySwitchedOff &&
+		(cause === "disabled" ||
+			cause === "disabledFallback" ||
+			(cause === undefined && deniedRunnerIds.length > 0))
+	) {
 		// #4403: the operator turned the primary off on purpose. That is not a
 		// tool that is missing or failed, and it holds for every file the
 		// server serves, so it gets one note per server per session, then the
@@ -857,7 +943,10 @@ function buildCoverageNotice(
 		const disabledIds = [
 			...new Set(relevant.flatMap((r) => r.disabledPrimaryServerIds ?? [])),
 		].sort((a, b) => Number(a > b) - Number(a < b));
-		const onceKeys = disabledIds.map((id) => `disabled-primary:${id}`);
+		const onceKeys = [
+			...disabledIds.map((id) => `disabled-primary:${id}`),
+			...deniedRunnerIds.map((id) => `disabled-runner:${id}`),
+		];
 		if (dedupe) {
 			if (onceKeys.every((key) => coverageNoticeSeen.has(key)))
 				return { unconfirmedStatus };
@@ -865,11 +954,15 @@ function buildCoverageNotice(
 		}
 		return {
 			notice: {
-				id: `coverage-disabled:${ctx.kind}:${disabledIds.join(",")}`,
+				id: `coverage-disabled:${ctx.kind}:${[...disabledIds, ...deniedRunnerIds].join(",")}`,
 				message:
-					cause === "disabled"
-						? `Pi-lens ${ctx.kind} analysis unconfirmed — Primary LSP (${disabledIds.join(", ")}) is disabled in config by lsp.disabledServers, so no language server checks these files this session (not a clean result).`
-						: `Pi-lens ${ctx.kind} analysis unconfirmed — Primary LSP (${disabledIds.join(", ")}) is disabled in config by lsp.disabledServers and its fallback did not answer, so no language server checked these files (not a clean result).`,
+					disabledIds.length === 0
+						? `Pi-lens ${ctx.kind} analysis unconfirmed — Runner (${deniedRunnerIds.join(", ")}) is disabled in config by dispatch.disabledRunners, so no runner checks these files this session (not a clean result).`
+						: deniedRunnerIds.length > 0
+							? `Pi-lens ${ctx.kind} analysis unconfirmed — Primary LSP (${disabledIds.join(", ")}) is disabled in config by lsp.disabledServers and runner (${deniedRunnerIds.join(", ")}) by dispatch.disabledRunners, so nothing checks these files this session (not a clean result).`
+							: cause === "disabled"
+								? `Pi-lens ${ctx.kind} analysis unconfirmed — Primary LSP (${disabledIds.join(", ")}) is disabled in config by lsp.disabledServers, so no language server checks these files this session (not a clean result).`
+								: `Pi-lens ${ctx.kind} analysis unconfirmed — Primary LSP (${disabledIds.join(", ")}) is disabled in config by lsp.disabledServers and its fallback did not answer, so no language server checked these files (not a clean result).`,
 				filePath: ctx.filePath,
 				severity: "warning",
 				semantic: "warning",
@@ -888,7 +981,7 @@ function buildCoverageNotice(
 	return {
 		notice: {
 			id: `coverage-unavailable:${ctx.kind}:${path.basename(ctx.filePath)}`,
-			message: `Pi-lens ${ctx.kind} analysis unavailable — a language tool is missing, timed out, or failed to run, or the LSP server isn't ready yet, so this file was not fully checked (not a clean result).`,
+			message: `Pi-lens ${ctx.kind} analysis unavailable — a language tool is missing, timed out, or failed to run, or the LSP server isn't ready yet, so this file was not fully checked (not a clean result).${deniedRunnerIds.length > 0 ? ` Runner (${deniedRunnerIds.join(", ")}) is also disabled in config by dispatch.disabledRunners.` : ""}`,
 			filePath: ctx.filePath,
 			severity: "warning",
 			semantic: "warning",
@@ -1134,6 +1227,36 @@ async function runGroup(
 			continue;
 		}
 
+		// `dispatch.disabledRunners`: the operator turned this runner off. It is
+		// skipped before `when`/`run`, so its tool never spawns (not even an
+		// availability probe), and the skip carries a stated reason, so it is
+		// neither a failure nor a runner that reached no verdict: a fallback
+		// group moves on to its next member as for any other skip.
+		if (ctx.disabledRunnerIds?.has(runnerId)) {
+			const runnerEnd = Date.now();
+			latencies.push({
+				runnerId,
+				startTime: runnerStart,
+				endTime: runnerEnd,
+				durationMs: 0,
+				status: "skipped",
+				diagnosticCount: 0,
+				semantic: "none",
+				skipReason: DISABLED_BY_CONFIG_SKIP_REASON,
+			});
+			logLatency({
+				type: "runner",
+				filePath: ctx.filePath,
+				runnerId,
+				durationMs: 0,
+				status: "skipped",
+				diagnosticCount: 0,
+				semantic: "none",
+				metadata: { skipReason: DISABLED_BY_CONFIG_SKIP_REASON },
+			});
+			continue;
+		}
+
 		// Check preconditions
 		let shouldRun = true;
 		if (runner.when) {
@@ -1343,6 +1466,9 @@ async function runGroup(
 			}),
 			...(result.disabledPrimaryServerIds !== undefined && {
 				disabledPrimaryServerIds: result.disabledPrimaryServerIds,
+			}),
+			...(result.withheldNotice !== undefined && {
+				withheldNotice: result.withheldNotice,
 			}),
 		});
 		logLatency({
@@ -1678,20 +1804,27 @@ export async function dispatchForFile(
 		ctx.facts.getFileFact<string>(ctx.filePath, "file.content") ?? "";
 	// Project rule policy (`.pi-lens.json` `rules.<id>.disable`/`select`).
 	//
-	// Resolved from `ctx.projectRoot` (falling back to `ctx.cwd`), NOT
-	// `ctx.projectConfig` — `ctx.projectConfig` is loaded from the nested
-	// LANGUAGE root (`resolveLanguageRootForFile`), so in a monorepo where a
-	// package directory has its own `.pi-lens.json`, `discoverPiLensProjectConfig`'s
-	// upward walk stops there and never sees a repo-root policy.
-	// `lens_diagnostics` loads its policy map from `runtime.projectRoot`; using
-	// the same root here keeps the two surfaces in agreement. `ctx.projectConfig`
-	// itself is untouched — thresholds and mutation flags keep their existing
-	// language-root resolution.
-	const rulePolicy =
-		ctx.rulePolicy ??
-		rulePolicyMapFromConfig(
-			loadPiLensProjectConfig(ctx.projectRoot ?? ctx.cwd).rules,
-		);
+	// Each finding is filtered by its OWN file's config owner under
+	// `ctx.projectRoot` (falling back to `ctx.cwd`), NOT `ctx.projectConfig` —
+	// `ctx.projectConfig` is loaded from the nested LANGUAGE root
+	// (`resolveLanguageRootForFile`), and `discoverPiLensProjectConfig`'s upward
+	// walk stops at the first config, so it never sees a repo-root policy. The
+	// owner's resolution layers the global tier, the repo root's file, and each
+	// nested file between. A runner may report on files other than the edited
+	// one (helm-lint puts chart-level findings on `Chart.yaml`), so one owner's
+	// map must not filter another owner's finding (#5011 r8, F24).
+	// `lens_diagnostics` reads the same owner per file (`loadProjectRulePolicy`),
+	// which keeps the two surfaces in agreement. `ctx.projectConfig` itself is
+	// untouched — thresholds and mutation flags keep their existing
+	// language-root resolution. A context `createDispatchContext` built carries
+	// the edited file's map (possibly empty), which that owner reuses.
+	const rulePolicyRoot = ctx.projectRoot ?? ctx.cwd;
+	const rulePolicy = projectRulePolicy(
+		rulePolicyRoot,
+		"rulePolicy" in ctx
+			? { filePath: ctx.filePath, map: ctx.rulePolicy }
+			: undefined,
+	);
 	// The output-only filter pipeline: LSP/docker overlap suppression + inline
 	// `pi-lens-ignore` + agent/user dispositions + project rule policy. Applied
 	// AFTER dedupe so the pi renderer, widget, and delta all see one filtered
@@ -1715,15 +1848,16 @@ export async function dispatchForFile(
 	const applyOutputFilters = (diags: Diagnostic[]): Diagnostic[] => {
 		const dockerOverlap = suppressTrivyConfigDockerOverlap(diags);
 		const overlap = suppressLintOverlapsWithLsp(dockerOverlap);
-		const inline = applyInlineSuppressions(overlap, fileContent);
-		const disposition = applyDispositions(
-			inline,
-			ctx.projectRoot ?? ctx.cwd,
-			ctx.filePath,
-			fileContent,
-		);
+		// #5044: inline comments and dispositions belong to the file a finding
+		// NAMES, not the edited one (see `applyFindingPolicyByOwner`).
+		const { disposed: disposition } = applyFindingPolicyByOwner(overlap, {
+			cwd: rulePolicyRoot,
+			filePath: ctx.filePath,
+			content: fileContent,
+			policyMap: undefined,
+		});
 		return applyRulePolicy(disposition, rulePolicy, {
-			root: ctx.projectRoot ?? ctx.cwd,
+			root: rulePolicyRoot,
 			filePath: ctx.filePath,
 		});
 	};
@@ -1864,7 +1998,12 @@ export async function dispatchForFile(
 
 	const inlineBlockers = blockers;
 	const inlineFixed = fixedItems;
-	const { notice: coverageNotice, unconfirmedStatus } = buildCoverageNotice(
+	const {
+		notice: coverageNotice,
+		unconfirmedStatus,
+		coverage,
+		primaryLspChecked,
+	} = buildCoverageNotice(
 		ctx,
 		runnerLatencies,
 		options?.dedupeCoverageNotice ?? true,
@@ -1875,9 +2014,29 @@ export async function dispatchForFile(
 	const blockerOutput = formatDiagnostics(inlineBlockers, "blocking");
 	let output = blockerOutput;
 	output += formatDiagnostics(inlineFixed, "fixed");
-	if (coverageNotice) {
-		output += formatDiagnostics([coverageNotice], "warning", 1);
-		warnings.push(coverageNotice);
+	// #4638 r3 (N2): findings a runner withheld on purpose are named on the same
+	// inline channel as the coverage notice, never left to the ledger alone.
+	const withheldMessages = [
+		...new Set(runnerLatencies.flatMap((r) => r.withheldNotice ?? [])),
+	];
+	const withheldNotice: Diagnostic | undefined =
+		withheldMessages.length > 0
+			? {
+					id: `withheld-compile:${ctx.kind}:${path.basename(ctx.filePath)}`,
+					message: withheldMessages.join("\n"),
+					filePath: ctx.filePath,
+					severity: "warning",
+					semantic: "warning",
+					tool: "pi-lens",
+				}
+			: undefined;
+	const inlineNotices = [
+		...(coverageNotice ? [coverageNotice] : []),
+		...(withheldNotice ? [withheldNotice] : []),
+	];
+	if (inlineNotices.length > 0) {
+		output += formatDiagnostics(inlineNotices, "warning", inlineNotices.length);
+		warnings.push(...inlineNotices);
 	}
 	const pendingRunners = runnerLatencies
 		.filter((runner) => runner.status === "pending")
@@ -1982,6 +2141,8 @@ export async function dispatchForFile(
 			},
 		}),
 		...(unconfirmedStatus !== undefined && { unconfirmedStatus }),
+		...(coverage !== undefined && { coverage }),
+		...(primaryLspChecked && { primaryLspChecked }),
 	};
 }
 
@@ -2028,15 +2189,25 @@ function normalizeDiagnosticFilePath(
  * The `failureKind` of a failed run, for the latency.log runner row (#3796).
  * Inline and collect-later rows share it, so the log analyzer reads one place.
  */
-function failureRowMetadata(
-	result: RunnerResult,
-): { failureKind: string; failureMessage: string | undefined } | undefined {
-	return result.status === "failed" && result.failureKind
-		? {
-				failureKind: result.failureKind,
-				failureMessage: result.failureMessage,
-			}
-		: undefined;
+function failureRowMetadata(result: RunnerResult):
+	| Partial<{
+			failureKind: string;
+			failureMessage: string | undefined;
+			inconclusive: true;
+	  }>
+	| undefined {
+	// #4522 T3: an inconclusive run says so on its row even when it succeeded
+	// (detekt exit 1 with warning findings), so latency.log shows a partial read.
+	const inconclusive =
+		result.inconclusive === true ? { inconclusive: true as const } : {};
+	if (result.status === "failed" && result.failureKind) {
+		return {
+			failureKind: result.failureKind,
+			failureMessage: result.failureMessage,
+			...inconclusive,
+		};
+	}
+	return result.inconclusive === true ? inconclusive : undefined;
 }
 
 async function runRunner(
@@ -2048,7 +2219,6 @@ async function runRunner(
 		runner.timeoutMs ?? RUNNER_TIMEOUT_MS,
 		getRunnerTimeoutFloorMs(),
 	);
-	let timer: ReturnType<typeof setTimeout> | undefined;
 	// #1723: mark this runner as the in-flight phase for the WHOLE race below,
 	// not just the runner's own promise — a synchronous CPU hog inside
 	// `runner.run` (ast-grep-napi, tree-sitter, …) blocks the event loop before
@@ -2060,18 +2230,17 @@ async function runRunner(
 	// reasoning and the cost note (negligible next to a runner invocation).
 	const phaseToken = phaseStarted(runner.id);
 	try {
-		const result = await Promise.race([
-			runner.run(ctx).finally(() => clearTimeout(timer)),
-			new Promise<never>((_, reject) => {
-				timer = setTimeout(
-					() =>
-						reject(
-							new Error(`Runner ${runner.id} timed out after ${timeoutMs}ms`),
-						),
-					timeoutMs,
-				);
-			}),
-		]);
+		// `withBudget` settles `undefined` when the budget lapses; boxing the
+		// runner's value tells that apart from a runner that resolved nothing.
+		// The message keeps the words `failureKind` is classified from below.
+		const outcome = await withBudget(
+			runner.run(ctx).then((value) => ({ value })),
+			timeoutMs,
+		);
+		if (outcome === undefined) {
+			throw new Error(`Runner ${runner.id} timed out after ${timeoutMs}ms`);
+		}
+		const result = outcome.value;
 
 		const diagnostics = result.diagnostics.map((d) => ({
 			...d,
@@ -2084,7 +2253,6 @@ async function runRunner(
 			semantic: result.semantic ?? defaultSemantic,
 		};
 	} catch (error) {
-		clearTimeout(timer);
 		ctx.log(`Runner ${runner.id} failed: ${error}`);
 		const message = error instanceof Error ? error.message : String(error);
 		return {

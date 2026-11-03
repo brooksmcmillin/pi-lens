@@ -9,6 +9,9 @@ issue and the requested evidence surface.
 - Keep the worktree and Git state read-only.
 - Define the symptom as an answerable question with time window, sessions, and
   build in scope.
+- Search closed issues and merged PRs for the target before the first probe;
+  a closed duplicate is the answer (a second #5123 investigation ran on
+  2026-11-02).
 - Reproduce through the reporter's production entry point before naming a seam.
 - Deliver a proven diagnosis and one concrete next step; a plausible story is
   not a diagnosis. Implement only a contained fix the brief asks for, under
@@ -67,6 +70,14 @@ to read them.
   entries and include one non-TypeScript case when the rule is language-neutral.
 
 ## Reproducible behavior
+
+Reproduce on the reporter's pi host version and pi-lens version, taken from
+the report or its session log. When you cannot install that version, say so
+and name the version you used instead. Never substitute the latest silently.
+Report one of four outcomes: confirmed, partially confirmed (name what
+differed), not reproduced (name what you tried), or blocked (name the missing
+access or state). Our bugs often depend on the host version; #4690 raises the
+certified floor to 0.86.1.
 
 When the symptom reproduces, the loop comes before the reading. Build the
 tightest loop that goes red on the symptom (a failing test, a minimal driver, a

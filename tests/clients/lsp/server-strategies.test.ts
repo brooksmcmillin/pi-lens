@@ -26,6 +26,18 @@ describe("TypeScript diagnostic strategies (#1412)", () => {
 			0,
 		);
 	});
+
+	// #4914 recurrence: an unlisted launch variant falls through to the
+	// `typescript` row measured on classic (`silentOnClean`), which would let the
+	// cascade skip the wait for the typescript-go server behind `effect-tsgo`.
+	it("answers the effect-tsgo launch with the native typescript-go strategy (#4914)", () => {
+		expect(getStrategy("typescript", "effect-tsgo")).toBe(
+			getStrategy("typescript", "native-ts7"),
+		);
+		expect(getStrategy("typescript", "effect-tsgo").silentOnClean).not.toBe(
+			true,
+		);
+	});
 });
 
 describe("cue diagnostic strategy (#1522) — measured against the real v0.17.1 binary", () => {

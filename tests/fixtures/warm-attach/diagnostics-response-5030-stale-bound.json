@@ -1,0 +1,32 @@
+{
+  "route": "diagnostics",
+  "version": 1,
+  "diagnostics": [
+    {
+      "severity": 1,
+      "message": "Cannot find name 'BAD_OTHER'.",
+      "source": "ts",
+      "serverId": "typescript",
+      "code": 2304,
+      "range": {
+        "start": {
+          "line": 0,
+          "character": 0
+        },
+        "end": {
+          "line": 0,
+          "character": 5
+        }
+      }
+    }
+  ],
+  "contentHash": "95befdd6e691d4d89031a2a2901cc74fc6242109980b060e08ddf87829924483",
+  "servedAt": 1793402858626,
+  "fresh": true,
+  "inconclusive": false,
+  "binding": {
+    "contentHash": "2ad21d5e89849c34021330c42624e67b494ed26f33fca1819704af80434ba91c",
+    "boundToCurrentDisk": false
+  },
+  "confirmation": "confirmed"
+}

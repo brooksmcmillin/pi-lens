@@ -92,17 +92,16 @@ since the verdict · is the durable record present.
 | 5 | no (no-file turn end) | unchanged | cleared | allow | `still allows the commit after an unjudged turn end that changed nothing` |
 | 6 | no (no-file turn end) | changed outside dispatch | cleared | **unknown** | `keeps the gate closed when the suppressed file's bytes moved outside dispatch` |
 | 7 | no turn end at all after the change | changed outside dispatch | cleared | **unknown** | same case, and `does not allow the commit after an external change to a marked file` (pi host) |
-| 8 | yes, after an outside change | changed outside dispatch | re-rendered | block | the freshness sweep demotes the record before the policy loop, so it is never a survivor and the verdict is cleared |
+| 8 | yes, after an outside change | changed outside dispatch | re-rendered | block | the freshness sweep demotes the record; since #4990 the demoted channel re-runs the policy, and the content check below is what keeps the stamp from opening the gate |
 | 9 | yes | unverifiable (no content baseline) | either | **unknown** | `keeps the gate closed for a suppressed record with no content baseline` |
 
 One clause, added to the rule above rather than replacing it: **a suppression
 verdict is a statement about BYTES, so it stands only while the file still
 matches the content baseline the record carries** (`recordedHash`, the #2982
-baseline the freshness sweep already compares against — and which the sweep
-guarantees matched at stamping time, since a self-drifted record is demoted
-before the policy loop can suppress it). The gate — the one reader that can let
-a verdict OPEN a commit — confirms that before allowing, and an unverifiable
-record (no baseline) fails closed. Rejected alternatives, from the table:
+baseline the freshness sweep already compares against). The gate — the one
+reader that can let a verdict OPEN a commit — confirms that before allowing, and
+an unverifiable record (no baseline) fails closed. Rejected alternatives, from
+the table:
 
 - a TURN generation on the stamp: reds cell 3, which is the defect #3248 is
   about (an unrelated edit must not re-block).
@@ -201,3 +200,9 @@ reason to `block: false`, as this slice committed them to do.
 - Issue: #3248.
 - PR: #3254, “The git-guard latch” remainder and writers-by-axis table.
 - Follow-up: #3282 (record provenance parse) — amendment 3.
+- #4990 (amendment 4, 2026-10-29): the DEMOTED channel now runs the same
+  policy pass as the live channel, so a demoted record can carry
+  `policySuppressed`. Cell 8 stays a block because the content check below the
+  latch compares the record's `recordedHash` against the file's current bytes,
+  and a self-drifted record no longer matches. No second identity clause was
+  added.

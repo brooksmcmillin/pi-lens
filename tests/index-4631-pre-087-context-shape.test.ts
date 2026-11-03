@@ -16,6 +16,18 @@
  * handler loop); `pi.on` stores that unknown name silently, so the newer
  * registration is inert there. A host that emitted both still injects once,
  * because the first hook consumes the queued payload.
+ *
+ * NOT OBSERVABLE AT TIER 2 (#4632 slice 3), so both cases keep the double.
+ * Tier 2 (`tests/support/pi-session.ts`) runs the INSTALLED host, and no
+ * payload there can carry the shape this file asserts: 1.3.0's own
+ * `ExtensionRunner.emitContext` STRIPS the system messages before it builds a
+ * `context` event — `dist/core/extensions/runner.js` does
+ * `currentMessages.filter((message) => message.role !== "system")` into
+ * `{ type: "context", messages: visibleMessages }` — so a tier-2 `context`
+ * handler never sees the head, and the pre-0.87 arm cannot be driven from it.
+ * The certified 0.86.1 host is the probe (#4632 acceptance 9's manual host
+ * spread), not a per-PR tier-2 case. The row for this file in
+ * `tests/support/pi-mock-importers.ts` records the class.
  */
 
 import * as fs from "node:fs";
@@ -30,6 +42,7 @@ import {
 	cleanupTestEnvironmentsDrained,
 	setupTestEnvironment,
 } from "./clients/test-utils.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 const TMP_PREFIX = "pi-lens-4631-pre087-";
@@ -46,7 +59,9 @@ beforeEach(() => {
 	process.env.PILENS_DATA_DIR = path.join(tmp, "data");
 });
 
-afterEach(() => {
+afterEach(async () => {
+	// #5146: end the session before the lifecycle state and the root go.
+	await endMockSessions();
 	_resetSessionLifecycleForTests();
 	if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 	else process.env.PILENS_DATA_DIR = previousDataDir;

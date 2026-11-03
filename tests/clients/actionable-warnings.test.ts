@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
 	_setBeforeWarningStateLockForTests,
 	buildActionableWarningsReport,
@@ -15,7 +15,7 @@ import {
 import type { Diagnostic } from "../../clients/dispatch/types.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // PRE-#1816 id formula, reproduced here (not imported — it no longer exists
@@ -47,13 +47,13 @@ function legacyActionableWarningIdForTest(args: {
 	return `aw:${createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 10)}`;
 }
 
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	// `supportsLSP: false` short-circuits `buildActionableWarningsReport` before
-	// it reaches any other service method; the rest of the surface comes from the
-	// factory so a method added to the production path cannot TypeError into this
-	// suite's swallow-all catch (#2592).
-	getLSPService: () => makeLspServiceDouble({ supportsLSP: () => false }),
-}));
+// `supportsLSP: false` short-circuits `buildActionableWarningsReport` before
+// it reaches any other service method; the rest of the surface comes from the
+// factory so a method added to the production path cannot TypeError into this
+// suite's swallow-all catch (#2592).
+beforeEach(async () => {
+	await installLspServiceDouble({ supportsLSP: () => false });
+});
 
 function makeWarning(filePath: string): Diagnostic {
 	return {

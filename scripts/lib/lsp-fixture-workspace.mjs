@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { gitExecFileSync } from "./git-fixture-env.mjs";
+import { scratchHomeEnv } from "./scratch-home-env.mjs";
 import { assertFixtureWorkspaceRegistered } from "./lsp-fixture-session-guard.mjs";
 import { safeRm } from "./safe-rm.mjs";
 import {
@@ -224,7 +225,11 @@ export function withScratchHome(opts = {}) {
 	// itself (#2670 review F2).
 	sweepScratchDirs(SCRATCH_DIR_ROOT, tmpPrefix);
 	const dir = claimScratchDir(SCRATCH_DIR_ROOT, tmpPrefix);
-	process.env.PI_LENS_HOME = dir;
+	const pin = scratchHomeEnv(dir);
+	const priorEnv = Object.fromEntries(
+		Object.keys(pin).map((key) => [key, process.env[key]]),
+	);
+	Object.assign(process.env, pin);
 	const dataDirWasUnset = !process.env.PILENS_DATA_DIR?.trim();
 	if (dataDirWasUnset) process.env.PILENS_DATA_DIR = dir;
 	// #2670 review F3: the redirect otherwise announces itself nowhere — the
@@ -247,7 +252,10 @@ export function withScratchHome(opts = {}) {
 		dir,
 		pinned: true,
 		restore() {
-			delete process.env.PI_LENS_HOME;
+			for (const [key, value] of Object.entries(priorEnv)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
 			if (dataDirWasUnset) delete process.env.PILENS_DATA_DIR;
 			process.off("exit", announceEnd);
 			announceEnd();

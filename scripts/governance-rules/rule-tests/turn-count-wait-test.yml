@@ -1,0 +1,150 @@
+# Planted members (invalid) and admitted forms (valid) for turn-count-wait
+# (#4865). Recurrence: #4850 / #4830 (fixed by #4852), #4969, #4977 -- each a
+# count-bounded poll found by a flaky red or a bot review, never a detector.
+id: turn-count-wait
+valid:
+  # waitFor with a real-clock deadline: the admitted form.
+  - |
+    await waitFor(() => fs.existsSync(file), Boolean, { timeoutMs: 4_000 });
+  # waitFor's own loop reads Date.now().
+  - |
+    async function waitFor(read, ready) {
+      const deadline = Date.now() + budgetMs;
+      let value = read();
+      while (!ready(value) && Date.now() < deadline) {
+        await yieldControl();
+        value = read();
+      }
+    }
+  # A count loop with no await is not a wait.
+  - |
+    for (let i = 0; i < 10; i++) {
+      if (seen.has(i)) break;
+      seen.add(i);
+    }
+  # A loop awaiting real work, bounded by a deadline.
+  - |
+    for (let attempt = 0; attempt < 50 && performance.now() < deadline; attempt++) {
+      if (await probePort(port)) break;
+    }
+  # N rounds of work with no exit besides the count.
+  - |
+    for (let i = 0; i < MAX_ENTRIES + 10; i++) {
+      await appendRecentTouches({ cwd, paths: [`f${i}.ts`] });
+    }
+  # Fake timers: the count is virtual time.
+  - |
+    for (let i = 0; i < 100 && !settled; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+    }
+  # Iteration over a collection is not a count bound.
+  - |
+    for (const file of files) {
+      if (stop) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  # An await inside a nested callback belongs to that callback.
+  - |
+    for (let i = 0; i < 5 && !done; i++) {
+      queue.push(async () => { await tick(); });
+    }
+  # A deadline on elapsed time: the clock sits inside the compared operand.
+  - |
+    for (let i = 0; !done && performance.now() - started < budgetMs; i++) await tick();
+invalid:
+  # The #4830 cell (pre-#4852): a for loop of setImmediate turns.
+  - |
+    for (let i = 0; i < 5000 && !fs.existsSync(file); i++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+  # The #4850 cell (pre-#4852): a resolved-promise yield, condition in the test.
+  - |
+    for (let i = 0; i < 100 && vi.getTimerCount() === 0; i++)
+      await Promise.resolve();
+  # A while loop with a counter and a throw.
+  - |
+    let turns = 0;
+    while (!ready()) {
+      await new Promise((r) => setTimeout(r, 0));
+      if (turns++ > 400) throw new Error("never ready");
+    }
+  # A do-while with the counter in the test.
+  - |
+    let n = 0;
+    do {
+      await flushMicrotasks();
+    } while (pending.size > 0 && ++n < 200);
+  # An aliased yield helper.
+  - |
+    const pump = () => new Promise((resolve) => setImmediate(resolve));
+    for (let turn = 0; turn < 100 && accepted.length === 0; turn++) await pump();
+  # An indirect call through a member.
+  - |
+    for (let i = 0; i < 20; i += 1) {
+      await helpers.flush.call(undefined);
+      if (calls.length > 0) break;
+    }
+  # The yield reached through another binding.
+  - |
+    const settle = setImmediate;
+    for (let i = 0; i < 50 && !done; i++) await new Promise((r) => settle(r));
+  # The counter read through another binding.
+  - |
+    let i = 0;
+    while (!done) {
+      const n = i;
+      await tick();
+      i += 1;
+      if (n > 50) break;
+    }
+  # A plain-assignment step.
+  - |
+    let turns = 0;
+    while (!done && turns < 50) {
+      await tick();
+      turns = turns + 1;
+    }
+  # A constant bound and a return.
+  - |
+    async function waitForState() {
+      for (let turn = 0; turn < MAX_TURNS; turn += 1) {
+        const state = await loadSessionState(cwd, sessionId);
+        if (state !== undefined) return state;
+      }
+      return undefined;
+    }
+  # A sleep-count budget (200 x 10 ms) that ends without a signal (#4969).
+  - |
+    for (
+      let attempts = 0;
+      attempts < 200 && (requests.size > 0 || active.size > 0);
+      attempts++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  # Fake timers beside a real-I/O yield (#4977 dadeeff85): the advance does
+  # not admit the loop, the setImmediate wait is still counted.
+  - |
+    for (let i = 0; i < 400 && !settled; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (spy.mock.calls.length > 0) {
+        await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.session_start);
+      }
+    }
+  # An await in the loop condition.
+  - |
+    for (let i = 0; i < 5000 && (await rows(late)).length === 0; i += 1)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+  # A clock read but never compared (#4983 r2, the drainedNudge shape): a
+  # timestamp in a payload or an elapsed-time log line does not bound the wait.
+  - |
+    for (let i = 0; i < 5000; i += 1) {
+      await emit([{ role: "user", timestamp: Date.now() }]);
+      log(`turn ${i} at ${Date.now() - started} ms`);
+      const [row] = await rows("agent_nudge");
+      if (row) return row;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  # An ignore with no reason does not exempt (the runner's reasoned-ignore check reds it).
+  - |
+    // ast-grep-ignore: some-other-rule
+    for (let i = 0; i < 50 && pending.length === 0; i++) await tick();

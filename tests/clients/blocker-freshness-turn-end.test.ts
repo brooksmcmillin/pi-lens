@@ -596,8 +596,10 @@ describe("turn-end blocker freshness (#1631)", () => {
 		// The result is built by the real shared tail, not shaped by hand: a
 		// nonzero exit with unparsable stdout, the arm eslint, prisma-validate
 		// and others share. Recurrence prevented: it carried no kind, so it was
-		// delivered as a finding and the log analyzer filed it as one.
-		it("reports finishParsedRun's parse-error arm as a parser_error runner failure", async () => {
+		// delivered as a finding and the log analyzer filed it as one; then it
+		// carried the kind and still delivered its synthetic diagnostic beside the
+		// failure note, so the fault message reached the agent twice (#4130).
+		it("reports finishParsedRun's parse-error arm once, as a parser_error runner failure", async () => {
 			const { content, metadata } = await runDeferredFailed({
 				runnerId: "eslint",
 				diagnostics: [],
@@ -612,11 +614,13 @@ describe("turn-end blocker freshness (#1631)", () => {
 			expect(content).toContain(
 				"Deferred runner eslint failed (parser_error): eslint exited 2 but its output could not be parsed",
 			);
+			expect(content.split("eslint exited 2 but its output")).toHaveLength(2);
+			expect(content).not.toContain("Late runner diagnostics");
 			expect(metadata).toMatchObject({
 				pending: 1,
-				delivered: 1,
+				delivered: 0,
 				failed: 1,
-				deliveredIds: ["eslint:parse-error:1"],
+				deliveredIds: [],
 			});
 		});
 

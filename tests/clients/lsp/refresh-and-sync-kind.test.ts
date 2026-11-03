@@ -902,6 +902,99 @@ describe("#2066 one JS document pass per send", () => {
 		expect(probe.lfIndexOfCalls).toBe(CRLF_DOCUMENT.split("\n").length);
 	});
 
+	// #2066 round 3: AC2's "one pass total" for the bytes a send pushes. The
+	// sync bound (`exceedsLspSyncLimits`, run by the post-write pipeline and by
+	// the dispatch runner on the SAME string) already counted this document's
+	// `\n`, and the send used to count them again. A JS string is immutable, so
+	// an equal value proves equal bytes: the count of one spelling is the count
+	// of every other spelling of those bytes. The second case is the fail-closed
+	// direction — different bytes are always walked.
+	it("sends the whole-document range whose last line the reused count describes", async () => {
+		const state = createMockState({ syncKind: 2 });
+		// The reuse path answers `lastLine` from `lastIndexOf` plus the reused
+		// count, so it has to agree with the walk character for character: the
+		// second change's range is built from the position the first send stored.
+		const first = "alpha\nbeta\ngamma\n";
+		const second = `${first}delta\n`;
+		exceedsLspSyncLimits(first);
+		await handleNotifyChange(state, TEST_FILE, first);
+		await handleNotifyChange(state, TEST_FILE, second);
+		const calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		const change = calls.filter(
+			(call) => call[0] === "textDocument/didChange",
+		)[0];
+		const params = change[1] as {
+			contentChanges: Array<{
+				range?: {
+					start: { line: number; character: number };
+					end: { line: number; character: number };
+				};
+				text: string;
+			}>;
+		};
+		// `alpha\nbeta\ngamma\n` is four addressable lines (line 3 is empty after
+		// the trailing newline), and line 3 is 0 characters long.
+		expect(params.contentChanges[0]?.range?.end).toEqual({
+			line: 3,
+			character: 0,
+		});
+	});
+
+	it("counts a lone \\r as a terminator when the reused count came from the LF walk", async () => {
+		const state = createMockState({ syncKind: 2 });
+		// Mixed endings: three LSP terminators (\\r\\n, \\r, \\n) but only two `\\n`.
+		// The reused count answers `lfNewlineCount`; where the last line STARTS is
+		// still the terminator loop's answer, or the range ends inside the document.
+		const mixed = "alpha\r\nbeta\rgamma\n";
+		exceedsLspSyncLimits(mixed);
+		await handleNotifyChange(state, TEST_FILE, mixed);
+		await handleNotifyChange(state, TEST_FILE, `${mixed}delta\n`);
+		const calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		const change = calls.filter(
+			(call) => call[0] === "textDocument/didChange",
+		)[0];
+		const params = change[1] as {
+			contentChanges: Array<{
+				range?: {
+					start: { line: number; character: number };
+					end: { line: number; character: number };
+				};
+				text: string;
+			}>;
+		};
+		expect(params.contentChanges[0]?.range?.end).toEqual({
+			line: 3,
+			character: 0,
+		});
+	});
+
+	it("reuses the sync bound's LF walk for a send of the same bytes", async () => {
+		const state = createMockState({ syncKind: 2 });
+		await handleNotifyChange(state, TEST_FILE, DOCUMENT);
+		const probe = await measureDocumentScans(1024, async () => {
+			exceedsLspSyncLimits(DOCUMENT);
+			await handleNotifyChange(state, TEST_FILE, DOCUMENT);
+		});
+		// Bound check: every `\n` once, then the miss that ends it. Send: none.
+		expect(probe.lfIndexOfCalls).toBe(NEWLINES + 1);
+		expect(probe.splitReceiverChars).toBe(0);
+	});
+
+	it("walks a send's own bytes when they differ from the ones the bound check counted", async () => {
+		const state = createMockState({ syncKind: 2 });
+		// Same length, one character apart: a count carried from the bound
+		// check's document would be the OTHER document's answer.
+		const edited = DOCUMENT.replace("value = 1", "value = 2");
+		expect(edited).toHaveLength(DOCUMENT.length);
+		await handleNotifyChange(state, TEST_FILE, DOCUMENT);
+		const probe = await measureDocumentScans(1024, async () => {
+			exceedsLspSyncLimits(DOCUMENT);
+			await handleNotifyChange(state, TEST_FILE, edited);
+		});
+		// Two walks: the bound check's, then this send's own.
+		expect(probe.lfIndexOfCalls).toBe(2 * (NEWLINES + 1));
+	});
+
 	it("reads one line without splitting the document", async () => {
 		const probe = await measureDocumentScans(1024, async () => {
 			lineTextAt(DOCUMENT, 3);
@@ -921,6 +1014,127 @@ describe("#2066 one JS document pass per send", () => {
 		// Without this, a probe that observed nothing would also read 0 for
 		// both consumers above.
 		expect(probe.lfIndexOfCalls).toBe(1);
+	});
+});
+
+describe("#2066: the send binds to the fingerprint the caller already computed", () => {
+	// The LSP service fingerprints every touch before it notifies
+	// (`clients/lsp/index.ts` `touchFile` -> `hashContent`), and the send used to
+	// walk the same bytes for the same sha256 a second time. A caller-supplied
+	// digest is used as given, so a value the send could never produce proves the
+	// walk did not happen.
+	it("stores the caller's fingerprint instead of hashing the document again", async () => {
+		const state = createMockState({ syncKind: 2 });
+		await handleNotifyChange(
+			state,
+			TEST_FILE,
+			"const x = 1;",
+			"fingerprint-from-the-touch",
+		);
+		expect(state.documentContentHashes.get(TEST_KEY)?.hash).toBe(
+			"fingerprint-from-the-touch",
+		);
+	});
+
+	it("hashes for itself when the caller has no fingerprint", async () => {
+		const state = createMockState({ syncKind: 2 });
+		await handleNotifyChange(state, TEST_FILE, "const x = 1;");
+		// Fail-closed direction: a caller that cannot state the fingerprint of
+		// these bytes (a cascade read, a client double, `updateFile`) gets the
+		// real #1095 digest, never a value borrowed from another send.
+		expect(state.documentContentHashes.get(TEST_KEY)?.hash).toBe(
+			hashDiagnosticContent("const x = 1;"),
+		);
+	});
+
+	// Review F2: `recordSentContent` takes the digest at five sites, and the
+	// fallback-open case above binds one. These four drive the other four
+	// branches, each asserting the notification that proves which site ran. A
+	// dropped argument at any of them leaves the send hashing the document again,
+	// which only a benchmark would notice.
+	function sentMethods(state: LSPClientState): string[] {
+		return vi
+			.mocked(state.connection.sendNotification)
+			.mock.calls.map((call) => call[0]);
+	}
+
+	it("keeps the caller's fingerprint on the didChange of an already-open document", async () => {
+		const state = createMockState({ syncKind: 2 });
+		state.openDocuments.add(TEST_KEY);
+		await handleNotifyChange(
+			state,
+			TEST_FILE,
+			"const x = 1;",
+			"fingerprint-from-the-did-change",
+		);
+		// The dominant send (#2066: 579 of 1 083 in the reporter's sample).
+		expect(sentMethods(state)).toContain("textDocument/didChange");
+		expect(sentMethods(state)).not.toContain("textDocument/didOpen");
+		expect(state.documentContentHashes.get(TEST_KEY)?.hash).toBe(
+			"fingerprint-from-the-did-change",
+		);
+	});
+
+	it("keeps the caller's fingerprint when an open of a held document sends a didChange", async () => {
+		const state = createMockState({ syncKind: 2 });
+		state.openDocuments.add(TEST_KEY);
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;",
+			"typescript",
+			false,
+			false,
+			false,
+			undefined,
+			"fingerprint-from-the-open-as-change",
+		);
+		expect(sentMethods(state)).toContain("textDocument/didChange");
+		expect(state.documentContentHashes.get(TEST_KEY)?.hash).toBe(
+			"fingerprint-from-the-open-as-change",
+		);
+	});
+
+	it("keeps the caller's fingerprint on the main didOpen", async () => {
+		const state = createMockState({ syncKind: 2 });
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;",
+			"typescript",
+			false,
+			false,
+			false,
+			undefined,
+			"fingerprint-from-the-main-open",
+		);
+		expect(sentMethods(state)).toContain("textDocument/didOpen");
+		expect(state.documentContentHashes.get(TEST_KEY)?.hash).toBe(
+			"fingerprint-from-the-main-open",
+		);
+	});
+
+	it("keeps the caller's fingerprint across an opengrep reopen-resync didOpen", async () => {
+		// `opengrep` re-syncs by didClose + didOpen (`reopenOnResync`), a fifth
+		// `recordSentContent` site with its own branch.
+		const state = createMockState({ serverId: "opengrep" });
+		state.openDocuments.add(TEST_KEY);
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;",
+			"plaintext",
+			false,
+			false,
+			false,
+			undefined,
+			"fingerprint-from-the-reopen",
+		);
+		expect(sentMethods(state)).toContain("textDocument/didClose");
+		expect(sentMethods(state)).toContain("textDocument/didOpen");
+		expect(state.documentContentHashes.get(TEST_KEY)?.hash).toBe(
+			"fingerprint-from-the-reopen",
+		);
 	});
 });
 
@@ -1538,7 +1752,7 @@ describe("workspace/diagnostic/refresh reaches an unregistered cwd's on-disk cac
 describe("workspace/diagnostic/refresh reaches a never-swept monorepo cache (#1707)", () => {
 	it("clears the sweep-root cache when the client root is a nested member", async () => {
 		const workspaceRoot = fs.mkdtempSync(
-			path.join(process.cwd(), "pi-lens-refresh-1707-"),
+			path.join(os.tmpdir(), "pi-lens-refresh-1707-"),
 		);
 		const memberRoot = path.join(workspaceRoot, "packages", "member");
 		fs.mkdirSync(memberRoot, { recursive: true });

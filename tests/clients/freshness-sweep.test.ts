@@ -21,7 +21,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
+import {
+	freshnessFromMtime,
+	MTIME_DRIFT_TOLERANCE_MS,
+} from "../../clients/freshness.js";
 import { toPosix } from "../../clients/path-utils.js";
 import { assertNonEmptyScan, stripSource } from "../support/sweep-kit.js";
 
@@ -44,6 +49,8 @@ const EXEMPT: Record<string, string> = {
 		"lock staleness is a cross-process liveness check on a foreign file, not a content-freshness read; freshnessFromMtime targets in-kernel content caches",
 	"installer/index.ts":
 		"age-based maxAge expiry of a cached install probe, same TTL-not-freshness shape",
+	"installer/managed-tool-refresh.ts":
+		"age-based cutoff for stale rule-pack candidate files a killed refresh left behind (Date.now() - mtime > one hour), not freshness against a scan or record timestamp",
 	"lsp/edits.ts":
 		"the rename staleness guard's compare-and-refuse bounds (#3601, #3734): it refuses AT the request instant and inside a margin BEFORE it, while freshnessFromMtime's verdict tolerates drift after the reference and treats the tie as fresh. Migrating would widen this fail-closed write guard by 50 ms and drop the tie, so the guard keeps its own comparison; the kernel's own doc comment scopes it to caches.",
 	"lsp/lombok.ts":
@@ -124,5 +131,99 @@ describe("freshness kernel coverage (#1739)", () => {
 			(name) => !names.has(path.basename(name)),
 		);
 		expect(phantom, "exempt files must exist").toEqual([]);
+	});
+});
+
+/**
+ * Property (#4928): the kernel's verdict over arbitrary mtimes, references and
+ * tolerances, stated as relations between calls.
+ *
+ * Recurrence this prevents: a gate that serves stale content as fresh, or
+ * demotes fresh content, with no error. #1664, #1710 and #1711 were three
+ * copies of one tolerance defect (a skewed mtime read as a modification, 42
+ * false demotions in 50 Windows runs); a verdict that reads `fresh` for a file
+ * edited after the reference is the silent direction.
+ *
+ * Relations: an undefined mtime is `indeterminate` whatever the reference and
+ * tolerance; omitting the tolerance is `MTIME_DRIFT_TOLERANCE_MS`; staleness is
+ * monotone in the mtime and in the tolerance; a file not newer than the
+ * reference is fresh; an mtime exactly one tolerance past the reference is
+ * fresh (the tie, as the `lsp/edits.ts` exemption above describes it) and one
+ * millisecond more is stale; a tolerance of 0 is honored, not defaulted.
+ * Fractional mtimes are drawn because `fs.Stats.mtimeMs` is fractional.
+ *
+ * numRuns 400, seed 492804.
+ *
+ * Not modelled: NaN and infinite inputs (`fs.stat` never yields them), the
+ * callers' mapping of `indeterminate` (each owns its policy), and clock skew
+ * between hosts.
+ */
+describe("freshnessFromMtime property (#4928)", () => {
+	it("keeps the verdict monotone, tie-fresh and tolerance-honoring", () => {
+		const referenceArb = fc.double({
+			min: 1e12,
+			max: 2e12,
+			noNaN: true,
+			noDefaultInfinity: true,
+		});
+		const spanArb = fc.oneof(
+			fc.integer({ min: 0, max: 500 }),
+			fc.double({ min: 0, max: 500, noNaN: true, noDefaultInfinity: true }),
+		);
+		const verdict = (
+			mtimeMs: number | undefined,
+			referenceMs: number,
+			toleranceMs?: number,
+		) => freshnessFromMtime({ mtimeMs, referenceMs, toleranceMs });
+		fc.assert(
+			fc.property(
+				referenceArb,
+				spanArb,
+				spanArb,
+				spanArb,
+				fc.option(spanArb, { nil: undefined }),
+				(reference, past, ahead, extra, tolerance) => {
+					expect(
+						verdict(undefined, reference, tolerance),
+						"no mtime evidence",
+					).toEqual({ verdict: "indeterminate", reason: "no-mtime-evidence" });
+
+					const m = reference + ahead;
+					expect(verdict(m, reference), "the default tolerance").toEqual(
+						verdict(m, reference, MTIME_DRIFT_TOLERANCE_MS),
+					);
+
+					const effective = tolerance ?? MTIME_DRIFT_TOLERANCE_MS;
+					expect(
+						verdict(reference - past, reference, tolerance).verdict,
+						"a file not newer than the reference",
+					).toBe("fresh");
+					expect(
+						verdict(reference + effective, reference, tolerance).verdict,
+						"the tie",
+					).toBe("fresh");
+					expect(
+						verdict(reference + effective + 1, reference, tolerance),
+						"one millisecond past the tie",
+					).toEqual({ verdict: "stale", reason: "modified-after-reference" });
+					expect(
+						verdict(reference + 1, reference, 0).verdict,
+						"a tolerance of 0",
+					).toBe("stale");
+
+					if (verdict(m, reference, tolerance).verdict === "stale") {
+						expect(
+							verdict(m + extra, reference, tolerance).verdict,
+							"a later mtime",
+						).toBe("stale");
+						expect(
+							verdict(m, reference, Math.max(0, effective - extra)).verdict,
+							"a narrower tolerance",
+						).toBe("stale");
+					}
+				},
+			),
+			{ numRuns: 400, seed: 492804 },
+		);
 	});
 });

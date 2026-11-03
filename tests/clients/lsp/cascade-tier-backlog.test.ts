@@ -18,16 +18,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 
-const getServersForFileWithConfig = vi.fn();
 const registerQuietWindowTask = vi.fn();
 // Module scope so the spy identity survives `vi.resetModules()` — a
 // factory-local `vi.fn()` is rebuilt with the module, and the assertions would
 // then read a different spy than the code under test called.
 const logCascade = vi.fn();
-
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-}));
 
 vi.mock("../../../clients/quiet-window.js", () => ({
 	registerQuietWindowTask,
@@ -35,13 +30,6 @@ vi.mock("../../../clients/quiet-window.js", () => ({
 
 vi.mock("../../../clients/cascade-logger.js", () => ({
 	logCascade,
-}));
-
-vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
-	...(await importActual<
-		typeof import("../../../clients/latency-logger.js")
-	>()),
-	logLatency: vi.fn(),
 }));
 
 const FILE = "C:/repo/neighbor.ts";
@@ -59,7 +47,6 @@ let ledger: Ledger;
 
 beforeEach(async () => {
 	vi.resetModules();
-	getServersForFileWithConfig.mockReset();
 	registerQuietWindowTask.mockReset();
 	logCascade.mockClear();
 	mod = await import("../../../clients/lsp/cascade-tier.js");

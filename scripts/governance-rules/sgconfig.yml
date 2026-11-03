@@ -1,0 +1,19 @@
+# Governance ast-grep rules (#4865): code-pattern checks over pi-lens's OWN
+# tests and test hooks. Nothing here ships: `rules/ast-grep-rules/` is the
+# catalog users get, this directory is repo governance. The runner and the
+# baseline machinery are shared with the self-scan
+# (scripts/run-astgrep-pi-lens.mjs --suite governance, npm run
+# astgrep:governance); the baseline is ./baseline.json.
+ruleDirs:
+  - ./rules
+utilDirs:
+  - ./utils
+# Plain JavaScript test support (tests/support/*.mjs) parses as TypeScript, so
+# one rule covers both and a .mjs helper is not a blind spot.
+languageGlobs:
+  typescript: ["*.mjs", "*.cjs", "*.js"]
+# Rule tests: planted members and admitted forms, run by
+# `ast-grep test -c scripts/governance-rules/sgconfig.yml --skip-snapshot-tests`
+# (tests/scripts/astgrep-self-scan.test.ts).
+testConfigs:
+  - testDir: ./rule-tests

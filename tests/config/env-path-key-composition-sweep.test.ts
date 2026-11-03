@@ -228,6 +228,8 @@ import {
 	relativePosix,
 	stableOccurrenceKey,
 } from "../support/sweep-kit.js";
+import { cookedIdentifier, cookedString } from "../support/cooked-literal.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -339,122 +341,6 @@ function isCanonicalSpelling(text: string): boolean {
 function shapeOfSpelling(text: string): SpellingShape {
 	if (isCanonicalSpelling(text)) return "canonical";
 	return text === "path" ? "lowercase" : "case-variant";
-}
-
-/** The simple one-character escapes a string literal can carry. */
-const SIMPLE_ESCAPES: Readonly<Record<string, string>> = {
-	"0": "\0",
-	b: "\b",
-	f: "\f",
-	n: "\n",
-	r: "\r",
-	t: "\t",
-	v: "\v",
-	"\\": "\\",
-	"'": "'",
-	'"': '"',
-	"`": "`",
-};
-
-/** A hex escape body as its character, or `undefined` when it is not one. */
-function fromHex(hex: string, maxLength: number): string | undefined {
-	if (hex.length === 0 || hex.length > maxLength) return undefined;
-	if (!/^[0-9a-fA-F]+$/.test(hex)) return undefined;
-	const value = Number.parseInt(hex, 16);
-	return value > 0x10ffff ? undefined : String.fromCodePoint(value);
-}
-
-/**
- * The COOKED value of a string literal: what the program holds at runtime, not
- * what the source spells. `"Pa\x74h"` is `Path` and `"\u0050ATH"` is `PATH`,
- * so reading the source text instead passes every value the detector cannot
- * see (AGENTS.md shape 69; #4600 R4-1).
- *
- * `undefined` means "not decodable with certainty": an unterminated token, a
- * legacy octal escape, `\8`, `\9`, or an escape this reader does not know. A
- * caller must fail CLOSED on it, never read it as a proven non-path value.
- */
-function cookedString(text: string): string | undefined {
-	const quote = text[0];
-	if (quote !== '"' && quote !== "'" && quote !== "`") return undefined;
-	if (text.length < 2 || !text.endsWith(quote)) return undefined;
-	const body = text.slice(1, -1);
-	let cooked = "";
-	for (let i = 0; i < body.length; i++) {
-		const char = body[i] as string;
-		if (char !== "\\") {
-			cooked += char;
-			continue;
-		}
-		const escape = body[i + 1];
-		if (escape === undefined) return undefined;
-		i += 1;
-		// A line continuation contributes no character.
-		if (escape === "\n") continue;
-		if (escape === "\r") {
-			if (body[i + 1] === "\n") i += 1;
-			continue;
-		}
-		if (escape === "x" || escape === "u") {
-			let hex: string;
-			if (escape === "u" && body[i + 1] === "{") {
-				const close = body.indexOf("}", i + 2);
-				if (close < 0) return undefined;
-				hex = body.slice(i + 2, close);
-				i = close;
-			} else {
-				const width = escape === "x" ? 2 : 4;
-				hex = body.slice(i + 1, i + 1 + width);
-				if (hex.length !== width) return undefined;
-				i += width;
-			}
-			const decoded = fromHex(hex, 6);
-			if (decoded === undefined) return undefined;
-			cooked += decoded;
-			continue;
-		}
-		const simple = SIMPLE_ESCAPES[escape];
-		// `\0` before a digit is a legacy octal escape, which is not decoded here.
-		if (
-			simple === undefined ||
-			(escape === "0" && /\d/.test(body[i + 1] ?? ""))
-		)
-			return undefined;
-		cooked += simple;
-	}
-	return cooked;
-}
-
-/**
- * An identifier's cooked NAME: `\u0050ATH` is `PATH`. A JavaScript identifier
- * carries non-ASCII characters only as `\u` escapes, so any other backslash
- * leaves the name as written, which matches no spelling.
- */
-function cookedIdentifier(text: string): string {
-	if (!text.includes("\\")) return text;
-	let cooked = "";
-	for (let i = 0; i < text.length; i++) {
-		const char = text[i] as string;
-		if (char !== "\\" || text[i + 1] !== "u") {
-			cooked += char;
-			continue;
-		}
-		let hex: string;
-		if (text[i + 2] === "{") {
-			const close = text.indexOf("}", i + 3);
-			if (close < 0) return text;
-			hex = text.slice(i + 3, close);
-			i = close;
-		} else {
-			hex = text.slice(i + 2, i + 6);
-			if (hex.length !== 4) return text;
-			i += 5;
-		}
-		const decoded = fromHex(hex, 6);
-		if (decoded === undefined) return text;
-		cooked += decoded;
-	}
-	return cooked;
 }
 
 /** A comment marker in a node's source: the cheap pre-test for blanking. */
@@ -1565,10 +1451,10 @@ export interface PathKeyCensus {
  * passes the walked population; a case passes one planted file to prove that
  * what reaches this loop is scanned (#4600 R3).
  */
-export function censusPathKeyFiles(files: readonly string[]): {
+export async function censusPathKeyFiles(files: readonly string[]): Promise<{
 	identities: Map<string, PathKeyReason>;
 	findings: PathKeyFinding[];
-} {
+}> {
 	const identities = new Map<string, PathKeyReason>();
 	const occurrences = new Map<string, number>();
 	const findings: PathKeyFinding[] = [];
@@ -1592,11 +1478,15 @@ export function censusPathKeyFiles(files: readonly string[]): {
 			identities.set(identity, finding.reason);
 			findings.push(finding);
 		}
+		// #4736: turn the loop so `@ast-grep/napi` frees this file's tree before
+		// the next parse; a synchronous walk held ~2,350 trees at once (1,703 MB
+		// peak RSS of a 2,048 MB budget, 37 MB of V8 heap).
+		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 	return { identities, findings };
 }
 
-export function censusPathKeyCompositions(): PathKeyCensus {
+export async function censusPathKeyCompositions(): Promise<PathKeyCensus> {
 	const files: string[] = [];
 	for (const { dir, extensions, floor } of SCAN_ROOTS) {
 		const found = listSourceFiles(path.join(REPO_ROOT, dir), {
@@ -1607,7 +1497,7 @@ export function censusPathKeyCompositions(): PathKeyCensus {
 		files.push(...found);
 	}
 	files.push(path.join(REPO_ROOT, "index.ts"));
-	return { ...censusPathKeyFiles(files), scanned: files.length };
+	return { ...(await censusPathKeyFiles(files)), scanned: files.length };
 }
 
 /**
@@ -1732,7 +1622,6 @@ const SEEDED_OFFENDERS: Readonly<Record<string, PathKeyReason>> = {
 		"spread-override",
 	"tests/scripts/install-smoke-handshake-steps.test.ts#bash:8c06ec3b#PATH":
 		"spread-override",
-	"tests/scripts/lane-check.test.ts#runLane:f2fe9f48#PATH": "spread-override",
 	"tests/scripts/lint-js.test.ts#runNodeWithOxlint:e2627086#PATH":
 		"spread-override",
 	"tests/scripts/notify-install-smoke-drift.test.ts#EXISTING_TRACKER:7b47e8d1#PATH":
@@ -1760,6 +1649,7 @@ const SEEDED_OFFENDERS: Readonly<Record<string, PathKeyReason>> = {
 		"spread-override",
 	"tests/scripts/resolve-newest-in-range-host.test.ts#runCli:7b47e8d1#PATH":
 		"spread-override",
+	"tests/support/lane-check-kit.ts#runLane:f2fe9f48#PATH": "spread-override",
 };
 
 const REMEDIATION =
@@ -2666,7 +2556,7 @@ describe("#4590 env PATH composition", () => {
 	 * own file list so the layout is the one under test, and removing the scan
 	 * from the walk (rather than from `findPathKeyFindings`) reds it.
 	 */
-	it("scans a walked file whose layout no key filter could spell", () => {
+	it("scans a walked file whose layout no key filter could spell", async () => {
 		const fixture = setupTestEnvironment("pi-lens-4590-census-");
 		try {
 			const file = path.join(fixture.tmpDir, "candidate.ts");
@@ -2681,7 +2571,7 @@ describe("#4590 env PATH composition", () => {
 					"}",
 				].join("\n"),
 			);
-			const rows = [...censusPathKeyFiles([file]).identities.keys()];
+			const rows = [...(await censusPathKeyFiles([file])).identities.keys()];
 			expect(rows.map((row) => row.split("#").at(-1))).toEqual([
 				"PATH",
 				"getPathKey()",
@@ -2693,8 +2583,8 @@ describe("#4590 env PATH composition", () => {
 
 	it(
 		"keeps the seeded baseline exact in both directions",
-		() => {
-			const census = censusPathKeyCompositions();
+		async () => {
+			const census = await censusPathKeyCompositions();
 			const audit = auditRegistry({
 				sweepName: "env PATH composition",
 				flagged: [...census.identities].map(([key, reason]) => ({
@@ -2733,8 +2623,9 @@ describe("#4590 env PATH composition", () => {
 		// filtered walk this replaced took 3.4 s). The ceiling is load-bearing, not
 		// decorative: the Windows lane runs the same work about seven times slower
 		// — 23.9 s for the FILTERED census of the first head that carried one
-		// (#4600 F3) — so the old 5 s default could not pass there and this 60 s
-		// bound is what a pathological runner hits instead of hanging the shard.
-		60_000,
+		// (#4600 F3) — so the old 5 s default could not pass there and the shared
+		// `TREE_WALK_TIMEOUT_MS` (30 s, scaled by the lane: 90 s on Windows) is what a
+		// pathological runner hits instead of hanging the shard.
+		TREE_WALK_TIMEOUT_MS,
 	);
 });

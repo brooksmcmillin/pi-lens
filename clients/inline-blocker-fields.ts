@@ -15,6 +15,16 @@ import type { Diagnostic } from "./dispatch/types.js";
 import { normalizeEphemeralMapKey } from "./path-utils.js";
 
 /**
+ * #1561 F1: the source id ONE blocking diagnostic is attributed to. The single
+ * derivation `inlineBlockerSources` and the per-source row retirement
+ * (`retireInlineBlockerOnConfirmedClean`, #4990) both read, so a verdict's
+ * coverage and a row's provenance cannot drift apart.
+ */
+export function inlineBlockerSourceOf(diagnostic: Diagnostic): string {
+	return diagnostic.tool?.trim() || "unknown";
+}
+
+/**
  * #1561 F1: taken from the very diagnostics the record's text was rendered
  * from, so the provenance can never disagree with the text it guards. An
  * untagged diagnostic contributes the literal "unknown", which no verdict
@@ -24,7 +34,7 @@ import { normalizeEphemeralMapKey } from "./path-utils.js";
 export function inlineBlockerSources(
 	blockers: readonly Diagnostic[],
 ): string[] {
-	return [...new Set(blockers.map((d) => d.tool?.trim() || "unknown"))];
+	return [...new Set(blockers.map(inlineBlockerSourceOf))];
 }
 
 /**
@@ -51,13 +61,99 @@ export function inlineBlockerLines(
 	blockers: readonly Diagnostic[],
 	filePath: string,
 ): number[] {
-	const own = normalizeEphemeralMapKey(filePath);
-	return blockers
-		.filter(
+	return inlineBlockerPlaces(blockers, filePath).map((place) => place.line);
+}
+
+/**
+ * #5020: whether a blocker row cites a file other than `filePath`: the one
+ * own-file test, shared by the record's line list (`inlineBlockerPlacement`)
+ * and the retire seams that treat such a row as another file's claim. The two
+ * read it the same way, so a row the line list calls "no line in this file" is
+ * the row a retire may judge by its cited file.
+ *
+ * TOTAL over the rows a record holds: a row with no `filePath` is the record's
+ * own, never another file's claim, so no caller needs a `d.filePath &&` guard
+ * in front of it. `Diagnostic.filePath` is required, so such a row reaches a
+ * record only from outside the type system (a persisted or foreign row, which
+ * `InlineBlockerRecord.diagnostics` holds as `Diagnostic[]`); without this
+ * clause the `normalizeEphemeralMapKey` below dereferences the absent path
+ * (`TypeError: Cannot read properties of undefined (reading 'includes')`), so
+ * every caller that can see one would have to repeat the guard (AGENTS.md
+ * shape 83: one owner per rule).
+ */
+export function isCrossFileBlocker(d: Diagnostic, filePath: string): boolean {
+	return (
+		!!d.filePath &&
+		normalizeEphemeralMapKey(d.filePath) !== normalizeEphemeralMapKey(filePath)
+	);
+}
+
+/** One place a blocker is cited in `filePath`: the line, and the rule that
+ *  reported it. */
+export interface InlineBlockerPlace {
+	line: number;
+	rule: string;
+}
+
+/**
+ * #5008 review r3 (F6): the counted blockers these bytes cannot place, split by
+ * WHY. Both causes have a line; only the first one has it in THIS file.
+ */
+export interface UnplacedBlockerCounts {
+	/** Carried from older bytes of this file: the line exists, but not here. */
+	movedLine: number;
+	/** Another file's row (a chart-wide runner naming `values.yaml` while the
+	 *  template is processed), or a blocker with no line at all. */
+	noLineInThisFile: number;
+}
+
+/**
+ * #5008: the places a blocker set is cited at, one per blocker that HAS a place
+ * in these bytes, plus the counted remainder by cause. `inlineBlockerLines` is
+ * the places' line column, so the record's line list and the agent-facing
+ * `Still unfixed` line cannot disagree about which blockers are placeable, and
+ * the rendered count cannot disagree with the list it counts (AGENTS.md shape
+ * 83: one owner per rule).
+ *
+ * `rule` falls back to the same source id `inlineBlockerSourceOf` derives, so an
+ * untagged blocker reads as `unknown` rather than citing an empty rule.
+ */
+export function inlineBlockerPlacement(
+	blockers: readonly Diagnostic[],
+	filePath: string,
+): { places: InlineBlockerPlace[]; unplaced: UnplacedBlockerCounts } {
+	const places: InlineBlockerPlace[] = [];
+	let movedLine = 0;
+	for (const d of blockers) {
+		// Another file's row (#1641) and a blocker with no line are both "no line
+		// in this file"; only a stale carry of THIS file has a line to report.
+		// A row that cites no file at all is this record's own (`isCrossFileBlocker`
+		// is total), so it is placed when it carries a line.
+		if (isCrossFileBlocker(d, filePath)) continue;
+		if (typeof d.line !== "number") continue;
+		if (d.positionStale) {
 			// #4509 (N3): a stale entry's line is from older bytes, so it cites
 			// none: the past-EOF sweep would retire the whole record on it.
-			(d) => !d.positionStale && normalizeEphemeralMapKey(d.filePath) === own,
-		)
-		.map((d) => d.line)
-		.filter((line): line is number => typeof line === "number");
+			movedLine += 1;
+			continue;
+		}
+		places.push({
+			line: d.line,
+			rule: d.rule?.trim() || inlineBlockerSourceOf(d),
+		});
+	}
+	return {
+		places,
+		unplaced: {
+			movedLine,
+			noLineInThisFile: blockers.length - places.length - movedLine,
+		},
+	};
+}
+
+export function inlineBlockerPlaces(
+	blockers: readonly Diagnostic[],
+	filePath: string,
+): InlineBlockerPlace[] {
+	return inlineBlockerPlacement(blockers, filePath).places;
 }

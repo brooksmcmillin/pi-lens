@@ -8,7 +8,7 @@
  * the only fix that lets a later call recover.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeLspServiceDouble } from "../../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../../support/lsp-service-seam.js";
 
 const loadBootstrapClients = vi.hoisted(() => vi.fn());
 
@@ -16,13 +16,6 @@ vi.mock("../../../clients/bootstrap.js", () => ({ loadBootstrapClients }));
 vi.mock("../../../clients/ast-grep-client.js", () => ({
 	AstGrepClient: class {},
 }));
-vi.mock("../../../clients/lsp/capabilities.js", () => ({
-	// `getMcpSessionContext` reads only `getAliveClientCount`; the rest of the
-	// surface comes from the factory (#2592).
-	getLSPService: () => makeLspServiceDouble({ getAliveClientCount: () => 0 }),
-	resetLSPService: vi.fn(),
-}));
-
 // Static (module-load-time) import, not a dynamic `await import(...)` inside
 // the it() body — a dynamic import's module-graph transform cost (measured
 // 3.3-5.2s under contention) was charged against the per-test timeout and
@@ -34,7 +27,10 @@ import {
 	getMcpSessionContext,
 } from "../../../clients/mcp/session.js";
 
-beforeEach(() => {
+beforeEach(async () => {
+	// `getMcpSessionContext` reads only `getAliveClientCount`; the rest of the
+	// surface comes from the factory (#2592).
+	await installLspServiceDouble({ getAliveClientCount: () => 0 });
 	loadBootstrapClients.mockReset();
 });
 

@@ -59,6 +59,8 @@ import {
 } from "vitest";
 import { removeTempDirSync } from "./test-utils.js";
 
+let previousHome: string | undefined;
+
 const h = vi.hoisted(() => ({
 	dir: "",
 	/** Every pid this file spawned: the only rows the reaper may see. */
@@ -70,11 +72,6 @@ const h = vi.hoisted(() => ({
 	/** Runs once, after the first owner-tag read returns. */
 	afterFirstTagRead: undefined as undefined | (() => Promise<void>),
 	latency: [] as Array<{ phase?: string; metadata?: Record<string, unknown> }>,
-}));
-
-vi.mock("../../clients/file-utils.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/file-utils.js")>()),
-	getGlobalPiLensDir: () => h.dir,
 }));
 
 vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
@@ -280,6 +277,10 @@ function sweepRecord(): Record<string, unknown> | undefined {
 
 beforeEach(() => {
 	h.dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pid-reuse-"));
+	// `PI_LENS_HOME` is the knob `getGlobalPiLensDir` reads, so the registry
+	// file lands in `h.dir` as in production.
+	previousHome = process.env.PI_LENS_HOME;
+	process.env.PI_LENS_HOME = h.dir;
 	h.afterFirstIdentityQuery = undefined;
 	h.latency.length = 0;
 	signals.length = 0;
@@ -287,6 +288,8 @@ beforeEach(() => {
 });
 afterEach(() => {
 	process.kill = kill;
+	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+	else process.env.PI_LENS_HOME = previousHome;
 	removeTempDirSync(h.dir);
 });
 afterAll(() => {

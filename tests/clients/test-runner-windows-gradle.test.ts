@@ -344,6 +344,12 @@ describe("Windows Gradle wrapper resolution reaches the owner spawn (#3956)", ()
 		process.env.PATH = "C:\\tools";
 		process.env.PATHEXT = ".CMD";
 		markWindowsFilesPresent(["C:\\tools\\mvn.cmd"]);
+		// #4530: this host's path judgment reads the Windows-shaped PATH below as a
+		// relative directory under the session cwd, so the session's trust is
+		// adopted; the Windows trust cells run on the Windows lane.
+		const { setProjectTrustState } =
+			await import("../../clients/project-trust.js");
+		setProjectTrustState("trusted");
 
 		const { RUNNERS, TestRunnerClient } =
 			await import("../../clients/test-runner-client.js");

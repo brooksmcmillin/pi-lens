@@ -26,6 +26,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
+import {
+	resetUserNotifier,
+	wireUserNotifier,
+} from "../../clients/user-notify.js";
 
 /**
  * Flipped per test. `true` reproduces the compiled host: a bare specifier
@@ -87,8 +91,12 @@ vi.mock("../../clients/tree-sitter-logger.js", async (importOriginal) => {
 	};
 });
 
-const notifyUserDegradation = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/user-notify.js", () => ({ notifyUserDegradation }));
+const notifyUserDegradation = vi.fn();
+beforeEach(() => {
+	resetUserNotifier();
+	wireUserNotifier(() => notifyUserDegradation);
+});
+afterEach(() => resetUserNotifier());
 
 /** The private surface these tests observe, all of it pre-existing. */
 type GrammarDirClient = {
@@ -549,6 +557,12 @@ describe("#3409 compiled host — bare specifier unresolvable", () => {
 			cause: "write-dir-unwritable",
 		});
 		expect(record.message).toContain(readOnly);
+		// #4689 batch 7: the probe is the nearest EXISTING ancestor of the
+		// grammars dir, so the verdict carries that directory's own errno. The
+		// hand-rolled `path.dirname` loop and the shared identity walk
+		// (`walkUpDirs`) answer the same code here, and a walk that stopped at the
+		// missing directory instead would report ENOENT.
+		expect(record.message).toContain("(EACCES)");
 		expect(record.message).not.toContain("approve-builds");
 		fs.chmodSync(readOnly, 0o700);
 	});

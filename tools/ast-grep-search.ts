@@ -18,10 +18,18 @@ import {
 	synthesizeRule,
 } from "../clients/ast-grep-yaml-synth.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
-import { isAtOrAboveHomeDir } from "../clients/path-utils.js";
+import {
+	type LensToolHost,
+	translateGuidanceToolNames,
+} from "../clients/tool-config.js";
 import { compactRenderResult } from "./render-compact.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
-import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
+import {
+	defaultedCwdHomeRefusal,
+	readAstGrepLang,
+	MAX_PATHS_ENTRIES,
+	readPathsArgument,
+} from "./shared.js";
 
 /**
  * Build the agent-facing error text, appending a remediation hint derived from
@@ -29,9 +37,14 @@ import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
  * the hint map (their message already carries guidance), so this never doubles
  * up — it only adds value for the raw-stderr categories (#ast-grep tool errors).
  */
-function errorTextWithHint(raw: string): string {
+function errorTextWithHint(raw: string, host: LensToolHost): string {
 	const hint = astGrepRemediationHint(classifyAstGrepError(raw));
-	return hint ? `Error: ${raw}\n\n${hint}` : `Error: ${raw}`;
+	// The hint names this tool family (“use ast_grep_search with dump=true”), so it
+	// goes through the host translation; the raw stderr stays byte-identical
+	// because it can quote the caller's own pattern (#4809 F3).
+	return hint
+		? `Error: ${raw}\n\n${translateGuidanceToolNames(hint, host)}`
+		: `Error: ${raw}`;
 }
 
 export function _telemetryErrorForTest(
@@ -68,7 +81,6 @@ function toSearchReads(matches: AstGrepMatch[]): SearchReadLocation[] {
 // multi-file tools, while a single directory path remains a valid project scope.
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
-const MAX_PATHS = 200;
 const AST_GREP_SEARCH_TIMEOUT_MS = 30_000;
 
 /**
@@ -345,12 +357,11 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			dump: Type.Optional(Type.Boolean()),
 			pattern: Type.Optional(Type.String({ description: "AST pattern." })),
 			lang: Type.String({
-				enum: [...LANGUAGES] as string[],
-				description: "Target language",
+				description: "Language id, e.g. typescript, tsx, python, go.",
 			}),
 			paths: Type.Optional(
 				Type.Array(Type.String(), {
-					maxItems: MAX_PATHS,
+					maxItems: MAX_PATHS_ENTRIES,
 					description: "Files or directories to search.",
 				}),
 			),
@@ -376,7 +387,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			),
 			hasKind: Type.Optional(
 				Type.String({
-					description: "Immediate-child AST node kind filter.",
+					description: "Immediate child AST node kind filter.",
 				}),
 			),
 			hasDescendantKind: Type.Optional(
@@ -417,7 +428,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			strictness: Type.Optional(
 				Type.String({
 					enum: ["smart", "relaxed", "ast", "cst", "signature", "template"],
-					description: "Pattern matching strictness.",
+					description: "Match strictness; default smart.",
 				}),
 			),
 			validateOnly: Type.Optional(
@@ -431,10 +442,11 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			params: Record<string, unknown>,
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
-			ctx: { cwd?: string; signal?: AbortSignal },
+			ctx: { cwd?: string; signal?: AbortSignal; host?: LensToolHost },
 		) {
 			// Escape aborts the turn via ctx.signal; the positional signal is the
 			// tool-call one. Honor both so a broad search cancels on Escape.
+			const host: LensToolHost = ctx.host ?? "pi";
 			const abortSignal = combineAbortSignals(_signal, ctx.signal);
 			const startedAt = Date.now();
 			const deadlineAt = startedAt + AST_GREP_SEARCH_TIMEOUT_MS;
@@ -476,11 +488,10 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				validateOnly?: boolean;
 			};
 			const pattern = typeof params.pattern === "string" ? params.pattern : "";
-			const rawLang = typeof params.lang === "string" ? params.lang : "";
 			const normalizedNodeKind =
 				typeof nodeKind === "string" ? nodeKind.trim() : "";
 			const skipOffset = Math.max(0, Math.floor(skip ?? 0));
-			const lang = rawLang.replace(/^"|"$/g, "");
+			const { lang, refusal: langError } = readAstGrepLang(params.lang, true);
 			const searchPathsCount = paths?.length ?? 1;
 			const executionOptions = { signal: abortSignal, deadlineAt };
 			const dumpMode = dump === true;
@@ -544,13 +555,13 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				const hasPattern = Boolean(pattern.trim());
 				const hasNodeKind = normalizedNodeKind.length > 0;
 				const rawPaths = params.paths;
-				if (
-					rawPaths !== undefined &&
-					(!Array.isArray(rawPaths) ||
-						rawPaths.length > MAX_PATHS ||
-						rawPaths.some((value) => typeof value !== "string"))
-				) {
-					const errorRaw = `paths must contain at most ${MAX_PATHS} string entries`;
+				// #5041: one reader owns the `paths` entry rules for every tool.
+				const pathsRead = readPathsArgument(rawPaths, {
+					cwd: ctx.cwd,
+					absent: "cwd",
+				});
+				if (pathsRead.refusal) {
+					const errorRaw = pathsRead.refusal;
 					logOutcome("error", { errorRaw });
 					return {
 						content: [{ type: "text" as const, text: `Error: ${errorRaw}` }],
@@ -597,12 +608,10 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					};
 				}
 
-				if (!lang.trim()) {
-					logOutcome("error", { errorRaw: "lang is required" });
+				if (langError) {
+					logOutcome("error", { errorRaw: langError });
 					return {
-						content: [
-							{ type: "text" as const, text: "Error: lang is required" },
-						],
+						content: [{ type: "text" as const, text: `Error: ${langError}` }],
 						isError: true,
 						details: {},
 					};
@@ -683,24 +692,19 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					};
 				}
 
-				// #747/#250: only guard the DEFAULTED-cwd case. Explicit `paths` are
-				// what the user asked to search — never second-guessed. But when no
-				// paths are given we fall back to `ctx.cwd`, and if that resolves at or
-				// above $HOME a full structural scan of the entire home tree would be
-				// spawned. Refuse and tell the caller how to scope it.
-				if (!paths?.length && isAtOrAboveHomeDir(ctx.cwd || ".")) {
-					logOutcome("error", {
-						errorRaw: "defaulted cwd resolves at or above home directory",
-					});
+				// #747/#250, lifted to `defaultedCwdHomeRefusal` by #5039: only the
+				// DEFAULTED-cwd case is guarded. Explicit `paths` are what the user asked
+				// to search — never second-guessed. But when no paths are given we fall
+				// back to `ctx.cwd`, and if that resolves at or above $HOME a full
+				// structural scan of the entire home tree would be spawned. Refuse and
+				// tell the caller how to scope it. Runs after the `paths` reader: an
+				// empty list is the reader's refusal even at home, and the guard keys
+				// on the raw argument because `absent: "cwd"` always fills the entries.
+				const homeRefusal = defaultedCwdHomeRefusal(paths, ctx.cwd);
+				if (homeRefusal) {
+					logOutcome("error", { errorRaw: homeRefusal.reason });
 					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Refused: no \`paths\` given and the working directory (${
-									ctx.cwd || "."
-								}) resolves at or above the home directory — searching it would scan every unrelated tree under your home. Pass explicit \`paths\`, or run from a project directory.`,
-							},
-						],
+						content: [{ type: "text" as const, text: homeRefusal.text }],
 						isError: true,
 						details: {},
 					};
@@ -723,7 +727,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 						details: {},
 					};
 				}
-				const searchPaths = resolveAstGrepPaths(paths, ctx.cwd);
+				const searchPaths = pathsRead.entries;
 				const PAGE_SIZE = Math.max(
 					1,
 					Math.min(
@@ -829,7 +833,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 							content: [
 								{
 									type: "text" as const,
-									text: errorTextWithHint(ruleResult.error),
+									text: errorTextWithHint(ruleResult.error, host),
 								},
 							],
 							isError: true,
@@ -886,7 +890,10 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					logOutcome("error", { errorRaw: result.error });
 					return {
 						content: [
-							{ type: "text" as const, text: errorTextWithHint(result.error) },
+							{
+								type: "text" as const,
+								text: errorTextWithHint(result.error, host),
+							},
 						],
 						isError: true,
 						details: {},
@@ -901,10 +908,16 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				const output = groupByFile
 					? formatGroupedByFile(page)
 					: astGrepClient.formatMatches(page, false, false, PAGE_SIZE);
-				const hint =
+				// #4682 shape 84 (F3): the no-match hint recommends sibling tools, so it
+				// follows the delivery host. Only the hint is translated, never the match
+				// text: a match can quote source that spells a tool name.
+				const rawHint =
 					page.length === 0 && !result.error
 						? getPatternHint(pattern, lang, selector)
 						: undefined;
+				const hint = rawHint
+					? translateGuidanceToolNames(rawHint, host)
+					: undefined;
 				const paginationNote =
 					hasMore && page.length > 0
 						? `\n\n(Showing ${page.length} of ${result.matches.length - skipOffset} remaining matches. Use skip=${skipOffset + PAGE_SIZE} for the next page.)`

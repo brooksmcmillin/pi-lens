@@ -43,13 +43,6 @@ vi.mock("../../clients/dispatch/integration.js", async (importOriginal) => ({
 	dispatchLintWithResult: vi.fn(),
 	computeCascadeForFile: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(),
-	resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
-}));
 vi.mock("../../clients/recent-touches.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/recent-touches.js")>()),
 	appendRecentTouches: vi.fn().mockResolvedValue(undefined),
@@ -152,8 +145,7 @@ import {
 	drainPendingRunnerFindings,
 	resetPendingRunnerFindings,
 } from "../../clients/dispatch/pending-runner-findings.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 function gate() {
 	let open!: () => void;
@@ -361,17 +353,16 @@ const ev = (toolName: string, filePath: string, id: string) => ({
 });
 
 describe("formal/dispatch-pipeline replays", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		clearWidgetState();
-		vi.mocked(getLSPService).mockReturnValue(
-			makeLspServiceDouble({
-				supportsLSP: () => false,
-				hasLSP: async () => false,
-				openFile: async () => {},
-				touchFile: async () => {},
-				getAllDiagnostics: async () => new Map(),
-			}) as never,
-		);
+		await installLspServiceDouble({
+			resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
+			supportsLSP: () => false,
+			hasLSP: async () => false,
+			openFile: async () => {},
+			touchFile: async () => {},
+			getAllDiagnostics: async () => new Map(),
+		});
 		vi.mocked(dispatchLintWithResult).mockReset();
 	});
 

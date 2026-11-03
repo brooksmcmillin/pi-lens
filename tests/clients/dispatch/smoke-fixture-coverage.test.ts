@@ -61,6 +61,7 @@ import {
 	availabilityProblems,
 	CAPTURED_OUTPUT_DIR,
 	cleanProblems,
+	CapturedOutput,
 	listCapturedOutputs,
 	provenanceProblems,
 } from "../../helpers/captured-runner-output.js";
@@ -153,10 +154,6 @@ const EXEMPT = new Map<string, string>([
 	[
 		"credo",
 		"alternate: elixir-check is the Elixir primary; credo is the config-gated alternate",
-	],
-	[
-		"detekt",
-		"alternate: ktlint is the Kotlin primary; detekt needs the detekt CLI plus its formatting plugin, which is not a single-binary install",
 	],
 	[
 		"prisma-validate",
@@ -570,6 +567,32 @@ describe("smoke-fixture coverage", () => {
 	});
 });
 
+/**
+ * Every `tests/fixtures/runner-exit-codes/<runner>/<case>.captured.json` as a
+ * `CapturedOutput`-shaped record. Built here, not in the helper, because the
+ * helper's population is `runner-output` by design.
+ */
+function listExitCodeFixtures(): CapturedOutput[] {
+	const root = path.join(repoRoot, "tests/fixtures/runner-exit-codes");
+	const out: CapturedOutput[] = [];
+	if (!fs.existsSync(root)) return out;
+	for (const runner of fs.readdirSync(root).sort()) {
+		const dir = path.join(root, runner);
+		for (const entry of fs.readdirSync(dir).sort()) {
+			if (!entry.endsWith(".captured.json")) continue;
+			// Raw fields only: a missing exitCode or stderr must reach the checks
+			// that refuse it, not a default that makes it look captured.
+			const parsed = JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8"));
+			out.push({
+				...parsed,
+				relPath: `tests/fixtures/runner-exit-codes/${runner}/${entry}`,
+				caseName: entry.replace(/\.captured\.json$/, ""),
+			} as CapturedOutput);
+		}
+	}
+	return out;
+}
+
 describe("captured real-bytes fixture provenance", () => {
 	const captured = listCapturedOutputs();
 
@@ -653,6 +676,78 @@ describe("captured real-bytes fixture provenance", () => {
 		).toEqual([]);
 	});
 
+	// #4522 review F3: the exit-code fixtures (`tests/fixtures/runner-exit-codes/`)
+	// are written by the same capture script, so they meet the same provenance and
+	// availability gates. They sit outside `runner-output`, so `listCapturedOutputs`
+	// never reached them; this walk is their census.
+	it("every exit-code fixture carries a complete provenance and availability record", () => {
+		const problems = listExitCodeFixtures().flatMap((fixture) => [
+			...provenanceProblems(fixture),
+			...availabilityProblems(fixture),
+		]);
+		expect(
+			problems,
+			`exit-code fixture(s) with an incomplete provenance or availability record. Re-capture with scripts/capture-runner-output.mjs --out-dir tests/fixtures/runner-exit-codes:\n${problems.join("\n")}`,
+		).toEqual([]);
+	});
+
+	// #4522 review R2 F3: the capture gate's own rule (recordProblems) runs over the
+	// exit-code root too. Without it, a version the probe never printed (the
+	// availability answer's banner disagreeing with the recorded version) passes
+	// this census. Recurrence: the round-2 census ran the provenance and
+	// availability checks and not the gate the capture itself uses.
+	it("every exit-code fixture passes the capture gate's record rule", () => {
+		const problems = listExitCodeFixtures().flatMap((fixture) =>
+			recordProblems(fixture),
+		);
+		expect(
+			problems,
+			`exit-code fixture(s) whose recorded answers the capture gate refuses:\n${problems.join("\n")}`,
+		).toEqual([]);
+	});
+
+	// A clean run is required of every runner-output fixture because the matrix's
+	// clean cell replays it. An exit-code fixture is a failing run whose input is
+	// the failure itself: the invalid configuration. A valid-config run of the
+	// same invocation is a different capture, so each fixture below is admitted
+	// without a clean run, by name, with its reason. Stale entries red.
+	const EXIT_CODE_CLEAN_ADMISSIONS: Record<string, string> = {
+		"detekt/broken-config":
+			"the malformed detekt.yml is the input; the same invocation on a valid config is not this probe",
+		"detekt/findings-then-exit1":
+			"the non-numeric build.weights value is the input that fails the run after it reports",
+	};
+	it("every exit-code fixture without a clean run is admitted by name with its reason", () => {
+		const fixtures = listExitCodeFixtures();
+		const unadmitted = fixtures
+			.filter((f) => !f.clean)
+			.filter(
+				(f) =>
+					!(
+						f.relPath
+							.replace(/^tests\/fixtures\/runner-exit-codes\//, "")
+							.replace(/\.captured\.json$/, "") in EXIT_CODE_CLEAN_ADMISSIONS
+					),
+			)
+			.map((f) => f.relPath);
+		expect(
+			unadmitted,
+			`exit-code fixture(s) with no clean run and no named admission: ${unadmitted.join(", ")}`,
+		).toEqual([]);
+		const stale = Object.keys(EXIT_CODE_CLEAN_ADMISSIONS).filter(
+			(key) =>
+				!fixtures.some(
+					(f) =>
+						f.relPath ===
+						`tests/fixtures/runner-exit-codes/${key}.captured.json`,
+				),
+		);
+		expect(
+			stale,
+			`stale clean-run admission(s) with no such exit-code fixture: ${stale.join(", ")}`,
+		).toEqual([]);
+	});
+
 	// #4522 F1: `.gitignore` ignores `*.js` and `*.md` globally, so a clean
 	// workspace whose inputs are JavaScript or Markdown was captured, replayed
 	// from the working tree, and never committed: five fixtures named workspaces
@@ -663,6 +758,7 @@ describe("captured real-bytes fixture provenance", () => {
 		const roots = [
 			path.join(repoRoot, "tests/fixtures/runner-output"),
 			path.join(repoRoot, "tests/fixtures/runner-output-clean"),
+			path.join(repoRoot, "tests/fixtures/runner-exit-codes"),
 		];
 		const inputs: string[] = [];
 		const walk = (dir: string): void => {
@@ -871,6 +967,14 @@ describe("tier-1 parser lane", () => {
 		// The message keeps its counts (the helper's record supplies them).
 		expect(passFloorBreach(unavailable, 3)).toContain(
 			"1 runner(s) passed, at least 3 required (2 unavailable)",
+		);
+		// The sentence follows what happened (#5021 verify F10): a lane that
+		// passed servers did install something, so it must not say it installed
+		// nothing; one that passed nothing still says so.
+		expect(passFloorBreach(unavailable, 3)).not.toContain("installs nothing");
+		expect(passFloorBreach(unavailable, 3)).toContain("fewer servers");
+		expect(passFloorBreach([{ state: "skip" as const }], 1)).toContain(
+			"installs nothing",
 		);
 		// A floor that is not a number (`--min-pass=abc`) is red, never "no floor".
 		expect(() => passFloorBreach(unavailable, Number.NaN)).toThrow(TypeError);

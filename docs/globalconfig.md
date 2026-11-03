@@ -18,6 +18,10 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--no-tests` | `tests.enabled` | `true` |
 | `--no-delta` | `delta.enabled` | `true` |
 | `--no-opengrep` | `opengrep.enabled` | `true` |
+| `--no-ast-grep` | `astGrep.enabled` | `true` |
+| `--no-zizmor` | `zizmor.enabled` | `true` |
+| `--no-typos` | `typos.enabled` | `true` |
+| `--lens-spotbugs` | `spotbugs.enabled` | `false` |
 | `--no-read-guard` | `readGuard.enabled` | `true` |
 | `--no-autoformat` | `format.enabled` | `true` |
 | `--no-autofix` | `autofix.enabled` | `true` |
@@ -25,6 +29,7 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--lens-guard` | `guard.enabled` | `false` |
 | `--lens-checkout-guard` | `guard.sharedCheckout` | `false` |
 | `--immediate-format` | `format.mode` (`"immediate"`) | `"deferred"` |
+| `--lens-retain-injections` | `contextInjection.retain` | `false` |
 | `--lens-turn-summary` | `turnSummary.enabled` | `false` |
 | `--lens-actionable-warnings` | `actionableWarnings.enabled` | `false` |
 | `--lens-actionable-warning-actions` | `actionableWarnings.includeLspCodeActions` | `false` |
@@ -36,6 +41,7 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--lens-compact-widget` | `ui.compactWidget` | `false` |
 | `--no-lazy-tools` | `tools.lazy` | `true` |
 | `--lens-turn-end-madge` | `turnEnd.madge.enabled` | `false` |
+| `--lens-fallow` | `fallow.enabled` | `false` |
 | `--no-knip` | `knip.enabled` | `true` |
 | `--no-jscpd` | `jscpd.enabled` | `true` |
 | `--no-madge` | `madge.enabled` | `true` |
@@ -51,15 +57,41 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `startup.mode` | `full` | `quick`, `full`, or `minimal`; `PI_LENS_STARTUP_MODE` wins |
 | `startup.scans.enabled` | `true` | `true` or `false` |
 
-By default pi-lens registers five situational tools (the `ast_grep_*` family,
-`lsp_navigation`, `lens_diagnostic_mark`) inactive and exposes a small loader,
+pi-lens registers five situational tools (the `ast_grep_*` family,
+`lsp_navigation`, `lens_diagnostic_mark`) and a small loader,
 `pi_lens_activate_tools`, that the model calls to activate the ones it needs.
-`--no-lazy-tools` turns that off: every pi-lens tool is active from the first
-turn and pi-lens never changes the tool list. Use it if you would rather spend
-the tokens of a longer tool list than have the list change mid-session. The
-loader tool is still registered and still describes itself as activating
-inactive tools; under this flag those tools are already active, so calling it
-does nothing.
+`tools.lazy` decides whether the situational tools start inactive:
+
+| `tools.lazy` | Situational tools |
+| --- | --- |
+| `true` (default) | Start inactive on every model. |
+| `"auto"` | Start inactive only when the session's model keeps mid-conversation system messages (`compat.supportsMidConvoSystemMessages` is `true`). On any other model, including one that does not state the fact, every tool is active from the first turn. Before a model is known, the tools start inactive. |
+| `false`, or `--no-lazy-tools` | Every tool is active for the whole session and pi-lens never changes the tool list. |
+
+Why `true` is the default: a model without that fact gets every system message
+folded into one prompt head, so each tool-list change rewrites the whole cached
+prompt. Activations are rare, though. Over the window measured for #4687 the
+loader ran about once per 3,329 requests, while carrying every situational
+schema on every request costs more than the rewrites once activations are
+rarer than about one per 1,000 requests. `"auto"` is there for a workload that
+activates often on a folding model.
+
+Under `"auto"`, pi-lens decides at session start and again only when you
+switch models, never between turns of one model. A switch to a folding model
+activates every enabled situational tool. A switch back deactivates only the
+ones the conversation never activated or called. Any other value is reported
+once as an ignored setting, and the default applies.
+
+Precedence: `tools.<name>.enabled` (in either config file, or `--no-tool`)
+filters first. A disabled tool is never registered, so it is absent under every
+`tools.lazy` value and the loader refuses to activate it. `tools.lazy` then
+applies only to the enabled situational tools. It is user-level only: a project
+`.pi-lens.json` that sets it, `"auto"` included, is reported and ignored. The
+CLI flag outranks the key.
+
+The loader tool stays registered under every value and keeps describing itself
+as activating inactive tools; when the tools it names are already active,
+calling it does nothing.
 
 Keys are positive (`"enabled": true` means the feature runs), so a `--no-*` flag corresponds to setting its key `false`. A `no-*` flag on the command line is a one-way switch: it can disable, never re-enable, so `--no-lsp` wins over `lsp.enabled: true` but nothing on the CLI overrides `lsp.enabled: false`. Set the key back to `true` to re-enable.
 
@@ -112,11 +144,15 @@ Hide the diagnostics widget by default, run formatting immediately after write/e
 
 `contextInjection.enabled` (default `true`) controls whether pi-lens prepends automatic findings — session-start guidance, turn-end findings, and test findings — into the next model turn. Set it to `false` (or use `--no-lens-context` / `PI_LENS_NO_CONTEXT_INJECTION=1` / `/lens-context-toggle`) to keep tools, LSP, read-guard, and formatting running while avoiding the prompt-cache invalidation that injected messages cause in long, cache-sensitive sessions. Findings are still cached, so `lens_diagnostics` and `/lens-health` keep working.
 
+`contextInjection.retain` (default `false`, or `--lens-retain-injections`) keeps injection on and makes it cache-stable instead. An injection normally rides one provider request: pi rebuilds the next request from its own transcript, so that request no longer carries it, and an engine that caches by exact prefix (a local llama.cpp or Qwen server) re-processes everything after the point where it sat. With `retain` on, pi-lens re-sends each injection's bytes unchanged, at the same place, in every later request of the session, so each request is the previous one plus new content. Findings are still delivered once; each retained block ends with a snapshot label naming `lens_diagnostics` for the current state. A compaction, a `/tree` move, or a new, resumed, forked or reloaded session drops what was retained. A session holds at most 64 retained injections and 256 KiB; past either, a new injection reaches its one request only and one `context-injection-retain-declined` degradation row is recorded.
+
 `contextInjection.requirePreExistingFixes` (default `true`) controls whether the session-start orientation tells the agent to fix pre-existing blocking errors; set `false` to scope that demand to errors its own edits introduce.
 
 `actionableWarnings.enabled` gates the turn_end report. `includeLspCodeActions` fetches LSP code actions for each warning (requires an active language server). `deltaOnly` (default `true`) limits the report to lines touched in the current turn. `autoFix.enabled` applies conservative LSP quickfixes at `agent_end`; `autoFix.maxFixes` caps the number applied per turn (default `5`, must be a non-negative whole number). `maxFixes: 0` keeps the report and applies nothing, which is a useful halfway step before enabling `autoFix` for real. Unlike the toggles in the table above there is no CLI counterpart, since it takes a number rather than being on or off.
 
 `turnEnd.madge.enabled` (default `false`) runs the per-turn-end madge circular-dependency check on import-changed files. It is off by default because that pass only writes debug output — user-facing madge diagnostics come from the session-start scan cache and the `lens_diagnostics` extractor — and its subprocess spawns dominated the turn-end latency tail (#766). Enable it with `--lens-turn-end-madge` or `turnEnd.madge.enabled: true` if you want the per-edit circular-dependency note.
+
+`fallow.enabled` (default `false`, or `--lens-fallow`) runs [fallow](https://github.com/fallow-rs/fallow)'s `fallow-lsp` beside the TypeScript server on JS/TS files (`.ts .tsx .js .jsx .mjs .cjs .mts .cts`; no other file ever attaches it). It reports unused files, exports and dependencies, duplication and cycles as advisory warnings and never blocks. It overlaps knip, jscpd and madge, which keep running either way. Only the exact value `true` turns it on: an absent, misspelled or non-boolean value leaves it off, and pi-lens installs and launches nothing. On first use pi-lens downloads the pinned fallow release into `~/.pi-lens/tools/fallow-lsp` (a `fallow-lsp` already on `PATH` wins); the install is refused on a checksum mismatch. The per-edit diagnostics path runs it; the aggregate all-server checks (`lens_diagnostics source=lsp`, workspace sweeps) do not start it.
 
 `ignore` is an array of gitignore-style glob patterns excluded from pi-lens scans across **every** project — the global counterpart to the per-project `.pi-lens.json` `ignore` below. Precedence is lowest: a project `.gitignore` or `.pi-lens.json` (including a `!negation`) overrides it, so you can globally hide e.g. `scratch/**` and still re-include it in one repo.
 
@@ -127,12 +163,16 @@ Turn subsystems off globally instead of retyping flags every session:
   "lsp": { "enabled": false },
   "tests": { "enabled": false },
   "opengrep": { "enabled": false },
+  "astGrep": { "enabled": false },
+  "zizmor": { "enabled": false },
+  "typos": { "enabled": false },
+  "spotbugs": { "enabled": true },
   "readGuard": { "enabled": false },
   "guard": { "enabled": true }
 }
 ```
 
-`lens.enabled: false` starts every session with pi-lens off (the `--no-lens` equivalent); `/lens-toggle` still re-enables it for one session. `lsp.enabled: false` falls back to language-specific checkers such as pyright. `tests.enabled: false` skips the on-write test runner. `delta.enabled: false` reports every diagnostic rather than only ones introduced this turn. `opengrep.enabled: false` detaches the Opengrep security scanner. `readGuard.enabled: false` turns off the read-before-edit monitor. `guard.enabled: true` opts into the experimental commit/push blocker.
+`lens.enabled: false` starts every session with pi-lens off (the `--no-lens` equivalent); `/lens-toggle` still re-enables it for one session. `lsp.enabled: false` falls back to language-specific checkers such as pyright. `tests.enabled: false` skips the on-write test runner. `delta.enabled: false` reports every diagnostic rather than only ones introduced this turn. `opengrep.enabled: false` detaches the Opengrep security scanner. `astGrep.enabled: false` detaches the ast-grep auxiliary server. `zizmor.enabled: false` and `typos.enabled: false` detach the zizmor and typos auxiliary servers. `spotbugs.enabled: true` opts into SpotBugs on Java and Kotlin files (it also needs a Java build descriptor and a compiled `.class` directory). `readGuard.enabled: false` turns off the read-before-edit monitor. `guard.enabled: true` opts into the experimental commit/push blocker.
 
 The `tools.<name>.enabled` setting controls each model-facing tool. Valid names
 include `ast_grep_search`, `ast_grep_replace`, `ast_grep_outline`,

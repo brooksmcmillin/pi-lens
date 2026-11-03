@@ -24,13 +24,6 @@ import {
 } from "../../clients/degradation-ledger.js";
 
 const lsp = vi.hoisted(() => ({ service: undefined as unknown }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => lsp.service,
-}));
-
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
@@ -39,6 +32,7 @@ import {
 	_observedMutationStateForTests,
 	resetObservedMutationNet,
 } from "../../clients/observed-mutation.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
 function gate() {
 	let open!: () => void;
@@ -168,15 +162,17 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 	it("an agent write made while the rename is computed is not overwritten, and the refusal names the file", async () => {
 		const parked = gate();
 		const resume = gate();
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			rename: async () => {
-				parked.open();
-				await resume.p;
-				return valueEdit();
-			},
-		});
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				rename: async () => {
+					parked.open();
+					await resume.p;
+					return valueEdit();
+				},
+			}),
+		);
 
 		const pending = runRename();
 		await parked.p;
@@ -197,24 +193,26 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 	it("an agent write to a NON-target file made while the rename is computed is not overwritten, and the refusal names the file", async () => {
 		const parked = gate();
 		const resume = gate();
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			getTrackedContent: trackedSends({
-				[fileA]: "const = 1;\n",
-				[fileB]: "const = 2;\n",
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				getTrackedContent: trackedSends({
+					[fileA]: "const = 1;\n",
+					[fileB]: "const = 2;\n",
+				}),
+				rename: async () => {
+					parked.open();
+					await resume.p;
+					return {
+						changes: {
+							...valueEdit(fileA).changes,
+							...valueEdit(fileB).changes,
+						},
+					};
+				},
 			}),
-			rename: async () => {
-				parked.open();
-				await resume.p;
-				return {
-					changes: {
-						...valueEdit(fileA).changes,
-						...valueEdit(fileB).changes,
-					},
-				};
-			},
-		});
+		);
 
 		const pending = runRename();
 		await parked.p;
@@ -245,25 +243,27 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 		]);
 		const parked = gate();
 		const resume = gate();
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			// Production's client records each send's hash, and stamps it when the
-			// bytes change (clients/lsp/client.ts `recordSentContent`).
-			touchFile: vi.fn(async (p: string, content: string) => {
-				const key = fs.realpathSync(p);
-				const hash = hashDiagnosticContent(content);
-				if (sends.get(key)?.hash !== hash)
-					sends.set(key, { hash, changedAtMs: Date.now() });
-				return { diags: [] };
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				// Production's client records each send's hash, and stamps it when the
+				// bytes change (clients/lsp/client.ts `recordSentContent`).
+				touchFile: vi.fn(async (p: string, content: string) => {
+					const key = fs.realpathSync(p);
+					const hash = hashDiagnosticContent(content);
+					if (sends.get(key)?.hash !== hash)
+						sends.set(key, { hash, changedAtMs: Date.now() });
+					return { diags: [] };
+				}),
+				getTrackedContent: vi.fn((p: string) => sends.get(fs.realpathSync(p))),
+				rename: async () => {
+					parked.open();
+					await resume.p;
+					return twoFileEdit();
+				},
 			}),
-			getTrackedContent: vi.fn((p: string) => sends.get(fs.realpathSync(p))),
-			rename: async () => {
-				parked.open();
-				await resume.p;
-				return twoFileEdit();
-			},
-		});
+		);
 
 		const pending = runRename();
 		await parked.p;
@@ -285,25 +285,27 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 	});
 
 	it("an agent write to a non-target file made after the capture read is not overwritten", async () => {
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			// The client tracked the second file's current bytes, so capture passes
-			// and the agent's write lands in the window before the apply. The write
-			// runs inside the tracked-hash lookup, which the capture makes after it
-			// has read the file.
-			getTrackedContent: vi.fn((p: string) => {
-				const sent = pastSend(p === fileA ? "const = 1;\n" : "const = 2;\n");
-				if (sameFile(p, fileB)) fs.writeFileSync(fileB, "AGENT = 7;\n");
-				return sent;
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				// The client tracked the second file's current bytes, so capture passes
+				// and the agent's write lands in the window before the apply. The write
+				// runs inside the tracked-hash lookup, which the capture makes after it
+				// has read the file.
+				getTrackedContent: vi.fn((p: string) => {
+					const sent = pastSend(p === fileA ? "const = 1;\n" : "const = 2;\n");
+					if (sameFile(p, fileB)) fs.writeFileSync(fileB, "AGENT = 7;\n");
+					return sent;
+				}),
+				rename: async () => ({
+					changes: {
+						...valueEdit(fileA).changes,
+						...valueEdit(fileB).changes,
+					},
+				}),
 			}),
-			rename: async () => ({
-				changes: {
-					...valueEdit(fileA).changes,
-					...valueEdit(fileB).changes,
-				},
-			}),
-		});
+		);
 
 		const result = await runRename();
 
@@ -327,14 +329,16 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 			clientStartedAtMs,
 		});
 		const run = async (clientStartedAtMs?: number) => {
-			lsp.service = makeLspServiceDouble({
-				supportsLSP: () => true,
-				hasLSP: async () => true,
-				getTrackedContent: vi.fn((p: string) =>
-					sameFile(p, fileB) ? firstOpen(clientStartedAtMs) : undefined,
-				),
-				rename: async () => twoFileEdit(),
-			});
+			lsp.service = installLspService(
+				makeLspServiceDouble({
+					supportsLSP: () => true,
+					hasLSP: async () => true,
+					getTrackedContent: vi.fn((p: string) =>
+						sameFile(p, fileB) ? firstOpen(clientStartedAtMs) : undefined,
+					),
+					rename: async () => twoFileEdit(),
+				}),
+			);
 			return runRename();
 		};
 
@@ -352,13 +356,15 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 		// Written 1.5 s before the request, inside the 2 s margin: the server
 		// may have read either side of that write.
 		ageFile(fileB, 1500);
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			// Only the target was ever sent; the server reads the other from disk.
-			getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
-			rename: async () => twoFileEdit(),
-		});
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				// Only the target was ever sent; the server reads the other from disk.
+				getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
+				rename: async () => twoFileEdit(),
+			}),
+		);
 
 		const result = await runRename();
 
@@ -376,12 +382,14 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 	it("an unopened, untouched non-target file older than the margin is renamed with its target", async () => {
 		// A cross-file rename whose other file the server read from disk.
 		ageFile(fileB, 2500);
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
-			rename: async () => twoFileEdit(),
-		});
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
+				rename: async () => twoFileEdit(),
+			}),
+		);
 
 		const result = await runRename();
 
@@ -395,16 +403,18 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 		ageFile(fileB, 3_600_000);
 		const parked = gate();
 		const resume = gate();
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
-			rename: async () => {
-				parked.open();
-				await resume.p;
-				return twoFileEdit();
-			},
-		});
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
+				rename: async () => {
+					parked.open();
+					await resume.p;
+					return twoFileEdit();
+				},
+			}),
+		);
 
 		const pending = runRename();
 		await parked.p;
@@ -440,19 +450,21 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 		// comparison can catch it.
 		ageFile(fileB, 3_600_000);
 		const oldMtime = fs.statSync(fileB).mtime;
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			getTrackedContent: vi.fn((p: string) => {
-				if (sameFile(p, fileB)) {
-					fs.writeFileSync(fileB, "AGENT = 6;\n");
-					fs.utimesSync(fileB, oldMtime, oldMtime);
-					return undefined;
-				}
-				return pastSend("const = 1;\n");
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				getTrackedContent: vi.fn((p: string) => {
+					if (sameFile(p, fileB)) {
+						fs.writeFileSync(fileB, "AGENT = 6;\n");
+						fs.utimesSync(fileB, oldMtime, oldMtime);
+						return undefined;
+					}
+					return pastSend("const = 1;\n");
+				}),
+				rename: async () => twoFileEdit(),
 			}),
-			rename: async () => twoFileEdit(),
-		});
+		);
 
 		const result = await runRename();
 
@@ -464,20 +476,22 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 	});
 
 	it("a tracked non-target file that has not changed is renamed with its target", async () => {
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			getTrackedContent: trackedSends({
-				[fileA]: "const = 1;\n",
-				[fileB]: "const = 2;\n",
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				getTrackedContent: trackedSends({
+					[fileA]: "const = 1;\n",
+					[fileB]: "const = 2;\n",
+				}),
+				rename: async () => ({
+					changes: {
+						...valueEdit(fileA).changes,
+						...valueEdit(fileB).changes,
+					},
+				}),
 			}),
-			rename: async () => ({
-				changes: {
-					...valueEdit(fileA).changes,
-					...valueEdit(fileB).changes,
-				},
-			}),
-		});
+		);
 
 		const result = await runRename();
 
@@ -489,33 +503,35 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 
 	it("a file the edit creates is not content-checked and is written", async () => {
 		const created = path.join(env.tmpDir, "c.ts");
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			// The created file cannot be tracked; only the target exists.
-			getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
-			rename: async () => ({
-				documentChanges: [
-					{ kind: "create", uri: pathToFileURL(created).href },
-					{
-						textDocument: { uri: pathToFileURL(created).href, version: null },
-						edits: [
-							{
-								range: {
-									start: { line: 0, character: 0 },
-									end: { line: 0, character: 0 },
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				// The created file cannot be tracked; only the target exists.
+				getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
+				rename: async () => ({
+					documentChanges: [
+						{ kind: "create", uri: pathToFileURL(created).href },
+						{
+							textDocument: { uri: pathToFileURL(created).href, version: null },
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "export {};\n",
 								},
-								newText: "export {};\n",
-							},
-						],
-					},
-					{
-						textDocument: { uri: pathToFileURL(fileA).href, version: null },
-						edits: valueEdit(fileA).changes[pathToFileURL(fileA).href],
-					},
-				],
+							],
+						},
+						{
+							textDocument: { uri: pathToFileURL(fileA).href, version: null },
+							edits: valueEdit(fileA).changes[pathToFileURL(fileA).href],
+						},
+					],
+				}),
 			}),
-		});
+		);
 
 		const result = await runRename();
 
@@ -528,20 +544,22 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 	it("a file the edit only deletes is not a text edit and is not refused as untracked", async () => {
 		const doomed = path.join(env.tmpDir, "d.ts");
 		fs.writeFileSync(doomed, "const = 3;\n");
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
-			rename: async () => ({
-				documentChanges: [
-					{ kind: "delete", uri: pathToFileURL(doomed).href },
-					{
-						textDocument: { uri: pathToFileURL(fileA).href, version: null },
-						edits: valueEdit(fileA).changes[pathToFileURL(fileA).href],
-					},
-				],
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				getTrackedContent: trackedSends({ [fileA]: "const = 1;\n" }),
+				rename: async () => ({
+					documentChanges: [
+						{ kind: "delete", uri: pathToFileURL(doomed).href },
+						{
+							textDocument: { uri: pathToFileURL(fileA).href, version: null },
+							edits: valueEdit(fileA).changes[pathToFileURL(fileA).href],
+						},
+					],
+				}),
 			}),
-		});
+		);
 
 		const result = await runRename();
 
@@ -557,18 +575,20 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 		// answer is computed from the re-sent bytes, so the agent edit made
 		// before the retry is not a stale write.
 		let calls = 0;
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			rename: async () => {
-				calls++;
-				if (calls === 1) {
-					fs.writeFileSync(fileA, "const = 1;\n// agent comment\n");
-					return null;
-				}
-				return valueEdit();
-			},
-		});
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				rename: async () => {
+					calls++;
+					if (calls === 1) {
+						fs.writeFileSync(fileA, "const = 1;\n// agent comment\n");
+						return null;
+					}
+					return valueEdit();
+				},
+			}),
+		);
 
 		const result = await runRename();
 
@@ -582,27 +602,29 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 		fs.writeFileSync(fileA, "");
 		const parked = gate();
 		const resume = gate();
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			rename: async () => {
-				parked.open();
-				await resume.p;
-				return {
-					changes: {
-						[pathToFileURL(fileA).href]: [
-							{
-								range: {
-									start: { line: 0, character: 0 },
-									end: { line: 0, character: 0 },
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				rename: async () => {
+					parked.open();
+					await resume.p;
+					return {
+						changes: {
+							[pathToFileURL(fileA).href]: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "let",
 								},
-								newText: "let",
-							},
-						],
-					},
-				};
-			},
-		});
+							],
+						},
+					};
+				},
+			}),
+		);
 
 		const pending = runRename();
 		await parked.p;
@@ -619,11 +641,13 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 	});
 
 	it("no-drop: with no write in between, the rename applies and records no stale content", async () => {
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			hasLSP: async () => true,
-			rename: async () => valueEdit(),
-		});
+		lsp.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				rename: async () => valueEdit(),
+			}),
+		);
 
 		const result = await runRename();
 
@@ -654,15 +678,17 @@ describe("#3763 lsp_navigation bookkeeps under the session it was called in", ()
 			const cacheManager = new CacheManager(false);
 			const parked = gate();
 			const resume = gate();
-			lsp.service = makeLspServiceDouble({
-				supportsLSP: () => true,
-				hasLSP: async () => true,
-				rename: async () => {
-					parked.open();
-					await resume.p;
-					return valueEdit();
-				},
-			});
+			lsp.service = installLspService(
+				makeLspServiceDouble({
+					supportsLSP: () => true,
+					hasLSP: async () => true,
+					rename: async () => {
+						parked.open();
+						await resume.p;
+						return valueEdit();
+					},
+				}),
+			);
 			const tool = createLspNavigationTool((flag) => flag === "lens-lsp", {
 				runtime,
 				cacheManager,

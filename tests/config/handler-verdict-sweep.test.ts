@@ -57,6 +57,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -78,6 +79,8 @@ const INTENTIONAL_DEGRADATION: Readonly<Record<string, string>> = {
 		"Calls the throwing handler three times to assert the ledger keeps one record per tool name; the helper refuses a call after a recorded swallow, which is the state under test.",
 	"tests/clients/pi-host-contract.test.ts :: still blocks an unread edit when the attribution cleanup throws":
 		"Makes the blocked-attribution cleanup throw to assert the block verdict survives and the swallow is recorded under attribution-cleanup:<tool>; the recorded throw is the assertion.",
+	"tests/clients/runtime-tool-call.test.ts :: reports PARTIAL APPLY when tool_call throws after rewriting the batch":
+		"Makes the input's setter throw after the partial-apply rewrite (#5125 r1 F2) to assert the call runs and its tool_result still reports the partial apply; the recorded tool-call-handler-throw row is asserted, and the helper would fail the call this test requires to succeed.",
 };
 
 export interface HandlerCallScan {
@@ -199,36 +202,48 @@ function scanPopulation(): PopulationScan {
 describe("#3518 — handleToolCall is called through the swallowed-throw check", () => {
 	const population = scanPopulation();
 
-	it("scans a real population (floor)", () => {
-		assertNonEmptyScan(
-			"handler-verdict sweep: test files",
-			population.scannedFiles,
-			400,
-		);
-		// 14 migrated files held 135 call sites (130 checked, 5 registered raw) when this sweep landed.
-		assertNonEmptyScan(
-			"handler-verdict sweep: checked call sites",
-			population.checked,
-			120,
-		);
-	});
+	it(
+		"scans a real population (floor)",
+		() => {
+			assertNonEmptyScan(
+				"handler-verdict sweep: test files",
+				population.scannedFiles,
+				400,
+			);
+			// 14 migrated files held 135 call sites (130 checked, 5 registered raw) when this sweep landed.
+			assertNonEmptyScan(
+				"handler-verdict sweep: checked call sites",
+				population.checked,
+				120,
+			);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("has no raw handleToolCall call outside the registered intentional-degradation tests", () => {
-		const audit = auditRegistry({
-			sweepName: "handler-verdict sweep",
-			flagged: population.flagged,
-			registered: [],
-			exemptions: INTENTIONAL_DEGRADATION,
-			requireUniqueFlagged: false,
-			minFlagged: 1,
-			remediation: `Wrap the call: await ${HELPER}(() => handleToolCall(deps)) from tests/support/handler-verdict.ts. handleToolCall swallows every throw as "no opinion", so an unchecked verdict can pass on a crashed handler (#4182). A test that makes the handler throw on purpose is registered in INTENTIONAL_DEGRADATION with its reason.`,
-		});
-		expect(audit.problems).toEqual([]);
-	});
+	it(
+		"has no raw handleToolCall call outside the registered intentional-degradation tests",
+		() => {
+			const audit = auditRegistry({
+				sweepName: "handler-verdict sweep",
+				flagged: population.flagged,
+				registered: [],
+				exemptions: INTENTIONAL_DEGRADATION,
+				requireUniqueFlagged: false,
+				minFlagged: 1,
+				remediation: `Wrap the call: await ${HELPER}(() => handleToolCall(deps)) from tests/support/handler-verdict.ts. handleToolCall swallows every throw as "no opinion", so an unchecked verdict can pass on a crashed handler (#4182). A test that makes the handler throw on purpose is registered in INTENTIONAL_DEGRADATION with its reason.`,
+			});
+			expect(audit.problems).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("has no handleToolCall reference that evades the call-shaped check", () => {
-		expect(population.escapes).toEqual([]);
-	});
+	it(
+		"has no handleToolCall reference that evades the call-shaped check",
+		() => {
+			expect(population.escapes).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("pins the pi mock wrapping every tool_call registration in the helper", () => {
 		const source = fs.readFileSync(

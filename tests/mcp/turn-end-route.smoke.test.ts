@@ -267,6 +267,22 @@ describe("warm turn-end IPC route (real spawn)", { retry: 2 }, () => {
 		expect(reply.result).toMatchObject({ route: "turn-end" });
 	}, 40_000);
 
+	// #2556 RECURRENCE GUARDED: the guard read `path.relative(DEFAULT_CWD, cwd)
+	// .startsWith("..")`, so a package directory named `..pkg` inside the
+	// workspace was rejected as foreign and its turn-end never ran.
+	it("accepts a turn-end request for a ..-named subdirectory of its workspace (#2556)", async () => {
+		const nested = path.join(projectDir, "..pkg");
+		fs.mkdirSync(nested, { recursive: true });
+		const reply = await ask(endpoint, {
+			route: "turn-end",
+			version: WARM_TURN_END_SCHEMA_VERSION,
+			cwd: nested,
+		});
+
+		expect(reply.error).toBeUndefined();
+		expect(reply.result).toMatchObject({ route: "turn-end" });
+	}, 40_000);
+
 	// Re-confirms the exact-same-string root is accepted now that the guard no
 	// longer special-cases it with a `target === DEFAULT_CWD` fast path — every
 	// acceptance (including this one) now flows through the `rel === ""` branch,

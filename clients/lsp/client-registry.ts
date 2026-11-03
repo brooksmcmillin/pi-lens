@@ -26,7 +26,7 @@ import {
 	findLocalBinUpwards,
 	isProjectLocalBinPath,
 } from "../package-manager.js";
-import { isWindowsPath, normalizeMapKey } from "../path-utils.js";
+import { isWithinForm, normalizeMapKey } from "../path-utils.js";
 import {
 	assertInstallAllowed,
 	isLspSpawnAllowedByTrust,
@@ -50,6 +50,8 @@ import {
 	withLspProjectCodePermission,
 } from "./launch.js";
 import {
+	declinesLooseFileRoot,
+	declinesProjectlessRoot,
 	enforceLspRootCeiling,
 	getServerById,
 	hasProjectBoundaryMarker,
@@ -300,11 +302,19 @@ export class ClientRegistry {
 	readonly inFlight = new Map<string, Promise<SpawnedServer | undefined>>();
 	/** Epoch ms of each key's last successful spawn. */
 	readonly clientSpawnedAt = new Map<string, number>();
+	/**
+	 * Epoch ms each live client's LAUNCH began, before its process read the
+	 * tree (#4532 round 5, review F6). The install look compares an install
+	 * against this: `clientSpawnedAt` is stamped after the initialize handshake,
+	 * so an install that landed while the server was starting read as older
+	 * than the client and became the baseline. Kept apart from
+	 * `clientSpawnedAt` because the #1127 breaker measures post-init uptime from
+	 * that one. Same key and lifetime: written beside it, retired with it.
+	 */
+	readonly clientLaunchStartedAt = new Map<string, number>();
 	private readonly hooks: ClientGenerationHooks;
 	private readonly sessionCwd: string | undefined;
 	private readonly workspaceProbeLogged = new Set<string>();
-	/** Per-service immutable root-boundary verdicts; root detectors cache hits too. */
-	private readonly projectBoundaryCache = new Map<string, Promise<boolean>>();
 	/** Foreign roots are recorded once per normalized root for this service/session. */
 	private readonly warmStartLogged = new Set<string>();
 	private readonly optionalFailureLogged = new Set<string>();
@@ -542,30 +552,28 @@ export class ClientRegistry {
 		])) {
 			if (!key.startsWith(prefix)) continue;
 			const ancestorKey = key.slice(prefix.length);
-			const pathApi =
-				isWindowsPath(ancestorKey) || isWindowsPath(rootKey)
-					? path.win32
-					: path;
-			const relative = pathApi.relative(ancestorKey, rootKey);
-			if (
-				relative === "" ||
-				relative.startsWith("..") ||
-				pathApi.isAbsolute(relative)
-			) {
+			// Both are `normalizeMapKey` identities, so the text comparison is
+			// exact (no filesystem work per hosted client). Strictly below: the
+			// same key is the client itself, not an ancestor.
+			if (ancestorKey === rootKey || !isWithinForm(rootKey, ancestorKey))
 				continue;
-			}
 			if (!nearestAncestor || ancestorKey.length > nearestAncestor.length) {
 				nearestAncestor = ancestorKey;
 			}
 		}
 		if (!nearestAncestor) return root;
-		const boundaryKey = `${server.id}:${rootKey}`;
-		let boundary = this.projectBoundaryCache.get(boundaryKey);
-		if (!boundary) {
-			boundary = hasProjectBoundaryMarker(root, server);
-			this.projectBoundaryCache.set(boundaryKey, boundary);
-		}
-		if (await boundary) return root;
+		// #4532 gap 14: the boundary verdict is read from the disk on every
+		// resolution, never stored. It used to be cached per (server, root) for the
+		// service's life, negatives included, so a marker created in a subdirectory
+		// after its ancestor's client answered kept the subdirectory coalesced into
+		// that ancestor — its own `pyrightconfig.json` and manifests reached no
+		// server, and no client was ever hosted there (real pyright 1.1.414: stale
+		// through 40 calls over 20.25 s). `NearestRoot` already answers the same
+		// question this way (#3412): a miss is never cached. The probe is one
+		// directory's marker set — 0.024 ms on an early hit, 0.35 ms marker-less,
+		// measured — and it only runs when a nested candidate has a hosted
+		// same-server ancestor, after the per-call root walk above it.
+		if (await hasProjectBoundaryMarker(root, server)) return root;
 		return (
 			this.clients.get(`${server.id}:${nearestAncestor}`)?.root ??
 			nearestAncestor
@@ -710,6 +718,7 @@ export class ClientRegistry {
 		this.hooks.releaseNotifyWrite(key);
 		this.clients.delete(key);
 		this.clientSpawnedAt.delete(key);
+		this.clientLaunchStartedAt.delete(key);
 		this.hooks.forgetReadiness(key);
 		this.clientLastUsedAt.delete(key);
 		if (this.adoptedClientKeys.delete(key)) {
@@ -841,6 +850,38 @@ export class ClientRegistry {
 	}
 
 	/**
+	 * #4532: the roots of the live PRIMARY clients, each with the epoch ms its
+	 * earliest live client at that root spawned. The out-of-band install look
+	 * runs at these roots as well as the session's cwd, so a dependency install
+	 * in a LINKED WORKTREE — a root the session cwd is not under — restarts that
+	 * worktree's server. Read-only: never spawns and never waits.
+	 *
+	 * The earliest spawn, not the latest: `restartPrimaryClientsUnder` retires
+	 * every primary overlapping a root, so a root whose newer client spawned
+	 * after an install must not hide an older one that read the pre-install
+	 * tree. The epoch is the client's LAUNCH start (`clientLaunchStartedAt`):
+	 * the server reads the tree from its spawn on, not from the end of its
+	 * initialize handshake. An absent stamp reports 0, which a first look reads
+	 * as "no epoch" and never as "before every install".
+	 */
+	livePrimaryClientRoots(): Array<{ root: string; spawnedAt: number }> {
+		const byRoot = new Map<string, number>();
+		for (const [key, client] of this.clients) {
+			if (!client.isAlive()) continue;
+			const { serverId, root } = parseClientKey(key);
+			if (!root) continue;
+			if (isAuxiliary(getServerById(serverId))) continue;
+			const spawnedAt = this.clientLaunchStartedAt.get(key) ?? 0;
+			const prior = byRoot.get(root);
+			byRoot.set(
+				root,
+				prior === undefined ? spawnedAt : Math.min(prior, spawnedAt),
+			);
+		}
+		return [...byRoot].map(([root, spawnedAt]) => ({ root, spawnedAt }));
+	}
+
+	/**
 	 * #1934 review F1: record what a `spawnClient` call decided, at the point
 	 * it decides it. Called on EVERY path that returns without a client, so
 	 * "no verdict" cannot silently mean "failed".
@@ -908,6 +949,18 @@ export class ClientRegistry {
 
 		const normalizedRoot = normalizeMapKey(root);
 		const key = `${server.id}:${normalizedRoot}`;
+		if (declinesLooseFileRoot(server, root)) {
+			// #4760: a root at or above `$HOME` is too large to walk. Decline BEFORE
+			// any process starts, on the policy path (no failure-ladder count, no
+			// breaker), with one bounded record per (server, root) per session.
+			recordDegradationOnce({
+				kind: "lsp-root-declined",
+				subject: key,
+				reason: `LSP root declined for ${server.id}: root at or above $HOME`,
+			});
+			this.noteSpawnVerdict(key, "declined");
+			return undefined;
+		}
 		const adopted = this.analysisRootModeForFile(filePath) === "adopted";
 		if (adopted) {
 			const localCommand =
@@ -1355,6 +1408,19 @@ export class ClientRegistry {
 			this.noteSpawnVerdict(key, "declined");
 			return undefined;
 		}
+		// #4806: a server whose process aborts without a project file below its
+		// root (csharp-ls, SIGABRT) is declined BEFORE any process starts, on the
+		// policy path like `declinesLooseFileRoot`: no `spawn_failed`, no failure
+		// ladder, no breaker, and one record per (server, root) per session.
+		if (await declinesProjectlessRoot(server, root)) {
+			recordDegradationOnce({
+				kind: "lsp-root-declined",
+				subject: key,
+				reason: `LSP spawn declined for ${server.id}: no project file at or below ${root}`,
+			});
+			this.noteSpawnVerdict(key, "declined");
+			return undefined;
+		}
 		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
 		const startedAt = Date.now();
 		logSessionStart(
@@ -1469,6 +1535,14 @@ export class ClientRegistry {
 				initialization: mergedInit,
 				initializeTimeoutMs: server.initializeTimeoutMs,
 				launchVariant: spawned.launchVariant,
+				settingsSection: server.settingsSection,
+				// #4764: the declared role travels with the client, so a failed server
+				// config can gate an auxiliary scanner's empty publications only.
+				role: server.role,
+				// #5131 round 2: the config-declared flag gates the echo hold; a
+				// built-in row with the same behaviour declares `echoesOwnNotice`.
+				custom: server.custom,
+				echoesOwnNotice: server.echoesOwnNotice,
 				onDiagnosticsPublished: (serverId) => {
 					this.hooks.noteDiagnosticsPublished(serverId);
 				},
@@ -1506,6 +1580,7 @@ export class ClientRegistry {
 			// never outlives the attempts it describes.
 			this.lastSpawnVerdict.delete(key);
 			this.clientSpawnedAt.set(key, Date.now());
+			this.clientLaunchStartedAt.set(key, startedAt);
 			this.clientLastUsedAt.set(key, Date.now());
 			this.scheduleIdleEviction(key, server);
 			this.failureCounts.delete(key);

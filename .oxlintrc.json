@@ -9,6 +9,22 @@
   ],
   "overrides": [
     {
+      "files": ["index.ts", "clients/**", "tools/**", "mcp/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "regex": "/lsp/index\\.js$",
+                "message": "use clients/lsp/capabilities.ts (#2372/#277)"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "files": ["tests/**/*.ts", "tests/**/*.tsx"],
       "rules": {
         "typescript/no-floating-promises": "error",

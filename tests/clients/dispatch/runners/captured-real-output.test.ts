@@ -101,6 +101,7 @@ const RUNNER_DESCRIPTORS: Record<string, { module: string; kind: string }> = {
 	"cpp-check": { module: "cpp-check", kind: "cxx" },
 	"cue-vet": { module: "cue-vet", kind: "cue" },
 	"dart-analyze": { module: "dart-analyze", kind: "dart" },
+	detekt: { module: "detekt", kind: "kotlin" },
 	"dotnet-build": { module: "dotnet-build", kind: "csharp" },
 	"elixir-check": { module: "elixir-check", kind: "elixir" },
 	eslint: { module: "eslint", kind: "jsts" },
@@ -279,6 +280,22 @@ const REPLAY_EXPECTATIONS: Record<string, ReplayExpectation> = {
 				semantic: "warning",
 				file: "Bad.kt",
 				line: 3,
+			},
+		],
+	},
+	// detekt 1.23.8 emits TEXT reports with no severity token, so its real line
+	// is `file:line:col: message [Rule]`; a parser that requires `warning:`
+	// dropped every finding (#4522). The rule config the smoke workspace carries
+	// activates ForbiddenComment on the TODO comment.
+	"detekt/real": {
+		status: "succeeded",
+		semantic: "warning",
+		findings: [
+			{
+				rule: "ForbiddenComment",
+				semantic: "warning",
+				file: "Bad.kt",
+				line: 2,
 			},
 		],
 	},

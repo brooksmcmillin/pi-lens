@@ -246,9 +246,13 @@ describe("TOOLS registry consistency", () => {
 					// Tree bundle: no launcher → must declare a treeMarker (existence
 					// check). stripComponents must be explicit: 0 for a no-wrapping-dir
 					// bundle (PSES), ≥1 to drop a version dir (clangd's clangd_<ver>/).
-					expect(spec.treeMarker, `${t.id} treeMarker (tree bundle)`).toMatch(
-						relPath,
-					);
+					for (const [p] of PROBE)
+						expect(
+							typeof spec.treeMarker === "function"
+								? spec.treeMarker(p)
+								: spec.treeMarker,
+							`${t.id} treeMarker (tree bundle) on ${p}`,
+						).toMatch(relPath);
 					expect(
 						typeof spec.stripComponents,
 						`${t.id} tree bundle must set stripComponents explicitly`,

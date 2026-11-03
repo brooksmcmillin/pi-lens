@@ -24,10 +24,11 @@ import {
 } from "../../../clients/dispatch/collect-later-tier.js";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import { resetPendingRunnerFindings } from "../../../clients/dispatch/pending-runner-findings.js";
-import type {
-	Diagnostic,
-	RunnerGroup,
-	RunnerResult,
+import {
+	type Diagnostic,
+	faultResult,
+	type RunnerGroup,
+	type RunnerResult,
 } from "../../../clients/dispatch/types.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import {
@@ -953,6 +954,72 @@ describe("Dispatch Flow", () => {
 			expect(result.hasBlockers).toBe(true);
 		});
 
+		it("never promotes a runner fault to a blocker when its message names an unused value (#4130)", async () => {
+			// Recurrence (CodeRabbit review of #4934): `faultResult`
+			// is a warning by construction. A new fault whose message names an
+			// unused value reached `promoteDeltaUnusedToBlockers` in the delta, which
+			// raised it to `blocking`, so a tool that broke entered the blocker map
+			// (#3814).
+			const facts = new FactStore();
+			setBaselineFacts(facts, "/project/test.ts", []);
+
+			registerRunner(
+				createMockRunner({
+					id: "reporter",
+					appliesTo: ["jsts"],
+					runResult: unusedNamingFault(),
+				}),
+			);
+
+			const ctx = createDispatchContext(
+				"test.ts",
+				"/project",
+				{ getFlag: () => false },
+				facts,
+			);
+			const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["reporter"] }];
+
+			const result = await dispatchForFile(ctx, groups);
+
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0].semantic).toBe("warning");
+			expect(result.diagnostics[0].severity).toBe("warning");
+			expect(result.hasBlockers).toBe(false);
+		});
+
+		it("keeps a held-back runner fault a warning, so the record never holds it as a blocker (#4130)", async () => {
+			// Recurrence: the same fault on the next edit is no longer new, so the
+			// delta holds it back as already seen. That is the second caller of the
+			// promotion seam (`stillObserved`), which must leave the fault a warning.
+			const facts = new FactStore();
+			setBaselineFacts(
+				facts,
+				"/project/test.ts",
+				unusedNamingFault().diagnostics,
+			);
+
+			registerRunner(
+				createMockRunner({
+					id: "reporter",
+					appliesTo: ["jsts"],
+					runResult: unusedNamingFault(),
+				}),
+			);
+
+			const ctx = createDispatchContext(
+				"test.ts",
+				"/project",
+				{ getFlag: () => false },
+				facts,
+			);
+			const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["reporter"] }];
+
+			const result = await dispatchForFile(ctx, groups);
+
+			expect(result.stillObserved?.map((d) => d.semantic)).toEqual(["warning"]);
+			expect(result.hasBlockers).toBe(false);
+		});
+
 		it("states why a delta-promoted unused finding blocks, once for several items (#3218)", async () => {
 			// Recurrence (2026-09-19 live session): the agent's own edit promoted
 			// two hint-severity ts:6133 findings to `blocking`, but the STOP block
@@ -1672,6 +1739,28 @@ function createMockContext(filePath: string) {
 			getFlag: () => false,
 		},
 		new FactStore(),
+	);
+}
+
+/**
+ * A runner fault built by the production constructor (`faultResult`), whose
+ * own message names an unused value. That word is the trigger the delta's
+ * unused-value promotion reads.
+ */
+function unusedNamingFault(): RunnerResult {
+	return faultResult(
+		{
+			kind: "server_error",
+			failureMessage: "unused-variable check exited 2",
+		},
+		{
+			id: "lsp:server-error:0",
+			message: "LSP server failed: unused-variable check exited 2",
+			filePath: "test.ts",
+			line: 1,
+			column: 1,
+			tool: "lsp",
+		},
 	);
 }
 

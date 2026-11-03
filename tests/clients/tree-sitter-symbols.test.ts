@@ -16,6 +16,7 @@ import {
 import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import type { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 import { TreeSitterSymbolExtractor } from "../../clients/tree-sitter-symbol-extractor.js";
+import { readSymbol } from "../../clients/module-report.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 interface SymbolCase {
@@ -302,6 +303,170 @@ describe("decorator walk stops at a named sibling (#4368 r2 L2)", () => {
 			expect(
 				symbols.find((s) => s.name === "target")?.decorators,
 			).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("Python docstrings fill Symbol.doc (#4948)", () => {
+	// Recurrence: #4948. Python documents a def or class with the first string
+	// statement of its body, so a docstring-only symbol had no `doc` and the
+	// outline lost its contract. The trap the guard prevents: a docstring start
+	// line must never become `docStartLine`; readSymbol extends its range to
+	// `docStartLine`, so a start line inside the body would cut the signature
+	// off the returned source.
+	async function extractPy(src: string) {
+		const env = setupTestEnvironment("pi-lens-4948-py-doc-");
+		try {
+			const fp = createTempFile(env.tmpDir, "a.py", src);
+			const tree = await client.parseFile(fp, "python");
+			const extractor = new TreeSitterSymbolExtractor("python", client);
+			await extractor.init();
+			return extractor.extract(tree!, fp, src).symbols;
+		} finally {
+			env.cleanup();
+		}
+	}
+	const docOf = (syms: { name: string; doc?: string }[], name: string) =>
+		syms.find((s) => s.name === name)?.doc;
+
+	it("extracts the first sentence of a multi-line docstring", async () => {
+		const syms = await extractPy(
+			'def go(a):\n    \"\"\"Return the go thing.\n\n    More text.\n    \"\"\"\n    return a\n',
+		);
+		expect(docOf(syms, "go")).toBe("Return the go thing.");
+	});
+
+	it("extracts class and method docstrings", async () => {
+		const syms = await extractPy(
+			"class K:\n    \"\"\"Class doc.\"\"\"\n    def m(self):\n        '''Method doc.'''\n        return 1\n",
+		);
+		expect(docOf(syms, "K")).toBe("Class doc.");
+		expect(docOf(syms, "m")).toBe("Method doc.");
+	});
+
+	it("handles r, u and one-line string docstrings", async () => {
+		const syms = await extractPy(
+			[
+				'def a():\n    r\"\"\"Raw doc.\"\"\"\n',
+				'def b():\n    u\"\"\"Uni doc.\"\"\"\n',
+				'def c():\n    "One line."\n',
+			].join("\n"),
+		);
+		expect(docOf(syms, "a")).toBe("Raw doc.");
+		expect(docOf(syms, "b")).toBe("Uni doc.");
+		expect(docOf(syms, "c")).toBe("One line.");
+	});
+
+	it("gives no doc when the first statement is not a bare string", async () => {
+		const syms = await extractPy(
+			[
+				'def a():\n    x = "s"\n    return x\n',
+				'def b():\n    return "s"\n',
+				// A string AFTER other code is a no-op expression, not a docstring
+				// (mutation: drop the first-statement check).
+				'def c():\n    x = 1\n    "Late string."\n    return x\n',
+				// f and b prefixes are not docstrings.
+				'def d():\n    f"Fstring."\n',
+			].join("\n"),
+		);
+		for (const n of ["a", "b", "c", "d"])
+			expect(docOf(syms, n)).toBeUndefined();
+	});
+
+	it("leaves docStartLine undefined and readSymbol starts at the def", async () => {
+		const env = setupTestEnvironment("pi-lens-4948-py-read-");
+		try {
+			const src = 'x = 1\n\ndef go(a):\n    """Return a."""\n    return a\n';
+			createTempFile(env.tmpDir, "a.py", src);
+			const syms = await extractPy(src);
+			const go = syms.find((s) => s.name === "go");
+			expect(go?.doc).toBe("Return a.");
+			expect(go?.docStartLine).toBeUndefined();
+			const read = await readSymbol("a.py", "go", env.tmpDir);
+			expect(read.found).toBe(true);
+			expect(read.startLine).toBe(go?.line);
+			expect(read.source?.startsWith("def go(a):")).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("falls back to a # comment, and the docstring wins when both exist", async () => {
+		const syms = await extractPy(
+			[
+				"# Comment only.\ndef a():\n    pass\n",
+				'# Comment loses.\ndef b():\n    """Docstring wins."""\n',
+			].join("\n"),
+		);
+		const a = syms.find((s) => s.name === "a");
+		expect(a?.doc).toBe("Comment only.");
+		expect(a?.docStartLine).toBeDefined();
+		const b = syms.find((s) => s.name === "b");
+		expect(b?.doc).toBe("Docstring wins.");
+		expect(b?.docStartLine).toBeUndefined();
+	});
+
+	it("caps a long first sentence at 120 characters with an ellipsis", async () => {
+		const syms = await extractPy(
+			`def a():\n    "Abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."\n`,
+		);
+		const doc = docOf(syms, "a");
+		expect(doc?.length).toBe(120);
+		expect(doc?.endsWith("…")).toBe(true);
+	});
+
+	it("falls back to the # comment when the docstring is blank", async () => {
+		// Recurrence: #4951 F3. `if (text)` is what keeps a comment doc when the
+		// docstring summarizes to nothing; neutering it dropped the comment doc.
+		const syms = await extractPy(
+			'# Above comment.\ndef go():\n    \"\"\"   \"\"\"\n',
+		);
+		const go = syms.find((s) => s.name === "go");
+		expect(go?.doc).toBe("Above comment.");
+		expect(go?.docStartLine).toBeDefined();
+	});
+
+	it("reads concatenated and parenthesized docstrings", async () => {
+		// Recurrence: #4951 F5. Both are valid Python docstrings and were dropped.
+		const syms = await extractPy(
+			[
+				'def a():\n    "Part one. " "Part two."\n',
+				'def b():\n    ("Paren doc.")\n',
+				// One f-string part makes the concatenation an f-string: no doc.
+				'def c():\n    "Plain. " f"Fmt."\n',
+			].join("\n"),
+		);
+		expect(docOf(syms, "a")).toBe("Part one.");
+		expect(docOf(syms, "b")).toBe("Paren doc.");
+		expect(docOf(syms, "c")).toBeUndefined();
+	});
+
+	it("reads a docstring that follows a # comment inside the body", async () => {
+		// Recurrence: #4951 F4 / Sourcery thread 1: Python block comments are
+		// extras, not named children, so the docstring is still the first one.
+		const syms = await extractPy(
+			'def a():\n    # inner comment\n    \"\"\"Doc after comment.\"\"\"\n',
+		);
+		expect(docOf(syms, "a")).toBe("Doc after comment.");
+	});
+
+	it("does not read a bare string in another grammar's function_definition", async () => {
+		// Recurrence: #4951 F1. `function_definition` is PHP's node too; keying on
+		// node types alone gave a PHP function a docstring doc.
+		const env = setupTestEnvironment("pi-lens-4951-php-");
+		try {
+			const src = "<?php\nfunction f() {\n  'Php single quoted doc';\n}\n";
+			const fp = createTempFile(env.tmpDir, "a.php", src);
+			const tree = await client.parseFile(fp, "php");
+			const extractor = new TreeSitterSymbolExtractor("php", client);
+			await extractor.init();
+			const f = extractor
+				.extract(tree!, fp, src)
+				.symbols.find((s) => s.name === "f");
+			expect(f).toBeDefined();
+			expect(f?.doc).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}

@@ -86,8 +86,54 @@ export function mergeServerCapabilitiesDoc(
 	freshText: string,
 ): { text: string; preservedCount: number };
 
-/** #3401: elapsed days after the first miss before a `direct` `first-publish` cell expires. */
+/** #4615: days after which a marker-backed `empty-first` cell's first-miss stamp reds the census. */
 export const FIRST_PUBLISH_EXPIRY_DAYS: number;
+
+/** #4512: consecutive nightly misses after which a stale cell is raised. */
+export const MISSED_PROBE_RAISE_RUNS: number;
+
+/** #4512: the `first-publish` values that are a measurement. */
+export const MEASURED_FIRST_PUBLISHES: Set<string>;
+
+/** #4512: the columns an older matrix doc gains (`version`, `install`, `stale`). */
+export const MATRIX_ADDED_COLUMNS: string[];
+
+/** #4512: give an older matrix doc the version/install/stale columns; idempotent. */
+export function ensureMatrixColumns(text: string, marker?: string): string;
+
+/** #4512: the refresh-state key holding the missed-probe streaks. */
+export const MISSED_PROBE_KEY: "missed-probe";
+
+/** #4512: replace (or append) the refresh-state section; `[]` removes it. */
+export function replaceRefreshStateSection(
+	text: string,
+	section: string[],
+): string;
+
+export interface RaisedCell {
+	lang: string;
+	server: string;
+	cleanBehavior: string;
+	firstPublish: string;
+	since: string;
+	misses: number;
+}
+
+/** #4512: the raised stale cells of a refreshed doc, for the tracking issue. */
+export function describeRaisedCells(
+	text: string,
+	raisedLangs: Iterable<string>,
+	marker?: string,
+): RaisedCell[];
+
+/** #4512: merge one characterize-lsp run (mode + provenance) into the matrix. */
+export function mergeCharacterization(
+	text: string,
+	rows: ReadonlyArray<{ lang: string; mode: string }>,
+	provenance: ReadonlyMap<string, { install: string; version?: string }>,
+	src: string,
+	marker?: string,
+): { text: string; measured: number; rows: number } | null;
 
 /** #3401: consecutive agreeing runs before a `clean-behavior`/`tier` change is written. */
 export const TIER_CHANGE_AGREE_RUNS: number;
@@ -124,6 +170,16 @@ export interface RefreshState {
 		{ pendingBehavior: string; pendingTier: string; runs: number }
 	>;
 	"idle-eviction"?: Record<string, { nights: IdleEvictionNight[] }>;
+	/** #4512: consecutive-night misses per lang and axis behind the `stale` column. */
+	"missed-probe"?: Record<
+		string,
+		Partial<
+			Record<
+				"clean-behavior" | "first-publish",
+				{ since: string; last: string; misses: number }
+			>
+		>
+	>;
 }
 
 export function parseRefreshState(text: string): RefreshState;
@@ -150,7 +206,7 @@ export function refreshCapabilityMatrix(
 		src?: string;
 		marker?: string;
 		agreeRuns?: number;
-		expireDays?: number;
+		raiseRuns?: number;
 		/** The injected clock; default is the real one. */
 		now?: Date | number | string;
 		/** A subset probe's langs; a lang outside it keeps its bookkeeping. */
@@ -160,13 +216,15 @@ export function refreshCapabilityMatrix(
 	text: string;
 	changed: boolean;
 	reason?: string;
-	expired: number;
 	pending: number;
 	committed: number;
 	/** The langs behind each count, in table order (named in the step log). */
-	expiredLangs: string[];
 	pendingLangs: string[];
 	committedLangs: string[];
+	/** #4512: langs whose measured cell was not re-observed tonight (kept, marked stale). */
+	staleLangs: string[];
+	/** #4512: the stale langs that have missed `MISSED_PROBE_RAISE_RUNS` consecutive nights. */
+	raisedLangs: string[];
 };
 
 /** Whole UTC days since a real YYYY-MM-DD stamp; null for an invalid stamp. */

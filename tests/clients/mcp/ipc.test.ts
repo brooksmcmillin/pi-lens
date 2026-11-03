@@ -10,8 +10,10 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { withPlatform } from "../../support/platform-stub.js";
+import { warmAnswerBinding } from "../../../clients/lsp/diagnostic-binding.js";
 import type { McpAnalyzeResult } from "../../../clients/mcp/analyze.js";
 import {
 	boundUnixSocketPath,
@@ -140,6 +142,91 @@ describe("requestWarmDiagnostics", () => {
 			contentHash("const x = 1;"),
 		);
 		removeTempDirSync(cwd);
+	});
+
+	// #5030 corpus: every diagnostics response shape a released build has put on
+	// the socket (`tests/fixtures/warm-attach/`) still parses on the current
+	// transport, and `warmAnswerBinding` reads it as that build meant. The
+	// pre-#5030 shape has no binding, so it reads as not current: a session on
+	// this build attached to an incumbent on an older one withholds the rows
+	// instead of reading them as the current bytes. A response shape a released
+	// build adds gets a fixture and a row here.
+	const WARM_FIXTURES = new URL("../../fixtures/warm-attach/", import.meta.url);
+	const READ_AS = {
+		"diagnostics-response-pre-5030.json": { boundToCurrentDisk: false },
+		"diagnostics-response-5030-stale-bound.json": {
+			contentHash:
+				"2ad21d5e89849c34021330c42624e67b494ed26f33fca1819704af80434ba91c",
+			boundToCurrentDisk: false,
+		},
+	} as const;
+	it.each(Object.keys(READ_AS) as (keyof typeof READ_AS)[])(
+		"parses the %s response and reads its binding (#5030)",
+		async (name) => {
+			const fixture = JSON.parse(
+				fs.readFileSync(new URL(name, WARM_FIXTURES), "utf8"),
+			) as Record<string, unknown>;
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ipc-corpus-"));
+			const pid = 99002;
+			activeServer = net.createServer((socket) => {
+				socket.setEncoding("utf8");
+				socket.once("data", (chunk: string) => {
+					const request = JSON.parse(chunk.trim()) as { contentHash: string };
+					socket.end(
+						`${JSON.stringify({
+							result: {
+								...fixture,
+								contentHash: request.contentHash,
+								servedAt: Date.now(),
+							},
+						})}\n`,
+					);
+				});
+			});
+			await new Promise<void>((resolve) =>
+				activeServer?.listen(diagnosticsIpcPathForCwd(cwd, pid), resolve),
+			);
+			try {
+				const result = await requestWarmDiagnostics(
+					cwd,
+					pid,
+					"/x/app.ts",
+					"const x = 1;",
+					1000,
+				);
+				expect(result.available).toBe(true);
+				if (!result.available) return;
+				expect(result.response.diagnostics).toEqual(fixture.diagnostics);
+				expect(warmAnswerBinding(result.response)).toEqual(READ_AS[name]);
+			} finally {
+				removeTempDirSync(cwd);
+			}
+		},
+	);
+
+	// #5030: the compatibility rule for a binding the reader cannot trust, at the
+	// one function every reader takes it through. Gates fail closed: only the
+	// three known verdicts pass, whatever else arrives reads as not current.
+	it.each([
+		[undefined, { boundToCurrentDisk: false }],
+		[null, { boundToCurrentDisk: false }],
+		["true", { boundToCurrentDisk: false }],
+		[[], { boundToCurrentDisk: false }],
+		[{}, { boundToCurrentDisk: false }],
+		[{ boundToCurrentDisk: 1 }, { boundToCurrentDisk: false }],
+		[{ boundToCurrentDisk: "yes" }, { boundToCurrentDisk: false }],
+		[{ boundToCurrentDisk: true }, { boundToCurrentDisk: true }],
+		[{ boundToCurrentDisk: "unknown" }, { boundToCurrentDisk: "unknown" }],
+		[
+			{ boundToCurrentDisk: false, version: 2, contentHash: 7 },
+			{ boundToCurrentDisk: false },
+		],
+		[
+			{ boundToCurrentDisk: true, version: 2, contentHash: "ab" },
+			{ boundToCurrentDisk: true, contentHash: "ab" },
+		],
+	])("reads the wire binding %j as %j (#5030)", (binding, expected) => {
+		expect(warmAnswerBinding({ binding })).toEqual(expected);
 	});
 
 	// #1108 shape-5 (side-channel copy-loss). `inconclusive` rides the touchFile
@@ -612,6 +699,111 @@ describe("workspace id under an injected platform (#3255)", () => {
 			).toBe(true);
 		},
 	);
+});
+
+/**
+ * Property (#4928): the workspace id over arbitrary absolute cwds and spellings.
+ *
+ * Recurrence this prevents: the hook and the server missing each other, or two
+ * workspaces meeting. Every row of `workspaceHash`'s table is a separate
+ * process that must derive the same id from the cwd it was handed, and
+ * `/work/./app`, `/work/app/` and `/work/x/../app` name one directory. A split
+ * is silent: the hook finds no listener and falls back to the cold path. A
+ * merge is the #3255 shape, one socket and one turn-end file for two
+ * workspaces. #3255 pinned the case fold for one pair of names; this states it
+ * for any cwd.
+ *
+ * Properties: every spelling of a directory gets one id, on every platform
+ * and from all three derivations; two directories get two ids, except that
+ * win32 and darwin fold case, where they get two only if they differ beyond case.
+ * The second directory is a case variant of the first (optionally one segment
+ * longer) or an unrelated one. Drawn independently, it never folds equal to the
+ * first, so the case-fold arm would never run and the relation would be dead.
+ *
+ * numRuns 300, seed 492805.
+ *
+ * Not modelled: Windows path syntax (`path.resolve` is the host's, so drive
+ * letters and backslashes are not drawn), symlinks (the id is lexical on
+ * purpose, #1193 P3), and a 16-hex collision (2^-64 per pair).
+ */
+describe("workspace id property (#4928)", () => {
+	const segmentArb = fc.string({
+		unit: fc.constantFrom(..."abcAB09_-".split("")),
+		minLength: 1,
+		maxLength: 4,
+	});
+	const segmentsArb = fc.array(segmentArb, { minLength: 1, maxLength: 5 });
+	const platformArb = fc.constantFrom<NodeJS.Platform>(
+		"linux",
+		"darwin",
+		"win32",
+	);
+	const swapCase = (ch: string): string =>
+		ch === ch.toUpperCase() ? ch.toLowerCase() : ch.toUpperCase();
+	// A pair of directories: the second is a case variant of the first (each
+	// segment swapped or kept, optionally one segment longer) or unrelated.
+	const pairArb = segmentsArb.chain((segments) =>
+		fc.tuple(
+			fc.constant(segments),
+			fc.oneof(
+				fc
+					.tuple(
+						fc.array(fc.boolean(), {
+							minLength: segments.length,
+							maxLength: segments.length,
+						}),
+						fc.option(segmentArb, { nil: undefined }),
+					)
+					.map(([flips, extra]) => [
+						...segments.map((segment, i) =>
+							flips[i] ? [...segment].map(swapCase).join("") : segment,
+						),
+						...(extra === undefined ? [] : [extra]),
+					]),
+				segmentsArb,
+			),
+		),
+	);
+
+	it("gives every spelling of a directory one id and two directories two", () => {
+		const idsOf = (cwd: string, platform: NodeJS.Platform): string[] => [
+			workspaceIdIn(ipcPathForCwd(cwd, platform)),
+			workspaceIdIn(diagnosticsIpcPathForCwd(cwd, 4242, platform)),
+			workspaceIdIn(turnEndStatusPathForCwd(cwd, platform)),
+		];
+		fc.assert(
+			fc.property(
+				platformArb,
+				pairArb,
+				segmentArb,
+				fc.nat(),
+				fc.constantFrom("", "/", "//", "/."),
+				(platform, [segments, otherSegments], detour, at, tail) => {
+					const plain = `/${segments.join("/")}`;
+					const detoured = segments.slice();
+					detoured.splice(at % (segments.length + 1), 0, detour, "..");
+					const spellings = [
+						plain + tail,
+						`/${detoured.join("/")}`,
+						`/./${segments.join("//")}`,
+					];
+					const [id] = idsOf(plain, platform);
+					for (const spelling of spellings) {
+						expect(idsOf(spelling, platform), spelling).toEqual([id, id, id]);
+					}
+
+					const fold = (s: string[]): string =>
+						platform === "linux" ? s.join("/") : s.join("/").toLowerCase();
+					const [otherId] = idsOf(`/${otherSegments.join("/")}`, platform);
+					expect(
+						otherId === id,
+						`${plain} against /${otherSegments.join("/")}`,
+					).toBe(fold(segments) === fold(otherSegments));
+				},
+			),
+			{ numRuns: 300, seed: 492805 },
+		);
+	});
 });
 
 describe("requestWarmAnalyze", () => {

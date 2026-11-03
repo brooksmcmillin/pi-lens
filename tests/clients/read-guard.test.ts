@@ -6,6 +6,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import fc from "fast-check";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getDegradationSummary,
@@ -16,6 +17,7 @@ import {
 	captureReadContentBinding,
 	createReadGuard,
 	currentLinesMatchReadSnapshot,
+	lineContentHash,
 	type ReadRecord,
 } from "../../clients/read-guard.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
@@ -3133,6 +3135,82 @@ describe("ReadGuard.hasKnownPath / forgetPath (#1668)", () => {
 		} finally {
 			env.cleanup();
 		}
+	});
+});
+
+/**
+ * Property (#4928): `lineContentHash` over arbitrary lines and edits.
+ *
+ * Recurrence this prevents: a line fingerprint that misses an edit. #3480 shipped
+ * the LSP touch debounce with length, head and tail, so a same-length edit in
+ * the middle never reached the server. This hash gates two things the same way:
+ * the read guard's "the lines I read still match" check and the `dd:`
+ * false-positive anchor, where a miss keeps a mark on a finding whose line was
+ * rewritten (silently hiding it).
+ *
+ * Properties: whitespace of any kind never changes it; a one-character
+ * substitution anywhere, or one inserted character, always does. The FNV step
+ * is a bijection per character, so a single substitution cannot collide; an
+ * insertion could, at 2^-32 per case, which the fixed seed pins. The released
+ * value itself (stored `dd:` keys hold it, shape 57) is pinned by the anchor
+ * property in `diagnostic-dispositions.test.ts`.
+ *
+ * numRuns 500, seed 492803.
+ *
+ * Not modelled: collisions between unrelated lines (32 bits; the guard compares
+ * the same line before and after), edits of several characters, and whitespace
+ * outside JS `\s`.
+ */
+describe("lineContentHash property (#4928)", () => {
+	const NON_WS = "abcdefXYZ0189_(){};=.,'\"+-*/<>!&|:[]#@".split("");
+	// NBSP, EM SPACE, BOM and LINE SEPARATOR: all JS `\s`, none typeable.
+	const WS = [" ", "\t", "\r", "  ", 0xa0, 0x2003, 0xfeff, 0x2028].map((w) =>
+		typeof w === "number" ? String.fromCodePoint(w) : w,
+	);
+
+	it("ignores whitespace and follows every other edit", () => {
+		fc.assert(
+			fc.property(
+				fc.string({
+					unit: fc.constantFrom(...NON_WS),
+					minLength: 12,
+					maxLength: 120,
+				}),
+				fc.array(fc.record({ at: fc.nat(), ws: fc.constantFrom(...WS) }), {
+					maxLength: 8,
+				}),
+				fc.nat(),
+				fc.constantFrom(...NON_WS),
+				(stripped, spaces, where, char) => {
+					const spelled = [...spaces]
+						.sort((a, b) => b.at - a.at)
+						.reduce((text, { at, ws }) => {
+							const i = at % (text.length + 1);
+							return text.slice(0, i) + ws + text.slice(i);
+						}, stripped);
+					const hash = lineContentHash(stripped);
+
+					expect(hash).toMatch(/^[0-9a-f]{8}$/);
+					expect(lineContentHash(spelled), "whitespace").toBe(hash);
+
+					const p = where % stripped.length;
+					if (char !== stripped[p]) {
+						const substituted =
+							stripped.slice(0, p) + char + stripped.slice(p + 1);
+						expect(
+							lineContentHash(substituted),
+							`substituting ${char} at ${p}`,
+						).not.toBe(hash);
+					}
+					const inserted = stripped.slice(0, p) + char + stripped.slice(p);
+					expect(
+						lineContentHash(inserted),
+						`inserting ${char} at ${p}`,
+					).not.toBe(hash);
+				},
+			),
+			{ numRuns: 500, seed: 492803 },
+		);
 	});
 });
 

@@ -64,7 +64,7 @@ describe(
 			// language server confirm it clean is not what #2052 pins; since #4322 a
 			// check no server answered is inconclusive, never "clean".
 			expect(text).toContain("Files checked: 1");
-			expect(text).toMatch(/1 with no language server answer|clean=1,/);
+			expect(text).toMatch(/1 with no primary language server answer|clean=1,/);
 		}, 180_000);
 	},
 );

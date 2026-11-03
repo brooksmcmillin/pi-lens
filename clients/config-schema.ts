@@ -276,6 +276,32 @@ function lspNamespace(): ConfigSchemaNode {
 	};
 }
 
+/**
+ * The `dispatch` namespace. `disabledRunners` is the one typed key: a DENIAL
+ * list, so a nearer tier can add to it but never lift an entry
+ * (`array-union`, the same monotonic rule as `lsp.disabledServers`). The
+ * members are plain strings here; whether each names a registered dispatch
+ * runner is the dispatch loader's check (`clients/dispatch/disabled-runners.ts`),
+ * for the reason `lspServerEntryNode` gives — this module cannot import the
+ * dispatch registry. Every other key (`runnerTimeoutFloorMs`) stays opaque, so
+ * the global loader keeps owning its per-key diagnostics.
+ */
+function dispatchNamespace(): ConfigSchemaNode {
+	return {
+		type: "object",
+		additionalProperties: true,
+		[STABILITY_TIER_KEY]: "stable",
+		properties: {
+			disabledRunners: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[DENY_KEY]: "array-union",
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+		},
+	};
+}
+
 /** The shared public rule policy shape (#4226). */
 function rulePolicyEntryNode(): ConfigSchemaNode {
 	return {
@@ -351,6 +377,7 @@ function buildConfigSchema(): ConfigSchemaNode {
 	}
 
 	for (const key of [
+		"fallow",
 		"knip",
 		"jscpd",
 		"madge",
@@ -407,6 +434,7 @@ function buildConfigSchema(): ConfigSchemaNode {
 	}
 
 	properties[LSP_NAMESPACE_KEY] = lspNamespace();
+	properties.dispatch = dispatchNamespace();
 
 	properties[CONFIG_SCHEMA_ANCHOR_KEY] = {
 		type: "string",

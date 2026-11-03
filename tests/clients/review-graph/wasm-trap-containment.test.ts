@@ -14,6 +14,7 @@ import { loadWebTreeSitter } from "../../../clients/deps/web-tree-sitter.js";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import { getOpenDocumentSymbols } from "../../../clients/lsp-document-symbols.js";
 import {
+	_resetReviewGraphExtractorCacheForTests,
 	buildOrUpdateGraph,
 	clearReviewGraphWorkspaceCache,
 	flushReviewGraphPersistsForTests,
@@ -21,7 +22,10 @@ import {
 	reviewGraphCachePath,
 } from "../../../clients/review-graph/builder.js";
 import { logReviewGraph } from "../../../clients/review-graph-logger.js";
-import { getSharedTreeSitterClient } from "../../../clients/tree-sitter-shared.js";
+import {
+	_resetSharedTreeSitterClientForTests,
+	getSharedTreeSitterClient,
+} from "../../../clients/tree-sitter-shared.js";
 import { createTempFile, setupTestEnvironment } from "../test-utils.js";
 
 vi.mock("../../../clients/lsp-document-symbols.js", async (importOriginal) => ({
@@ -43,6 +47,13 @@ const { WebAssembly } = globalThis as unknown as {
 };
 
 const cleanups: Array<() => void> = [];
+// The shared client holds the trap registry and the per-process trap budget,
+// and the builder's extractor cache holds the client it was built on. Each
+// case's trap charges must not reach the next case (#4561 L5).
+beforeEach(() => {
+	_resetReviewGraphExtractorCacheForTests();
+	_resetSharedTreeSitterClientForTests();
+});
 afterEach(() => {
 	vi.restoreAllMocks();
 	flushReviewGraphPersistsForTests();

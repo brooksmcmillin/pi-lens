@@ -39,9 +39,18 @@ vi.mock("../clients/pipeline.js", () => pipeline);
 // The latency sink fixes its path when it loads, so the redirect to a private
 // home runs hoisted, before any import (the #3521 witness's shape): the row
 // assertion below reads the REAL sink and must not read a sibling run's rows.
-const witnessHome = vi.hoisted(() => {
+//
+// #4864: the parent is `os.tmpdir()`, never `.`. A `process.env.TMPDIR ?? "."`
+// parent resolves to the CHECKOUT ROOT on every runner that leaves TMPDIR
+// unset (CI does), which makes this home a directory NAMED at the repository
+// root: a repo-walking scan on a sibling worker lists it and then ENOENTs when
+// this file's afterAll removes it. `os.tmpdir()` reads the same variable with
+// the OS fallback, so the parent is never the checkout.
+const witnessHome = await vi.hoisted(async () => {
 	const previous = process.env.PI_LENS_HOME;
-	const home = `${process.env.TMPDIR ?? "."}/pi-lens-3814-witness-home-${process.pid}`;
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const home = join(tmpdir(), `pi-lens-3814-witness-home-${process.pid}`);
 	process.env.PI_LENS_HOME = home;
 	return { home, previous };
 });
@@ -73,7 +82,9 @@ import {
 	makeContextWithSystemEvent,
 	makeSessionStartEvent,
 } from "./support/host-event-factory.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { useGlobalConfig } from "./support/global-config.js";
 
 const SESSION_ID = "pi-3814-deferred-gate-session";
 const RUNNER_ID = "slow-runner";
@@ -172,7 +183,9 @@ beforeEach(async () => {
 	);
 });
 
-afterEach(() => {
+afterEach(async () => {
+	// #5146: end the case's sessions before its root goes.
+	await endMockSessions();
 	_resetSessionLifecycleForTests();
 	if (previousTestMode === undefined) delete process.env.PI_LENS_TEST_MODE;
 	else process.env.PI_LENS_TEST_MODE = previousTestMode;
@@ -271,8 +284,8 @@ const answersClean = async (): Promise<RunnerResult> => ({
 });
 
 async function startSession(guard = true) {
+	setGlobalConfig({ guard: { enabled: guard } });
 	const pi = createPiMock();
-	pi.setFlag("lens-guard", guard);
 	extension(pi.asExtensionAPI());
 	await pi.emit(
 		"session_start",
@@ -325,6 +338,8 @@ function editAfterScan(content: string): void {
 	const later = new Date(Date.now() + 2_000);
 	fs.utimesSync(filePath, later, later);
 }
+
+const setGlobalConfig = useGlobalConfig();
 
 describe("#3814: deferred blocking findings gate the commit", () => {
 	for (const shape of ["succeeded", "failed"] as const) {
@@ -512,14 +527,17 @@ describe("#3814: deferred blocking findings gate the commit", () => {
 		await host.edit();
 		await settle();
 		expect((await host.gate()).block).toBe(true);
-		await host.turnEnd();
+		const delivered = await host.turnEnd();
+		// #4921: the merged set reaches the agent once; a later turn that adds
+		// nothing does not send it again, and the gate still holds it.
 		const replay = await (async () => {
 			await host.turnStart();
 			return await host.turnEnd();
 		})();
 
-		expect(replay).toContain("inline finding on beta");
-		expect(replay).toContain("alpha is not a function");
+		expect(delivered).toContain("inline finding on beta");
+		expect(delivered).toContain("alpha is not a function");
+		expect(replay).toBe("");
 		expect((await host.gate()).block).toBe(true);
 	});
 
@@ -662,42 +680,41 @@ describe("#3814: deferred blocking findings gate the commit", () => {
 		expect(fs.readFileSync(filePath, "utf8")).toBe("alpha();\n");
 	});
 
+	// Recurrence (r1 M3): the deferred recording refreshed the latch but not the
+	// persisted guard record, so across a session boundary the deferred blocker
+	// let the commit through while an inline blocker blocked as `session_mismatch`.
+	//
+	// The INLINE half of this loop moved to tier 2 (#4632 slice 4,
+	// `tests/index-4632-s4-tool-call-verdict.test.ts`): its blocker needs no
+	// deferred tier, so it is produced by a real bundled rule and read through
+	// pi's own replacement, where the model-visible refusal and the tool not
+	// running are both observable. What stays here is the deferred half.
 	for (const reason of ["new", "resume", "fork", "reload"] as const) {
 		for (const order of ["gate-first", "turn-end-first"] as const) {
-			// Recurrence (r1 M3): the deferred recording refreshed the latch but not the
-			// persisted guard record, so across a session boundary the inline blocker
-			// blocked as `session_mismatch` and the deferred one let the commit
-			// through. The inline row is the control: the same boundary, the same
-			// record contract.
-			for (const mode of ["inline", "deferred"] as const) {
-				it(`blocks the ${reason} session as an unknown record, ${mode} blocker, ${order}`, async () => {
-					if (mode === "inline") {
-						runnerAnswer = answersClean;
-						inlineBlocker = blockingDiagnostic();
-					} else runnerAnswer = answersBlocking("succeeded");
-					const host = await startSession();
-					await host.turnStart();
-					await host.edit();
-					await settle();
-					if (order === "gate-first") await host.gate();
-					else await host.turnEnd();
-					expect((await host.gate()).block).toBe(true);
-					await host.pi.emit(
-						"session_shutdown",
-						{ reason },
-						makeCtx({ cwd: tmpDir, sessionId: SESSION_ID }),
-					);
-					await host.pi.emit(
-						"session_start",
-						makeSessionStartEvent({ reason }),
-						makeCtx({ cwd: tmpDir, sessionId: `next-${reason}` }),
-					);
-					const verdict = await host.gate();
+			it(`blocks the ${reason} session as an unknown record, deferred blocker, ${order}`, async () => {
+				runnerAnswer = answersBlocking("succeeded");
+				const host = await startSession();
+				await host.turnStart();
+				await host.edit();
+				await settle();
+				if (order === "gate-first") await host.gate();
+				else await host.turnEnd();
+				expect((await host.gate()).block).toBe(true);
+				await host.pi.emit(
+					"session_shutdown",
+					{ reason },
+					makeCtx({ cwd: tmpDir, sessionId: SESSION_ID }),
+				);
+				await host.pi.emit(
+					"session_start",
+					makeSessionStartEvent({ reason }),
+					makeCtx({ cwd: tmpDir, sessionId: `next-${reason}` }),
+				);
+				const verdict = await host.gate();
 
-					expect(verdict.block).toBe(true);
-					expect(verdict.reason).toContain("session_mismatch");
-				});
-			}
+				expect(verdict.block).toBe(true);
+				expect(verdict.reason).toContain("session_mismatch");
+			});
 		}
 	}
 

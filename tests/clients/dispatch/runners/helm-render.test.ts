@@ -232,6 +232,32 @@ describe("helm-render opt-in gate", () => {
 		expect(isHelmRenderEnabled(workspace)).toBe(false);
 	});
 
+	it("skips a chart that sits outside the workspace root even with the switch on", async () => {
+		// Recurrence (#2556, shape 83): the workspace gate is `isWithinIdentity`'s
+		// answer, and nothing else pinned it for the render runner.
+		const outside = fs.realpathSync(
+			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-helm-render-outside-")),
+		);
+		try {
+			const chart = path.join(outside, "valid-chart");
+			fs.cpSync(path.join(fixtures, "valid-chart"), chart, { recursive: true });
+			optIn({ helm: { renderValidation: { enabled: true } } });
+			stubSpawns({ render: { status: 0 } });
+
+			const result = await helmRenderRunner.run(
+				makeRunnerCtx(path.join(chart, "values.yaml"), workspace, {
+					kind: "yaml",
+					projectRoot: workspace,
+				}),
+			);
+
+			expect(result).toMatchObject({ status: "skipped", diagnostics: [] });
+			expect(safeSpawnAsync).not.toHaveBeenCalled();
+		} finally {
+			fs.rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
 	it("refuses to render an untrusted project even with the switch on", async () => {
 		// `.pi-lens.json` is a TRACKED file: a hostile chart repo can arrive with
 		// consent already granted, authorizing execution of its own templates.
@@ -496,6 +522,76 @@ describe("helm-render rendered-manifest checks", () => {
 		expect(result.diagnostics[0].message).toContain("deployment.yaml:4");
 	});
 
+	// #4689 batch 2 (clients/dispatch/runners/helm-render.ts, the trivy-target
+	// lookup): the map of rendered manifests is a `PathKeyedMap(normalizeMapKey)`,
+	// so a target that spells the scratch directory through a link must find the
+	// manifest the walk recorded under its real path. The `path.resolve` around
+	// that lookup is a join, not an identity derivation, so it stays (the map
+	// derives the identity); the cell passes on master and the mutation row in
+	// the PR body (plain `Map`) is its proof.
+	it("maps a trivy target that spells the scratch directory through a link (#4689)", async (ctx) => {
+		const chart = installChart("valid-chart");
+		optIn({
+			helm: { renderValidation: { enabled: true } },
+			trivy: { enabled: true },
+		});
+		const renderedRelative = path.join(
+			"pi-lens-render-valid",
+			"templates",
+			"deployment.yaml",
+		);
+		const outputLink = path.join(workspace, "scratch-link");
+		let linkTarget: string | undefined;
+		stubSpawns({
+			render: (outputDir) => {
+				writeRendered(outputDir, renderedRelative, RENDERED_DEPLOYMENT);
+				try {
+					fs.symlinkSync(outputDir, outputLink, "dir");
+					linkTarget = path.join(outputLink, renderedRelative);
+				} catch {
+					// the cell skips below
+				}
+				return { status: 0, stdout: "", stderr: "" };
+			},
+			scan: {
+				status: 0,
+				get stdout() {
+					return JSON.stringify({
+						Results: [
+							{
+								Target: linkTarget,
+								Misconfigurations: [
+									{
+										ID: "KSV011",
+										Title: "CPU not limited",
+										Severity: "HIGH",
+										CauseMetadata: { StartLine: 4 },
+									},
+								],
+							},
+						],
+					});
+				},
+				stderr: "",
+			},
+		});
+
+		const result = await helmRenderRunner.run(
+			makeRunnerCtx(
+				path.join(chart, "templates", "deployment.yaml"),
+				workspace,
+				{ kind: "yaml", projectRoot: workspace },
+			),
+		);
+
+		if (linkTarget === undefined) return ctx.skip("symlinks unavailable");
+		expect(result.diagnostics).toHaveLength(1);
+		expect(result.diagnostics[0]).toMatchObject({
+			filePath: path.join(chart, "templates", "deployment.yaml"),
+			rule: "KSV011",
+		});
+	});
+
 	it("flags a rendered document that is not a Kubernetes object", async () => {
 		const chart = installChart("valid-chart");
 		optIn({ helm: { renderValidation: { enabled: true } } });
@@ -659,13 +755,61 @@ describe("helm-render rendered-manifest checks", () => {
 		expect(chartContentFingerprint(chart)).toEqual(before);
 		const scratch = stub.renderedIn();
 		expect(scratch).toBeTruthy();
-		// Realpath BOTH sides: the runner builds the dir from a raw `os.tmpdir()`,
-		// which is a symlink on macOS (/var/folders -> /private/var/folders), so
-		// comparing a raw prefix against a realpath'd one is host-dependent.
+		// Realpath BOTH sides: the runner builds the dir from
+		// `scannerReportParentDir()`, which answers `os.tmpdir()` unless a harness
+		// sets the override, and `os.tmpdir()` is a symlink on macOS
+		// (/var/folders -> /private/var/folders), so a raw-prefix comparison is
+		// host-dependent. The expected side stays `os.tmpdir()` on purpose: it is an
+		// independent reading of the host, and the cell below pins the override.
 		expect(fs.realpathSync(path.dirname(scratch as string))).toBe(
 			fs.realpathSync(os.tmpdir()),
 		);
 		expect(fs.existsSync(scratch as string)).toBe(false);
+	});
+
+	// Recurrence: #4133 gave every scanner whose report directory is created
+	// with `mkdtempSync` the `scannerReportParentDir` seam, so a harness that
+	// SIGKILLs the child before the `finally` strands the directory inside a root
+	// it removes. The render scratch directory stayed on a raw `os.tmpdir()`.
+	it("renders into a scratch directory under the owned scanner root", async () => {
+		const chart = installChart("valid-chart");
+		optIn({ helm: { renderValidation: { enabled: true } } });
+		const scannerRoot = fs.realpathSync(
+			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-scanner-root-")),
+		);
+		vi.stubEnv("PI_LENS_TEST_SCANNER_TMPDIR", scannerRoot);
+		try {
+			const stub = stubSpawns({
+				render: (outputDir) => {
+					writeRendered(
+						outputDir,
+						path.join("pi-lens-render-valid", "templates", "deployment.yaml"),
+						RENDERED_DEPLOYMENT,
+					);
+					return { status: 0, stdout: "", stderr: "" };
+				},
+			});
+
+			await helmRenderRunner.run(
+				makeRunnerCtx(
+					path.join(chart, "templates", "deployment.yaml"),
+					workspace,
+					{ kind: "yaml", projectRoot: workspace },
+				),
+			);
+
+			const scratch = stub.renderedIn();
+			expect(scratch).toBeTruthy();
+			expect(fs.realpathSync(path.dirname(scratch as string))).toBe(
+				scannerRoot,
+			);
+			expect(path.basename(scratch as string)).toContain(
+				"pi-lens-helm-render-",
+			);
+		} finally {
+			vi.unstubAllEnvs();
+			fs.rmSync(scannerRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("says the manifests are unscanned when trivy exits 0 with an unreadable report", async () => {
@@ -1356,6 +1500,55 @@ describe("helm-render source mapping", () => {
 				chartRoot: chart,
 			}),
 		).toEqual({ filePath: path.join(chart, "Chart.yaml"), mapped: false });
+	});
+});
+
+describe("mapRenderedToSource layout reading (#2556)", () => {
+	// #2556 RECURRENCE GUARDED: the output-dir layout fallback read
+	// `path.relative(outputDir, rendered).startsWith("..")`, so a rendered
+	// directory named `..pkg` (inside outputDir) was read as a parent step and
+	// the finding fell back to Chart.yaml.
+	it("maps a rendered file under a ..-named output subdirectory by layout", () => {
+		const chart = installChart("valid-chart");
+		const outputDir = path.join(workspace, "out");
+		const decide = (rendered: string) =>
+			mapRenderedToSource({
+				renderedContent: "kind: Deployment\n",
+				renderedPath: rendered,
+				outputDir,
+				chartRoot: chart,
+			});
+
+		// A rendered file OUTSIDE outputDir has no layout. Plant a chart file where
+		// its absolute spelling would resolve if that spelling were read as a
+		// layout (`resolveTemplateSource` drops the first segment), so a guard
+		// that lets the absolute spelling through maps it onto the decoy.
+		const outside = path.join(workspace, "zz", "templates", "deployment.yaml");
+		const decoy = path.join(
+			chart,
+			...outside
+				.split(/[\\/]+/)
+				.filter(Boolean)
+				.slice(1),
+		);
+		fs.mkdirSync(path.dirname(decoy), { recursive: true });
+		fs.writeFileSync(decoy, "kind: Decoy\n");
+
+		expect({
+			dotDotNamed: decide(
+				path.join(outputDir, "..pkg", "templates", "deployment.yaml"),
+			),
+			outsideOutputDir: decide(outside),
+		}).toEqual({
+			dotDotNamed: {
+				filePath: path.join(chart, "templates", "deployment.yaml"),
+				mapped: true,
+			},
+			outsideOutputDir: {
+				filePath: path.join(chart, "Chart.yaml"),
+				mapped: false,
+			},
+		});
 	});
 });
 

@@ -5,31 +5,29 @@
  */
 
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
+import * as fs from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
-import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import {
+	createTempFile,
+	pinFixtureHome,
+	setupTestEnvironment,
+} from "./test-utils.js";
 
 const mockTouchFile = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn(),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() =>
-		makeLspServiceDouble({
-			touchFile: mockTouchFile,
-			supportsLSP: (f: string) => /\.(ts|tsx|js|jsx|py|cpp)$/.test(f),
-		}),
-	),
-}));
-
-import { initLSPConfig, loadLSPConfig } from "../../clients/lsp/config.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
+import { isSessionRootRegistered } from "../../clients/lsp/session-roots.js";
+import {
+	loadLSPConfig,
+	resetLSPConfigStateForTests,
+} from "../../clients/lsp/config.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "../support/lsp-service-seam.js";
 
 function setStartupMode(mode: "full" | "quick"): () => void {
 	const prev = process.env.PI_LENS_STARTUP_MODE;
@@ -114,32 +112,38 @@ function makeDeps(
 }
 
 describe("warmFiles session start", () => {
-	beforeEach(() => {
-		vi.clearAllMocks();
+	let pinnedHome: string;
 
-		vi.mocked(loadLSPConfig).mockResolvedValue({});
-		vi.mocked(getLSPService).mockReturnValue(
-			makeLspServiceDouble({
-				touchFile: mockTouchFile,
-				supportsLSP: (f: string) => /\.(ts|tsx|js|jsx|py|cpp)$/.test(f),
-			}) as any,
-		);
+	beforeEach(async () => {
+		vi.clearAllMocks();
+		// The real config loader walks up from the session cwd to HOME (#4709).
+		pinnedHome = pinFixtureHome("runtime-session-warm").home;
+
+		await installLspServiceDouble({
+			touchFile: mockTouchFile,
+			supportsLSP: (f: string) => /\.(ts|tsx|js|jsx|py|cpp)$/.test(f),
+		});
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		delete process.env.PI_LENS_STARTUP_MODE;
 	});
 
-	it("calls touchFile for each warm file in .pi-lens/lsp.json", async () => {
+	it("calls touchFile for each warm file in .pi-lens.json lsp.warmFiles", async () => {
 		const env = setupTestEnvironment("pi-lens-warm-");
 		const restoreStartupMode = setStartupMode("full");
 
 		createTempFile(env.tmpDir, "src/main.cpp", "int main() {}");
 		createTempFile(env.tmpDir, "src/engine.cpp", "void engine() {}");
 
-		vi.mocked(loadLSPConfig).mockResolvedValue({
-			warmFiles: ["src/main.cpp", "src/engine.cpp"],
-		});
+		createTempFile(
+			env.tmpDir,
+			".pi-lens.json",
+			JSON.stringify({
+				lsp: { warmFiles: ["src/main.cpp", "src/engine.cpp"] },
+			}),
+		);
 
 		try {
 			await handleSessionStart(makeDeps({ ctxCwd: env.tmpDir }));
@@ -166,18 +170,40 @@ describe("warmFiles session start", () => {
 				clientScope: "primary",
 			});
 
-			expect(initLSPConfig).toHaveBeenCalled();
+			// The warm path declares the project a served session root through the
+			// real `initLSPConfig`; the root registry is where that is visible.
+			expect(isSessionRootRegistered(env.tmpDir)).toBe(true);
 		} finally {
 			env.cleanup();
 			restoreStartupMode();
 		}
 	}, 15_000);
 
+	it("stops the config walk at the pinned home, so a config above it is never read (the HOME pin)", async () => {
+		// Recurrence it prevents (#4709): the group-B suites run the REAL config
+		// loader, whose project walk is bounded by `os.homedir()`. The pin is what
+		// bounds it at a fixture home; nothing observed that, so a lost pin let
+		// the walk read whatever sits above the session cwd on the maintainer's
+		// machine. The planted config sits ABOVE the pinned home: only a walk
+		// ceilinged at that home leaves it unread.
+		const project = path.join(pinnedHome, "project");
+		fs.mkdirSync(project, { recursive: true });
+		const above = path.join(path.dirname(pinnedHome), ".pi-lens.json");
+		fs.writeFileSync(
+			above,
+			JSON.stringify({ lsp: { warmFiles: ["hostile.cpp"] } }),
+		);
+		try {
+			const config = await loadLSPConfig(project);
+			expect(config.warmFiles ?? []).toEqual([]);
+		} finally {
+			fs.rmSync(above, { force: true });
+		}
+	});
+
 	it("skips touchFile when warmFiles is empty and the project has no source files", async () => {
 		const env = setupTestEnvironment("pi-lens-warm-");
 		const restoreStartupMode = setStartupMode("full");
-
-		vi.mocked(loadLSPConfig).mockResolvedValue({});
 
 		try {
 			// Empty project — no detected language, so dominant-language auto-warm
@@ -205,8 +231,6 @@ describe("warmFiles session start", () => {
 		createTempFile(env.tmpDir, "src/b.ts", "export const b = 2;");
 		createTempFile(env.tmpDir, "src/c.ts", "export const c = 3;");
 		createTempFile(env.tmpDir, "src/util.py", "x = 1\n");
-
-		vi.mocked(loadLSPConfig).mockResolvedValue({});
 
 		try {
 			await handleSessionStart(makeDeps({ ctxCwd: env.tmpDir }));
@@ -253,12 +277,11 @@ describe("warmFiles session start", () => {
 		createTempFile(env.tmpDir, "src/a.ts", "export const a = 1;");
 		createTempFile(env.tmpDir, "src/b.ts", "export const b = 2;");
 
-		vi.mocked(loadLSPConfig).mockResolvedValue({});
-		vi.mocked(getLSPService).mockReturnValue(
+		installLspService(
 			makeLspServiceDouble({
 				touchFile: mockTouchFile,
 				supportsLSP: (f: string) => /\.(ts|json|ya?ml)$/.test(f),
-			}) as any,
+			}),
 		);
 
 		try {
@@ -286,12 +309,11 @@ describe("warmFiles session start", () => {
 		createTempFile(env.tmpDir, "a.yaml", "a: 1\n");
 		createTempFile(env.tmpDir, "b.yaml", "b: 2\n");
 
-		vi.mocked(loadLSPConfig).mockResolvedValue({});
-		vi.mocked(getLSPService).mockReturnValue(
+		installLspService(
 			makeLspServiceDouble({
 				touchFile: mockTouchFile,
 				supportsLSP: (f: string) => /\.ya?ml$/.test(f),
-			}) as any,
+			}),
 		);
 
 		try {
@@ -312,8 +334,6 @@ describe("warmFiles session start", () => {
 	it("skips dominant-language auto-warm on home/no-project roots (#296)", async () => {
 		const restoreStartupMode = setStartupMode("full");
 		const dbgLog: string[] = [];
-
-		vi.mocked(loadLSPConfig).mockResolvedValue({});
 
 		try {
 			await handleSessionStart(
@@ -339,9 +359,11 @@ describe("warmFiles session start", () => {
 		const env = setupTestEnvironment("pi-lens-warm-");
 		const restoreStartupMode = setStartupMode("full");
 
-		vi.mocked(loadLSPConfig).mockResolvedValue({
-			warmFiles: ["src/main.cpp"],
-		});
+		createTempFile(
+			env.tmpDir,
+			".pi-lens.json",
+			JSON.stringify({ lsp: { warmFiles: ["src/main.cpp"] } }),
+		);
 		createTempFile(env.tmpDir, "src/main.cpp", "int main() {}");
 
 		try {

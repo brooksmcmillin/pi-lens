@@ -307,6 +307,38 @@ describe("ktfmtFormatter — Gradle and Spotless style carriage (#2468/#2481)", 
 		});
 	});
 
+	it("F8: consults sixteen Gradle directories and gives up before the seventeenth", async () => {
+		// Recurrence (#4966 review F8): the fold turned the `for (hop < 16)` bound
+		// into a counter the loop body owns, and no case nested more than a few
+		// Gradle builds, so moving the cap by one stayed green. The declaring
+		// root is the LAST directory consulted at 16 and the first one refused
+		// at 17.
+		const resolveAtDepth = async (
+			gradleDirs: number,
+		): Promise<string | undefined> => {
+			const root = newTmpDir(`pi-lens-ktfmt-hops-${gradleDirs}-`);
+			fs.writeFileSync(
+				path.join(root, "build.gradle.kts"),
+				"subprojects {\n  ktfmt {\n    googleStyle()\n  }\n}\n",
+			);
+			let dir = root;
+			for (let level = 1; level < gradleDirs; level += 1) {
+				dir = path.join(dir, `m${level}`);
+				fs.mkdirSync(dir, { recursive: true });
+				fs.writeFileSync(
+					path.join(dir, "build.gradle.kts"),
+					'plugins {\n  kotlin("jvm")\n}\n',
+				);
+			}
+			const filePath = path.join(dir, "Main.kt");
+			fs.writeFileSync(filePath, "fun main() {}\n");
+			return resolveKtfmtGradleStyle(filePath, path.dirname(root));
+		};
+
+		expect(await resolveAtDepth(16)).toBe("--google-style");
+		expect(await resolveAtDepth(17)).toBeUndefined();
+	});
+
 	it("stops the ancestor climb at the injected HOME ceiling even when a style sits one level above it", async () => {
 		// Mutation-proof HOME-ceiling fixture (mirrors formatters-rustfmt-
 		// edition.test.ts's F5 case): the fixture tree puts a build.gradle.kts

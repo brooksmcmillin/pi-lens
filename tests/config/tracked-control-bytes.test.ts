@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { gitExecFileSync } from "../support/git-fixture-env.js";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -84,35 +85,39 @@ export function formatControlByteScan(result: ControlByteScanResult): string {
 }
 
 describe("tracked source files contain no literal control bytes (#2571)", () => {
-	it("scans a non-empty tracked TypeScript, JavaScript, and Markdown population", () => {
-		const files = trackedSourceFiles();
-		// Calibration: 1,514 TypeScript, 99 MJS, and 64 Markdown files are
-		// tracked on this tree OUTSIDE `.changelog/`. Each floor is below half
-		// its live population. The Markdown floor deliberately ignores the
-		// `.changelog/*.md` fragments: they are transient and vanish on every
-		// release roll (the 4.1.4 bump consumed 151 of them and a floor of 80,
-		// calibrated while they existed, went red on the release PR).
-		assertNonEmptyScan("git ls-files source population", files.length, 800);
-		assertNonEmptyScan(
-			"git ls-files TypeScript population",
-			files.filter((file) => file.endsWith(".ts")).length,
-			700,
-		);
-		assertNonEmptyScan(
-			"git ls-files MJS population",
-			files.filter((file) => file.endsWith(".mjs")).length,
-			45,
-		);
-		assertNonEmptyScan(
-			"git ls-files Markdown population",
-			files.filter((file) => file.endsWith(".md")).length,
-			30,
-		);
-		const result = scanTrackedSourceFiles(files);
-		const report = formatControlByteScan(result);
-		expect(result.violations, report).toEqual([]);
-		expect(result.dropped, report).toBe(0);
-	});
+	it(
+		"scans a non-empty tracked TypeScript, JavaScript, and Markdown population",
+		() => {
+			const files = trackedSourceFiles();
+			// Calibration: 1,514 TypeScript, 99 MJS, and 64 Markdown files are
+			// tracked on this tree OUTSIDE `.changelog/`. Each floor is below half
+			// its live population. The Markdown floor deliberately ignores the
+			// `.changelog/*.md` fragments: they are transient and vanish on every
+			// release roll (the 4.1.4 bump consumed 151 of them and a floor of 80,
+			// calibrated while they existed, went red on the release PR).
+			assertNonEmptyScan("git ls-files source population", files.length, 800);
+			assertNonEmptyScan(
+				"git ls-files TypeScript population",
+				files.filter((file) => file.endsWith(".ts")).length,
+				700,
+			);
+			assertNonEmptyScan(
+				"git ls-files MJS population",
+				files.filter((file) => file.endsWith(".mjs")).length,
+				45,
+			);
+			assertNonEmptyScan(
+				"git ls-files Markdown population",
+				files.filter((file) => file.endsWith(".md")).length,
+				30,
+			);
+			const result = scanTrackedSourceFiles(files);
+			const report = formatControlByteScan(result);
+			expect(result.violations, report).toEqual([]);
+			expect(result.dropped, report).toBe(0);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("reports a literal NUL through the real scan and formatting seam", () => {
 		const fixtureRoot = fs.mkdtempSync(

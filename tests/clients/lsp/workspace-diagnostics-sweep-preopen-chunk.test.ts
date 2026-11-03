@@ -34,10 +34,6 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 function makeServer(id: string, ext: string) {
@@ -55,8 +51,11 @@ describe("runWorkspaceDiagnostics — pre-open is chunked, not whole-group (#621
 	let tmp: string;
 	const ORIGINAL_CHUNK_ENV = process.env.PI_LENS_LSP_WORKSPACE_PREOPEN_CHUNK;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-preopen-chunk-"));

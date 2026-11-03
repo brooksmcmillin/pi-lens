@@ -1,7 +1,9 @@
+import { getEventListeners } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { suspendAt } from "../clients/interleaving-kit.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
@@ -16,7 +18,8 @@ const mocked = vi.hoisted(() => ({
 	cascadeTier: "waits" as "waits" | "tier3-silent",
 }));
 
-vi.mock("../../clients/warm-attach.js", () => ({
+vi.mock("../../clients/warm-attach.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../clients/warm-attach.js")>()),
 	isWarmAttached: () => mocked.warmAttached,
 	tryWarmAttachedDiagnostics: (...args: unknown[]) =>
 		mocked.attachedDiagnostics(...args),
@@ -25,21 +28,12 @@ vi.mock("../../clients/warm-attach.js", () => ({
 // #631: `groupFilesByPrimaryServer`/`runPerServerGroups` are the REAL
 // per-server-group scheduling primitives (`tools/lsp-diagnostics.ts` now
 // imports them from this module instead of using a flat, server-oblivious
-// pool) — only `getLSPService` is faked here. Keeping the real
-// grouping/scheduling implementations wired through the mock is what lets
-// the "#631 per-server scheduling" describe block below actually exercise
-// the property under test (never >1 in-flight touch per server group),
-// rather than a mock that would trivially satisfy it either way.
-vi.mock("../../clients/lsp/capabilities.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/capabilities.js")
-	>("../../clients/lsp/capabilities.js");
-	return {
-		...actual,
-		getLSPService: () => mocked.service,
-	};
-});
-
+// pool) — only the service the singleton hands out is a double, installed
+// through the lifecycle seam. Keeping the real grouping/scheduling
+// implementations is what lets the "#631 per-server scheduling" describe
+// block below actually exercise the property under test (never >1 in-flight
+// touch per server group), rather than a mock that would trivially satisfy it
+// either way.
 vi.mock("../../clients/lsp/wait-policy/index.js", () => ({
 	classifyCascadeWaitTier: () => mocked.cascadeTier,
 }));
@@ -52,12 +46,20 @@ vi.mock("../../clients/widget-state.js", () => ({
 }));
 
 import { createLspDiagnosticsTool } from "../../tools/lsp-diagnostics.js";
+import {
+	type DiskChange,
+	subscribeDiskChange,
+} from "../../clients/disk-changes.js";
+import { lookForOutOfBandChanges } from "../../clients/out-of-band-changes.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { RUNTIME_CONFIG } from "../../clients/runtime-config.js";
+import { installLspService } from "../support/lsp-service-seam.js";
+import { useConfigPath } from "../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 /**
  * The mocked LSP service every case reads through `mocked.service`. #4397: it
@@ -70,37 +72,39 @@ function resetServiceDouble() {
 	mocked.warmAttached = false;
 	mocked.attachedDiagnostics.mockReset();
 	reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
-	mocked.service = makeLspServiceDouble({
-		getDiagnostics: vi.fn().mockImplementation(async (filePath: string) => {
-			if (filePath.endsWith("bad.ts")) {
-				return [
-					{
-						severity: 1,
-						message: "Type 'string' is not assignable to type 'number'.",
-						range: {
-							start: { line: 0, character: 16 },
-							end: { line: 0, character: 24 },
+	mocked.service = installLspService(
+		makeLspServiceDouble({
+			getDiagnostics: vi.fn().mockImplementation(async (filePath: string) => {
+				if (filePath.endsWith("bad.ts")) {
+					return [
+						{
+							severity: 1,
+							message: "Type 'string' is not assignable to type 'number'.",
+							range: {
+								start: { line: 0, character: 16 },
+								end: { line: 0, character: 24 },
+							},
+							source: "ts",
 						},
-						source: "ts",
-					},
-				];
-			}
-			return [];
+					];
+				}
+				return [];
+			}),
+			getDiagnosticsHealth: vi.fn().mockReturnValue(undefined),
+			getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
+			runWorkspaceDiagnostics: vi.fn(),
+			// #2598: `collectDiagnosticsForFile` now touches unconditionally —
+			// the real `LSPService` defines `touchFile` on every shape, so the
+			// probe that used to route this suite down an `openFile` arm is
+			// gone. `undefined` is what the real `touchFile` resolves to when
+			// it resolves NO client for the file (clients/lsp/index.ts, the
+			// `no_clients` return), and it is the state these cases want: the
+			// tool falls through to `getDiagnostics`, where their fixtures
+			// live. Cases that want the touch itself to answer install their
+			// own `touchFile` on the double.
+			touchFile: vi.fn(async () => undefined),
 		}),
-		getDiagnosticsHealth: vi.fn().mockReturnValue(undefined),
-		getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
-		runWorkspaceDiagnostics: vi.fn(),
-		// #2598: `collectDiagnosticsForFile` now touches unconditionally —
-		// the real `LSPService` defines `touchFile` on every shape, so the
-		// probe that used to route this suite down an `openFile` arm is
-		// gone. `undefined` is what the real `touchFile` resolves to when
-		// it resolves NO client for the file (clients/lsp/index.ts, the
-		// `no_clients` return), and it is the state these cases want: the
-		// tool falls through to `getDiagnostics`, where their fixtures
-		// live. Cases that want the touch itself to answer install their
-		// own `touchFile` on the double.
-		touchFile: vi.fn(async () => undefined),
-	});
+	);
 }
 
 describe("lsp_diagnostics tool", () => {
@@ -115,6 +119,7 @@ describe("lsp_diagnostics tool", () => {
 		mocked.attachedDiagnostics.mockResolvedValue({
 			available: true,
 			response: {
+				binding: { boundToCurrentDisk: true },
 				diagnostics: [
 					{
 						severity: 1,
@@ -153,6 +158,114 @@ describe("lsp_diagnostics tool", () => {
 			);
 			expect(ensureWarmForSweep).not.toHaveBeenCalled();
 			expect(touchFile).not.toHaveBeenCalled();
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	// Recurrence (#4944 review F2): the exclusion reached only the local touch, so
+	// a warm incumbent started without the flag still delivered its ast-grep rows
+	// to a batch that had switched ast-grep off.
+	it("drops a switched-off auxiliary's attached rows from a batch and keeps the others (#4944)", async () => {
+		mocked.warmAttached = true;
+		const row = (message: string, serverId: string) => ({
+			severity: 1,
+			message,
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
+			source: serverId,
+			serverId,
+		});
+		mocked.attachedDiagnostics.mockResolvedValue({
+			available: true,
+			response: {
+				binding: { boundToCurrentDisk: true },
+				diagnostics: [
+					row("from incumbent ts", "typescript"),
+					row("from incumbent ast-grep", "ast-grep"),
+				],
+			},
+		});
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-attached-off-"),
+		);
+		const file = path.join(tmpDir, "attached.ts");
+		fs.writeFileSync(file, "const value = 1;\n");
+		try {
+			const run = async (getFlag?: (name: string) => boolean) =>
+				String(
+					(
+						(await createLspDiagnosticsTool(
+							undefined,
+							undefined,
+							undefined,
+							getFlag,
+						).execute(
+							"diag-attached-off",
+							{
+								paths: [file],
+								severity: "all",
+								waitMs: 321,
+								serverScope: "all",
+							},
+							new AbortController().signal,
+							null,
+							{ cwd: "." },
+						)) as any
+					).content[0]?.text,
+				);
+
+			// The control: with the switch unset the fixture does deliver the row.
+			expect(await run()).toContain("from incumbent ast-grep");
+			const off = await run((name) => name === "no-ast-grep");
+			expect(off).toContain("from incumbent ts");
+			expect(off).not.toContain("from incumbent ast-grep");
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	// Recurrence (#4947 r2 verify N1): the receipt dropped a switched-off
+	// server's rows but kept its id, so the check rendered ast-grep as a scanner
+	// that "did not answer" beside "Switched off, not run: ast-grep."
+	it("drops a switched-off auxiliary from the incumbent's coverage gap and keeps the others (#4944)", async () => {
+		mocked.warmAttached = true;
+		mocked.attachedDiagnostics.mockResolvedValue({
+			available: true,
+			response: {
+				binding: { boundToCurrentDisk: true },
+				diagnostics: [],
+				confirmation: "partial",
+				unconfirmedServerIds: ["ast-grep", "typos"],
+			},
+		});
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-attached-off-gap-"),
+		);
+		const file = path.join(tmpDir, "attached.ts");
+		fs.writeFileSync(file, "const value = 1;\n");
+		try {
+			const gap = async (getFlag?: (name: string) => boolean) =>
+				(
+					(await createLspDiagnosticsTool(
+						undefined,
+						undefined,
+						undefined,
+						getFlag,
+					).execute(
+						"diag-attached-off-gap",
+						{ path: file, severity: "all", waitMs: 321, serverScope: "all" },
+						new AbortController().signal,
+						null,
+						{ cwd: "." },
+					)) as any
+				).details?.unconfirmedServerIds;
+
+			// The control: with the switch unset the incumbent's gap is reported.
+			expect(await gap()).toEqual(["ast-grep", "typos"]);
+			expect(await gap((name) => name === "no-ast-grep")).toEqual(["typos"]);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}
@@ -350,6 +463,35 @@ describe("lsp_diagnostics tool", () => {
 		}
 	});
 
+	// Shape 4 (an abort listener is a watcher: released on every settle path).
+	// `collectBatchDiagnostics` raced each file against the call's signal with a
+	// private listener nothing removed, so a 100-file batch left 100 dead
+	// listeners on the tool call's signal.
+	it("a finished batch leaves no abort listener per file on the call's signal", async () => {
+		const tool = createLspDiagnosticsTool();
+		const call = new AbortController();
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-abort-listeners-"),
+		);
+		const files = ["a.ts", "b.ts", "c.ts"].map((name) =>
+			path.join(tmpDir, name),
+		);
+		for (const file of files) fs.writeFileSync(file, "const value = 1;\n");
+		try {
+			const result = (await tool.execute(
+				"diag-abort-listeners",
+				{ paths: files, concurrency: 1 },
+				call.signal,
+				null,
+				{ cwd: tmpDir },
+			)) as any;
+			expect(result.details?.filesChecked).toBe(3);
+			expect(getEventListeners(call.signal, "abort")).toHaveLength(0);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
 	it("bounds an in-flight file and the whole batch on abort (#837)", async () => {
 		const previous = process.env.PI_LENS_LSP_BATCH_FILE_MS;
 		process.env.PI_LENS_LSP_BATCH_FILE_MS = "1000";
@@ -360,8 +502,13 @@ describe("lsp_diagnostics tool", () => {
 		);
 		const files = ["a.ts", "b.ts"].map((name) => path.join(tmpDir, name));
 		for (const file of files) fs.writeFileSync(file, "const value = 1;\n");
-		(mocked.service as any).touchFile = vi.fn(() => new Promise(() => {}));
-		const started = Date.now();
+		// Discovery may precede the first touch. Judge cancellation only once
+		// that touch is pending, without letting the 1000ms file deadline fire.
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const touch = vi.fn();
+		(mocked.service as any).touchFile = touch;
+		const suspended = suspendAt(touch, () => new Promise(() => {}));
+		let settled = false;
 		const pending = tool.execute(
 			"diag-abort-contract",
 			{ paths: files, concurrency: 1, waitMs: 1 },
@@ -369,13 +516,22 @@ describe("lsp_diagnostics tool", () => {
 			null,
 			{ cwd: process.cwd() },
 		);
-		setTimeout(() => controller.abort(), 20);
+		const completion = pending.then((result) => {
+			settled = true;
+			return result;
+		});
 		try {
-			const result = (await pending) as any;
-			expect(Date.now() - started).toBeLessThan(500);
+			await suspended.admitted;
+			controller.abort();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(settled, "abort completes before the file deadline").toBe(true);
+			const result = (await completion) as any;
 			expect(result.details?.outcomeCounts?.inconclusive).toBe(1);
 			expect(result.details?.incompleteFiles).toBe(1);
 		} finally {
+			suspended.restore();
+			vi.clearAllTimers();
+			vi.useRealTimers();
 			removeTempDirSync(tmpDir);
 			if (previous === undefined) delete process.env.PI_LENS_LSP_BATCH_FILE_MS;
 			else process.env.PI_LENS_LSP_BATCH_FILE_MS = previous;
@@ -411,6 +567,81 @@ describe("lsp_diagnostics tool", () => {
 		expect(result.details?.mode).toBe("batch");
 		expect(result.details?.filesChecked).toBe(0);
 		expect(result.details?.totalDiagnostics).toBe(0);
+	});
+
+	it("spends no declaration walk on an already-aborted call (#5005 F3)", async () => {
+		// Recurrence: the answer route's pre-answer look (#4532 gap 5) ran its
+		// whole forced walk for a call whose signal was already aborted, so an
+		// abandoned call paid a walk and published a declaration for an answer
+		// nobody reads.
+		const touchFile = vi.fn(async () => undefined);
+		(mocked.service as any).touchFile = touchFile;
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-abort-look-"),
+		);
+		const file = path.join(tmpDir, "a.ts");
+		fs.writeFileSync(file, "const value = 1;\n");
+		const published: DiskChange[] = [];
+		const unsubscribe = subscribeDiskChange(
+			"probe-5005-f3",
+			(change) => {
+				published.push(change);
+			},
+			["out-of-band"],
+		);
+		const run = (signal: AbortSignal) =>
+			createLspDiagnosticsTool().execute(
+				"diag-abort-look",
+				{ paths: [file], severity: "all", concurrency: 1 },
+				signal,
+				null,
+				{ cwd: tmpDir },
+			) as Promise<any>;
+		try {
+			// The baseline look records the root's empty declaration population.
+			await run(new AbortController().signal);
+			expect(touchFile).toHaveBeenCalledTimes(1);
+			// A declaration the call's own forced walk would publish...
+			const ambient = path.join(tmpDir, "types", "ambient.d.ts");
+			fs.mkdirSync(path.dirname(ambient), { recursive: true });
+			fs.writeFileSync(ambient, "declare const A: number;\n");
+			published.length = 0;
+			touchFile.mockClear();
+			const aborted = new AbortController();
+			aborted.abort();
+			const abandoned = await run(aborted.signal);
+			// No file is started for an answer the caller already abandoned.
+			expect(touchFile).not.toHaveBeenCalled();
+			expect(abandoned.details?.filesChecked).toBe(0);
+			// A look of this root now joins whatever pass the aborted call may have
+			// started, so a background publish is observed here rather than racing
+			// the assertions. The interval is pinned wide, so this look itself
+			// cannot walk; only the aborted call's own `"always"` demand could.
+			const priorInterval = process.env.PI_LENS_DECLARATION_LOOK_MS;
+			process.env.PI_LENS_DECLARATION_LOOK_MS = "600000";
+			try {
+				await lookForOutOfBandChanges(tmpDir, "tool_call");
+			} finally {
+				if (priorInterval === undefined)
+					delete process.env.PI_LENS_DECLARATION_LOOK_MS;
+				else process.env.PI_LENS_DECLARATION_LOOK_MS = priorInterval;
+			}
+			// ...is not published for an answer the caller already abandoned.
+			expect(published).toEqual([]);
+			// Control: a live call publishes it, so the aborted call left the walk
+			// record untouched rather than the declaration unreadable.
+			await run(new AbortController().signal);
+			expect(
+				published.some((change) =>
+					(change.pathChanges ?? []).some(
+						(entry) => entry.filePath === ambient && entry.type === "created",
+					),
+				),
+			).toBe(true);
+		} finally {
+			unsubscribe();
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it("short-circuits the directory fan-out when the signal is already aborted (#343)", async () => {
@@ -571,8 +802,7 @@ describe("lsp_diagnostics tool", () => {
 		// Anchor the ignore matcher's git root at tmpDir + isolate from any global
 		// ~/.pi-lens/config.json on the host so the scan is hermetic.
 		fs.mkdirSync(path.join(tmpDir, ".git"));
-		const prevConfig = process.env.PI_LENS_CONFIG_PATH;
-		process.env.PI_LENS_CONFIG_PATH = path.join(tmpDir, "no-global.json");
+		setConfigPath(path.join(tmpDir, "no-global.json"));
 		resetProjectLensConfigCache();
 		const write = (rel: string, body = "const value = 1;\n") => {
 			const full = path.join(tmpDir, rel);
@@ -608,8 +838,6 @@ describe("lsp_diagnostics tool", () => {
 			);
 			expect(opened).toEqual(["src/good.ts"]);
 		} finally {
-			if (prevConfig === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = prevConfig;
 			resetProjectLensConfigCache();
 			removeTempDirSync(tmpDir);
 		}
@@ -1400,6 +1628,7 @@ describe("lsp_diagnostics tool", () => {
 			mocked.attachedDiagnostics.mockResolvedValue({
 				available: true,
 				response: {
+					binding: { boundToCurrentDisk: true },
 					diagnostics: [
 						{
 							severity: 1,
@@ -1448,6 +1677,7 @@ describe("lsp_diagnostics tool", () => {
 			mocked.attachedDiagnostics.mockResolvedValue({
 				available: true,
 				response: {
+					binding: { boundToCurrentDisk: true },
 					diagnostics: [],
 					confirmation: "partial",
 					unconfirmedServerIds: ["opengrep"],
@@ -1585,7 +1815,11 @@ describe("lsp_diagnostics tool", () => {
 			mocked.warmAttached = true;
 			mocked.attachedDiagnostics.mockResolvedValue({
 				available: true,
-				response: { diagnostics: [], confirmation: "confirmed" },
+				response: {
+					diagnostics: [],
+					confirmation: "confirmed",
+					binding: { boundToCurrentDisk: true },
+				},
 			});
 			const executeCommand = vi.fn();
 			(mocked.service as any).executeCommand = executeCommand;
@@ -1610,12 +1844,123 @@ describe("lsp_diagnostics tool", () => {
 			}
 		});
 
+		// #5030: a warm incumbent's confirmed-clean answer about OLDER bytes. The
+		// DTO dropped the touch's content binding, so this reader rendered the
+		// answer clean for the current bytes (#5017 on the warm route; the direct
+		// route demotes a stale bound to unconfirmed, `boundMismatch`). The answer
+		// comes from the real producer through a JSON round trip. An incumbent
+		// built before #5030 sends no binding, and that reads as not current.
+		describe("warm-attached binding (#5030)", () => {
+			const servedAnswer = async (
+				file: string,
+				incumbentTouch: Record<string, unknown>,
+				edit: (response: Record<string, unknown>) => void = () => undefined,
+			) => {
+				const { _serveWarmRequestForTests } =
+					await import("../../clients/warm-attach.js");
+				const { contentHash, WARM_DIAGNOSTICS_SCHEMA_VERSION } =
+					await import("../../clients/mcp/ipc.js");
+				const content = fs.readFileSync(file, "utf-8");
+				(mocked.service as any).touchFile = vi
+					.fn()
+					.mockResolvedValueOnce(incumbentTouch);
+				const served = await _serveWarmRequestForTests({
+					route: "diagnostics",
+					version: WARM_DIAGNOSTICS_SCHEMA_VERSION,
+					file,
+					cwd: path.dirname(file),
+					content,
+					contentHash: contentHash(content),
+					deadlineAt: Date.now() + 60_000,
+				});
+				const response = JSON.parse(JSON.stringify(served.result));
+				edit(response);
+				return { available: true, response };
+			};
+			const readOf = async (route: "batch" | "single", file: string) => {
+				const result = await runMarkdown(
+					route === "batch"
+						? { paths: [file], severity: "all", serverScope: "primary" }
+						: { path: file, severity: "all", serverScope: "primary" },
+					[file],
+				);
+				return route === "batch"
+					? (result.details?.outcomeCounts?.clean ?? 0) === 1
+					: result.details?.unconfirmed === false;
+			};
+			const markdownFile = (prefix: string) => {
+				const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+				const file = path.join(tmpDir, "README.md");
+				fs.writeFileSync(file, "# Example\n");
+				return { tmpDir, file };
+			};
+
+			it.each([
+				["batch", false, false],
+				["batch", true, true],
+				["batch", "unknown", true],
+				["single", false, false],
+				["single", true, true],
+				["single", "unknown", true],
+			] as const)(
+				"%s route: an incumbent answer bound %s reads clean = %s",
+				async (route, bound, clean) => {
+					mocked.cascadeTier = "tier3-silent";
+					mocked.warmAttached = true;
+					const { tmpDir, file } = markdownFile("pi-lens-warm-5030-");
+					try {
+						mocked.attachedDiagnostics.mockResolvedValue(
+							await servedAnswer(file, {
+								diags: [],
+								confirmation: "confirmed",
+								binding: { boundToCurrentDisk: bound },
+							}),
+						);
+						expect(await readOf(route, file)).toBe(clean);
+					} finally {
+						removeTempDirSync(tmpDir);
+					}
+				},
+			);
+
+			it.each([
+				["no binding field (an older incumbent)", undefined],
+				["a null binding", null],
+				["a binding that is not an object", "yes"],
+				["a binding with no verdict", {}],
+				[
+					"a binding with an unrecognised verdict",
+					{ boundToCurrentDisk: "yes" },
+				],
+			] as const)("%s never reads clean", async (_label, wire) => {
+				mocked.cascadeTier = "tier3-silent";
+				mocked.warmAttached = true;
+				const { tmpDir, file } = markdownFile("pi-lens-warm-5030-old-");
+				try {
+					mocked.attachedDiagnostics.mockResolvedValue(
+						await servedAnswer(
+							file,
+							{ diags: [], confirmation: "confirmed" },
+							(response) => {
+								if (wire === undefined) delete response.binding;
+								else response.binding = wire;
+							},
+						),
+					);
+					expect(await readOf("batch", file)).toBe(false);
+					expect(await readOf("single", file)).toBe(false);
+				} finally {
+					removeTempDirSync(tmpDir);
+				}
+			});
+		});
+
 		it("a warm-attached result WITHOUT confirmation stays unconfirmed", async () => {
 			mocked.cascadeTier = "tier3-silent";
 			mocked.warmAttached = true;
 			mocked.attachedDiagnostics.mockResolvedValue({
 				available: true,
-				response: { diagnostics: [] },
+				response: { diagnostics: [], binding: { boundToCurrentDisk: true } },
 			});
 			const tmpDir = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-marksman-warm-unconfirmed-"),

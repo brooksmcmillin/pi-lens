@@ -164,6 +164,11 @@ const LANE_ALREADY_REACHED: Readonly<Record<string, string>> = {
 	"tests/support/tests-tree-write-guard.test.ts":
 		"already reached through the Vitest config's default project graph; " +
 		"Knip reports an explicit entry as redundant",
+	// #4709: verified the same way — `npm run knip` with this file added to
+	// knip.jsonc's entry list reported "Remove redundant entry pattern" for it.
+	"tests/support/path-probe-stub.test.ts":
+		"already reached through the Vitest config's default project graph; " +
+		"Knip reports an explicit entry as redundant",
 	// #3703: verified the same way — `npm run knip` with this file added to
 	// knip.jsonc's entry list reported "Remove redundant entry pattern" for it.
 	"tests/support/vitest-setup-registry-teardown.test.ts":
@@ -177,6 +182,12 @@ const LANE_ALREADY_REACHED: Readonly<Record<string, string>> = {
 	// #4504: verified the same way — `npm run knip` with this file added to
 	// knip.jsonc's entry list reported "Remove redundant entry pattern" for it.
 	"tests/index-4504-opaque-prescan-root-witness.test.ts":
+		"already reached through the Vitest config's default project graph; " +
+		"Knip reports an explicit entry as redundant",
+	// #5150: verified the same way — `npm run knip` with this file added to
+	// knip.jsonc's entry list reported "Remove redundant entry pattern" for
+	// exactly that line, and without it knip reports no unused file.
+	"tests/mcp/project-report-text-parity.smoke.test.ts":
 		"already reached through the Vitest config's default project graph; " +
 		"Knip reports an explicit entry as redundant",
 };

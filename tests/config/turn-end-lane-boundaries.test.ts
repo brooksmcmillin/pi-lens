@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import { stripCommentsAndStrings } from "../support/session-state-scan.js";
 import { assertNonEmptyScan, listSourceFiles } from "../support/sweep-kit.js";
 import { toPosix } from "../../clients/path-utils.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const LANE_DIR = path.join(REPO_ROOT, "clients/turn-end");
@@ -39,13 +40,17 @@ describe("turn-end lane boundaries (#1892)", () => {
 	// directory, so a lane tree that vanished (or moved) reds here first rather
 	// than passing three rules over nothing (`assertNonEmptyScan` above fires
 	// before any of them, at module load).
-	it("finds the lane interface and at least one lane module", () => {
-		const files = LANE_SOURCES.map((s) => s.file);
-		expect(files).toContain("clients/turn-end/lane.ts");
-		expect(
-			files.filter((f) => f.startsWith("clients/turn-end/lanes/")).length,
-		).toBeGreaterThan(0);
-	});
+	it(
+		"finds the lane interface and at least one lane module",
+		() => {
+			const files = LANE_SOURCES.map((s) => s.file);
+			expect(files).toContain("clients/turn-end/lane.ts");
+			expect(
+				files.filter((f) => f.startsWith("clients/turn-end/lanes/")).length,
+			).toBeGreaterThan(0);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// Recurrence prevented: the `@delivery-surface:` seam scan in
 	// `tests/clients/finding-delivery-gate.test.ts` reads exactly
@@ -54,12 +59,16 @@ describe("turn-end lane boundaries (#1892)", () => {
 	// agent-facing render seam that scan cannot see, so a new untagged,
 	// unregistered delivery surface would ship green. Lanes RETURN parts
 	// (`TurnEndLaneParts`); the composer owns the push.
-	it("no lane pushes into a turn tier — the tag scan only reads the composer", () => {
-		const offenders = LANE_SOURCES.filter((s) =>
-			TIER_PUSH_RE.test(s.stripped),
-		).map((s) => s.file);
-		expect(offenders, offenders.join(", ")).toEqual([]);
-	});
+	it(
+		"no lane pushes into a turn tier — the tag scan only reads the composer",
+		() => {
+			const offenders = LANE_SOURCES.filter((s) =>
+				TIER_PUSH_RE.test(s.stripped),
+			).map((s) => s.file);
+			expect(offenders, offenders.join(", ")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// Recurrence prevented: #3264 folded the turn-end scanner stores into ONE
 	// `gateFindingsByPathFreshness` call so a path two stores cite is stat'd
@@ -68,10 +77,14 @@ describe("turn-end lane boundaries (#1892)", () => {
 	// re-split that pass per lane the moment a second lane is extracted —
 	// silently, since every individual lane would still look correct. Lanes
 	// DECLARE sources from `collect`; the composer runs the one pass.
-	it("no lane calls the freshness gate itself — the pass is per delivery", () => {
-		const offenders = LANE_SOURCES.filter((s) =>
-			GATE_CALL_RE.test(s.stripped),
-		).map((s) => s.file);
-		expect(offenders, offenders.join(", ")).toEqual([]);
-	});
+	it(
+		"no lane calls the freshness gate itself — the pass is per delivery",
+		() => {
+			const offenders = LANE_SOURCES.filter((s) =>
+				GATE_CALL_RE.test(s.stripped),
+			).map((s) => s.file);
+			expect(offenders, offenders.join(", ")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });

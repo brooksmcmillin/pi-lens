@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { createPiMock } from "./support/pi-mock.js";
+import { endTurn } from "./support/pi-session-commit-gate.js";
+import { piSessionFixture, startPiSession } from "./support/pi-session.js";
 import type { Diagnostic } from "../clients/dispatch/types.js";
 import { normalizeMapKey } from "../clients/path-utils.js";
 
@@ -14,7 +15,14 @@ import { normalizeMapKey } from "../clients/path-utils.js";
  * index.ts registered; the record forgets the entry only if index.ts wires
  * `forgetCascadePendingNeighbor` there. The cascade-tier tests drive their
  * own callback, so only an activated extension shows the wiring.
+ *
+ * Tier 2, inline-factory mode (#4937 L6): the extension runs in a real pi
+ * session on THIS test graph's modules, so the cascade registries the case
+ * seeds and reads below are the ones the extension's wiring writes to. On the
+ * path load they would be a second copy and the assertion would see nothing.
  */
+
+const fixture = piSessionFixture();
 
 afterEach(async () => {
 	const { resetCascadePendingNeighbors } =
@@ -30,8 +38,12 @@ describe(
 	{ timeout: 30_000 },
 	() => {
 		it("a late clean answer clears the neighbour's pending cascade errors", async () => {
-			const { default: registerExtension } = await import("../index.js");
-			registerExtension(createPiMock({}).asExtensionAPI() as never);
+			const handle = await startPiSession({
+				root: fixture.root,
+				responses: [endTurn()],
+				inlineFactory: async () => (await import("../index.js")).default,
+			});
+			expect(handle.errors).toEqual([]);
 
 			const { listCascadePendingNeighbors, recordDeliveredCascadeNeighbor } =
 				await import("../clients/cascade-format.js");

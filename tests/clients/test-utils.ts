@@ -375,6 +375,290 @@ export function createCaseAliasFixture(
 		: { rawMisCased, onDisk };
 }
 
+/** The spellings {@link createPathIdentityFixture} plants, all absolute. */
+export interface PathIdentityFixture {
+	/** The real repository root. */
+	repo: string;
+	/** `repo-alias` -> `repo`: a link-spelled session root (case h). */
+	aliasRoot: string;
+	/** `repo/src/real.ts`, a regular file. */
+	realFile: string;
+	/** `repo/src/link.ts` -> `real.ts`: a file link in the root (case b). */
+	fileLink: string;
+	/** `repo/CLAUDE.md`, the target of {@link agentsLink}. */
+	claudeMd: string;
+	/** `repo/AGENTS.md` -> `CLAUDE.md`: the everyday markdown link (case a). */
+	agentsLink: string;
+	/** `repo/shared/util.ts`, reached through {@link dirLinkFile}. */
+	sharedFile: string;
+	/** `repo/src/linked/util.ts`, where `src/linked` -> `../shared` (case c). */
+	dirLinkFile: string;
+	/** `outside/ext.ts`, a file outside the repository. */
+	outsideFile: string;
+	/** `repo/src/out-link.ts` -> `../../outside/ext.ts`: a link out of the root (case d1). */
+	outLink: string;
+	/** Set when this host cannot create symlinks; the cell must skip visibly. */
+	skipReason?: string;
+}
+
+/**
+ * The #4689 symlinked-fixture family: one real repository and every link
+ * spelling pi-lens must key by path identity, the kernel-real path. Each
+ * shape names the defect its cells guard: a file link and a directory link
+ * split one file into two records (shape 1, divergent path keys), a link out
+ * of the root crosses the analysis-root class, and an alias root spells every
+ * in-root file differently from its identity. `baseDir` should be a
+ * `setupTestEnvironment` root so the shared hygiene owner removes it. The
+ * other-worktree and unrelated-repository members are opt-in plants
+ * ({@link plantOtherWorktree}, {@link plantUnrelatedRepo}), kept out of this
+ * function for the reason {@link plantPackageLink} gives.
+ */
+export function createPathIdentityFixture(
+	baseDir: string,
+): PathIdentityFixture {
+	const repo = path.join(baseDir, "repo");
+	const outside = path.join(baseDir, "outside");
+	fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+	fs.mkdirSync(path.join(repo, "shared"), { recursive: true });
+	fs.mkdirSync(outside, { recursive: true });
+	const realFile = path.join(repo, "src", "real.ts");
+	const claudeMd = path.join(repo, "CLAUDE.md");
+	const sharedFile = path.join(repo, "shared", "util.ts");
+	const outsideFile = path.join(outside, "ext.ts");
+	fs.writeFileSync(realFile, "export const real = 1;\n");
+	fs.writeFileSync(claudeMd, "# Agents\n");
+	fs.writeFileSync(sharedFile, "export const util = 1;\n");
+	fs.writeFileSync(outsideFile, "export const ext = 1;\n");
+	const fixture: PathIdentityFixture = {
+		repo,
+		aliasRoot: path.join(baseDir, "repo-alias"),
+		realFile,
+		fileLink: path.join(repo, "src", "link.ts"),
+		claudeMd,
+		agentsLink: path.join(repo, "AGENTS.md"),
+		sharedFile,
+		dirLinkFile: path.join(repo, "src", "linked", "util.ts"),
+		outsideFile,
+		outLink: path.join(repo, "src", "out-link.ts"),
+	};
+	try {
+		fs.symlinkSync("real.ts", fixture.fileLink, "file");
+		fs.symlinkSync("CLAUDE.md", fixture.agentsLink, "file");
+		fs.symlinkSync(
+			path.join("..", "shared"),
+			path.join(repo, "src", "linked"),
+			"dir",
+		);
+		fs.symlinkSync(
+			path.join("..", "..", "outside", "ext.ts"),
+			fixture.outLink,
+			"file",
+		);
+		fs.symlinkSync("repo", fixture.aliasRoot, "dir");
+	} catch (err) {
+		fixture.skipReason = `cannot create symlinks here: ${
+			err instanceof Error ? err.message : String(err)
+		}`;
+	}
+	return fixture;
+}
+
+/** The cross-package link {@link plantPackageLink} adds to a fixture repo. */
+export interface PackageLinkFixture {
+	/** `repo/pkg-a`, a package with its own `package.json`. */
+	pkgA: string;
+	/** `repo/pkg-b`, a package with its own `package.json`. */
+	pkgB: string;
+	/** `repo/pkg-b/b.ts`, a regular file. */
+	realFile: string;
+	/** `repo/pkg-a/src/blink.ts` -> `../../pkg-b/b.ts`: a file in package A that is package B's. */
+	fileLink: string;
+	/** `repo/pkg-b/lib/lib.ts`, a regular file in a directory of package B. */
+	libFile: string;
+	/** `repo/pkg-a/lib` -> `../pkg-b/lib`: a directory in package A that is package B's. */
+	dirLink: string;
+	/** Set when this host cannot create symlinks; the cell must skip visibly. */
+	skipReason?: string;
+}
+
+/**
+ * The #4689 item 6 member of the symlinked-fixture family: a file link from
+ * one package into another. Walking up from the link's SPELLING reaches
+ * `pkg-a`'s markers, walking up from the file's identity reaches `pkg-b`'s,
+ * so a marker walk or a child cwd chosen from the spelling runs the wrong
+ * package's tool config (shape 1, divergent path keys). Kept out of
+ * {@link createPathIdentityFixture} so the cells that count the repo's files
+ * do not see two more packages.
+ */
+export function plantPackageLink(repo: string): PackageLinkFixture {
+	const pkgA = path.join(repo, "pkg-a");
+	const pkgB = path.join(repo, "pkg-b");
+	fs.mkdirSync(path.join(pkgA, "src"), { recursive: true });
+	fs.mkdirSync(pkgB, { recursive: true });
+	fs.writeFileSync(path.join(pkgA, "package.json"), "{}\n");
+	fs.writeFileSync(path.join(pkgB, "package.json"), "{}\n");
+	const realFile = path.join(pkgB, "b.ts");
+	fs.writeFileSync(realFile, "export const b = 1;\n");
+	const libFile = path.join(pkgB, "lib", "lib.ts");
+	fs.mkdirSync(path.dirname(libFile), { recursive: true });
+	fs.writeFileSync(libFile, "export const lib = 1;\n");
+	const fixture: PackageLinkFixture = {
+		pkgA,
+		pkgB,
+		realFile,
+		fileLink: path.join(pkgA, "src", "blink.ts"),
+		libFile,
+		dirLink: path.join(pkgA, "lib"),
+	};
+	try {
+		fs.symlinkSync(
+			path.join("..", "..", "pkg-b", "b.ts"),
+			fixture.fileLink,
+			"file",
+		);
+		fs.symlinkSync(path.join("..", "pkg-b", "lib"), fixture.dirLink, "dir");
+	} catch (err) {
+		fixture.skipReason = `cannot create symlinks here: ${
+			err instanceof Error ? err.message : String(err)
+		}`;
+	}
+	return fixture;
+}
+
+/**
+ * A checkout with one linked worktree, written as git writes it: `<repo>/.git`
+ * is a directory (the shared commondir), `<worktree>/.git` is a file holding
+ * `gitdir: <repo>/.git/worktrees/<name>`, that gitdir's `commondir` points
+ * back at the shared `.git`, and each gitdir holds a `HEAD`.
+ * `resolveGitCheckout`/`resolveLinkedWorktreeOwner` read exactly these files,
+ * so no `git` child is needed to classify the file. The layout is
+ * `<root>/repo` and `<root>/repo-wt`.
+ */
+export function writeLinkedWorktree(root: string): {
+	repo: string;
+	worktree: string;
+} {
+	const repo = path.join(root, "repo");
+	const worktree = path.join(root, "repo-wt");
+	const gitDir = path.join(repo, ".git");
+	const linkedGitDir = path.join(gitDir, "worktrees", "repo-wt");
+	fs.mkdirSync(linkedGitDir, { recursive: true });
+	fs.mkdirSync(worktree, { recursive: true });
+	fs.writeFileSync(path.join(repo, "package.json"), "{}\n");
+	fs.writeFileSync(path.join(worktree, ".git"), `gitdir: ${linkedGitDir}\n`);
+	fs.writeFileSync(path.join(linkedGitDir, "commondir"), "../..\n");
+	// git writes a HEAD in both gitdirs, and a `.git` directory without one is
+	// not a repository to `resolveGitCheckout` (#4508).
+	fs.writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+	fs.writeFileSync(path.join(linkedGitDir, "HEAD"), "ref: refs/heads/wt\n");
+	return { repo, worktree };
+}
+
+/** The other-worktree member {@link plantOtherWorktree} adds to a fixture. */
+export interface OtherWorktreeFixture {
+	/** `repo-wt`, a linked worktree of the fixture's `repo` checkout. */
+	worktree: string;
+	/** `repo-wt/src/wt.ts`, a regular file in that worktree. */
+	worktreeFile: string;
+	/** `repo/src/wt-link.ts` -> `../../repo-wt/src/wt.ts`: spelled in the session root, owned by the other worktree. */
+	worktreeLink: string;
+	/** Set when this host cannot create symlinks; the cell must skip visibly. */
+	skipReason?: string;
+}
+
+/**
+ * The #4689 item 10 other-worktree member: a file link from the session's
+ * checkout into a LINKED WORKTREE of it. Its spelling sits under the session
+ * root, its identity under the worktree root, so a class decided from the
+ * spelling reads `session` where the identity reads `linked-worktree`
+ * (shape 1, divergent path keys, across the analysis-root class). `baseDir`
+ * is the one {@link createPathIdentityFixture} was given: `repo` is its
+ * checkout. Opt-in because it turns `repo` into a git checkout, which the
+ * cells that count the repo's files do not expect.
+ */
+export function plantOtherWorktree(baseDir: string): OtherWorktreeFixture {
+	const { repo, worktree } = writeLinkedWorktree(baseDir);
+	const worktreeFile = path.join(worktree, "src", "wt.ts");
+	fs.mkdirSync(path.dirname(worktreeFile), { recursive: true });
+	fs.writeFileSync(worktreeFile, "export const wt = 1;\n");
+	const fixture: OtherWorktreeFixture = {
+		worktree,
+		worktreeFile,
+		worktreeLink: path.join(repo, "src", "wt-link.ts"),
+	};
+	try {
+		fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+		fs.symlinkSync(
+			path.join("..", "..", "repo-wt", "src", "wt.ts"),
+			fixture.worktreeLink,
+			"file",
+		);
+	} catch (err) {
+		fixture.skipReason = `cannot create symlinks here: ${
+			err instanceof Error ? err.message : String(err)
+		}`;
+	}
+	return fixture;
+}
+
+/** The unrelated-repository member {@link plantUnrelatedRepo} adds to a fixture. */
+export interface UnrelatedRepoFixture {
+	/** `unrelated`, a git checkout sharing no history or worktree with `repo`. */
+	unrelatedRepo: string;
+	/** `unrelated/src/other.ts`, a regular file in that repository. */
+	unrelatedFile: string;
+	/** `repo/src/other-link.ts` -> `../../unrelated/src/other.ts`: spelled in the session root, owned by another project. */
+	unrelatedLink: string;
+	/** Set when this host cannot create symlinks; the cell must skip visibly. */
+	skipReason?: string;
+}
+
+/**
+ * The #4689 item 10 unrelated-repository member: a file link from the
+ * session's checkout into a DIFFERENT repository. Its identity is a foreign
+ * project, so a class decided from the spelling would treat the foreign file
+ * as the session's own (shape 1, across the analysis-root class). The session
+ * repo gets a `.git` too, so the member compares two checkouts. Whether the
+ * foreign project reads `adopted` or `none` is the host's temp-root rule
+ * (#4560): give `baseDir` a name without the `pi-lens-` prefix for `adopted`.
+ */
+export function plantUnrelatedRepo(baseDir: string): UnrelatedRepoFixture {
+	const unrelatedRepo = path.join(baseDir, "unrelated");
+	const unrelatedFile = path.join(unrelatedRepo, "src", "other.ts");
+	fs.mkdirSync(path.dirname(unrelatedFile), { recursive: true });
+	fs.mkdirSync(path.join(unrelatedRepo, ".git"), { recursive: true });
+	fs.writeFileSync(
+		path.join(unrelatedRepo, ".git", "HEAD"),
+		"ref: refs/heads/main\n",
+	);
+	fs.writeFileSync(path.join(unrelatedRepo, "package.json"), "{}\n");
+	fs.writeFileSync(unrelatedFile, "export const other = 1;\n");
+	const repo = path.join(baseDir, "repo");
+	// The session repo is a checkout too, so the cell compares two checkouts
+	// (`resolveLinkedWorktreeOwner` answers null) and not "no checkout". A
+	// `.git` directory without a HEAD is not a repository (#4508).
+	fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
+	fs.writeFileSync(path.join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+	const fixture: UnrelatedRepoFixture = {
+		unrelatedRepo,
+		unrelatedFile,
+		unrelatedLink: path.join(repo, "src", "other-link.ts"),
+	};
+	try {
+		fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+		fs.symlinkSync(
+			path.join("..", "..", "unrelated", "src", "other.ts"),
+			fixture.unrelatedLink,
+			"file",
+		);
+	} catch (err) {
+		fixture.skipReason = `cannot create symlinks here: ${
+			err instanceof Error ? err.message : String(err)
+		}`;
+	}
+	return fixture;
+}
+
 export function createTempFile(
 	baseDir: string,
 	relativePath: string,

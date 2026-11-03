@@ -46,7 +46,10 @@ const PHP_DEBOUNCE_MS = 150;
 // parameterized suite from silently shrinking when the strategy table drifts.
 // #4615: typescript left the class (its matrix `first-publish` cell is the
 // measured `direct`), so its row is gone rather than silently parametrized out.
-const EMPTY_FIRST_PUBLISH_CONSUMER_SERVERS = ["php", "terraform"] as const;
+// terraform left it the same way: its 2026-10-17..20 `empty-first` reads came
+// from a probe that counted the workspace directory's empty row, so its cell is
+// `direct` and the marker is retired.
+const EMPTY_FIRST_PUBLISH_CONSUMER_SERVERS = ["php"] as const;
 
 const FINDING: LSPDiagnostic = {
 	severity: 1,
@@ -251,6 +254,28 @@ describe("#3310 empty-first-publish hold (php/intelephense class)", () => {
 		// measured on the wire 2026-10-20) resolves the wait instead of being
 		// swallowed into an unconfirmed touch that spends the full budget.
 		const { state, publish, emitted } = armHandler("typescript");
+
+		publish({ uri, diagnostics: [] });
+		vi.advanceTimersByTime(200);
+
+		expect(state.pushDiagnostics.get(KEY)).toEqual([]);
+		expect(emitted).toEqual([KEY]);
+		expect(state.emptyFirstPublishHoldSpent).toBeFalsy();
+		expect(
+			logLatency.mock.calls.filter(
+				([row]) =>
+					(row as { phase?: string }).phase === "lsp_empty_first_publish_held",
+			),
+		).toEqual([]);
+	});
+
+	it("resolves terraform's clean empty first publish — the class no longer holds it (#4615)", () => {
+		// The matrix's `terraform` `first-publish` cell is the measured `direct`
+		// (terraform-ls 0.39.0; the recorded burst is pinned in
+		// tests/scripts/clean-signal.test.ts). With no marker, a clean `.tf` file's
+		// own `[]` resolves the wait instead of being held: the one-shot hold would
+		// otherwise be spent on the workspace directory's row, not on the file.
+		const { state, publish, emitted } = armHandler("terraform");
 
 		publish({ uri, diagnostics: [] });
 		vi.advanceTimersByTime(200);

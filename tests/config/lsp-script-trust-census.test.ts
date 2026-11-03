@@ -8,6 +8,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 // Recurrence #4514 (shape: a seam changed in the product, the standalone hosts
 // under scripts/ that drive the built `dist/` copy were not swept). #4248 and
@@ -63,57 +64,71 @@ describe("scripts that reach the built LSP service adopt project trust (#4514)",
 		]),
 	);
 
-	it("every scripts/*.mjs importing dist/clients/lsp/ calls adoptFixtureProjectTrust", () => {
-		const reaching = [...sources].filter(([, src]) => reachesCompiledLsp(src));
-		// Dead-scan guard: the six harness entry points plus the exempt one.
-		assertNonEmptyScan(
-			"scripts reaching dist/clients/lsp/",
-			reaching.length,
-			7,
-		);
-		const audit = auditRegistry({
-			sweepName: "lsp-script-trust-census",
-			flagged: reaching
-				.filter(([, src]) => !adoptsFixtureTrust(src))
-				.map(([file]) => file),
-			registered: [],
-			exemptions: EXEMPT,
-			scannedCount: files.length,
-			minScanned: 40,
-			remediation: `call adoptFixtureProjectTrust({ repoRoot }) from ${SHARED} before the first touch, or exempt the script with the reason it never drives the service`,
-		});
-		expect(audit.problems).toEqual([]);
-	});
+	it(
+		"every scripts/*.mjs importing dist/clients/lsp/ calls adoptFixtureProjectTrust",
+		() => {
+			const reaching = [...sources].filter(([, src]) =>
+				reachesCompiledLsp(src),
+			);
+			// Dead-scan guard: the six harness entry points plus the exempt one.
+			assertNonEmptyScan(
+				"scripts reaching dist/clients/lsp/",
+				reaching.length,
+				7,
+			);
+			const audit = auditRegistry({
+				sweepName: "lsp-script-trust-census",
+				flagged: reaching
+					.filter(([, src]) => !adoptsFixtureTrust(src))
+					.map(([file]) => file),
+				registered: [],
+				exemptions: EXEMPT,
+				scannedCount: files.length,
+				minScanned: 40,
+				remediation: `call adoptFixtureProjectTrust({ repoRoot }) from ${SHARED} before the first touch, or exempt the script with the reason it never drives the service`,
+			});
+			expect(audit.problems).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// Recurrence #4514 (net-count rule): smoke-tools.mjs carried three inline
 	// copies of the adoption before it moved onto the shared helper. A script
 	// that adopts trust itself, bypassing the helper, is the next copy.
-	it("no scripts/*.mjs adopts trust inline: the shared helper is the only caller", () => {
-		const inline = [...sources]
-			.filter(([, src]) =>
-				/\badoptProjectTrustFromContext\s*\(/.test(
-					stripSource(src, { strings: "blank" }),
-				),
-			)
-			.map(([file]) => file);
-		expect(inline).toEqual([]);
-	});
+	it(
+		"no scripts/*.mjs adopts trust inline: the shared helper is the only caller",
+		() => {
+			const inline = [...sources]
+				.filter(([, src]) =>
+					/\badoptProjectTrustFromContext\s*\(/.test(
+						stripSource(src, { strings: "blank" }),
+					),
+				)
+				.map(([file]) => file);
+			expect(inline).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// Recurrence #4514 acceptance 2: a refusal must be named in the row. The
 	// call sites live in two entry points that execute on import, so the pin is
 	// a scan: reverting either leaves every unit test green and the nightly
 	// printing "no publish observed" for a server that never launched.
-	it("characterize-lsp and probe-clean-signal name a trust refusal (call-site pin)", () => {
-		for (const [file, needle] of [
-			["scripts/characterize-lsp.mjs", /\bfixtureTrustRefusal\s*\(/],
-			["scripts/probe-clean-signal.mjs", /\btrustRefusal\s*:\s*\(\)\s*=>/],
-		] as const) {
-			const stripped = stripSource(sources.get(file) ?? "", {
-				strings: "blank",
-			});
-			expect(stripped, file).toMatch(needle);
-		}
-	});
+	it(
+		"characterize-lsp and probe-clean-signal name a trust refusal (call-site pin)",
+		() => {
+			for (const [file, needle] of [
+				["scripts/characterize-lsp.mjs", /\bfixtureTrustRefusal\s*\(/],
+				["scripts/probe-clean-signal.mjs", /\btrustRefusal\s*:\s*\(\)\s*=>/],
+			] as const) {
+				const stripped = stripSource(sources.get(file) ?? "", {
+					strings: "blank",
+				});
+				expect(stripped, file).toMatch(needle);
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	describe("the detector reads code, not prose", () => {
 		const adopt = "await adoptFixtureProjectTrust({ repoRoot });";

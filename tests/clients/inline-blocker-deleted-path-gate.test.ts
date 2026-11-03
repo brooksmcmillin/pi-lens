@@ -42,13 +42,15 @@ import { CacheManager } from "../../clients/cache-manager.js";
 import type { Diagnostic } from "../../clients/dispatch/types.js";
 import { formatDiagnostics } from "../../clients/dispatch/utils/format-utils.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
-import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import {
+	clearLastAnalyzedStateCache,
+	handleToolResult,
+} from "../../clients/runtime-tool-result.js";
 import {
 	cancelLSPIdleReset,
 	handleTurnEnd,
 } from "../../clients/runtime-turn.js";
 import { setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 vi.mock("../../clients/dispatch/integration.js", async (importOriginal) => ({
 	...(await importOriginal<
@@ -57,16 +59,8 @@ vi.mock("../../clients/dispatch/integration.js", async (importOriginal) => ({
 	dispatchLintWithResult: vi.fn(),
 	computeCascadeForFile: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(),
-	resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
-}));
-
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const DEAD_MARKER = "DEAD-PATH-BLOCKER-MARKER nil pointer evaluating .replicas";
 const LIVE_MARKER = "LIVE-BLOCKER-MARKER unused variable";
@@ -74,17 +68,16 @@ const LIVE_MARKER = "LIVE-BLOCKER-MARKER unused variable";
 let tmpDir: string;
 let cleanup: () => void;
 
-beforeEach(() => {
+beforeEach(async () => {
 	const env = setupTestEnvironment("pi-lens-3190-inline-gate-");
 	tmpDir = env.tmpDir;
 	cleanup = env.cleanup;
 	vi.mocked(dispatchLintWithResult).mockReset();
-	vi.mocked(getLSPService).mockReturnValue(
-		makeLspServiceDouble({
-			supportsLSP: () => false,
-			hasLSP: async () => false,
-		}) as never,
-	);
+	await installLspServiceDouble({
+		resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
+		supportsLSP: () => false,
+		hasLSP: async () => false,
+	});
 });
 
 afterEach(() => {
@@ -339,5 +332,112 @@ describe("#3190 the inline-blocker record carries only deliverable blockers", ()
 		const text = await turnEndText(runtime, cacheManager);
 		expect(text).toContain("Unresolved from this turn");
 		expect(text).toContain(LIVE_MARKER);
+	});
+});
+
+describe("#4733 r2: the pipeline marks a whole-file verdict only for a dispatch that checked the file", () => {
+	it("drops another session's git-guard section through the real pipeline only when every running runner answered", async () => {
+		// RECURRENCE GUARDED: #4733 r1 F2 at the producer. The tool_result cell
+		// (`tests/clients/runtime-tool-result.test.ts`) doubles the pipeline, so
+		// it cannot see `runPipeline` stamp `fileVerdictComplete` on a dispatch
+		// whose runner failed; a stamp on every clean dispatch dropped another
+		// session's section after a write nothing checked.
+		const edited = path.join(tmpDir, "templates", "deploy.yaml");
+		fs.mkdirSync(path.dirname(edited), { recursive: true });
+		fs.writeFileSync(edited, "replicas: 2\n");
+		const section = `${edited}: 🔴 STOP — 1 issue(s) must be fixed:\n  L1: Debugger statement`;
+		const latency = (status: "succeeded" | "failed") => ({
+			filePath: edited,
+			fileKind: "yaml",
+			overallStartMs: 0,
+			overallEndMs: 0,
+			totalDurationMs: 0,
+			runners: [
+				{
+					runnerId: "yamllint",
+					startTime: 0,
+					endTime: 0,
+					durationMs: 0,
+					status,
+					diagnosticCount: 0,
+					semantic: "none",
+				},
+			],
+		});
+		const dispatches: Array<[string, Record<string, unknown>]> = [
+			["no runner ran", dispatchWith([])],
+			[
+				"the runner failed",
+				{
+					...dispatchWith([]),
+					latencyReport: latency("failed"),
+					inconclusiveSources: { runnerIds: ["yamllint"], serverIds: [] },
+				},
+			],
+			[
+				// #4733 r2 (#4734's review): the coverage rule gave no positive
+				// answer (a defined primary group that never ran), so a linter's
+				// answer is not the file's verdict.
+				"no primary checked the file",
+				{ ...dispatchWith([]), latencyReport: latency("succeeded") },
+			],
+			[
+				"every running runner answered",
+				{
+					...dispatchWith([]),
+					latencyReport: latency("succeeded"),
+					coverage: "primary",
+				},
+			],
+		];
+		const kept: Array<[string, boolean]> = [];
+		for (const [label, dispatch] of dispatches) {
+			const { runtime, cacheManager } = newSession();
+			cacheManager.writeCache(
+				"turn-end-findings",
+				{
+					content: section,
+					blockerContent: section,
+					blockingFiles: [edited],
+					hasBlockers: true,
+					affectedFiles: [edited],
+					sessionId: "an-earlier-session",
+					projectSeqStart: 0,
+					projectSeqEnd: 0,
+					fileSeqByPath: {},
+					fileContentHashes: {},
+					consumed: true,
+				},
+				tmpDir,
+			);
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(dispatch as never);
+			// Each cell writes the same bytes; index.ts' turn_start clears the
+			// already-analysed latch that would otherwise skip the dispatch.
+			clearLastAnalyzedStateCache();
+			await handleToolResult({
+				...toolResultDeps(runtime, cacheManager),
+				getFlag: (name: string) => name === "no-lsp" || name === "lens-guard",
+				event: {
+					toolName: "edit",
+					input: { path: edited },
+					details: { diff: "+  1 replicas: 2" },
+					content: [{ type: "text", text: "base" }],
+				},
+			} as never);
+			kept.push([
+				label,
+				cacheManager.readCache<{ blockerContent?: string }>(
+					"turn-end-findings",
+					tmpDir,
+					Number.POSITIVE_INFINITY,
+				)?.data?.blockerContent === section,
+			]);
+		}
+		expect(kept).toEqual([
+			["no runner ran", true],
+			["the runner failed", true],
+			["no primary checked the file", true],
+			["every running runner answered", false],
+		]);
 	});
 });

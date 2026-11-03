@@ -1,6 +1,6 @@
 {
 	"name": "pi-lens",
-	"version": "4.4.4",
+	"version": "4.4.8",
 	"type": "module",
 	"description": "Real-time code feedback for pi — LSP, linters, formatters, type-checking, structural analysis & booboo",
 	"repository": {
@@ -49,7 +49,9 @@
 		"audit:tree-sitter": "node scripts/audit-tree-sitter-rules.mjs",
 		"audit:rule-catalog": "node scripts/validate-rule-catalog.mjs",
 		"audit:astgrep-rule-pairs": "node scripts/audit-astgrep-rule-pairs.mjs",
-		"astgrep:self-scan": "node scripts/run-astgrep-pi-lens.mjs",
+		"astgrep:self-scan": "node scripts/run-astgrep-pi-lens.mjs && node scripts/run-astgrep-pi-lens.mjs --suite governance",
+		"astgrep:governance": "node scripts/run-astgrep-pi-lens.mjs --suite governance",
+		"astgrep:governance:update-baseline": "node scripts/run-astgrep-pi-lens.mjs --suite governance --update-baseline",
 		"lane:check": "node scripts/lane-check.mjs",
 		"astgrep:self-scan:update-baseline": "node scripts/run-astgrep-pi-lens.mjs --update-baseline",
 		"audit:playground": "node scripts/playground-verify-rule.mjs",
@@ -114,7 +116,9 @@
 		"scripts/analyze-pi-lens-logs.mjs",
 		"scripts/install-selftest.mjs",
 		"scripts/lib/host-provided-deps.mjs",
+		"scripts/lib/is-main-module.mjs",
 		"scripts/lib/latency-log-phases.mjs",
+		"scripts/lib/scratch-home-env.mjs",
 		"scripts/lib/skills-predicate.mjs",
 		"scripts/lib/web-tree-sitter-dir.mjs",
 		"scripts/lib/warm-loader-cache.mjs",
@@ -122,6 +126,7 @@
 		"scripts/rpc-load-check.mjs",
 		"README.md",
 		"CHANGELOG.md",
+		"CHANGELOG-USER.md",
 		"banner.svg",
 		"banner.png"
 	],
@@ -129,9 +134,9 @@
 		"@ast-grep/cli": "0.51.0",
 		"@ast-grep/napi": "^0.51.0",
 		"js-yaml": "^5.2.2",
-		"minimatch": "^10.2.6",
+		"minimatch": "^11.0.4",
 		"pidusage": "^4.0.1",
-		"vscode-jsonrpc": "^9.0.0"
+		"vscode-jsonrpc": "^10.0.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
@@ -155,12 +160,12 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.15",
-		"@earendil-works/pi-coding-agent": "^1.3.0",
-		"@earendil-works/pi-tui": "^1.3.0",
+		"@earendil-works/pi-coding-agent": "^1.5.0",
+		"@earendil-works/pi-tui": "^1.5.0",
 		"@jridgewell/sourcemap-codec": "^1.6.0",
 		"@jridgewell/trace-mapping": "^0.3.31",
-		"@stryker-mutator/core": "10.0.0",
-		"@stryker-mutator/vitest-runner": "10.0.0",
+		"@stryker-mutator/core": "10.1.1",
+		"@stryker-mutator/vitest-runner": "10.1.1",
 		"@taplo/cli": "0.7.0",
 		"@types/node": "^26.6.3",
 		"@types/pidusage": "^2.0.5",
@@ -170,13 +175,14 @@
 		"esbuild": "0.28.2",
 		"fast-check": "^4.10.2",
 		"husky": "^9.1.7",
-		"jscpd": "5.4.1",
+		"jscpd": "5.4.2",
 		"json5": "^2.2.3",
-		"knip": "6.41.0",
-		"oxc-parser": "0.154.0",
-		"oxfmt": "0.73.0",
-		"oxlint": "1.88.0",
-		"oxlint-tsgolint": "7.0.2004",
+		"knip": "6.44.0",
+		"marked": "18.1.2",
+		"oxc-parser": "0.156.0",
+		"oxfmt": "0.75.0",
+		"oxlint": "1.90.0",
+		"oxlint-tsgolint": "7.0.2005",
 		"publint": "0.3.25",
 		"semver": "^7.8.0",
 		"typebox": "^1.0.0",
@@ -185,6 +191,7 @@
 		"vitest": "^5.0.3"
 	},
 	"pi": {
+		"changelogPath": "CHANGELOG-USER.md",
 		"extensions": [
 			"./dist/index.js"
 		],
@@ -200,6 +207,10 @@
 		"protobufjs@7.6.6": true
 	},
 	"overrides": {
-		"qs": "^6.15.4"
+		"@stryker-mutator/core": {
+			"minimatch": "$minimatch"
+		},
+		"qs": "^6.15.4",
+		"undici": "^8.12.2"
 	}
 }

@@ -116,3 +116,29 @@ describe("rule-ignore matcher path-shape containment (#3240 r3)", () => {
 		}
 	});
 });
+
+/**
+ * Recurrence this guards (#5029): `rules.<id>.ignorePaths` moved onto the
+ * gitignore evaluator, and this matcher is also called by
+ * `applyAuxiliarySuppressions` with a rule's own YAML `ignores:` globs. Those
+ * mirror `ast-grep scan`'s glob carve-out (#3041), not `.gitignore`, so moving
+ * this matcher onto gitignore semantics would silently widen every bundled
+ * rule's carve-out: a slashless `logger.ts` would start to match
+ * `src/logger.ts`, and a `legacy/` entry would start to match.
+ */
+describe("a rule's YAML `ignores` keep glob semantics (#5029)", () => {
+	it("matches a slashless entry at the root only, as a plain glob", () => {
+		expect(
+			keptWithPatterns("/tmp/root", "/tmp/root/logger.ts", ["logger.ts"]),
+		).toBe(false);
+		expect(
+			keptWithPatterns("/tmp/root", "/tmp/root/src/logger.ts", ["logger.ts"]),
+		).toBe(true);
+	});
+
+	it("does not read a trailing slash as a directory-only gitignore entry", () => {
+		expect(
+			keptWithPatterns("/tmp/root", "/tmp/root/legacy/a.ts", ["legacy/"]),
+		).toBe(true);
+	});
+});

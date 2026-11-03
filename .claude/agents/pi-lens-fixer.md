@@ -30,3 +30,8 @@ specific to the Claude Code harness.
   `run_in_background` is not a way to wait.
 - Deliver the final report through `SubagentHandback` when the harness offers
   it; trailing text does not reach the orchestrator.
+- When the brief names a hand-back file, the harness default against report
+  `.md` files does not cover it. Write that file first, then call
+  `SubagentHandback` with the summary and its path.
+- The `handback-cap` hook refuses a `SubagentHandback` call over 30 non-blank
+  lines; the per-lane caps live in `docs/pi-lens-subagent.md` "Deliverable".
