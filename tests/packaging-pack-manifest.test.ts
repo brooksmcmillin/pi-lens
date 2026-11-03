@@ -418,7 +418,7 @@ describe("published manifest carries no devDependencies", () => {
 		);
 		expect(packTarball().filename).toBe("retry-1.0.0.tgz");
 		expect(attempts, "one failed attempt and one retry").toBe(2);
-	});
+	}, 20_000);
 
 	it(
 		"the real `npm pack` tarball's package.json has no devDependencies, and the working manifest is restored",

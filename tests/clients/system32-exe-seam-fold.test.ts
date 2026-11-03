@@ -151,11 +151,9 @@ describe("safe-spawn names its System32 executables through the seam", () => {
 	it("pins the UTF-8 code-page switch (chcp.com) in the cmd.exe command line", async () => {
 		const { buildWindowsShellCommand } =
 			await import("../../clients/safe-spawn.js");
-		expect(
-			buildWindowsShellCommand("tool", ["a"]).startsWith(
-				`${system32("chcp.com")} 65001 >nul 2>&1 & `,
-			),
-		).toBe(true);
+		expect(buildWindowsShellCommand("tool", ["a"])).toBe(
+			`""${system32("chcp.com")}" 65001 >nul 2>&1 & tool a"`,
+		);
 	});
 
 	it("safeSpawnAsync runs a .cmd shim through the pinned cmd.exe, never ComSpec", async () => {
@@ -168,9 +166,12 @@ describe("safe-spawn names its System32 executables through the seam", () => {
 		await safeSpawnAsync("tool", ["x"], { env: SHIM_ENV });
 
 		expect(spawns[0]?.command).toBe(system32("cmd.exe"));
-		expect(String(spawns[0]?.args[3])).toContain(
-			`${system32("chcp.com")} 65001`,
-		);
+		expect(spawns[0]?.args).toEqual([
+			"/d",
+			"/s",
+			"/c",
+			`""${system32("chcp.com")}" 65001 >nul 2>&1 & C:\\fixture\\tool.cmd x"`,
+		]);
 	});
 
 	it("the first direct .exe spawn runs the code-page one-shot through the pinned cmd.exe", async () => {
@@ -198,9 +199,12 @@ describe("safe-spawn names its System32 executables through the seam", () => {
 		safeSpawn("tool", ["x"], { env: SHIM_ENV });
 
 		expect(syncs.map((call) => call.command)).toEqual([system32("cmd.exe")]);
-		expect(String(syncs[0]?.args[3])).toContain(
-			`${system32("chcp.com")} 65001`,
-		);
+		expect(syncs[0]?.args).toEqual([
+			"/d",
+			"/s",
+			"/c",
+			`""${system32("chcp.com")}" 65001 >nul 2>&1 & C:\\fixture\\tool.cmd x"`,
+		]);
 	});
 
 	it("the async timeout tree-kill spawns the pinned taskkill.exe", async () => {

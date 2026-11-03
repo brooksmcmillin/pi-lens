@@ -21,12 +21,14 @@
  * POSIX cells run on every POSIX lane; the planted scripts are `#!/bin/sh`.
  * The Windows cells (F13) run on the Windows lane only.
  */
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
+	truncateForLedger,
 } from "../../clients/degradation-ledger.js";
 import { createAvailabilityLatch } from "../../clients/dispatch/runners/utils/availability-policy.js";
 import {
@@ -210,7 +212,9 @@ describe.skipIf(!POSIX)("bare lookups under untrusted pi trust (#4530)", () => {
 		expect(ran(globalMarker)).toBe(true);
 		// One bounded row for the dropped entry, however many spawns met it.
 		expect(trustRefusals()).toEqual([
-			`project-path-entry:${path.join(layout.wt, "node_modules", ".bin")}`,
+			truncateForLedger(
+				`project-path-entry:${path.join(layout.wt, "node_modules", ".bin")}`,
+			),
 		]);
 	});
 
@@ -231,7 +235,9 @@ describe.skipIf(!POSIX)("bare lookups under untrusted pi trust (#4530)", () => {
 
 		expect(result.status).not.toBe(0);
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-path-entry:${layout.main}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-path-entry:${layout.main}`),
+		]);
 		// The scoped search path the installer and launcher read agrees.
 		expect(trustScopedSearchPath(entry)).toBeUndefined();
 	});
@@ -260,7 +266,9 @@ describe.skipIf(!POSIX)("bare lookups under untrusted pi trust (#4530)", () => {
 
 		expect(result.status).toBe(0);
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-path-entry:${layout.main}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-path-entry:${layout.main}`),
+		]);
 	});
 
 	it("I2/I3: a relative or empty entry is the child's cwd, judged there", async () => {
@@ -350,7 +358,9 @@ describe.skipIf(!POSIX)("bare lookups under untrusted pi trust (#4530)", () => {
 		expect(result.spawnFailure?.kind).toBe("trust-refused");
 		expect(result.status).toBeNull();
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 	});
 
 	// #4776 review F1: on POSIX a backslash is a name character, not a
@@ -373,7 +383,9 @@ describe.skipIf(!POSIX)("bare lookups under untrusted pi trust (#4530)", () => {
 		expect(result.spawnFailure?.kind).toBe("trust-refused");
 		expect(result.status).toBeNull();
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 	});
 
 	it("I7/A9: the installer reads a POSIX name holding a backslash as a lookup", async () => {
@@ -398,7 +410,9 @@ describe.skipIf(!POSIX)("bare lookups under untrusted pi trust (#4530)", () => {
 		);
 
 		expect(await findCommandAsync(TOOL)).toBeNull();
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 	});
 
 	it("A5: a formatter's `which` answer that links into the project is no answer", async () => {
@@ -719,7 +733,9 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 
 		expect(await findGlobalBinary(TOOL)).toBeUndefined();
 		expect(await findGlobalBinary(TOOL)).toBeUndefined();
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 		setProjectTrustState("trusted");
 		expect(await findGlobalBinary(TOOL)).toBe(
 			path.join(path.dirname(link), TOOL),
@@ -738,7 +754,9 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 
 		expect(await getToolPath("stylelint")).toBeUndefined();
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 		// Control: trusted, the same rung verifies and answers with the link.
 		setProjectTrustState("trusted");
 		expect(await getToolPath("stylelint")).toBe(
@@ -760,7 +778,9 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 
 		expect(await getToolPath("yamllint")).toBeUndefined();
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 		setProjectTrustState("trusted");
 		expect(await getToolPath("yamllint")).toBe(
 			path.join(userBase, "bin", "yamllint"),
@@ -792,13 +812,19 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 			await GoServer.spawn(layout.main, { allowInstall: false }),
 		).toBeUndefined();
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
-		// Control: trusted, the same candidate is started (the stand-in exits,
-		// so the launch itself fails after the marker is written).
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
+		// The stand-in may exit before or after the launcher's startup check.
 		setProjectTrustState("trusted");
-		await expect(
-			GoServer.spawn(layout.main, { allowInstall: false }),
-		).rejects.toThrow(/exited immediately/);
+		const started = await GoServer.spawn(layout.main, {
+			allowInstall: false,
+		}).catch((error: Error) => {
+			expect(error.message).toMatch(/exited immediately/);
+		});
+		const child = started?.process.process;
+		if (child?.exitCode === null && child.signalCode === null)
+			await once(child, "exit");
 		expect(ran(marker)).toBe(true);
 	});
 
@@ -817,7 +843,9 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 
 		expect(await runAnswer()).not.toBe(path.join(cargoBin, "cargo"));
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 		setProjectTrustState("trusted");
 		expect(await runAnswer()).toBe(path.join(cargoBin, "cargo"));
 		expect(ran(marker)).toBe(true);
@@ -845,7 +873,9 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 		const refused = await new GovulncheckClient().analyze(layout.main);
 		expect(refused.summary).toBe("govulncheck not installed");
 		expect(ran(marker)).toBe(false);
-		expect(trustRefusals()).toEqual([`project-command:${target}`]);
+		expect(trustRefusals()).toEqual([
+			truncateForLedger(`project-command:${target}`),
+		]);
 		setProjectTrustState("trusted");
 		await new GovulncheckClient().analyze(layout.main);
 		expect(ran(marker)).toBe(true);

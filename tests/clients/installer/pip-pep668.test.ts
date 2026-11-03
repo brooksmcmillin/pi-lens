@@ -628,7 +628,7 @@ broken=no
 if [ -n "\${FAKE_STALE_VENV:-}" ]; then
   broken=yes
 elif [ -n "\${FAKE_REQUIRE_CONSTRAINT:-}" ]; then
-  if [ -z "$backend_constraint" ] || ! /bin/grep -q "pygls<2" "$backend_constraint"; then
+  if [ -z "$backend_constraint" ] || ! /usr/bin/grep -q "pygls<2" "$backend_constraint"; then
     broken=yes
   fi
 fi

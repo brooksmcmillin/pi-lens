@@ -31,7 +31,10 @@ if (mode === "server") {
 	setProjectTrustState("trusted");
 	const { launchLSP } = await import("../../clients/lsp/launch.js");
 	const { createLSPClient } = await import("../../clients/lsp/client.js");
-	const proc = await launchLSP(process.execPath, [fileURLToPath(import.meta.url), "server", mode], { cwd: process.cwd() });
+	// Hold startup only; the natural-exit witness must have no host timer.
+	const startupHold = setTimeout(() => {}, 15_000);
+	const proc = await launchLSP(process.execPath, [fileURLToPath(import.meta.url), "server", mode], { cwd: process.cwd() })
+		.finally(() => clearTimeout(startupHold));
 	// launchLSP unrefs background servers; keep this probe alive until the wire arrives.
 	proc.process.ref();
 	for (const stream of [proc.stdin, proc.stdout, proc.stderr]) stream.ref?.();
