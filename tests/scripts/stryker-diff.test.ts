@@ -866,9 +866,7 @@ describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
 	])(
 		"bounds a %i MiB integration diff without silently truncating selection",
 		(mib, status) => {
-			const root = mkdtempSync(
-				join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
-			);
+			const root = strykerFixtureDir("stryker-diff-fixture-");
 			try {
 				fixtureGit(root, ["init", "-q"]);
 				fixtureGit(root, ["commit", "--allow-empty", "-qm", "base"]);
