@@ -226,6 +226,7 @@ const SEAM_ADMISSIONS: Readonly<Record<string, string>> = {
  * admission make the 21 sites printed now.
  */
 const BASELINE: Readonly<Record<string, string>> = {
+	"scripts/red-on-base.mjs#within": `${SEAM_COPY} This standalone verifier must copy dependencies before loading runtime modules; importing clients/path-utils.ts would require those dependencies. tests/scripts/red-on-base.test.ts exercises internal symlink copies and escaping-link refusal.`,
 	"clients/actionable-warnings.ts#legacyActionableWarningId": `${DURABLE_ID} This one rebuilds the id older releases wrote so a stored record can be migrated, so its spelling is the old release's by definition.`,
 	"clients/finding-identity.ts#relativeFile": `${DURABLE_ID} This one is the relative component of every \`dd:\`/\`ddw:\`/\`aw:\`/\`cq:\` finding id.`,
 	"scripts/hooks/guard-bash.mjs#hasNodeModulesSymlinkOutside": `${SEAM_COPY} It cannot fold because the hook is a bare-Node \`.mjs\` that Claude Code runs before any build, so it may not import a TypeScript seam. Baselined as the record that the copy was read.`,

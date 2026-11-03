@@ -264,7 +264,7 @@ const TEST_JOBS = [
 	"unit-tests-windows",
 	"install-test",
 	"prod-install-build",
-	"changed-tests-shuffled",
+	"targeted-tests-advisory",
 	"lint-and-typecheck",
 	"tla-models",
 ];
@@ -430,7 +430,7 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 				install: "true",
 			});
 			for (const id of [
-				...TEST_JOBS.filter((id) => id !== "changed-tests-shuffled"),
+				...TEST_JOBS.filter((id) => id !== "targeted-tests-advisory"),
 				TLA_SHARDS,
 				"heavy-gate",
 			]) {
@@ -439,7 +439,7 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 			// CodeQL, targeted tests and the changelog fast-fail are pull_request jobs
 			for (const id of [
 				"codeql",
-				"changed-tests-shuffled",
+				"targeted-tests-advisory",
 				"changelog-fragment-fastfail",
 			]) {
 				expect(results[id], id).toBe("skipped");

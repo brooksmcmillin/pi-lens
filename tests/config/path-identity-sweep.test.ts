@@ -306,6 +306,18 @@ const PINS: Readonly<Record<string, Pin>> = {
 		identities: "0ac5152568baccfe",
 		reason: PRE_4689,
 	}, // :860 path-resolve-keyed (new Set element), :864 path-resolve-keyed (.has key), :1489 path-resolve-keyed (.get key), :1490 path-resolve-keyed (.set key), :2896 path-resolve-keyed (.get key), :2903 path-resolve-keyed (.set key), :2910 path-resolve-keyed (.set key), :2917 path-resolve-keyed (.delete key)
+	"clients/runtime-tool-call.ts#raw-realpath": {
+		sites: 1,
+		identities: "90331567ca8c335f",
+		reason:
+			"opaque replacement compares the kernel-real target with its spelling and refuses every realpath error; realpathOrResolve would conceal missing or unreadable targets with a fallback. tests/clients/runtime-tool-call.test.ts pins symlink and non-file refusal",
+	},
+	"clients/runtime-tool-call.ts#hand-rolled-upward-walk": {
+		sites: 1,
+		identities: "12c8bd1daa33614e",
+		reason:
+			"canonical receipt creation climbs only ENOENT components to stable existing directory ancestry, rejecting non-directories and every other probe error; this is a fail-closed creation preflight, not project-marker discovery. tests/clients/runtime-tool-call.test.ts exercises missing ancestry and symlink refusal",
+	},
 	"clients/runtime-tool-result.ts#path-resolve-keyed": {
 		sites: 2,
 		identities: "3a38f213298e8a5d",
