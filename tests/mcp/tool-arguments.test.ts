@@ -504,3 +504,44 @@ describe("refusal versus hint", () => {
 		expect(report?.unsentSuggestions).toEqual([]);
 	});
 });
+
+// Recurrence (#5047 r1 F3): `path`, `file` and `filePath` became declared
+// spellings of one parameter (#5041), but the unsent test only looked at the
+// matched key. `{ path, file_path }` folds `file_path` to `filePath`, which was
+// not sent, so a call that DID name its file was refused with "looks like a
+// mistyped `filePath`, which was not sent". Any declared sibling spelling that
+// was sent settles the file; an undeclared sibling settles nothing.
+describe("single-file spellings settle each other (#5047 F3)", () => {
+	const SINGLE_FILE = {
+		properties: { path: {}, file: {}, filePath: {}, cwd: {} },
+	};
+
+	it("does not call a mistyped extra 'unsent' when a sibling spelling was sent", () => {
+		for (const args of [
+			{ path: "a.ts", file_path: "a.ts" },
+			{ file: "a.ts", sourcePath: "a.ts" },
+			{ filePath: "a.ts", File_Path: "a.ts" },
+		]) {
+			const report = findIgnoredArguments(SINGLE_FILE, args);
+			expect(report?.ignored.length, JSON.stringify(args)).toBe(1);
+			expect(report?.unsentSuggestions, JSON.stringify(args)).toEqual([]);
+		}
+	});
+
+	it("still names a spelling that was not sent when no sibling was", () => {
+		expect(
+			findIgnoredArguments(SINGLE_FILE, { file_path: "a.ts" })
+				?.unsentSuggestions,
+		).toEqual([{ key: "file_path", suggestion: "filePath" }]);
+		expect(
+			findIgnoredArguments(SINGLE_FILE, { sourcePath: "a.ts" })
+				?.unsentSuggestions,
+		).toEqual([{ key: "sourcePath", suggestion: "path" }]);
+		// A sibling the tool does NOT declare is itself ignored, so it settles
+		// nothing: `filePath` is a mistyped `path` on a tool declaring only `path`.
+		expect(
+			findIgnoredArguments({ properties: { path: {} } }, { filePath: "a.ts" })
+				?.unsentSuggestions,
+		).toEqual([{ key: "filePath", suggestion: "path" }]);
+	});
+});

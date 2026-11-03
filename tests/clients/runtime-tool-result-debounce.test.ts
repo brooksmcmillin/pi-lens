@@ -53,6 +53,7 @@ describe("tool_result debounce (#115)", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 	});
 
@@ -269,6 +270,7 @@ describe("tool_result path-keyed maps: divergent-spelling collapse (#1086)", () 
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		savedPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 		Object.defineProperty(process, "platform", { value: "win32" });

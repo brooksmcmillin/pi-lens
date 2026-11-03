@@ -22,7 +22,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeLspServiceDouble } from "../../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../../support/lsp-service-seam.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 const stubClients = vi.hoisted(() => {
@@ -77,14 +77,6 @@ vi.mock("../../../clients/ast-grep-client.js", () => ({
 // Partial override, not a whole-module replacement: only the two entry points
 // that would start a language server are doubled, so the module's other
 // exports stay real (#2281's vi.mock export ratchet).
-vi.mock("../../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => makeLspServiceDouble({ getAliveClientCount: () => 0 }),
-	resetLSPService: vi.fn(),
-}));
-
 import { markDisposition } from "../../../clients/diagnostic-dispositions.js";
 import { evaluateGitGuard } from "../../../clients/git-guard.js";
 import type { Diagnostic } from "../../../clients/dispatch/types.js";
@@ -99,7 +91,8 @@ import {
 let tmpDir: string;
 let previousDataDir: string | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble({ getAliveClientCount: () => 0 });
 	previousDataDir = process.env.PILENS_DATA_DIR;
 	_resetMcpSessionContext();
 	_resetTurnEndChain();

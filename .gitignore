@@ -73,12 +73,17 @@ migrate-*.js
 !tests/fixtures/ci-pr-bodies/*.md
 !CLAUDE.md
 !tests/fixtures/changelog-entries/*.md
+# #4512: the recorded pre-#4338 matrix is a test input. The global *.md ignore
+# hid it from the first commit, so two test files failed to load on a fresh
+# clone (#4980 F1; the #4522 F1 shape).
+!tests/fixtures/lsp-nightly/*.md
 !tests/support/scheduler-properties.md
 !.changelog/*.md
 !AGENTS.md
 !HISTORY.md
 !README.md
 !CHANGELOG.md
+!CHANGELOG-USER.md
 !CODE_OF_CONDUCT.md
 !CONTRIBUTING.md
 !LICENSE
@@ -93,7 +98,15 @@ migrate-*.js
 !docs/pi-lens-investigator.md
 !docs/pi-lens-merge-policy.md
 !docs/pi-lens-warden.md
+# #4361: the agent contract's moved text lives in these files.
+!docs/defect-shapes.md
+# #5026: scripts/check-pr-body.mjs reads the alignment family names from here.
+!docs/alignment-families.md
+!docs/invariants/*.md
+!docs/pi-lens-orchestration.md
+!docs/pi-lens-release.md
 !docs/merge-queue-rollout.md
+!docs/ci-bot-pr-checks.md
 !docs/pi-lens-monitor.md
 !docs/real-harness.md
 !docs/audit1.md
@@ -218,8 +231,12 @@ tests/native-ts7-live-*/
 # prepack backup of package.json (scripts/strip-dev-deps-for-pack.mjs)
 .pack-backup/
 
-# Probe hygiene home for tests and scripts (AGENTS.md "Probe hygiene"); never tracked.
+# Probe hygiene home for tests and scripts (docs/invariants/paths-os.md
+# "Paths, data, and operating systems"); never tracked.
 .probe-home/
 
 # TLA+ tools jar fetched by scripts/check-tla-models.mjs (#3447)
 /.cache/
+
+# Vitest module cache, one per worktree (fsModuleCachePath, #5206)
+.vitest-cache/

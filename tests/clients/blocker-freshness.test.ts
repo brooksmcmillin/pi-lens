@@ -418,8 +418,9 @@ describe("blocker freshness sweep — drift demotion (#1631)", () => {
  *
  * Demotion here is CONTENT-confirmed (mtime moving is not evidence a byte
  * moved) and RE-ARMING (bytes that come back un-demote it), which is why it
- * carries `"self-drift"` rather than `"dependency-drift"` and never enters the
- * #1950 delivery cap.
+ * carries `"self-drift"` rather than `"dependency-drift"`. The re-arm covers
+ * the healing shape only; a rewrite that never returns to the recorded bytes is
+ * capped by `SELF_DRIFT_MAX_DELIVERIES` at the turn end (#4990).
  */
 describe("blocker freshness sweep — self-drift on non-LSP provenance", () => {
 	/**

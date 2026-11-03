@@ -332,6 +332,46 @@ describe("jscpd-client", () => {
 		}
 	});
 
+	// RECURRENCE GUARDED: #4911. The refusal compared spellings, so a HOME or a
+	// root spelled through a link spawned jscpd over the whole home tree. Both
+	// directions, each with a real directory link.
+	it.each([["home-link"], ["root-link"]] as const)(
+		"refuses to scan the home directory when the %s spelling names it (#4911)",
+		async (kind) => {
+			const { JscpdClient } = await import("../../clients/jscpd-client.js");
+			const safeSpawnMod = await import("../../clients/safe-spawn.js");
+
+			const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-");
+			try {
+				const home = path.join(tmpDir, "home");
+				fs.mkdirSync(path.join(home, "src"), { recursive: true });
+				fs.writeFileSync(
+					path.join(home, "src", "index.ts"),
+					"export const x = 1;\n",
+				);
+				const link = path.join(tmpDir, "link");
+				fs.symlinkSync(home, link, "junction");
+
+				const client = new JscpdClient(false);
+				await client.ensureAvailable();
+				vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+
+				const result = await client.scan(
+					kind === "root-link" ? link : home,
+					5,
+					50,
+					true,
+					{ homeDir: kind === "home-link" ? link : home },
+				);
+
+				expect(result.success).toBe(false);
+				expect(safeSpawnMod.safeSpawnAsync).not.toHaveBeenCalled();
+			} finally {
+				await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
+			}
+		},
+	);
+
 	// #126 — language gate expanded beyond JS/TS
 
 	for (const lang of [

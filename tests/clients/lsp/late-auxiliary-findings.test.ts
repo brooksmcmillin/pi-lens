@@ -19,21 +19,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeLspServiceDouble } from "../../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../../support/lsp-service-seam.js";
 
 const readCachedDiagnosticsForServers = vi.hoisted(() => vi.fn());
 const observeLateAuxiliaryAnswer = vi.hoisted(() => vi.fn());
-vi.mock("../../../clients/lsp/capabilities.js", () => ({
-	// Only `getLSPService` crosses this seam in handleTurnEnd's import graph;
-	// the double still carries the full surface so a method this path grows
-	// later cannot throw into a swallow-all catch (#2582).
-	getLSPService: () =>
-		makeLspServiceDouble({
-			readCachedDiagnosticsForServers,
-			observeLateAuxiliaryAnswer,
-		}),
-}));
-
+// Only `getLSPService` crosses this seam in handleTurnEnd's import graph; the
+// double still carries the full surface so a method this path grows later
+// cannot throw into a swallow-all catch (#2582).
 const logLatency = vi.hoisted(() => vi.fn());
 vi.mock("../../../clients/latency-logger.js", async (importOriginal) => {
 	const actual =
@@ -173,7 +165,11 @@ function lateAuxRecord(): any | undefined {
 		);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble({
+		readCachedDiagnosticsForServers,
+		observeLateAuxiliaryAnswer,
+	});
 	readCachedDiagnosticsForServers.mockReset();
 	observeLateAuxiliaryAnswer.mockReset();
 	observeLateAuxiliaryAnswer.mockResolvedValue(undefined);
@@ -1769,9 +1765,12 @@ describe("turn-end late-auxiliary drain never delivers an older revision's scan 
 		try {
 			// Receipts still inside the debounce at the notification: a second
 			// one on a counted path, a first one, and one for a path never opened.
+			// Non-empty on purpose (#4763): an EMPTY receipt before the
+			// notification is held and counted at receipt, so it is never
+			// pending; a non-empty one is a scan result and still debounces.
 			scanner.receive(counted, [diag(0, "again")]);
-			scanner.receive(first, []);
-			scanner.receive(unopened, []);
+			scanner.receive(first, [diag(0, "pending first")]);
+			scanner.receive(unopened, [diag(0, "never opened")]);
 			scanner.rulesRefreshed();
 			expect(counts(counted)).toEqual({ sent: 1, published: 0 });
 			expect(counts(first)).toEqual({ sent: 1, published: -1 });
@@ -1819,7 +1818,12 @@ describe("turn-end late-auxiliary drain never delivers an older revision's scan 
 				type: "phase",
 				filePath: "/project",
 				durationMs: 0,
-				metadata: { serverId: "opengrep", rebaselinedPaths: 1 },
+				// #4763: the one empty publish before the notification was held.
+				metadata: {
+					serverId: "opengrep",
+					rebaselinedPaths: 1,
+					heldEmptyPublishes: 1,
+				},
 			}),
 		]);
 

@@ -32,12 +32,6 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
-const logLatency = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/latency-logger.js", async (importActual) => ({
-	...(await importActual<typeof import("../../clients/latency-logger.js")>()),
-	logLatency,
-}));
-
 vi.mock("../../clients/pipeline.js", () => ({ runPipeline: vi.fn() }));
 
 // The cross-process record is a separate delivery of the same payload (#492)
@@ -128,7 +122,6 @@ describe("#1464 write-path autofix nudge suppression", () => {
 		vi.mocked(runPipeline).mockReset();
 		_resetAgentNudgeForTests();
 		resetBusPublish();
-		logLatency.mockClear();
 		wireBus();
 	});
 

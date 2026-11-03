@@ -275,6 +275,41 @@ describe("singleFlight — trailing-rerun coalescing (#1687)", () => {
 		expect(sf.size()).toBe(0);
 	});
 
+	it("reports a pending trailing pass only while one is owed (#4612 r4)", async () => {
+		// A joiner's own closure never runs, so the ONLY thing a caller can
+		// observe about a join before the flight settles is this bit. It is the
+		// rendezvous the joined-discard case waits on, and a bit stuck on (or
+		// never set) would make that case pass or fail for the wrong reason.
+		const sf = createSingleFlight<number>({ coalesceTrailing: true });
+		let calls = 0;
+		let gate = deferred<number>();
+		const fn = () => {
+			calls++;
+			return gate.promise;
+		};
+
+		const first = sf.run("k", fn);
+		await flush();
+		expect(sf.hasPendingRerun("k")).toBe(false);
+
+		const joiner = sf.run("k", fn);
+		expect(sf.hasPendingRerun("k")).toBe(true);
+
+		const pass1 = gate;
+		gate = deferred<number>();
+		pass1.resolve(1);
+		await flush();
+		// Pass 2 is running and nothing has arrived during it.
+		expect(calls).toBe(2);
+		expect(sf.hasPendingRerun("k")).toBe(false);
+
+		gate.resolve(2);
+		expect(await first).toBe(2);
+		expect(await joiner).toBe(2);
+		expect(sf.hasPendingRerun("k")).toBe(false);
+		expect(sf.has("k")).toBe(false);
+	});
+
 	it("does NOT rerun when nothing arrived mid-flight", async () => {
 		const sf = createSingleFlight<number>({ coalesceTrailing: true });
 		let calls = 0;

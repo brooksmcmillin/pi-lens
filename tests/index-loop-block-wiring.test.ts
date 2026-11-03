@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock } from "./support/pi-mock.js";
 import { getCurrentPhase, phaseStarted } from "../clients/latency-logger.js";
 
@@ -86,7 +87,7 @@ const turnCtx = {
 
 async function fireTurnEnd() {
 	const { default: registerExtension } = await import("../index.js");
-	const mock = createPiMock({ "lens-lsp": true });
+	const mock = createPiMock();
 	registerExtension(mock.asExtensionAPI() as never);
 	const turnEnd = mock.getHandlers("turn_end")[0];
 	expect(turnEnd).toBeTypeOf("function");
@@ -132,7 +133,9 @@ describe(
 			statsToReturn = undefined;
 			phaseForWindowToReturn = undefined;
 		});
-		afterEach(() => {
+		afterEach(async () => {
+			// #5146: case (f) starts a session; end it before the mocks clear.
+			await endMockSessions();
 			vi.clearAllMocks();
 		});
 
@@ -154,7 +157,7 @@ describe(
 			// resetModules is per-test, so re-import once and drive two turns against
 			// the SAME module instance to exercise the cross-turn high-water.
 			const { default: registerExtension } = await import("../index.js");
-			const mock = createPiMock({ "lens-lsp": true });
+			const mock = createPiMock();
 			registerExtension(mock.asExtensionAPI() as never);
 			const turnEnd = mock.getHandlers("turn_end")[0];
 
@@ -201,7 +204,7 @@ describe(
 
 		it("(c) #1723: logs a block below the session's prior worst, not only new maxima", async () => {
 			const { default: registerExtension } = await import("../index.js");
-			const mock = createPiMock({ "lens-lsp": true });
+			const mock = createPiMock();
 			registerExtension(mock.asExtensionAPI() as never);
 			const turnEnd = mock.getHandlers("turn_end")[0];
 
@@ -349,7 +352,7 @@ describe(
 		// can see it.
 		it("(f) #1723 S3: session_start clears a leaked in-flight phase via the real handler", async () => {
 			const { default: registerExtension } = await import("../index.js");
-			const mock = createPiMock({ "lens-lsp": true });
+			const mock = createPiMock();
 			registerExtension(mock.asExtensionAPI() as never);
 
 			// Seed a live bracket BEFORE firing session_start — simulates a phase
@@ -358,8 +361,7 @@ describe(
 			phaseStarted("leaked_before_session_start");
 			expect(getCurrentPhase()).toBeDefined();
 
-			const sessionStart = mock.getHandlers("session_start")[0];
-			expect(sessionStart).toBeTypeOf("function");
+			expect(mock.getHandlers("session_start")[0]).toBeTypeOf("function");
 			const sessionCtx = {
 				cwd: process.cwd(),
 				ui: {
@@ -368,7 +370,8 @@ describe(
 					theme: { fg: (_c: string, s: string) => s },
 				},
 			};
-			await sessionStart?.({ reason: "new" }, sessionCtx as never);
+			// `emit` runs the real handler and records the session for the teardown.
+			await mock.emit("session_start", { reason: "new" }, sessionCtx);
 
 			expect(getCurrentPhase()).toBeUndefined();
 		});

@@ -97,6 +97,54 @@ describe("LSPService.renameFile", () => {
 		}
 	});
 
+	// #5013: the rename description folds each `path.relative` result through
+	// `toPosix`, so a backslash-spelled relative path is reported with forward
+	// slashes. Two on-disk spellings of the same logical file are created for
+	// one reason: the preflight decodes the URI through `uriToPath` ->
+	// `normalizeFilePath`, which folds the separator before it stats the source,
+	// while the apply step renames the caller's raw spelling verbatim. Neither
+	// reads the other's path, and both behaviours predate the fold; only the
+	// description under test folds. On win32 the two spellings are the same path
+	// and `path.relative` hands back a backslash on its own.
+	it("describes the rename with a folded relative path (lsp/index.ts fold)", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-fold-"),
+		);
+		const physicalDir = path.join(tmpDir, "sub", "dir");
+		const spelledDir = path.join(tmpDir, "sub\\dir");
+		for (const dir of [physicalDir, spelledDir]) {
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(
+				path.join(dir, "old.ts"),
+				"export const value = 1;\n",
+				"utf-8",
+			);
+		}
+		const oldPath = path.join(spelledDir, "old.ts");
+		const newPath = path.join(spelledDir, "new.ts");
+
+		const service = new LSPService();
+		addRenameClient(
+			service,
+			"typescript",
+			tmpDir,
+			makeRenameClient(tmpDir, null),
+		);
+
+		try {
+			const result = await service.renameFile(oldPath, newPath, {
+				cwd: tmpDir,
+				apply: true,
+			});
+
+			expect(result.descriptions).toContain(
+				"Renamed sub/dir/old.ts → sub/dir/new.ts",
+			);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
 	it("records malformed registration skips at both service gates", async () => {
 		resetDegradationLedger();
 		const tmpDir = fs.mkdtempSync(
@@ -618,6 +666,40 @@ describe("LSPService.renameFile", () => {
 				originalUri,
 				`file://localhost/${tmpDir.replace(/\\/g, "/")}/new%2Ets`,
 			);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	// #3734 r3 class sweep: the open-document lookup was joined by server id, so
+	// a second root of the same server that never opened the file was told the
+	// first root's URI spelling, which names a document it does not hold.
+	it("gives each root of one server its own old URI spelling, not another root's", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-file-"),
+		);
+		const oldPath = path.join(tmpDir, "old.ts");
+		const newPath = path.join(tmpDir, "new.ts");
+		fs.writeFileSync(oldPath, "value\n", "utf-8");
+		const originalUri = `file://localhost/${tmpDir.replace(/\\/g, "/")}/OLD%2Ets`;
+		const opener = makeRenameClient(tmpDir, null);
+		opener.isDocumentOpen.mockReturnValue(true);
+		opener.getDocumentUri.mockReturnValue(originalUri);
+		const otherRoot = path.join(tmpDir, "package");
+		fs.mkdirSync(otherRoot);
+		const other = makeRenameClient(otherRoot, null);
+		const service = new LSPService();
+		addRenameClient(service, "typescript", tmpDir, opener);
+		addRenameClient(service, "typescript", otherRoot, other);
+		try {
+			await service.renameFile(oldPath, newPath, { cwd: tmpDir, apply: true });
+			expect(opener.didRenameFiles).toHaveBeenCalledWith(
+				oldPath,
+				newPath,
+				originalUri,
+				`file://localhost/${tmpDir.replace(/\\/g, "/")}/new%2Ets`,
+			);
+			expect(other.didRenameFiles.mock.calls).toEqual([[oldPath, newPath]]);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}

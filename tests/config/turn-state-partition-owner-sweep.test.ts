@@ -11,26 +11,31 @@ import {
 	listSourceFiles,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const ROOT = path.resolve(import.meta.dirname, "../..");
 
 describe("turn-state partition ownership sweep", () => {
-	it("keeps direct sessions indexing inside CacheManager", () => {
-		const offenders: string[] = [];
-		const sourceFiles = listSourceFiles(path.join(ROOT, "clients"));
-		for (const file of sourceFiles) {
-			const source = stripSource(fs.readFileSync(file, "utf8"));
-			if (
-				/sessions\s*\[/.test(source) &&
-				!file.endsWith("clients/cache-manager.ts")
-			) {
-				offenders.push(path.relative(ROOT, file));
+	it(
+		"keeps direct sessions indexing inside CacheManager",
+		() => {
+			const offenders: string[] = [];
+			const sourceFiles = listSourceFiles(path.join(ROOT, "clients"));
+			for (const file of sourceFiles) {
+				const source = stripSource(fs.readFileSync(file, "utf8"));
+				if (
+					/sessions\s*\[/.test(source) &&
+					!file.endsWith("clients/cache-manager.ts")
+				) {
+					offenders.push(path.relative(ROOT, file));
+				}
 			}
-		}
-		assertNonEmptyScan(
-			"turn-state partition ownership sweep",
-			sourceFiles.length,
-		);
-		expect(offenders).toEqual([]);
-	});
+			assertNonEmptyScan(
+				"turn-state partition ownership sweep",
+				sourceFiles.length,
+			);
+			expect(offenders).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });

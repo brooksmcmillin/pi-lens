@@ -50,6 +50,7 @@ Auto-install behavior depends on gate type:
 | `gitleaks`                          | Committed-secret session scan    | Auto-install   | Opt-in (config / hook / dep)       |
 | `govulncheck`                       | Go reachable-CVE session scan    | `go install`   | Auto (`go.mod` present)            |
 | `trivy`                             | Dependency-CVE session scan      | Auto-install   | Explicit opt-in (`trivy.enabled`)  |
+| `fallow-lsp`                        | JS/TS unused-code, duplication and cycle advisories | Auto-install | Explicit opt-in (`fallow.enabled`, pinned GitHub release) |
 | `psscriptanalyzer`                  | PowerShell linting               | Manual         | —                                  |
 
 Lean LSP is launched as `lake serve` from the detected Lake project root, so elan selects the toolchain from that project's `lean-toolchain` file and Lake supplies its project environment. pi-lens does not install or manage Lean/elan; install Lean and Lake separately and ensure `lake` is on `PATH`.

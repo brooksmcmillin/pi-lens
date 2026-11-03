@@ -55,13 +55,16 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { isMainModule as isEntryPoint } from "./lib/is-main-module.mjs";
 import {
 	acquireSharedSlot,
 	acquireTestLock,
 	getLockPath,
 	resolveSharedSlots,
 } from "./lib/suite-lock.mjs";
+
+// Preserve the existing import surface used by the pre-push selector and tests.
+export { isEntryPoint };
 
 const require = createRequire(import.meta.url);
 
@@ -306,37 +309,6 @@ async function main() {
 	}
 }
 
-// Whether `selfUrl` (a module's `import.meta.url`) is the process entry
-// point. Not a lexical compare: a silent MISMATCH is a silent-success failure
-// mode (`npm test` exits 0 having run zero tests, nothing printed), and a
-// lexical compare mismatches whenever `scripts/` is reached through a symlink
-// (#4086). Both sides go through `realpath`, so `fs.realpathSync.native` also
-// canonicalises the win32 casing and 8.3 short-name spellings the old
-// lexical/basename fallback handled.
-//  - argv[1] that is not a real path (`node -e`, stdin, a removed file): not
-//    the entry point, so importing a script never throws (#4086 review F2).
-//  - `selfUrl` that cannot be resolved: throw. Returning false would silently
-//    skip the CLI, the failure mode above. The `realpath` of `selfUrl` is
-//    load-bearing only under `--preserve-symlinks-main`, where the main
-//    module's URL keeps its symlinked spelling.
-export function isEntryPoint(
-	selfUrl,
-	{ argv1 = process.argv[1], realpath = fs.realpathSync.native } = {},
-) {
-	let invoked;
-	try {
-		invoked = realpath(argv1);
-	} catch {
-		return false;
-	}
-	try {
-		return invoked === realpath(fileURLToPath(selfUrl));
-	} catch (error) {
-		throw new Error(
-			`[with-test-lock] cannot resolve the entry-point path of ${selfUrl}: ${error instanceof Error ? error.message : error}`,
-		);
-	}
-}
 const isMain = isEntryPoint(import.meta.url);
 if (isMain) {
 	main().catch((error) => {

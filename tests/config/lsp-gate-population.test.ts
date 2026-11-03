@@ -16,7 +16,7 @@
 // commented-out block can satisfy any assertion here (#3217 F5 — the
 // "detectors match code, not prose" screen, satisfied structurally instead of
 // by comment-and-string blanking).
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -37,6 +37,8 @@ type Fixture = (typeof LSP_FIXTURES)[number] & {
 	lspGateExempt?: string;
 	lensFull?: boolean;
 	createdModuleWitness?: unknown;
+	bornAfterStartConfig?: unknown;
+	venvInstall?: unknown;
 	setup?: string | string[];
 	serverId?: string;
 	expectServerId?: string;
@@ -117,6 +119,66 @@ const repoRoot = path.resolve(
 );
 const fixtures = LSP_FIXTURES as Fixture[];
 
+// #3405 review r1 F1/F3: both helpers parse structure, not prose. A prose
+// substring of a manifest or a result line satisfied the census while the
+// project no longer compiled the seed (a commented-out Compile item) or a
+// failed row padded the sample floor (`still unanswered` contains `answered`).
+// Admitted form (round 2, F6): outside XML comments and CDATA, a whole
+// manifest of `<Project>` (optional `Sdk`) holding only attribute-free
+// `<PropertyGroup>`s of simple elements and attribute-free `<ItemGroup>`s of
+// `<Compile Include="X" />` items. Anything else (a Condition, a Remove or
+// Exclude, a Target or Choose wrapper, single quotes, another attribute)
+// makes the manifest unreadable, so the census reds and a human looks. A
+// per-element reading cannot see what makes an item live.
+const FSPROJ_ADMITTED =
+	/^\s*<Project(?:\s+Sdk="[^"]*")?\s*>(?:\s*<PropertyGroup>(?:\s*<(?<leaf>[A-Za-z]+)>[^<]*<\/\k<leaf>>)*\s*<\/PropertyGroup>|\s*<ItemGroup>(?:\s*<Compile Include="[^"]*"\s*\/>)*\s*<\/ItemGroup>)*\s*<\/Project>\s*$/;
+
+// One left-to-right scan that skips comment and CDATA spans, as an XML reader
+// does, instead of replace-then-match: removing a span can splice its
+// neighbours into a new opener (`<!<!---->--`), which CodeQL flags (alert 78,
+// js/incomplete-multi-character-sanitization). A spliced opener stays in the
+// output, where the grammar below refuses it. An unterminated span is
+// malformed XML: its opener stays in the output so the grammar refuses the
+// manifest instead of reading past it.
+function stripCommentsAndCdata(xml: string): string {
+	let live = "";
+	let at = 0;
+	while (at < xml.length) {
+		const close = xml.startsWith("<!--", at)
+			? "-->"
+			: xml.startsWith("<![CDATA[", at)
+				? "]]>"
+				: null;
+		if (close === null) {
+			live += xml[at];
+			at += 1;
+			continue;
+		}
+		const end = xml.indexOf(close, at + 4);
+		if (end < 0) {
+			live += xml.slice(at);
+			break;
+		}
+		at = end + close.length;
+	}
+	return live;
+}
+
+function fsprojCompileIncludes(xml: string): string[] {
+	const live = stripCommentsAndCdata(xml);
+	if (!FSPROJ_ADMITTED.test(live)) return [];
+	return [...live.matchAll(/<Compile Include="([^"]*)"/g)].map(
+		(match) => match[1],
+	);
+}
+
+function answeredSamples(rows: { line: string }[]): number[] {
+	return rows.flatMap((row) => {
+		const match = /^✓.*\banswered on call \d+, (\d+) ms/.exec(row.line);
+		return match ? [Number(match[1])] : [];
+	});
+}
+
 describe("LSP clean-gate population (#3217)", () => {
 	it("gives every gate-eligible fixture exactly one of lspGate / lspGateExempt", () => {
 		const { eligible } = lspGatePopulation() as { eligible: Fixture[] };
@@ -169,6 +231,29 @@ describe("LSP clean-gate population (#3217)", () => {
 		expect(witnessed[0].lspGate).toBe(true);
 	});
 
+	// #4521/#4532: the config-file and root-marker phases run inside the same
+	// gate on the same fixture. Dropping the flag would retire the nightly's only
+	// end-to-end check that a config created after pyright answered is read.
+	it("pins the born-after-start config witness to the gated python fixture", () => {
+		const witnessed = fixtures.filter(
+			(fixture) => fixture.bornAfterStartConfig !== undefined,
+		);
+		expect(witnessed.map((fixture) => fixture.lang)).toEqual(["python"]);
+		expect(witnessed[0].lspGate).toBe(true);
+	});
+
+	// #4532 gap 3: the lockfile-less venv install phase runs inside the same gate
+	// on the same fixture. Dropping the flag would retire the nightly's only
+	// end-to-end check that a `pip install` into a project `.venv` clears the
+	// importer's cached missing import.
+	it("pins the venv install witness to the gated python fixture", () => {
+		const witnessed = fixtures.filter(
+			(fixture) => fixture.venvInstall !== undefined,
+		);
+		expect(witnessed.map((fixture) => fixture.lang)).toEqual(["python"]);
+		expect(witnessed[0].lspGate).toBe(true);
+	});
+
 	// #2780's own guard, carried over from the deleted
 	// tests/scripts/smoke-tools-lsp-gate-fixtures.test.ts: a fixture with no
 	// seeded defect (`clean: true`) or one whose contract is an AUXILIARY
@@ -199,6 +284,208 @@ describe("LSP clean-gate population (#3217)", () => {
 			);
 			expect(source, fixture.lang).toContain(fixture.lspGateMarker);
 		}
+	});
+
+	// #3405 H1 recurrence: the Expert row's seeded bad.ex sat at the Mix project
+	// root, outside the default `elixirc_paths` (["lib"]), so Expert had no
+	// compile error to publish and the row read as a server limit for six weeks
+	// (the same fixture was already known to be uncompiled:
+	// scripts/capture-runner-fixtures.mjs). The F# row had the same shape: an
+	// fsproj with no Compile item does not own Program.fs. A seed outside its
+	// project's compile set proves nothing about the server. Scope: the two
+	// manifest kinds whose compile set is explicit and cheap to read.
+	it("seeds every Mix and F# fixture inside its project's compile set (#3405)", () => {
+		let checked = 0;
+		for (const fixture of fixtures) {
+			const dir = path.join(repoRoot, fixture.dir);
+			const manifests = readdirSync(dir);
+			const fsproj = manifests.find((name) => name.endsWith(".fsproj"));
+			if (manifests.includes("mix.exs")) {
+				const mix = readFileSync(path.join(dir, "mix.exs"), "utf8");
+				expect(
+					mix,
+					`${fixture.lang}: mix.exs redirects compile paths`,
+				).not.toContain("elixirc_paths");
+				expect(
+					fixture.file.startsWith("lib/"),
+					`${fixture.lang}: ${fixture.file} is outside Mix's default elixirc_paths ["lib"]`,
+				).toBe(true);
+				checked += 1;
+			}
+			if (fsproj) {
+				const project = readFileSync(path.join(dir, fsproj), "utf8");
+				expect(
+					fsprojCompileIncludes(project),
+					`${fixture.lang}: ${fsproj} lists no live Compile item for ${fixture.file}`,
+				).toContain(fixture.file);
+				checked += 1;
+			}
+		}
+		// Floor: elixir, expert and fsharp. An empty scan would pass vacuously.
+		expect(checked).toBeGreaterThanOrEqual(3);
+	});
+
+	// #3405 review r1 F1 recurrence (Greptile): the census matched a substring
+	// of the manifest, so a commented-out `<Compile Include="Program.fs" />` kept
+	// it green after the project stopped compiling the seed. Each plant is a
+	// spelling the first design did not name.
+	it.each([
+		[
+			"a commented-out item",
+			`<Project><!-- <Compile Include="Program.fs" /> --></Project>`,
+		],
+		[
+			"an item in an unterminated comment",
+			`<Project><!-- <Compile Include="Program.fs" />`,
+		],
+		[
+			"an item inside CDATA",
+			`<Project><![CDATA[<Compile Include="Program.fs" />]]></Project>`,
+		],
+		[
+			"a single-quoted Include",
+			`<Project><Compile Include='Program.fs' /></Project>`,
+		],
+		[
+			"an attribute before Include",
+			`<Project><Compile Condition="false" Include="Program.fs" /></Project>`,
+		],
+		["a wildcard", `<Project><Compile Include="*.fs" /></Project>`],
+		[
+			"a property reference",
+			`<Project><Compile Include="$(Seed)" /></Project>`,
+		],
+		["a Remove item", `<Project><Compile Remove="Program.fs" /></Project>`],
+		[
+			"a clean item inside a conditioned ItemGroup",
+			`<Project><ItemGroup Condition="false"><Compile Include="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"an Include cancelled by a later Remove",
+			`<Project><ItemGroup><Compile Include="Program.fs" /><Compile Remove="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"an Include with an Exclude attribute",
+			`<Project><ItemGroup><Compile Include="Program.fs" Exclude="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"an ItemGroup inside a Target",
+			`<Project><Target Name="T"><ItemGroup><Compile Include="Program.fs" /></ItemGroup></Target></Project>`,
+		],
+		[
+			"a split comment opener that a strip would splice together",
+			`<Project><ItemGroup><!<!---->-- <Compile Include="Program.fs" /> --></ItemGroup></Project>`,
+		],
+		[
+			"a split CDATA opener that a strip would splice together",
+			`<Project><ItemGroup><![CD<!---->ATA[ ]]><Compile Include="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"a complete project followed by an unterminated comment",
+			`<Project><ItemGroup><Compile Include="Program.fs" /></ItemGroup></Project><!-- x`,
+		],
+		[
+			"a Project with an attribute besides Sdk",
+			`<Project Sdk="Microsoft.NET.Sdk" ToolsVersion="15.0"><ItemGroup><Compile Include="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"a conditioned PropertyGroup",
+			`<Project><PropertyGroup Condition="false"><A>b</A></PropertyGroup><ItemGroup><Compile Include="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"a property whose closing tag names another element",
+			`<Project><PropertyGroup><A>x</B></PropertyGroup><ItemGroup><Compile Include="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"a conditioned PropertyGroup child",
+			`<Project><PropertyGroup><A Condition="false">b</A></PropertyGroup><ItemGroup><Compile Include="Program.fs" /></ItemGroup></Project>`,
+		],
+		[
+			"a nested comment",
+			`<Project><ItemGroup><!-- <!-- x --> <Compile Include="Program.fs" /> --></ItemGroup></Project>`,
+		],
+		[
+			"an ItemGroup under a conditioned When",
+			`<Project><Choose><When Condition="false"><ItemGroup><Compile Include="Program.fs" /></ItemGroup></When></Choose></Project>`,
+		],
+		[
+			"a longer file name",
+			`<Project><Compile Include="Program.fs.bak" /></Project>`,
+		],
+	])("refuses %s as a Compile item for Program.fs", (_name, xml) => {
+		expect(fsprojCompileIncludes(xml)).not.toContain("Program.fs");
+	});
+
+	it("admits a live Compile item next to CDATA", () => {
+		expect(
+			fsprojCompileIncludes(
+				`<Project><ItemGroup><![CDATA[ <Compile Include="Old.fs" /> ]]><Compile Include="Program.fs" /></ItemGroup></Project>`,
+			),
+		).toEqual(["Program.fs"]);
+	});
+
+	it("admits a live Compile item next to a commented-out one", () => {
+		expect(
+			fsprojCompileIncludes(
+				`<Project><!-- <Compile Include="Old.fs" /> --><ItemGroup><Compile Include="Program.fs" /></ItemGroup></Project>`,
+			),
+		).toEqual(["Program.fs"]);
+	});
+
+	// #3405: the readiness deadline is a measured constant (#3648). The raw Expert
+	// rows live in the fixture; the shipped deadline must clear twice the slowest
+	// answer, and the root-seeded arm must stay unanswered for the whole deadline
+	// (the premise that the old fixture, not the server, was the limit).
+	it("keeps the Expert readiness deadline above twice the measured answer time (#3405)", () => {
+		const artifact = JSON.parse(
+			readFileSync(
+				path.join(
+					repoRoot,
+					"tests/fixtures/nightly-floors/expert-readiness.json",
+				),
+				"utf8",
+			),
+		) as { arms: Record<string, { run: number; line: string }[]> };
+		const expert = fixtures.find((fixture) => fixture.lang === "expert") as {
+			lspGateReadiness: { deadlineMs: number };
+		};
+		// every row of a measured arm is a passing answer: a row that is not
+		// cannot be dropped silently and shrink the sample set
+		const samplesA = answeredSamples(artifact.arms["A-didSave-lib-seed"]);
+		const samplesB = answeredSamples(artifact.arms["B-no-didSave-lib-seed"]);
+		expect(samplesA).toHaveLength(artifact.arms["A-didSave-lib-seed"].length);
+		expect(samplesB).toHaveLength(
+			artifact.arms["B-no-didSave-lib-seed"].length,
+		);
+		const samples = [...samplesA, ...samplesB];
+		expect(samples.length).toBeGreaterThanOrEqual(6);
+		expect(expert.lspGateReadiness.deadlineMs).toBeGreaterThanOrEqual(
+			2 * Math.max(...samples),
+		);
+		const [root] = artifact.arms["C-didSave-root-seed"];
+		const waited = Number(
+			/still unanswered on call \d+, (\d+) ms/.exec(root.line)?.[1],
+		);
+		expect(waited).toBeGreaterThanOrEqual(expert.lspGateReadiness.deadlineMs);
+	});
+
+	// #3405 review r1 F3 recurrence (CodeRabbit): `answered on call` also
+	// matches inside `still unanswered on call`, so an unanswered row parsed as
+	// a sample and could pad the sample floor.
+	it("counts only passing rows as answer-time samples", () => {
+		expect(
+			answeredSamples([
+				{
+					line: "✓  expert  x  1  lsp_diagnostics returned 1 primary finding (answered on call 6, 10955 ms after the cold call)",
+				},
+				{
+					line: "✗  expert  x  0  lsp_diagnostics returned 0 diagnostic(s) but 0 primary findings (auxiliary=0) (still unanswered on call 61, 151521 ms after the cold call)",
+				},
+				{
+					line: "⚠  expert  x  0  probe server unavailable (answered on call 2, 5 ms after the cold call)",
+				},
+			]),
+		).toEqual([10955]);
 	});
 
 	it("requires every exemption to state a reason, not just carry the key", () => {

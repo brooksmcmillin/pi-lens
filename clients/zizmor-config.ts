@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { type SpawnResult, safeSpawnAsync } from "./safe-spawn.js";
-import { findLocalToolConfig } from "./path-utils.js";
+import { findLocalToolConfig, toPosix } from "./path-utils.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import {
 	type AvailabilityCause,
@@ -56,7 +56,7 @@ export function findLocalZizmorConfig(startDir: string): string | undefined {
 // over-matching would leave the wasted-wait gap in place for common
 // non-GitHub YAML (docker-compose.yml, k8s manifests, …).
 export function isZizmorAuditTarget(filePath: string): boolean {
-	const normalized = filePath.replace(/\\/g, "/");
+	const normalized = toPosix(filePath);
 	const base = path.basename(normalized).toLowerCase();
 	if (/(^|\/)\.github\/workflows\/[^/]+\.ya?ml$/i.test(normalized)) return true;
 	if (base === "action.yml" || base === "action.yaml") return true;

@@ -58,6 +58,8 @@ describe("debug-handles: PI_LENS_DEBUG_HANDLES=1 unset (default)", () => {
 
 	beforeEach(() => {
 		originalFlag = process.env.PI_LENS_DEBUG_HANDLES;
+		// The enabled describe writes the shared log; a sibling case must not see it.
+		fs.rmSync(debugHandlesLogPath(), { force: true });
 	});
 
 	afterEach(() => {

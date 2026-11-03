@@ -9,6 +9,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -50,8 +51,8 @@ type Outcome = {
 	summary: { head: { blob: string }; base: { blob: string } | null };
 };
 
-const scratch = mkdtempSync(
-	path.join(tmpdir(), "pi-lens-guard-bash-probe-test-"),
+const scratch = realpathSync(
+	mkdtempSync(path.join(tmpdir(), "pi-lens-guard-bash-probe-test-")),
 );
 afterAll(() => {
 	rmSync(scratch, { recursive: true, force: true });
@@ -139,10 +140,7 @@ describe.skipIf(process.platform === "win32")(
 						return count;
 					}, {}),
 				).sort(),
-			).toEqual([
-				["#4025", 3],
-				["#4060", 3],
-			]);
+			).toEqual([["#4025", 3]]);
 			console.info(
 				`guard-bash corpus: ${outcome.results.length} rows in ${elapsed} ms`,
 			);

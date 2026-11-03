@@ -81,12 +81,7 @@ import {
 	dispatchLintWithResult,
 } from "../../clients/dispatch/integration.js";
 
-// Mock LSP service
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(),
-}));
-
-import { getLSPService } from "../../clients/lsp/capabilities.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 
 // #4019: the Windows lane declares PI_LENS_TEST_TIMEOUT_SCALE=3 because a
@@ -119,11 +114,10 @@ describe("Pipeline", () => {
 				},
 			}),
 		);
-		mockLSPService = makeLspServiceDouble({
+		mockLSPService = await installLspServiceDouble({
 			supportsLSP: vi.fn().mockReturnValue(true),
 			hasLSP: vi.fn().mockResolvedValue(true),
 		});
-		vi.mocked(getLSPService).mockReturnValue(mockLSPService as any);
 		vi.mocked(dispatchLintWithResult).mockReset();
 		const { resetFormatService } =
 			await import("../../clients/format-service.js");
@@ -654,7 +648,9 @@ describe("Pipeline", () => {
 				getFormatService: () => formatService,
 			});
 			formatService.formatFile = async (fp: string) => {
-				const result = await originalFormatFile(fp);
+				const result = await originalFormatFile(fp, {
+					sessionRoot: path.dirname(fp),
+				});
 				// Force a file change by writing different content
 				if (fp === filePath || path.resolve(fp) === path.resolve(filePath)) {
 					fs.writeFileSync(filePath, "const x = 1;\n");
@@ -1019,7 +1015,9 @@ describe("Pipeline", () => {
 			const originalFormatFile = formatService.formatFile.bind(formatService);
 			const deps = createMockDeps({ getFormatService: () => formatService });
 			formatService.formatFile = async (fp: string) => {
-				const result = await originalFormatFile(fp);
+				const result = await originalFormatFile(fp, {
+					sessionRoot: path.dirname(fp),
+				});
 				if (fp === filePath || path.resolve(fp) === path.resolve(filePath)) {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
@@ -1149,7 +1147,9 @@ describe("Pipeline", () => {
 			const originalFormatFile = formatService.formatFile.bind(formatService);
 			const deps = createMockDeps({ getFormatService: () => formatService });
 			formatService.formatFile = async (fp: string) => {
-				const result = await originalFormatFile(fp);
+				const result = await originalFormatFile(fp, {
+					sessionRoot: path.dirname(fp),
+				});
 				if (fp === filePath || path.resolve(fp) === path.resolve(filePath)) {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
@@ -1693,6 +1693,188 @@ describe("Pipeline", () => {
 			expect(result.hasBlockers).toBe(false);
 			expect(result.isError).toBe(false);
 		});
+
+		// Recurrence: #4734 review F1 and Greptile "Unchecked edits look checked".
+		// `tool_result` read "found nothing" off `output` being empty, but a clean
+		// run's output is the all-clear line, and an empty output is a format-only
+		// change whose primary may never have answered. #4734 r3: the all-clear
+		// line is not the verdict either; it also ends a run with only warnings,
+		// one no language server answered, and one without authorship holding a
+		// blocker. Each cell below is a row of the round-3 state table.
+		const cleanDispatch = (
+			shape: {
+				unconfirmedStatus?: string;
+				primaryLspChecked?: true;
+				warnings?: Diagnostic[];
+				heldBackBlockers?: Diagnostic[];
+			} = {},
+		) =>
+			({
+				diagnostics: shape.warnings ?? [],
+				blockers: [],
+				warnings: shape.warnings ?? [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+				...(shape.unconfirmedStatus !== undefined && {
+					unconfirmedStatus: shape.unconfirmedStatus,
+				}),
+				...(shape.primaryLspChecked && { primaryLspChecked: true }),
+				...(shape.heldBackBlockers && {
+					heldBackBlockers: shape.heldBackBlockers,
+				}),
+			}) as Awaited<ReturnType<typeof dispatchLintWithResult>>;
+		const answered = { primaryLspChecked: true } as const;
+		const verdictOf = async (
+			filePath: string,
+			dispatched: Awaited<ReturnType<typeof dispatchLintWithResult>>,
+			overrides?: Partial<PipelineContext>,
+		) => {
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(dispatched);
+			const result = await runPipeline(
+				createMockContext(filePath, overrides),
+				createMockDeps(),
+			);
+			return [result.output.split(" · ")[0], result.checkedClean];
+		};
+
+		it("reports a checked clean verdict with the clean line, and none for an unconfirmed one", async () => {
+			const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
+			// A file no language covers ends with a bare timing line, no "clean".
+			const unknownPath = createTempFile(tmpDir, "notes.zzz", "x\n");
+
+			expect({
+				// Row 14, the one cell: a language server answered, nothing recorded.
+				clean: await verdictOf(filePath, cleanDispatch(answered)),
+				// Row 7.
+				unconfirmed: (
+					await verdictOf(
+						filePath,
+						cleanDispatch({
+							unconfirmedStatus:
+								"no primary language server answered (disabled)",
+						}),
+					)
+				).map((v) => (typeof v === "string" ? v.split(" — ")[0] : v)),
+				// Row 9: the dispatcher sets no language-server verdict without a kind.
+				unknown: (await verdictOf(unknownPath, cleanDispatch())).map((v) =>
+					typeof v === "string" ? v.includes("clean") : v,
+				),
+			}).toEqual({
+				clean: ["✓ JavaScript/TypeScript clean", true],
+				unconfirmed: ["⚠ JavaScript/TypeScript unconfirmed", false],
+				unknown: [false, false],
+			});
+		});
+
+		it("reports no checked clean verdict for a run with only a warning behind the clean line", async () => {
+			// Row 6 (verify r2 F1): the dispatcher renders no text for a warning, so
+			// the run ends with the clean line while it recorded a finding.
+			const filePath = createTempFile(tmpDir, "warn.ts", "const x = 1;");
+			const warning: Diagnostic = {
+				id: "lsp-unused",
+				message: "'x' is declared but never read",
+				filePath,
+				line: 1,
+				severity: "warning",
+				semantic: "warning",
+				tool: "lsp",
+			};
+
+			expect(
+				await verdictOf(
+					filePath,
+					cleanDispatch({ ...answered, warnings: [warning] }),
+				),
+			).toEqual(["✓ JavaScript/TypeScript clean", false]);
+		});
+
+		it("reports no checked clean verdict for a clean line no language server answered", async () => {
+			// Rows 8 and 10-13 (verify r2 F4): `--no-lsp`, a CLI primary, a fallback
+			// linter, a deferred or a latched silent server all reach the pipeline
+			// as this shape, no `unconfirmedStatus` and no language-server verdict
+			// (the dispatcher cells in coverage-notice-runner-outcome.test.ts).
+			const filePath = createTempFile(tmpDir, "nolsp.ts", "const x = 1;");
+
+			expect(await verdictOf(filePath, cleanDispatch())).toEqual([
+				"✓ JavaScript/TypeScript clean",
+				false,
+			]);
+		});
+
+		it("reports no checked clean verdict, and the withheld disclosure, for a run without authorship that keeps a blocker", async () => {
+			// Row 5: without authorship (#3226) a held-back blocker renders no STOP
+			// text. #5108: the run no longer ends with the clean line over it; it
+			// states that the blocker was withheld.
+			const filePath = createTempFile(
+				tmpDir,
+				"held.ts",
+				"const x: number = 'a';",
+			);
+			const blocker: Diagnostic = {
+				id: "lsp-2322",
+				message: "Type 'string' is not assignable to type 'number'.",
+				filePath,
+				line: 1,
+				severity: "error",
+				semantic: "blocking",
+				tool: "lsp",
+			};
+
+			expect(
+				await verdictOf(
+					filePath,
+					cleanDispatch({ ...answered, heldBackBlockers: [blocker] }),
+					{ allowAutonomousWriters: false },
+				),
+			).toEqual([
+				expect.stringMatching(/^⚠ 1 blocking finding in held\.ts withheld/),
+				false,
+			]);
+		});
+
+		it("reports no checked clean verdict for a format-only change whose primary did not answer", async () => {
+			const filePath = createTempFile(tmpDir, "fmt.ts", "const x=1;\n");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(
+				cleanDispatch({
+					unconfirmedStatus: "no primary language server answered (disabled)",
+				}),
+			);
+			const formatFile = vi.fn(async (fp: string) => {
+				fs.writeFileSync(fp, "const x = 1;\n");
+				return {
+					filePath: fp,
+					formatters: [
+						{
+							name: "biome",
+							success: true,
+							changed: true,
+							outcome: "formatted" as const,
+						},
+					],
+					anyChanged: true,
+					allSucceeded: true,
+				};
+			});
+
+			const result = await runPipeline(
+				createMockContext(filePath, {
+					getFlag: (name) => name === "immediate-format",
+				}),
+				createMockDeps({
+					getFormatService: () => ({ recordRead: vi.fn(), formatFile }) as any,
+				}),
+			);
+
+			// The shape the consumer used to read as "found nothing": no output.
+			expect(formatFile).toHaveBeenCalled();
+			expect(result.output).toBe("");
+			expect(result.postAutofixNotice).toBeDefined();
+			expect(result.checkedClean).toBe(false);
+		});
 	});
 
 	// #1641 review F1/F2: `inlineBlockerLines` is the structured field the
@@ -2235,6 +2417,132 @@ describe("Pipeline", () => {
 			expect(result.inlineBlockerLines).toEqual([1, 2]);
 			expect(result.inlineBlockerDiagnostics).toHaveLength(2);
 			expect(result.hasBlockers).toBe(true);
+		});
+	});
+	// #5108: a run without authorship (#3226) withholds the STOP block and the
+	// record, and says so. Recurrence prevented: pi session 01a192b9, where the
+	// withheld blocker left the output empty and `buildAllClearOutput` rendered
+	// `✓ JavaScript/TypeScript clean` over an lsp error on the written file.
+	describe("#5108 withheld blockers in a run without authorship", () => {
+		function blocker(
+			filePath: string,
+			tool: string,
+			message: string,
+			line = 3,
+		): Diagnostic {
+			return {
+				id: `${tool}:${line}`,
+				message,
+				filePath,
+				line,
+				severity: "error",
+				semantic: "blocking",
+				tool,
+			} as Diagnostic;
+		}
+
+		function dispatchWith(blockers: Diagnostic[]) {
+			const blockerOutput = formatDiagnostics(blockers, "blocking");
+			return {
+				diagnostics: [...blockers],
+				blockers,
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: blockerOutput,
+				blockerOutput,
+				hasBlockers: blockers.length > 0,
+			};
+		}
+
+		// The family axis: the disclosure keys off the run's blocker set, not off
+		// which runner raised it or which language the file is.
+		it.each([
+			["a TypeScript language server", "config.ts", "lsp"],
+			["a Python language server", "config.py", "lsp"],
+			["a Rust language server", "config.rs", "lsp"],
+			["oxlint", "config.ts", "oxlint"],
+		])(
+			"discloses the blocker %s raised, never the all-clear",
+			async (_member, name, tool) => {
+				const filePath = createTempFile(tmpDir, name, "x = 1\n");
+				vi.mocked(dispatchLintWithResult).mockResolvedValue(
+					dispatchWith([
+						blocker(filePath, tool, "Cannot find name 'PROVIDER_INFERX'"),
+					]) as never,
+				);
+
+				const result = await runPipeline(
+					createMockContext(filePath, { allowAutonomousWriters: false }),
+					createMockDeps(),
+				);
+
+				expect(result.output).toContain(
+					`1 blocking finding in ${name} withheld`,
+				);
+				expect(result.output).not.toMatch(/clean|\u2713/);
+				expect(result.output).not.toContain("STOP");
+				expect(result.withheldBlockerLine).toBe(result.output);
+				// Withheld stays withheld (#3226, #4137): no record for the turn-end
+				// replay and no verdict for the commit gate.
+				expect(result.hasBlockers).toBe(false);
+				expect(result.inlineBlockerSummary).toBeUndefined();
+				expect(result.checkedClean).toBe(false);
+			},
+		);
+
+		it("counts every withheld blocker", async () => {
+			const filePath = createTempFile(tmpDir, "two.ts", "const x = 1;\n");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(
+				dispatchWith([
+					blocker(filePath, "lsp", "first", 1),
+					blocker(filePath, "oxlint", "second", 2),
+				]) as never,
+			);
+
+			const result = await runPipeline(
+				createMockContext(filePath, { allowAutonomousWriters: false }),
+				createMockDeps(),
+			);
+
+			expect(result.output).toContain("2 blocking findings in two.ts withheld");
+			expect(result.output).toContain("lens_diagnostics mode=all lists them");
+		});
+
+		it("keeps the all-clear for a run that held no blocker", async () => {
+			// The control: the disclosure is the blocker's, not every unauthored
+			// run's.
+			const filePath = createTempFile(tmpDir, "fine.ts", "const x = 1;\n");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(
+				dispatchWith([]) as never,
+			);
+
+			const result = await runPipeline(
+				createMockContext(filePath, { allowAutonomousWriters: false }),
+				createMockDeps(),
+			);
+
+			expect(result.output).toContain("clean");
+			expect(result.withheldBlockerLine).toBeUndefined();
+		});
+
+		it("renders the STOP block, not the disclosure, when the run is authored", async () => {
+			// The other direction: authorship decides the channel, and the two are
+			// never both rendered for one blocker.
+			const filePath = createTempFile(tmpDir, "authored.ts", "const x = 1;\n");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(
+				dispatchWith([blocker(filePath, "lsp", "bad name")]) as never,
+			);
+
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+
+			expect(result.output).toContain("STOP");
+			expect(result.output).not.toContain("withheld");
+			expect(result.withheldBlockerLine).toBeUndefined();
 		});
 	});
 });

@@ -1,4 +1,3 @@
-// flake-shape: in-process-mock — the tool's service shell is a factory-seeded double over a REAL LSPService, so `rename_file` runs the production rename, capture, queue and apply while no language server can be spawned; the language client stays a double at the process boundary (tests/support/lsp-rename-client-double.ts), as tests/clients/lsp/service-rename-file.test.ts already does for this method.
 /**
  * #3734: `LSPService.renameFile` applied the merged `workspace/willRenameFiles`
  * text edits with no content binding, so a file written between a server
@@ -24,6 +23,13 @@
  *  | one opened (clean) + one unopened (written) | between T and the answer | two importers | the whole edit refused: neither importer rewritten, nothing moved |
  *  | unopened, mtime before T                 | none                    | one importer  | applies: importer rewritten, file moved |
  *  | unopened, written                        | between T and the answer| one importer, preview | preview returns the merged edit and writes nothing |
+ *
+ * Round 3 (one identity, the registry client key; table in the PR body):
+ *
+ *  | contributors                                   | write lands             | expected |
+ *  |------------------------------------------------|-------------------------|----------|
+ *  | one root of a server throws, another answers   | none                    | applies the answer; the failure is still reported |
+ *  | one with a matching record + one with none     | after T, or in the margin | refused, names the contributor with no record |
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -38,6 +44,7 @@ import {
 	makeRenameClient,
 } from "../support/lsp-rename-client-double.js";
 import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
 import { setHostFileMutationQueueLoader } from "../../clients/file-mutation-queue.js";
 import {
 	getDegradationSummary,
@@ -45,15 +52,9 @@ import {
 } from "../../clients/degradation-ledger.js";
 
 const lsp = vi.hoisted(() => ({ service: undefined as unknown }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => lsp.service,
-}));
-
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
 import { LSPService } from "../../clients/lsp/index.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
 /** The importer as the server read it: the edit replaces `old` with `new`. */
 const OLD_IMPORT = "import { value } from './old';\n";
@@ -78,6 +79,20 @@ const importEdit = (importPath: string) => ({
 	},
 });
 
+const agentImportEdit = (importPath: string) => ({
+	changes: {
+		[pathToFileURL(importPath).href]: [
+			{
+				range: {
+					start: { line: 1, character: 25 },
+					end: { line: 1, character: 28 },
+				},
+				newText: "new",
+			},
+		],
+	},
+});
+
 let env: ReturnType<typeof setupTestEnvironment>;
 let oldPath: string;
 let newPath: string;
@@ -91,6 +106,8 @@ beforeEach(() => {
 	importPath = path.join(env.tmpDir, "import.ts");
 	fs.writeFileSync(oldPath, "export const value = 1;\n");
 	fs.writeFileSync(importPath, OLD_IMPORT);
+	clientFor = () => makeRenameClient(env.tmpDir, null);
+	clientsFor = () => [{ serverId: "typescript", client: clientFor() }];
 	setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
 });
 
@@ -116,21 +133,30 @@ const staleRows = () =>
 /** The per-case language client double; a case replaces it before it builds
  *  the harness, so the client its rename answers from is the one it controls. */
 let clientFor = (): RenameClientDouble => makeRenameClient(env.tmpDir, null);
+let clientsFor = (): Array<{
+	serverId: string;
+	client: RenameClientDouble;
+	root?: string;
+}> => [{ serverId: "typescript", client: clientFor() }];
 
 /** A real `LSPService` rename behind the shell the tool resolves. Nothing the
  *  case starts may outlive it: `shutdown` runs before the fixture goes. */
 function makeHarness(): { realService: LSPService } {
 	const realService = new LSPService();
-	addRenameClient(realService, "typescript", env.tmpDir, clientFor());
-	lsp.service = makeLspServiceDouble({
-		supportsLSP: vi.fn(() => true),
-		hasLSP: vi.fn(async () => true),
-		renameFile: (
-			oldFilePath: string,
-			newFilePath: string,
-			options: Parameters<LSPService["renameFile"]>[2],
-		) => realService.renameFile(oldFilePath, newFilePath, options),
-	});
+	for (const { serverId, client, root } of clientsFor()) {
+		addRenameClient(realService, serverId, root ?? env.tmpDir, client);
+	}
+	lsp.service = installLspService(
+		makeLspServiceDouble({
+			supportsLSP: vi.fn(() => true),
+			hasLSP: vi.fn(async () => true),
+			renameFile: (
+				oldFilePath: string,
+				newFilePath: string,
+				options: Parameters<LSPService["renameFile"]>[2],
+			) => realService.renameFile(oldFilePath, newFilePath, options),
+		}),
+	);
 	return { realService };
 }
 
@@ -183,6 +209,222 @@ describe("#3734: rename_file refuses an edit on a file that changed", () => {
 			await harness.realService.shutdown();
 		}
 	});
+
+	it("checks the client that produced a lower-priority edit", async () => {
+		const edit = importEdit(importPath);
+		const primary = makeRenameClient(env.tmpDir, null);
+		primary.getSentContent = vi.fn(() => ({
+			hash: hashDiagnosticContent(AGENT_IMPORT),
+			changedAtMs: 0,
+		}));
+		const secondary = makeRenameClient(env.tmpDir, edit);
+		secondary.getSentContent = vi.fn(() => ({
+			hash: hashDiagnosticContent(OLD_IMPORT),
+			changedAtMs: 0,
+		}));
+		secondary.willRenameFiles.mockImplementation(async () => {
+			fs.writeFileSync(importPath, AGENT_IMPORT);
+			return edit;
+		});
+		clientsFor = () => [
+			{ serverId: "typescript", client: primary },
+			{ serverId: "eslint", client: secondary },
+		];
+		const harness = makeHarness();
+
+		try {
+			const result = await runRenameFile(env.tmpDir, true);
+
+			expect(fs.readFileSync(importPath, "utf-8")).toBe(AGENT_IMPORT);
+			expect(result.isError).toBe(true);
+			expect(resultText(result)).toContain(path.basename(importPath));
+			expect(resultText(result)).toContain(
+				"it changed after the language server computed the rename from it",
+			);
+			expect(staleRows()).toEqual([expect.objectContaining({ count: 1 })]);
+		} finally {
+			await harness.realService.shutdown();
+		}
+	});
+
+	it("ignores a same-server client that contributed no edit", async () => {
+		const edit = agentImportEdit(importPath);
+		const contributor = makeRenameClient(env.tmpDir, edit);
+		contributor.getSentContent = vi.fn(() => ({
+			hash: hashDiagnosticContent(AGENT_IMPORT),
+			changedAtMs: 0,
+		}));
+		contributor.willRenameFiles.mockImplementation(async () => {
+			fs.writeFileSync(importPath, AGENT_IMPORT);
+			return edit;
+		});
+		const bystanderRoot = path.join(env.tmpDir, "package");
+		fs.mkdirSync(bystanderRoot);
+		const bystander = makeRenameClient(bystanderRoot, null);
+		bystander.getSentContent = vi.fn(() => ({
+			hash: hashDiagnosticContent(OLD_IMPORT),
+			changedAtMs: 0,
+		}));
+		clientsFor = () => [
+			{ serverId: "typescript", client: contributor },
+			{ serverId: "typescript", client: bystander, root: bystanderRoot },
+		];
+		const harness = makeHarness();
+
+		try {
+			const result = await runRenameFile(env.tmpDir, true);
+
+			expect(result.isError).toBeUndefined();
+			expect(fs.readFileSync(importPath, "utf-8")).toContain("./new");
+			expect(fs.existsSync(newPath)).toBe(true);
+			expect(staleRows()).toEqual([]);
+		} finally {
+			await harness.realService.shutdown();
+		}
+	});
+
+	it("excludes a non-contributing server with a different stale send", async () => {
+		const edit = agentImportEdit(importPath);
+		const contributor = makeRenameClient(env.tmpDir, edit);
+		contributor.getSentContent = vi.fn(() => ({
+			hash: hashDiagnosticContent(AGENT_IMPORT),
+			changedAtMs: 0,
+		}));
+		contributor.willRenameFiles.mockImplementation(async () => {
+			fs.writeFileSync(importPath, AGENT_IMPORT);
+			return edit;
+		});
+		const bystander = makeRenameClient(env.tmpDir, null);
+		bystander.getSentContent = vi.fn(() => ({
+			hash: hashDiagnosticContent(OLD_IMPORT),
+			changedAtMs: 0,
+		}));
+		clientsFor = () => [
+			{ serverId: "eslint", client: contributor },
+			{ serverId: "typescript", client: bystander },
+		];
+		const harness = makeHarness();
+
+		try {
+			const result = await runRenameFile(env.tmpDir, true);
+
+			expect(result.isError).toBeUndefined();
+			expect(fs.readFileSync(importPath, "utf-8")).toContain("./new");
+			expect(fs.existsSync(newPath)).toBe(true);
+			expect(staleRows()).toEqual([]);
+		} finally {
+			await harness.realService.shutdown();
+		}
+	});
+
+	// #3734 r3 F5: the failure partition was keyed by server id, so one root of
+	// `typescript` throwing discarded the other root's answer too. Alone, that
+	// refused a valid rename ("failed for all active LSP servers"); beside a
+	// server that answered no edit, the rename moved the file and silently left
+	// the importer on `./old`.
+	it.each([
+		{ label: "the only answer", withBystander: false },
+		{ label: "beside a server that answered no edit", withBystander: true },
+	])(
+		"keeps a same-server client's edit when another root of that server fails ($label)",
+		async ({ withBystander }) => {
+			ageFile(importPath, 60_000);
+			ageFile(oldPath, 60_000);
+			const failing = makeRenameClient(env.tmpDir, null);
+			failing.willRenameFiles.mockRejectedValue(
+				new Error("boom from the first root"),
+			);
+			const answeringRoot = path.join(env.tmpDir, "package");
+			fs.mkdirSync(answeringRoot);
+			const answering = makeRenameClient(answeringRoot, importEdit(importPath));
+			clientsFor = () => [
+				{ serverId: "typescript", client: failing },
+				{ serverId: "typescript", client: answering, root: answeringRoot },
+				...(withBystander
+					? [{ serverId: "eslint", client: makeRenameClient(env.tmpDir, null) }]
+					: []),
+			];
+			const harness = makeHarness();
+
+			try {
+				const result = await runRenameFile(env.tmpDir, true);
+
+				expect(result.isError).toBeUndefined();
+				expect(fs.readFileSync(importPath, "utf-8")).toBe(
+					"import { value } from './new';\n",
+				);
+				expect(fs.existsSync(newPath)).toBe(true);
+				// The failing root is still reported, not swallowed.
+				expect(resultText(result)).toContain("boom from the first root");
+				expect(staleRows()).toEqual([]);
+			} finally {
+				await harness.realService.shutdown();
+			}
+		},
+	);
+
+	// #3734 r3 F6: one contributor's matching record bound the whole file, so a
+	// second contributor holding no record had its stale edit applied with no
+	// refusal (`rnewme`). Both mtime branches must see it: a write stamped after
+	// the request, and one inside the margin before it (a coarse clock).
+	const unboundWriteStamps = [
+		{
+			label: "stamped after the request",
+			stampMs: 5_000,
+			why: "it was written after the rename was requested",
+		},
+		{
+			label: "stamped inside the margin before the request",
+			stampMs: -1_000,
+			why: "it was modified within 2 s of the rename request",
+		},
+	];
+	it.each(unboundWriteStamps)(
+		"refuses an edit from a contributor with no send record although another contributor's record matches ($label)",
+		async ({ stampMs, why }) => {
+			const recorded = makeRenameClient(
+				env.tmpDir,
+				agentImportEdit(importPath),
+			);
+			recorded.getSentContent = vi.fn(() => ({
+				hash: hashDiagnosticContent(AGENT_IMPORT),
+				changedAtMs: 0,
+			}));
+			const unrecorded = makeRenameClient(env.tmpDir, null);
+			unrecorded.willRenameFiles.mockImplementation(async () => {
+				// Computed from the old bytes; the agent's write lands meanwhile.
+				fs.writeFileSync(importPath, AGENT_IMPORT);
+				const when = new Date(Date.now() + stampMs);
+				fs.utimesSync(importPath, when, when);
+				return importEdit(importPath);
+			});
+			clientsFor = () => [
+				{ serverId: "typescript", client: recorded },
+				{ serverId: "eslint", client: unrecorded },
+			];
+			const harness = makeHarness();
+
+			try {
+				const result = await runRenameFile(env.tmpDir, true);
+
+				expect(fs.readFileSync(importPath, "utf-8")).toBe(AGENT_IMPORT);
+				expect(result.isError).toBe(true);
+				expect(resultText(result)).toContain(path.basename(importPath));
+				expect(resultText(result)).toContain(why);
+				// The refusal names the contributor that holds no record, and only it.
+				expect(resultText(result)).toContain(
+					`eslint:${normalizeMapKey(env.tmpDir)}`,
+				);
+				expect(resultText(result)).not.toContain(
+					`typescript:${normalizeMapKey(env.tmpDir)}`,
+				);
+				expect(fs.existsSync(oldPath)).toBe(true);
+				expect(staleRows()).toEqual([expect.objectContaining({ count: 1 })]);
+			} finally {
+				await harness.realService.shutdown();
+			}
+		},
+	);
 
 	it("an opened importer whose disk no longer holds the client's last send is refused on the hash", async () => {
 		const client = makeRenameClient(env.tmpDir, importEdit(importPath));

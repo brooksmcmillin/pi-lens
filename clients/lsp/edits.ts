@@ -10,9 +10,11 @@ import path from "node:path";
 import { URL } from "node:url";
 import {
 	isUnderDir,
+	kernelPathIdentityAsync,
 	normalizeEphemeralMapKey,
 	normalizeMapKey,
 	pathsEqual,
+	realpathOrResolveAsync,
 	uriToDiskPath,
 	uriToPath,
 } from "./path-utils.js";
@@ -33,6 +35,7 @@ import {
 	normalizeToLF,
 	restoreLineEndings,
 } from "../host-edit-normalize.js";
+import { toPosix, walkUpDirs } from "../path-utils.js";
 
 interface LSPPosition {
 	line: number;
@@ -628,18 +631,24 @@ export interface MergeWorkspaceEditsResult {
 	droppedConflicts: number;
 	inputEditCount: number;
 	serverIds: string[];
+	/** The provenance side channel, keyed by the same normalized path as `edit`. */
+	sourceClientKeys: ReadonlyMap<string, readonly string[]>;
 }
 
 export function mergeWorkspaceTextEditsByPriority(
 	entries: Array<{
 		serverId: string;
+		clientKey?: string;
 		edit:
 			| { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }
 			| null
 			| undefined;
 	}>,
 ): MergeWorkspaceEditsResult {
-	const merged = new Map<string, { uri: string; edits: LSPTextEdit[] }>();
+	const merged = new Map<
+		string,
+		{ uri: string; edits: LSPTextEdit[]; sourceClientKeys: Set<string> }
+	>();
 	// Exact-duplicate dedup is a CROSS-SERVER concern only: two servers proposing
 	// the identical non-empty replace should collapse to one. Zero-width inserts
 	// are never deduplicated here — same as `validateTextEdits` on the normal
@@ -658,7 +667,11 @@ export function mergeWorkspaceTextEditsByPriority(
 		if (!entry.edit) continue;
 		for (const [uri, edits] of flattenWorkspaceTextEdits(entry.edit)) {
 			const key = pathIndexKey(uri);
-			const bucket = merged.get(key) ?? { uri, edits: [] };
+			const bucket = merged.get(key) ?? {
+				uri,
+				edits: [],
+				sourceClientKeys: new Set<string>(),
+			};
 			const kept = bucket.edits;
 			for (const edit of edits) {
 				inputEditCount += 1;
@@ -674,13 +687,24 @@ export function mergeWorkspaceTextEditsByPriority(
 				}
 				if (exactKey !== undefined) seenExact.add(exactKey);
 				kept.push(edit);
+				bucket.sourceClientKeys.add(entry.clientKey ?? entry.serverId);
 			}
 			if (kept.length > 0) merged.set(key, bucket);
 		}
 	}
 	const changes: Record<string, LSPTextEdit[]> = {};
-	for (const { uri, edits } of merged.values()) changes[uri] = edits;
-	return { edit: { changes }, droppedConflicts, inputEditCount, serverIds };
+	const sourceClientKeys = new Map<string, readonly string[]>();
+	for (const [key, { uri, edits, sourceClientKeys: sources }] of merged) {
+		changes[uri] = edits;
+		sourceClientKeys.set(key, [...sources]);
+	}
+	return {
+		edit: { changes },
+		droppedConflicts,
+		inputEditCount,
+		serverIds,
+		sourceClientKeys,
+	};
 }
 
 type TextEditOrigin =
@@ -791,6 +815,9 @@ export interface RenameTrackedSend {
 	openedAtMs?: number | undefined;
 	openedHash?: string | undefined;
 	clientStartedAtMs?: number | undefined;
+	/** The registry key of the client holding the record; set by the lookup
+	 *  that is given the edit's contributing client keys. */
+	clientKey?: string | undefined;
 }
 
 /**
@@ -827,6 +854,10 @@ export interface RenameTrackedSend {
  *   that first open, say) keeps the send check and its stamp, which refuses it:
  *   the server may hold the load-time copy, not these bytes. A client that
  *   reports no start makes no such claim.
+ * With `sourceClientKeysByPath` (the merged edit's contributors, #3734), every
+ * contributing client's record is checked, and the records bind the file only
+ * when every contributor holds a comparable one; otherwise the file also takes
+ * the unopened rule, and its refusal names the contributors that hold none.
  * The read that passed either check is the content the apply is then held to.
  * A file the edit creates, or one that cannot be read, is left out of the map,
  * matching every other `expectedContent` caller.
@@ -838,8 +869,10 @@ export function captureRenameExpectedContent(
 	readTrackedSend: (
 		filePath: string,
 		cwd: string,
-	) => RenameTrackedSend | undefined,
+		sourceClientKeys?: readonly string[],
+	) => RenameTrackedSend | readonly RenameTrackedSend[] | undefined,
 	target?: { filePath: string; content: string },
+	sourceClientKeysByPath?: ReadonlyMap<string, readonly string[]>,
 ): Map<string, string> {
 	const expected = new Map<string, string>();
 	let targetRealPath: string | undefined;
@@ -871,51 +904,83 @@ export function captureRenameExpectedContent(
 			expected.set(realPath, target.content);
 			continue;
 		}
-		const tracked = readTrackedSend(diskPath, cwd);
+		const contributorKeys = sourceClientKeysByPath?.get(
+			normalizeEphemeralMapKey(realPath),
+		);
+		const trackedResult = readTrackedSend(diskPath, cwd, contributorKeys);
+		const tracked =
+			trackedResult === undefined
+				? []
+				: Array.isArray(trackedResult)
+					? trackedResult
+					: [trackedResult];
 		// #3827: a file this client first opened at or after the request, and
 		// that nobody wrote since the client started, was unopened when the
 		// server answered and held the bytes the disk holds: the first open adds
 		// none, so its stamp is skipped. The disk must still hold the first
 		// open's bytes, then the unopened rule below applies.
-		const firstOpenedAfterRequest =
-			tracked !== undefined && (tracked.openedAtMs ?? 0) >= requestedAtMs;
-		const quietSinceClientStart =
-			tracked?.clientStartedAtMs !== undefined &&
-			mtimeMs < tracked.clientStartedAtMs - RENAME_MTIME_MARGIN_MS;
-		const sent =
-			firstOpenedAfterRequest && quietSinceClientStart ? undefined : tracked;
-		if (sent !== undefined) {
-			if (
-				sent.hash !== hashDiagnosticContent(content) ||
-				(sent.changedAtMs ?? requestedAtMs) >= requestedAtMs
+		const contentHash = hashDiagnosticContent(content);
+		let hasComparableSend = false;
+		const comparableKeys = new Set<string | undefined>();
+		for (const trackedSend of tracked) {
+			const firstOpenedAfterRequest =
+				(trackedSend.openedAtMs ?? 0) >= requestedAtMs;
+			const quietSinceClientStart =
+				trackedSend.clientStartedAtMs !== undefined &&
+				mtimeMs < trackedSend.clientStartedAtMs - RENAME_MTIME_MARGIN_MS;
+			const sent =
+				firstOpenedAfterRequest && quietSinceClientStart
+					? undefined
+					: trackedSend;
+			if (sent !== undefined) {
+				hasComparableSend = true;
+				comparableKeys.add(trackedSend.clientKey);
+				if (
+					sent.hash !== contentHash ||
+					(sent.changedAtMs ?? requestedAtMs) >= requestedAtMs
+				) {
+					refuseStaleWorkspaceEdit(
+						diskPath,
+						"it changed after the language server computed the rename from it",
+					);
+				}
+			} else if (
+				trackedSend.hash !== contentHash ||
+				trackedSend.openedHash !== trackedSend.hash
 			) {
+				// #3827 verify r2 F4: the exemption skips only the first open's own
+				// stamp. A disk that no longer holds the last send, or a record whose
+				// bytes changed after its first send, was written after that open
+				// although the mtime says otherwise (#3747's mtime-kept write).
 				refuseStaleWorkspaceEdit(
 					diskPath,
-					"it changed after the language server computed the rename from it",
+					"it changed after the language client first opened it, after the rename was requested",
 				);
 			}
+		}
+		// #3734 r3: a record binds the file only when EVERY contributing client
+		// holds a comparable one. A contributor with none (never opened, or first
+		// opened after the request) answered from bytes nothing here can see, so
+		// the file takes the mtime rule and the refusal names that client.
+		const unboundKeys =
+			contributorKeys?.filter((key) => !comparableKeys.has(key)) ?? [];
+		const boundByRecord = hasComparableSend && unboundKeys.length === 0;
+		const noOpenCopy =
+			unboundKeys.length === 0
+				? "the language server has no open copy"
+				: `the language client ${unboundKeys.join(", ")} that edits it had no open copy`;
+		if (!boundByRecord && mtimeMs >= requestedAtMs) {
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				`it was written after the rename was requested and ${noOpenCopy}, so it may not have read these bytes`,
+			);
 		} else if (
-			tracked !== undefined &&
-			(tracked.hash !== hashDiagnosticContent(content) ||
-				tracked.openedHash !== tracked.hash)
+			!boundByRecord &&
+			mtimeMs >= requestedAtMs - RENAME_MTIME_MARGIN_MS
 		) {
-			// #3827 verify r2 F4: the exemption skips only the first open's own
-			// stamp. A disk that no longer holds the last send, or a record whose
-			// bytes changed after its first send, was written after that open
-			// although the mtime says otherwise (#3747's mtime-kept write).
 			refuseStaleWorkspaceEdit(
 				diskPath,
-				"it changed after the language client first opened it, after the rename was requested",
-			);
-		} else if (mtimeMs >= requestedAtMs) {
-			refuseStaleWorkspaceEdit(
-				diskPath,
-				"it was written after the rename was requested and the language server has no open copy, so it may not have read these bytes",
-			);
-		} else if (mtimeMs >= requestedAtMs - RENAME_MTIME_MARGIN_MS) {
-			refuseStaleWorkspaceEdit(
-				diskPath,
-				`it was modified within ${RENAME_MTIME_MARGIN_MS / 1000} s of the rename request; retry`,
+				`it was modified within ${RENAME_MTIME_MARGIN_MS / 1000} s of the rename request${unboundKeys.length === 0 ? "" : ` and ${noOpenCopy}`}; retry`,
 			);
 		}
 		expected.set(realPath, content);
@@ -1107,7 +1172,7 @@ export function __planWorkspaceEditForTest(edit: {
 
 function relativeToCwd(filePath: string, cwd: string): string {
 	const rel = path.relative(cwd, filePath) || path.basename(filePath);
-	return rel.replace(/\\/g, "/");
+	return toPosix(rel);
 }
 
 // Matches an import declaration or a re-export-from declaration — the two
@@ -1240,43 +1305,45 @@ async function assertParentIsUsable(
 	filePath: string,
 	stateFor: (filePath: string) => Promise<VirtualFile>,
 ): Promise<void> {
-	let current = path.dirname(filePath);
-	while (true) {
+	// `filePath` is the confined identity and `stateFor` keys its overlay by it,
+	// so the climb takes the names as given: a second resolution would look up
+	// a directory the overlay never recorded.
+	for (const current of walkUpDirs(path.dirname(filePath), {
+		spelling: true,
+	})) {
 		const known = await stateFor(current);
 		if (known.exists) {
 			if (!known.directory)
 				throw new Error(`resource parent is not a directory: ${current}`);
 			return;
 		}
-		const parent = path.dirname(current);
-		if (parent === current)
-			throw new Error(`resource parent does not exist: ${filePath}`);
-		current = parent;
-	}
+	} // The walk ran off the filesystem root: no ancestor exists.
+	throw new Error(`resource parent does not exist: ${filePath}`);
 }
 
-async function resolveExistingAncestor(filePath: string): Promise<string> {
-	let current = path.resolve(filePath);
-	const tail: string[] = [];
-	while (true) {
-		try {
-			const resolved = await fs.realpath(current);
-			return path.join(resolved, ...tail.reverse());
-		} catch (err) {
-			const code = (err as { code?: string }).code;
-			if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
-			const parent = path.dirname(current);
-			if (parent === current) throw err;
-			tail.push(path.basename(current));
-			current = parent;
-		}
-	}
+/**
+ * The identity a workspace edit may act on: a name the kernel answered for.
+ * `realpathOrResolveAsync` falls back to the spelling when a component refuses
+ * for a reason other than absence (`EACCES`, `ELOOP`), which is the right key
+ * for a queue and the wrong answer at a trust boundary: the confiner would
+ * prove containment for a path whose real name it never learned, where this
+ * file's former `resolveExistingAncestor` rethrew every errno that is not
+ * `ENOENT`/`ENOTDIR` and refused the whole edit (#4689 r2 F-CR2).
+ */
+async function requireKernelIdentity(
+	filePath: string,
+	subject: string,
+): Promise<string> {
+	const identity = await kernelPathIdentityAsync(filePath);
+	if (identity === undefined || !identity.kernelConfirmed)
+		throw new Error(`workspace edit path identity is unresolvable: ${subject}`);
+	return identity.identity;
 }
 
 async function createWorkspaceUriConfiner(
 	cwd: string,
 ): Promise<(uri: string) => Promise<string>> {
-	const root = await resolveExistingAncestor(cwd);
+	const root = await requireKernelIdentity(cwd, cwd);
 	return async (uri: string): Promise<string> => {
 		let filePath = "";
 		try {
@@ -1295,7 +1362,7 @@ async function createWorkspaceUriConfiner(
 		}
 		if (!path.isAbsolute(filePath))
 			throw new Error(`workspace edit path escapes workspace: ${uri}`);
-		const resolved = await resolveExistingAncestor(filePath);
+		const resolved = await requireKernelIdentity(filePath, uri);
 		if (!isUnderDir(resolved, root))
 			throw new Error(`workspace edit path escapes workspace: ${uri}`);
 		return filePath;
@@ -1410,9 +1477,9 @@ async function preflightWorkspaceEdit(
 		if (!physicalPath)
 			throw new Error(`text edit target does not exist: ${filePath}`);
 		const content = await fs.readFile(physicalPath, "utf-8");
-		// `?.` skips the realpath when no caller passed expected content.
+		// `?.` skips the identity lookup when no caller passed expected content.
 		const expected = options.expectedContent?.get(
-			await fs.realpath(physicalPath),
+			await realpathOrResolveAsync(physicalPath),
 		);
 		if (expected !== undefined && expected !== content) {
 			refuseStaleWorkspaceEdit(
@@ -1500,10 +1567,7 @@ async function preflightWorkspaceEdit(
 			// treat a same-key-different-case pair as a real rename below.
 			const oldDisk = uriToDiskPath(op.oldUri);
 			const newDisk = uriToDiskPath(op.newUri);
-			if (
-				path.resolve(oldDisk).replace(/\\/g, "/") ===
-				path.resolve(newDisk).replace(/\\/g, "/")
-			) {
+			if (toPosix(path.resolve(oldDisk)) === toPosix(path.resolve(newDisk))) {
 				throw new Error("rename source and destination must differ");
 			}
 			const source = await stateFor(oldPath);

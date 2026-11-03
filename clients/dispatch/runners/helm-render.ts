@@ -52,8 +52,8 @@
  *
  * ## No repo writes
  *
- * Rendering goes to a scratch directory under `os.tmpdir()`, removed on every
- * exit path. The chart directory is never touched, and `--dependency-update` is
+ * Rendering goes to a scratch directory under `scannerReportParentDir()`
+ * (`os.tmpdir()` in production), removed on every exit path. The chart directory is never touched, and `--dependency-update` is
  * deliberately NOT passed: it would fetch archives into `charts/`. A missing
  * dependency is reported as a finding instead.
  *
@@ -71,17 +71,22 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { logLatency } from "../../latency-logger.js";
 import { PathKeyedMap } from "../../path-keyed-map.js";
-import { normalizeMapKey } from "../../path-utils.js";
+import {
+	isAbsoluteFilePath,
+	isWithinIdentity,
+	normalizeMapKey,
+	toProjectRelativePath,
+} from "../../path-utils.js";
 import { loadPiLensProjectConfig } from "../../project-lens-config.js";
 import {
 	getProjectTrustState,
 	projectTrustDenialReason,
 } from "../../project-trust.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { scannerReportParentDir } from "../../scanner-temp-root.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import {
 	killedForOutputCap,
@@ -141,18 +146,12 @@ const SKIPPED: RunnerResult = {
 	semantic: "none",
 };
 
-function isWithin(root: string, candidate: string): boolean {
-	const relative = path.relative(
-		normalizeMapKey(root),
-		normalizeMapKey(candidate),
-	);
-	return (
-		relative === "" ||
-		(!relative.startsWith(`..${path.sep}`) &&
-			relative !== ".." &&
-			!path.isAbsolute(relative))
-	);
-}
+/**
+ * Render validation is opt-in and left off: the user's own choice, stated so a
+ * denied sibling's coverage notice names no failed tool (#5042). The other
+ * `SKIPPED` returns (no chart, outside the workspace) stay bare.
+ */
+const NOT_ENABLED: RunnerResult = { ...SKIPPED, skipReason: "not-enabled" };
 
 /**
  * Explicit opt-in for rendering. Rendering runs chart-authored template code,
@@ -187,7 +186,7 @@ export function isHelmRenderEnabled(workspaceRoot: string): boolean {
  *
  * A `# Source:` annotation is content the CHART wrote, which is the same trust
  * boundary the opt-in exists for, so containment has to hold on every OS. The
- * textual `isWithin` fold is not enough on its own: `normalizeFilePath` only
+ * textual `isWithinIdentity` fold is not enough on its own: `normalizeFilePath` only
  * canonicalizes through `realpath` on win32, so on Linux and macOS a symlinked
  * template passes the string test and is then followed by `stat`. Two checks
  * close it, and BOTH are needed (recurring defect shape 2 — verify on the CI OS,
@@ -215,14 +214,14 @@ export function resolveTemplateSource(
 		.filter((segment) => segment && segment !== ".");
 	if (segments.length < 2) return null;
 	const candidate = path.resolve(chartRoot, ...segments.slice(1));
-	if (!isWithin(chartRoot, candidate)) return null;
+	if (!isWithinIdentity(candidate, chartRoot)) return null;
 	try {
 		if (!fs.lstatSync(candidate).isFile()) return null;
 		// Canonicalize both sides: comparing a resolved path against an
 		// unresolved root would reject every chart that legitimately lives under
 		// a symlinked parent (a /tmp or /home symlink, or a linked worktree).
 		const root = realChartRoot ?? fs.realpathSync(chartRoot);
-		if (!isWithin(root, fs.realpathSync(candidate))) return null;
+		if (!isWithinIdentity(fs.realpathSync(candidate), root)) return null;
 	} catch {
 		return null;
 	}
@@ -302,8 +301,13 @@ export function mapRenderedToSource(options: {
 		);
 		if (resolved) return { filePath: resolved, mapped: true };
 	}
-	const relative = path.relative(options.outputDir, options.renderedPath);
-	if (relative && !relative.startsWith("..")) {
+	// The shared project-relative display path: relative when the rendered file
+	// is strictly inside the output dir, otherwise its absolute spelling.
+	const relative = toProjectRelativePath(
+		options.renderedPath,
+		options.outputDir,
+	);
+	if (!isAbsoluteFilePath(relative)) {
 		const resolved = resolveTemplateSource(relative, chartRoot, realChartRoot);
 		if (resolved) return { filePath: resolved, mapped: true };
 	}
@@ -926,7 +930,7 @@ async function renderAndValidate(
 	if (!helmCmd) return helmUnavailableResult(cwd);
 
 	const outputDir = fs.mkdtempSync(
-		path.join(os.tmpdir(), "pi-lens-helm-render-"),
+		path.join(scannerReportParentDir(), "pi-lens-helm-render-"),
 	);
 	try {
 		const render = await safeSpawnAsync(
@@ -1120,13 +1124,13 @@ const helmRenderRunner: RunnerDefinition = {
 		// Gate 1 — consent, read from the project whose chart would run. Keying
 		// this on `cwd` let an opt-in in one directory authorize a DIFFERENT
 		// project root's chart.
-		if (!isHelmRenderEnabled(workspaceRoot)) return SKIPPED;
+		if (!isHelmRenderEnabled(workspaceRoot)) return NOT_ENABLED;
 
 		const startDir = path.dirname(path.resolve(ctx.filePath));
 		const discovered = findNearestDirWithMarker(startDir, "chartYamlPath");
 		if (!discovered) return SKIPPED;
 		const chartRoot = path.resolve(discovered);
-		if (!isWithin(workspaceRoot, chartRoot)) return SKIPPED;
+		if (!isWithinIdentity(chartRoot, workspaceRoot)) return SKIPPED;
 
 		// Gate 2 — project trust. `.pi-lens.json` is a TRACKED file, so consent
 		// can arrive inside a cloned repository: a hostile chart repo would

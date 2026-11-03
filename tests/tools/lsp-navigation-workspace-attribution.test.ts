@@ -9,15 +9,10 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
 	...(await importOriginal()),
 	logLatency,
 }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/lsp/capabilities.js")>();
-	return { ...actual, getLSPService: () => serviceHolder.current };
-});
-
 import { LSPService } from "../../clients/lsp/index.js";
 import type { LSPOperationSupport } from "../../clients/lsp/client.js";
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
 const support = (workspaceSymbol: boolean): LSPOperationSupport => ({
 	definition: false,
@@ -33,6 +28,7 @@ const support = (workspaceSymbol: boolean): LSPOperationSupport => ({
 	rename: false,
 	willRenameFiles: false,
 	didRenameFiles: false,
+	didCreateFiles: false,
 	implementation: false,
 	callHierarchy: false,
 });
@@ -64,7 +60,7 @@ describe("workspace-scope LSP client attribution (#1854)", () => {
 		const service = new LSPService();
 		injectClient(service, "json:C:/workspace", json);
 		injectClient(service, "typescript:C:/workspace", typescript);
-		serviceHolder.current = service;
+		serviceHolder.current = installLspService(service);
 
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		const result = await tool.execute(

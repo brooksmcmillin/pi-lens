@@ -333,6 +333,39 @@ describe("classifyCleanBehavior (phase-aware 4-way)", () => {
 			expect(buildMatrixObservations(resolved)[0].firstPublish).toBeNull();
 		});
 
+		it("pins terraform's recorded burst as direct under document scoping (#4615 cross-document attribution)", () => {
+			// Recurrence: #4615 cross-document attribution, second instance. The
+			// pre-#4615 drainer kept rows by server id alone, so terraform-ls's
+			// EMPTY set for the WORKSPACE DIRECTORY URI, published in the same ~1 ms
+			// burst as the file's own finding, counted as the dirty file's first
+			// publish and classified `empty-first`. That is how the 2026-10-17..20
+			// nights were read. The fixture is one recorded burst (2026-10-22,
+			// terraform-ls 0.39.0): the directory row (diags=0, path = the workspace
+			// directory) leads each pair, then bad.tf (diags=1). Scoped to bad.tf,
+			// the first dirty-phase row is the file's own finding: `direct`.
+			const file = "/proj/terraform-burst/bad.tf";
+			const burst = fs.readFileSync(
+				path.join(
+					process.cwd(),
+					"tests/fixtures/extension-logs/probe-clean-signal-terraform-burst.log",
+				),
+				"utf8",
+			);
+			const scoped = drainRows(burst, "terraform", file);
+			expect(scoped.map((publish) => publish.diags)).toEqual([1, 1, 1]);
+			expect(scoped.every((publish) => publish.path === file)).toBe(true);
+			expect(classifyFirstPublish(scoped.slice(0, 2)).firstPublish).toBe(
+				"direct",
+			);
+			// The directory rows are real in the same burst. Pinned here so the
+			// test cannot pass by the directory rows being absent from the fixture.
+			expect(
+				drainRows(burst, "terraform", "/proj/terraform-burst").map(
+					(publish) => publish.diags,
+				),
+			).toEqual([0, 0, 0]);
+		});
+
 		/**
 		 * Drive the production row construction for a `clean: true` fixture whose
 		 * dirty phase appends exactly `buildLines(absFile)` to the sink.

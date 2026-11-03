@@ -42,11 +42,6 @@ import { normalizeMapKey } from "../../../clients/path-utils.js";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
@@ -54,17 +49,6 @@ vi.mock("../../../clients/lsp/client.js", () => ({
 // Prevent quiet-window registration side-effects in tests
 vi.mock("../../../clients/quiet-window.js", () => ({
 	registerQuietWindowTask: vi.fn(),
-}));
-
-vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
-	...(await importActual<
-		typeof import("../../../clients/latency-logger.js")
-	>()),
-	logLatency: vi.fn(),
-}));
-
-vi.mock("../../../clients/widget-state.js", () => ({
-	recordLsp: vi.fn(),
 }));
 
 vi.mock("../../../clients/cascade-logger.js", () => ({
@@ -170,8 +154,11 @@ function makeClient(overrides: Record<string, unknown> = {}) {
 // ---------------------------------------------------------------------------
 
 describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		delete process.env.PI_LENS_TSSERVER_SYNC_GRACE_MS;

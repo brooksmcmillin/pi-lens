@@ -25,7 +25,7 @@
 		},
 		".github/workflows/ci.yml#targeted-tests-advisory": {
 			"status": "no-floor",
-			"reason": "A pull request that touches no test-covered source legitimately matches zero test files, so a count floor would red a docs-only PR. scripts/pre-push-targeted-tests.mjs logs every file it matched nothing for ('[pre-push] no tests matched <file>'), the job is advisory by its name suffix, and a job-level continue-on-error still lets its check row read failure."
+			"reason": "A pull request that adds or changes no test file legitimately shuffles zero files, so a count floor would red a docs-only PR. scripts/ci-shuffle-changed-tests.mjs prints 'no test file added or changed' for that case, exits 3 (unproven) when a vitest start answers 'No test files found' or never finishes, the job is advisory by its name suffix, and a job-level continue-on-error still lets its check row read failure."
 		},
 		".github/workflows/compat-smoke.yml#compat-smoke#Layer A — pinned-contract verification (no pi, no LLM)": {
 			"status": "no-floor",
@@ -94,35 +94,11 @@
 			"status": "no-floor",
 			"reason": "A fail-open classifier, not a producer. A failed job leaves outputs.smoke empty, and pi-load reads empty as 'not false', so the full matrix runs: the green path cannot skip the work this job scopes."
 		},
-		".github/workflows/lint.yml#complexity": {
+		".github/workflows/lint.yml#lint-advisory": {
 			"status": "floored",
 			"floorStep": "Generate complexity report",
 			"evidence": "scripts/complexity-report.mjs",
-			"reason": "scripts/complexity-report.mjs calls the shared assertEvaluated with COMPLEXITY_ANALYZED_FILES_FLOOR, so a run that analyses too few source files exits non-zero and the graded step reds; set -o pipefail keeps a crash behind the pipe from reading green."
-		},
-		".github/workflows/lint.yml#jscpd": {
-			"status": "no-floor",
-			"reason": "jscpd's exit code is the whole verdict (threshold 1) over four fixed in-repo paths: a missing path exits 1, and only a .jscpd.json format or ignore edit can empty the scan. The header above the job in lint.yml states this.",
-			"header": true
-		},
-		".github/workflows/lint.yml#strictness": {
-			"status": "no-floor",
-			"reason": "The job only publishes the two tsc counts. The gating tests/config/strictness-ratchet.test.ts runs the same two configurations and reds on exit 0, zero diagnostics or any drift, so a tsc that evaluated nothing reds the Unit lane. The header above the job states this.",
-			"header": true
-		},
-		".github/workflows/lint.yml#taplo": {
-			"status": "no-floor",
-			"reason": "npm run taplo feeds git ls-files '*.toml' to taplo, which exits non-zero on a parse error or format drift; only a pathspec edit can empty the match. The header above the job states this.",
-			"header": true
-		},
-		".github/workflows/lint.yml#typos": {
-			"status": "no-floor",
-			"reason": "crate-ci/typos walks the checkout and exits non-zero on any finding or error; the population is the repo itself and cannot be empty. The header above the job states this.",
-			"header": true
-		},
-		".github/workflows/lint.yml#yamllint": {
-			"status": "no-floor",
-			"reason": "The file list is git ls-files of the checkout, and yamllint with an empty list exits 2 (usage), so an empty population reds the row instead of reading clean. The header above the job states this.",
+			"reason": "Seven advisory tool steps share this job-level site (#5002). scripts/complexity-report.mjs calls the shared assertEvaluated with COMPLEXITY_ANALYZED_FILES_FLOOR, so a run that analyses too few source files exits non-zero and the graded step reds; set -o pipefail keeps a crash behind the pipe from reading green. The comment on the jscpd, taplo, typos, yamllint and strictness steps states the reader that makes an empty result visible. No step is continue-on-error, so the row reads failure on any finding. The header above the job in lint.yml states this.",
 			"header": true
 		},
 		".github/workflows/parser-smoke.yml#parser-smoke#Save the managed tool tree": {
@@ -247,9 +223,21 @@
 			"status": "no-floor",
 			"reason": "Tracker maintenance over the clean-signal probe's summary: the probe's own continue-on-error outcome and the #4514 evaluated floor carry the verdict; this step only files, refreshes or closes the #594 issue."
 		},
+		".github/workflows/tool-smoke.yml#tool-smoke-notify#Notify on stale matrix cells (file/update/close tracking issue)": {
+			"status": "no-floor",
+			"reason": "Tracker maintenance over the probe's stale-cell verdict (#4512): the probe, the matrix refresh and tests/scripts/lsp-matrix-refresh-expiry.test.ts carry the verdict, and a missing verdict file leaves the issue as it is rather than reading clean."
+		},
 		".github/workflows/tool-smoke.yml#tool-smoke-notify#Notify on tool-smoke red (file/update/close tracking issue)": {
 			"status": "no-floor",
 			"reason": "Tracker maintenance over the six gating layer outcomes (#2723): it reports a red the non-continue-on-error layers already produced, so gating the notifier itself would only hide that verdict."
+		},
+		".github/workflows/tool-smoke.yml#tool-smoke-prs#Arm auto-merge for a flip-free refresh": {
+			"status": "no-floor",
+			"reason": "PR plumbing, not a producer (#4512): it runs only for a refresh the non-continue-on-error 'Refuse a degraded refresh' guard passed and the flip check found flip-free, and a failed arming shows as this step's own outcome with the PR left for a maintainer."
+		},
+		".github/workflows/tool-smoke.yml#tool-smoke-prs#Mint the refresh App token (starts CI on the refresh PR)": {
+			"status": "no-floor",
+			"reason": "Token plumbing, not a producer (#4512): when the App is absent or the mint fails the refresh PR falls back to the repository token, which the PR body states, and a failed mint shows as this step's own outcome."
 		},
 		".github/workflows/tool-smoke.yml#tool-smoke-prs#Open/update LSP-docs refresh PR": {
 			"status": "no-floor",
@@ -258,6 +246,18 @@
 		".github/workflows/tool-smoke.yml#tool-smoke-prs#Open/update idle-eviction promotion PR": {
 			"status": "no-floor",
 			"reason": "PR plumbing, not a producer: it opens only for a promotion the measurement step proposed, and the same job's non-continue-on-error refresh guard reads the docs the measurement wrote before either PR step runs."
+		},
+		".github/workflows/untriaged-issues.yml#detect#Warn when a required CI job's p90 nears its timeout cap": {
+			"status": "no-floor",
+			"reason": "An advisory reporter, not a producer (#4691, #4989 r3): scripts/check-ci-job-p90.mjs prints one ::warning annotation per job over the ratio and one per required context it could not measure, and exits 1 only when its data read failed, so a blown read (a GitHub 502, run 40690133466) is visible in the run log and as this step's own failed outcome without reddening the nightly. The job's verdict is the untriaged-issue detector below it, which is not continue-on-error and still reds the job."
+		},
+		".github/workflows/tool-smoke.yml#tool-smoke#Install JDK 25 for the cascade layer's jdtls": {
+			"status": "no-floor",
+			"reason": "JDK 25 install for the jdtls cascade row, not a producer: an absent JDK leaves JAVA_HOME empty, jdtls 1.63.0 cannot resolve its bundles on the job's JDK 21, and the \"LSP cascade layer\" step in the same job reds on the java row (a provisioned server that never answers), so an install that silently did nothing cannot read green."
+		},
+		".github/workflows/tool-smoke.yml#tool-smoke#Install jdtls 1.63.0 for the cascade layer": {
+			"status": "no-floor",
+			"reason": "jdtls install for the cascade row, not a producer: a failed download or digest check leaves the step output path empty, the \"LSP cascade layer\" step in the same job reads java as not provisioned (a warning row), and its --min-pass floor of 3 of 4 still reds the night when the other servers do not prove the lane, so an install that silently did nothing cannot read green."
 		}
 	}
 }

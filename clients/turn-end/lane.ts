@@ -107,6 +107,23 @@ export type TurnEndLaneGates<S extends TurnEndLaneSources> = {
 };
 
 /**
+ * One rendered section, with the files its text reports (#4617).
+ *
+ * A lane renders findings the agent reads, so the section's provenance
+ * declaration belongs to the lane that knows which findings it printed: the
+ * composer cannot recover it from the text. `cites` is every file the section
+ * reports (a section with an "and N more" line reports all N, not only the
+ * five it names); `filelessThisTurn` is a section with no file it could be
+ * stale against, rendered from this turn's own evidence (a count, a crash
+ * note). The union has no third arm: a section the stamp cannot speak for is
+ * not a shape a lane may return, so `runtime-turn.ts`'s tier pushes never have
+ * to guess.
+ */
+export type TurnEndLanePart =
+	| { part: string; cites: readonly string[] }
+	| { part: string; filelessThisTurn: true };
+
+/**
  * What a lane contributes to the turn. Sections only — the composer pushes
  * them into the tiers it owns (see the module doc for why the push stays
  * there).
@@ -121,9 +138,9 @@ export type TurnEndLaneGates<S extends TurnEndLaneSources> = {
  */
 export interface TurnEndLaneParts {
 	/** Blocker sections: findings that must be addressed before continuing. */
-	blockerParts?: readonly string[];
+	blockerParts?: readonly TurnEndLanePart[];
 	/** Demoted-finding sections (#1622 review M2's own tier). */
-	staleSecretParts?: readonly string[];
+	staleSecretParts?: readonly TurnEndLanePart[];
 	/**
 	 * ℹ️ Advisory sections: informational this turn, never blocking.
 	 *
@@ -138,7 +155,7 @@ export interface TurnEndLaneParts {
 	 * `advisoryParts.push(...)` in `clients/runtime-turn.ts`) — the tag is
 	 * what makes this tier a registered delivery surface rather than a string.
 	 */
-	advisoryParts?: readonly string[];
+	advisoryParts?: readonly TurnEndLanePart[];
 	/**
 	 * Store name → findings this lane dropped because of a stored disposition.
 	 * The composer folds these into the turn's ONE suppressed-by-disposition

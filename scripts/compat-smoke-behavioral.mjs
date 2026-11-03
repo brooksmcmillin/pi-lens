@@ -15,7 +15,7 @@
  * after pi exits cleanly (the #472 orphan class #474 fixed).
  *
  * IMPORTANT — forcing full startup mode: pi-lens's cold-start-quick
- * optimization (see AGENTS.md "Session-start critical path") forces the
+ * optimization (see HISTORY.md "Session-start critical path") forces the
  * FIRST session_start of any process to the fast "quick" path regardless of
  * `--print`, which returns before the subagent-light-mode check even runs
  * (verified empirically against a locally packed tarball — see
@@ -74,6 +74,7 @@ import {
 	countEntriesSince,
 } from "./lib/latency-log-phases.mjs";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
+import { scratchHomeEnv } from "./lib/scratch-home-env.mjs";
 import { startRpcSession } from "./rpc-load-check.mjs";
 
 const isWindows = process.platform === "win32";
@@ -166,7 +167,7 @@ function runPiRpc({
 			stderr: "inherit",
 			env: {
 				...process.env,
-				PI_LENS_HOME: logHome,
+				...scratchHomeEnv(logHome),
 				...env,
 				ANTHROPIC_API_KEY:
 					process.env.ANTHROPIC_API_KEY || "sk-ant-dummy-compat-smoke",

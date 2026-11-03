@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeLspServiceDouble } from "../../../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../../../support/lsp-service-seam.js";
 import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
@@ -12,13 +12,6 @@ const getCommand = vi.hoisted(() => vi.fn(() => "pyright"));
 const resolveAvailableOrInstall = vi.hoisted(() => vi.fn());
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({ safeSpawnAsync }));
-
-vi.mock("../../../../clients/lsp/capabilities.js", () => ({
-	// The runner's warm-up (`clients/dispatch/runners/pyright.ts`) awaits
-	// `getClientForFile` inside a swallow-all catch, so a partial double here
-	// fails silently — factory-seeded, with only that method asserted (#2592).
-	getLSPService: () => makeLspServiceDouble({ getClientForFile }),
-}));
 
 vi.mock(
 	"../../../../clients/dispatch/runners/utils/runner-helpers.js",
@@ -36,6 +29,10 @@ const originalConda = process.env.CONDA_PREFIX;
 
 beforeEach(async () => {
 	vi.resetModules();
+	// The runner's warm-up (`clients/dispatch/runners/pyright.ts`) awaits
+	// `getClientForFile` inside a swallow-all catch, so a partial double here
+	// fails silently — factory-seeded, with only that method asserted (#2592).
+	await installLspServiceDouble({ getClientForFile });
 	// The suite plants a project `.venv` on purpose; the trust gate itself is
 	// witnessed in `tests/clients/project-local-bin-trust.test.ts`.
 	const trust = await import("../../../../clients/project-trust.js");

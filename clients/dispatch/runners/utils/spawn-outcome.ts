@@ -85,6 +85,19 @@ export interface ClassifyRunOutcomeInput {
 }
 
 /**
+ * The process itself never completed: a spawn error, a signal, or no exit
+ * status ever arrived (#4130). This is the process-level half of
+ * `did-not-run` (rules 1 and 2 below), without the output-based rule 5, so a
+ * caller that already parsed the output can ask it without re-judging the
+ * output.
+ */
+export function processCutShort(result: SpawnResult): boolean {
+	return (
+		Boolean(result.error || result.signal) || (result.status ?? null) === null
+	);
+}
+
+/**
  * Decide whether a tool ran, and if not, why (#1816).
  *
  * The defect this closes (the #1736 class): a runner that reads only its
@@ -128,8 +141,11 @@ export function classifyRunOutcome(input: ClassifyRunOutcomeInput): RunOutcome {
 		outputCapped: truncatedByOutputCap(result),
 	};
 
-	if (result.error || signal) return { kind: "did-not-run", ...base };
-	if (status === null) return { kind: "did-not-run", ...base };
+	// `status === null` is already inside `processCutShort`; it is repeated
+	// only so the type narrows for the status rules below.
+	if (processCutShort(result) || status === null) {
+		return { kind: "did-not-run", ...base };
+	}
 	if (reportMissing) {
 		return status === 0
 			? { kind: "ran", ...base }

@@ -1,0 +1,995 @@
+// flake-shape: real-process-spawn — the subject is what a REAL bash tool call writes into a REAL git checkout and what the model receives for it; the detector is git's own `status --porcelain` and a stubbed shell could not say whether the write was seen.
+// flake-shape: raw-timer-wait — the 500 ms read-only bound is a live wall deadline racing a handler that this file holds open for 700 ms; a fake clock would settle the race instantly and the abandonment under test would never happen. The 10 s inner pipeline bound is the same kind of live deadline: the pipeline is held past it for 11.5 s, and no fake clock can move it.
+// flake-shape: in-process-mock — the wrapper around `handleToolResult` is the only way to hold the real handler open past the host bound and to read its return value; the dispatch, the pipeline, the advisory queue and the pi session are real.
+// flake-shape: in-process-mock — the wrapper around `runPipeline` only delays the REAL pipeline (a cold analyzer stand-in) so a dispatch outlives the inner 10 s bound; it runs the real pipeline after the hold.
+/**
+ * #5108 witness: a blocker on a file the agent wrote through a script (a
+ * heredoc that is not a recognised write) is delivered or disclosed as
+ * withheld, never rendered as a clean result.
+ *
+ * Recurrence prevented: pi session 01a192b9 (2026-10-31), where a python
+ * heredoc wrote `config.ts` over an undefined name. The write is opaque, so
+ * the recovered dispatch runs without authorship and withholds the STOP block
+ * (#3226); the pipeline then dropped the blocker from every channel and the
+ * tool result read `✓ JavaScript/TypeScript clean`. The host's 500 ms
+ * read-only bound had also abandoned the handler, so the model saw `done`
+ * and nothing about the blocker. Defect shape 10, silencing as fixing.
+ *
+ * Tier 2 (#4632), inline-factory mode: the BUILT extension in a real pi
+ * `AgentSession`, pi's real `bash` tool, the real git recovery, and the real
+ * bundled `debugger-statement` rule as the blocker. The one double is the
+ * TIMING of `handleToolResult` (the real export, held for longer than the
+ * read-only budget before it runs), the same seam
+ * `tests/index-2939-tool-result-budget-witness.test.ts` uses.
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Type } from "../clients/deps/typebox.js";
+import { getDiagnosticLogger } from "../clients/diagnostic-logger.js";
+import { getGlobalPiLensLogDir } from "../clients/probe-home-state.js";
+import { describe, expect, it, vi } from "vitest";
+
+/**
+ * `holdMs` delays the real handler for a bash event so the host's 500 ms
+ * bound abandons it. `pending` settles when every handler has finished,
+ * so a case can wait for the late record instead of sleeping. `results` is
+ * what the real handler RETURNED for each bash event, whether or not the
+ * host was still listening: a cold dispatch outruns the 500 ms bound by
+ * itself, so the model's transcript cannot say what the handler produced.
+ */
+const gate = vi.hoisted(() => ({
+	holdMs: 0,
+	/**
+	 * #5108 remainder: a stand-in for a cold analyzer. The real `runPipeline`
+	 * for a file named in `pipelineHoldFile` starts only after `pipelineHoldMs`
+	 * (a live wall delay, because the 10 s inner bound is the subject) and after
+	 * `pipelineLatch` settles. `pipelines` settle when each held run has finished.
+	 */
+	pipelineHoldMs: 0,
+	pipelineReject: false,
+	pipelineHoldFile: "",
+	pipelineLatch: undefined as Promise<void> | undefined,
+	pipelines: [] as Promise<void>[],
+	pipelineStartedAt: [] as number[],
+	/** A handler that, after `holdMs`, finishes having collected these notices. */
+	fakeNotices: undefined as string[] | undefined,
+	pending: [] as Promise<void>[],
+	results: [] as Array<{ command: string; text: string }>,
+}));
+vi.mock("../clients/pipeline.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../clients/pipeline.js")>();
+	return {
+		...actual,
+		runPipeline: (...args: Parameters<typeof actual.runPipeline>) => {
+			const held =
+				gate.pipelineHoldFile !== "" &&
+				args[0].filePath.endsWith(gate.pipelineHoldFile);
+			if (!held) return actual.runPipeline(...args);
+			const run = (async () => {
+				gate.pipelineStartedAt.push(Date.now());
+				if (gate.pipelineHoldMs > 0)
+					await new Promise((resolve) =>
+						setTimeout(resolve, gate.pipelineHoldMs),
+					);
+				await gate.pipelineLatch;
+				if (gate.pipelineReject)
+					throw new Error("#5165 late analyzer rejection");
+				return actual.runPipeline(...args);
+			})();
+			gate.pipelines.push(
+				run.then(
+					() => undefined,
+					() => undefined,
+				),
+			);
+			return run;
+		},
+	};
+});
+vi.mock("../clients/runtime-tool-result.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../clients/runtime-tool-result.js")>();
+	return {
+		...actual,
+		handleToolResult: async (
+			deps: Parameters<typeof actual.handleToolResult>[0],
+		) => {
+			if (deps.event.toolName !== "bash") return actual.handleToolResult(deps);
+			if (gate.fakeNotices !== undefined) {
+				const notices = gate.fakeNotices;
+				const fake = (async () => {
+					if (gate.holdMs > 0)
+						await new Promise((resolve) => setTimeout(resolve, gate.holdMs));
+					deps.withheldNotices?.push(...notices);
+					return undefined;
+				})();
+				gate.pending.push(fake);
+				return fake;
+			}
+			const work = (async () => {
+				if (gate.holdMs > 0)
+					await new Promise((resolve) => setTimeout(resolve, gate.holdMs));
+				const result = await actual.handleToolResult(deps);
+				const content = (result?.content ?? []) as Array<{ text?: string }>;
+				gate.results.push({
+					command: String((deps.event.input as { command?: string }).command),
+					text: content.map((block) => block.text ?? "").join("\n"),
+				});
+				return result;
+			})();
+			gate.pending.push(
+				work.then(
+					() => undefined,
+					() => undefined,
+				),
+			);
+			return work;
+		},
+	};
+});
+
+import {
+	flushLatencyLog,
+	getLatencyLogPath,
+} from "../clients/latency-logger.js";
+import { execFileSync } from "./support/git-fixture-env.js";
+import { readNdjsonRows } from "./support/ndjson-rows.js";
+import {
+	BLOCKING_FILE,
+	CLEAN_FILE,
+	GATE_BLOCK,
+	GUARDED_FLAGS,
+	RAN_MARKER,
+	commitAttempt,
+	endTurn,
+	step,
+	toolResults,
+} from "./support/pi-session-commit-gate.js";
+import {
+	type PiMessage,
+	fauxToolCall,
+	piSessionFixture,
+	startPiSession,
+} from "./support/pi-session.js";
+
+const fixture = piSessionFixture();
+
+function git(args: string[], cwd: string): void {
+	execFileSync("git", args, { cwd, encoding: "utf8" });
+}
+
+/** A git checkout with one committed file, so the bash recovery has a base. */
+function initRepo(name: string): string {
+	const dir = path.join(fixture.root, name, "proj");
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(path.join(dir, "seed.ts"), CLEAN_FILE);
+	git(["init", "-q"], dir);
+	git(["config", "user.email", "t@t.local"], dir);
+	git(["config", "user.name", "t"], dir);
+	git(["add", "-A"], dir);
+	git(["commit", "-qm", "base"], dir);
+	return fs.realpathSync.native(dir);
+}
+
+/**
+ * A heredoc that writes the file through `node`. The write extractor
+ * recognises `cat > path` and a few verbs, not an interpreter's own file
+ * write, so the path comes back through the git recovery and runs without
+ * authorship, exactly as the python heredoc did.
+ */
+function scriptWrite(file: string, content: string): Record<string, unknown> {
+	return fauxToolCall("bash", {
+		command: `node - <<'JS'\nrequire("node:fs").writeFileSync(${JSON.stringify(file)}, ${JSON.stringify(content)});\nJS`,
+	});
+}
+
+/** How many times an inner pipeline bound has been ledgered in the fixture's log. */
+async function innerBoundRows(label = "pipeline-analysis"): Promise<number> {
+	await flushLatencyLog();
+	return readNdjsonRows(getLatencyLogPath()).rows.filter(
+		(row) =>
+			row.phase === "degradation_ledger" &&
+			row.filePath === `tool_result_edit:${label}`,
+	).length;
+}
+
+/** How many `withheld_blocker_late_advisory` rows the fixture's log holds. */
+async function lateAdvisoryRows(): Promise<number> {
+	await flushLatencyLog();
+	const read = readNdjsonRows(getLatencyLogPath());
+	expect(read.skipped).toBe(0);
+	return read.rows.filter(
+		(row) => row.phase === "withheld_blocker_late_advisory",
+	).length;
+}
+
+/** How many late REJECTION disclosures the fixture's log holds (#5165 F3). */
+async function crashLateRows(): Promise<number> {
+	await flushLatencyLog();
+	const read = readNdjsonRows(getLatencyLogPath());
+	expect(read.skipped).toBe(0);
+	return read.rows.filter(
+		(row) =>
+			row.phase === "withheld_blocker_late_advisory" &&
+			(row.metadata as { crash?: boolean } | undefined)?.crash === true,
+	).length;
+}
+
+function everyText(requests: readonly (readonly PiMessage[])[]): string {
+	return requests
+		.flatMap((messages) => messages)
+		.map((message) => JSON.stringify(message.content ?? ""))
+		.join("\n");
+}
+
+describe("#5108: a blocker on a script-written file is never rendered clean", () => {
+	it(
+		"names the file and count in the tool result and leaves the commit gate open",
+		{ timeout: 60_000 },
+		async () => {
+			gate.results.length = 0;
+			const repo = initRepo("in-time");
+			const handle = await startPiSession({
+				root: fixture.root,
+				cwd: repo,
+				flags: new Map(GUARDED_FLAGS),
+				inlineFactory: async () => (await import("../index.js")).default,
+				responses: [
+					step(scriptWrite("opaque.ts", BLOCKING_FILE), "writing"),
+					step(commitAttempt(), "committing"),
+					endTurn("turn 1 done"),
+					step(fauxToolCall("lens_diagnostics", { mode: "all" }), "listing"),
+					endTurn("turn 2 done"),
+				],
+			});
+			await handle.prompt("write the file with a script");
+
+			await Promise.all(gate.pending);
+			await handle.prompt("list the findings");
+			const write = gate.results.find((r) => r.command.includes("opaque.ts"));
+			const [, commit] = toolResults(handle.requests.at(-1) ?? [], "bash");
+			expect(fs.readFileSync(path.join(repo, "opaque.ts"), "utf8")).toBe(
+				BLOCKING_FILE,
+			);
+			// DELIVERY: the model is told a blocker exists and where, and never
+			// reads the all-clear line over it.
+			expect(write?.text).toContain("opaque.ts");
+			// One or two: the bundled rule always raises it and biome's `noDebugger`
+			// sometimes joins it (`BLOCKING_FILE`).
+			expect(write?.text).toMatch(/[12] blocking findings? in opaque\.ts/);
+			expect(write?.text).toContain("withheld");
+			expect(write?.text).toContain("lens_diagnostics mode=all");
+			expect(write?.text).not.toMatch(/clean/);
+			// Unauthored bytes never latch the commit gate (#3226, #4137): the
+			// disclosure is not a blocker record.
+			expect(commit?.text).not.toContain(GATE_BLOCK);
+			expect(commit?.text).toContain(RAN_MARKER);
+			const [listed] = toolResults(
+				handle.requests.at(-1) ?? [],
+				"lens_diagnostics",
+			);
+			// The pointer holds: the withheld finding is in the session cache the
+			// disclosure names.
+			expect(listed?.text).toContain("opaque.ts");
+			expect(listed?.text).toContain("[debugger-statement]");
+			expect(handle.errors).toEqual([]);
+		},
+	);
+
+	it(
+		"leaves an authored blocker standing when a later script write still holds one",
+		{ timeout: 60_000 },
+		async () => {
+			// Pins #3226/#4137/#4484: the run without authorship neither replaces the
+			// authored record with its own nor retires it, so the commit gate keeps
+			// naming the blocker the agent was shown, and the disclosure is additive.
+			gate.results.length = 0;
+			const repo = initRepo("authored-then-script");
+			const handle = await startPiSession({
+				root: fixture.root,
+				cwd: repo,
+				flags: new Map(GUARDED_FLAGS),
+				inlineFactory: async () => (await import("../index.js")).default,
+				responses: [
+					step(
+						fauxToolCall("write", {
+							path: path.join(repo, "kept.ts"),
+							content: BLOCKING_FILE,
+						}),
+						"writing",
+					),
+					step(
+						scriptWrite("kept.ts", `${BLOCKING_FILE}// edited\n`),
+						"scripting",
+					),
+					step(commitAttempt(), "committing"),
+					endTurn("done"),
+				],
+			});
+			await handle.prompt("write it, then rewrite it with a script");
+			await Promise.all(gate.pending);
+
+			const [authored] = toolResults(handle.requests.at(-1) ?? [], "write");
+			expect(authored?.text).toContain("\u{1F534} STOP");
+			// #5165: truthful late visibility must not relabel an in-bound STOP.
+			await getDiagnosticLogger().flush();
+			const inlineRead = readNdjsonRows(
+				path.join(
+					getGlobalPiLensLogDir(),
+					"logs",
+					`${new Date().toISOString().slice(0, 10)}.jsonl`,
+				),
+			);
+			expect(inlineRead.skipped).toBe(0);
+			expect(inlineRead.rows).toContainEqual(
+				expect.objectContaining({
+					filePath: path.join(repo, "kept.ts"),
+					ruleId: "debugger-statement",
+					shownInline: true,
+					shownToAgent: true,
+				}),
+			);
+
+			const scripted = gate.results.find((r) =>
+				r.command.includes("// edited"),
+			);
+			expect(scripted?.text).toMatch(/[12] blocking findings? in kept\.ts/);
+			expect(scripted?.text).not.toContain("\u{1F534} STOP");
+			const [, commit] = toolResults(handle.requests.at(-1) ?? [], "bash");
+			expect(commit?.text).toContain(GATE_BLOCK);
+			expect(commit?.text).not.toContain(RAN_MARKER);
+			expect(handle.errors).toEqual([]);
+		},
+	);
+
+	it(
+		"queues the disclosure for the next context call when the host abandoned the handler",
+		{ timeout: 60_000 },
+		async () => {
+			gate.results.length = 0;
+			gate.holdMs = 700;
+			try {
+				const repo = initRepo("abandoned");
+				const rowsBefore = await lateAdvisoryRows();
+				const handle = await startPiSession({
+					root: fixture.root,
+					cwd: repo,
+					flags: new Map(GUARDED_FLAGS),
+					inlineFactory: async () => (await import("../index.js")).default,
+					responses: [
+						step(scriptWrite("opaque.ts", BLOCKING_FILE), "writing"),
+						endTurn("turn 1 done"),
+						// Turn 2 writes no file: its turn end is the first chance to say it.
+						endTurn("turn 2 done"),
+					],
+				});
+				await handle.prompt("write the file with a script");
+				const [write] = toolResults(handle.requests.at(-1) ?? [], "bash");
+				// The host gave up on the handler: the model saw no pi-lens text.
+				expect(write?.text).not.toContain("opaque.ts");
+				// The abandoned handler finishes later and records its verdict.
+				await Promise.all(gate.pending);
+				await handle.prompt("anything else?");
+
+				const surface = everyText(handle.requests);
+				expect(surface).toContain("opaque.ts");
+				expect(surface).toContain("withheld");
+				expect(surface).toMatch(/abandoned/);
+				expect(surface).not.toContain("\u2713");
+				// The queued advisory leaves one bounded record for the call. The
+				// file is the fixture root's, so an earlier case's row is subtracted.
+				expect(await lateAdvisoryRows()).toBe(rowsBefore + 1);
+				expect(handle.errors).toEqual([]);
+			} finally {
+				gate.holdMs = 0;
+			}
+		},
+	);
+	it(
+		"queues nothing when the handler finished inside the bound",
+		{ timeout: 60_000 },
+		async () => {
+			// The tool result already carried the disclosure: a second copy at the
+			// next context call would be noise.
+			gate.results.length = 0;
+			gate.fakeNotices = [
+				"\u26a0 1 blocking finding in fast.ts withheld: test",
+			];
+			try {
+				const repo = initRepo("in-bound");
+				const rowsBefore = await lateAdvisoryRows();
+				const handle = await startPiSession({
+					root: fixture.root,
+					cwd: repo,
+					flags: new Map(GUARDED_FLAGS),
+					inlineFactory: async () => (await import("../index.js")).default,
+					responses: [
+						step(scriptWrite("fast.ts", CLEAN_FILE), "writing"),
+						endTurn("turn 1 done"),
+						endTurn("turn 2 done"),
+					],
+				});
+				await handle.prompt("write the file with a script");
+				await handle.prompt("anything else?");
+
+				expect(await lateAdvisoryRows()).toBe(rowsBefore);
+				expect(everyText(handle.requests)).not.toContain("fast.ts withheld");
+				expect(handle.errors).toEqual([]);
+			} finally {
+				gate.fakeNotices = undefined;
+			}
+		},
+	);
+
+	it(
+		"says nothing about an abandoned check that withheld nothing",
+		{ timeout: 60_000 },
+		async () => {
+			// The abandonment alone is not the disclosure: a clean script write the
+			// host stopped waiting for has nothing to report.
+			gate.results.length = 0;
+			gate.holdMs = 700;
+			try {
+				const repo = initRepo("abandoned-clean");
+				const rowsBefore = await lateAdvisoryRows();
+				const handle = await startPiSession({
+					root: fixture.root,
+					cwd: repo,
+					flags: new Map(GUARDED_FLAGS),
+					inlineFactory: async () => (await import("../index.js")).default,
+					responses: [
+						step(scriptWrite("tidy.ts", CLEAN_FILE), "writing"),
+						endTurn("turn 1 done"),
+						endTurn("turn 2 done"),
+					],
+				});
+				await handle.prompt("write the file with a script");
+				await Promise.all(gate.pending);
+				await handle.prompt("anything else?");
+
+				expect(gate.results.some((r) => r.command.includes("tidy.ts"))).toBe(
+					true,
+				);
+				expect(await lateAdvisoryRows()).toBe(rowsBefore);
+				expect(everyText(handle.requests)).not.toContain("abandoned");
+				expect(handle.errors).toEqual([]);
+			} finally {
+				gate.holdMs = 0;
+			}
+		},
+	);
+	it(
+		"bounds the queued advisory to five notices and counts the rest",
+		{ timeout: 60_000 },
+		async () => {
+			// A script that writes many files must not queue an unbounded message.
+			gate.results.length = 0;
+			gate.holdMs = 700;
+			gate.fakeNotices = Array.from(
+				{ length: 7 },
+				(_, i) => `\u26a0 1 blocking finding in file${i}.ts withheld: test`,
+			);
+			try {
+				const repo = initRepo("capped");
+				const handle = await startPiSession({
+					root: fixture.root,
+					cwd: repo,
+					flags: new Map(GUARDED_FLAGS),
+					inlineFactory: async () => (await import("../index.js")).default,
+					responses: [
+						step(scriptWrite("many.ts", CLEAN_FILE), "writing"),
+						endTurn("turn 1 done"),
+						endTurn("turn 2 done"),
+					],
+				});
+				await handle.prompt("write the files with a script");
+				await Promise.all(gate.pending);
+				await handle.prompt("anything else?");
+
+				const surface = everyText(handle.requests);
+				expect(surface).toContain("file4.ts withheld");
+				expect(surface).not.toContain("file5.ts withheld");
+				expect(surface).toContain("+2 more");
+				expect(handle.errors).toEqual([]);
+			} finally {
+				gate.holdMs = 0;
+				gate.fakeNotices = undefined;
+			}
+		},
+	);
+
+	describe("a pipeline slower than the 10 s inner bound (#5108 remainder)", () => {
+		// Recurrence prevented: a first-run analyzer (cold Pyright) outruns the
+		// inner `pipeline-analysis` bound, `handleToolResult` returns before the
+		// tail that collects the withheld line, and #5114's late advisory reads an
+		// empty array. The line then reached no channel (r2 probe case B:
+		// `[0,0,0,0,0,0,0,0]` requests carried it). Defect shape 10.
+		const SETTLE_TAIL_MS = 1_000;
+
+		/** The held run has finished; give the dispatch tail a moment to queue. */
+		async function afterPipelines(): Promise<void> {
+			await Promise.all(gate.pipelines);
+			await new Promise((resolve) => setTimeout(resolve, SETTLE_TAIL_MS));
+		}
+
+		/** Occurrences, not messages: the drain may join advisories into one message. */
+		function copiesOfAdvisory(
+			requests: readonly (readonly PiMessage[])[],
+		): number {
+			return everyText(requests).split("was abandoned").length - 1;
+		}
+
+		function hold(file: string, ms: number): void {
+			gate.pipelineHoldFile = file;
+			gate.pipelineHoldMs = ms;
+			gate.pipelines.length = 0;
+			gate.pipelineStartedAt.length = 0;
+		}
+		function release(): void {
+			gate.pipelineHoldFile = "";
+			gate.pipelineHoldMs = 0;
+			gate.pipelineLatch = undefined;
+			gate.pipelineReject = false;
+		}
+
+		it.each(["classified", "observed"] as const)(
+			"#5165 %s late authored blocker closes the commit gate and reports honest inline delivery",
+			{ timeout: 90_000 },
+			async (member) => {
+				// Recurrence: both authored dispatch callers abandoned their verdict
+				// after 10 s, leaving a real blocker with an open commit gate.
+				hold("authored.ts", 11_500);
+				try {
+					const repo = initRepo(`5165-${member}`);
+					const target = path.join(repo, "authored.ts");
+					fs.writeFileSync(target, CLEAN_FILE);
+					const call =
+						member === "classified"
+							? fauxToolCall("write", { path: target, content: BLOCKING_FILE })
+							: fauxToolCall("change_module", { path: target });
+					const handle = await startPiSession({
+						root: fixture.root,
+						cwd: repo,
+						flags: new Map(GUARDED_FLAGS),
+						inlineFactory: async () => (await import("../index.js")).default,
+						customTools: [
+							{
+								name: "change_module",
+								label: "Change module",
+								description: "Change the module",
+								parameters: Type.Object({ path: Type.String() }),
+								async execute() {
+									fs.writeFileSync(target, BLOCKING_FILE);
+									return {
+										content: [{ type: "text", text: "changed" }],
+										details: undefined,
+									};
+								},
+							},
+						],
+						responses: [
+							step(fauxToolCall("read", { path: target })),
+							step(call),
+							endTurn("write done"),
+							step(commitAttempt()),
+							endTurn("commit done"),
+						],
+					});
+					await handle.prompt("change the module");
+					await afterPipelines();
+					await flushLatencyLog();
+					const boundLabel =
+						member === "classified"
+							? "pipeline-analysis"
+							: "observed-tool-result-analysis";
+					expect(
+						readNdjsonRows(getLatencyLogPath()).rows.some(
+							(row) =>
+								row.phase === "degradation_ledger" &&
+								row.filePath === `tool_result_edit:${boundLabel}`,
+						),
+					).toBe(true);
+					await handle.prompt("commit it");
+					const commit = toolResults(handle.requests.at(-1) ?? [], "bash").at(
+						-1,
+					);
+					expect(commit?.text).toContain(GATE_BLOCK);
+					expect(commit?.text).not.toContain(RAN_MARKER);
+					expect(everyText(handle.requests)).toContain("was abandoned");
+					await getDiagnosticLogger().flush();
+					const read = readNdjsonRows(
+						path.join(
+							getGlobalPiLensLogDir(),
+							"logs",
+							`${new Date().toISOString().slice(0, 10)}.jsonl`,
+						),
+					);
+					expect(read.skipped).toBe(0);
+					const findings = read.rows.filter(
+						(row) =>
+							row.filePath === target && row.ruleId === "debugger-statement",
+					);
+					expect(findings.length).toBeGreaterThan(0);
+					expect(findings.every((row) => row.shownInline === false)).toBe(true);
+					expect(handle.errors).toEqual([]);
+				} finally {
+					release();
+				}
+			},
+		);
+
+		it.each([
+			["classified", "rejected"],
+			["observed", "rejected"],
+			["classified", "replaced"],
+			["observed", "replaced"],
+		] as const)(
+			"#5165 %s late %s result stays with its writing session",
+			{ timeout: 90_000 },
+			async (member, state) => {
+				// Recurrence: a late failed analysis must be disclosed; a replaced
+				// session's late verdict must never gate or message its replacement.
+				hold("authored.ts", 11_500);
+				let open = () => {};
+				if (state === "replaced")
+					gate.pipelineLatch = new Promise<void>((resolve) => {
+						open = resolve;
+					});
+				gate.pipelineReject = state === "rejected";
+				const crashRowsBefore =
+					state === "rejected" ? await crashLateRows() : 0;
+				try {
+					const repo = initRepo(`5165-${member}-${state}`);
+					const target = path.join(repo, "authored.ts");
+					fs.writeFileSync(target, CLEAN_FILE);
+					const handle = await startPiSession({
+						root: fixture.root,
+						cwd: repo,
+						flags: new Map(GUARDED_FLAGS),
+						inlineFactory: async () => (await import("../index.js")).default,
+						customTools: [
+							{
+								name: "change_module",
+								label: "Change module",
+								description: "Change module",
+								parameters: Type.Object({ path: Type.String() }),
+								async execute() {
+									fs.writeFileSync(target, BLOCKING_FILE);
+									return {
+										content: [{ type: "text", text: "changed" }],
+										details: undefined,
+									};
+								},
+							},
+						],
+						responses: [
+							step(fauxToolCall("read", { path: target })),
+							step(
+								member === "classified"
+									? fauxToolCall("write", {
+											path: target,
+											content: BLOCKING_FILE,
+										})
+									: fauxToolCall("change_module", { path: target }),
+							),
+							endTurn("done"),
+							step(commitAttempt()),
+							endTurn("done"),
+						],
+					});
+					await handle.prompt("change module");
+					const live =
+						state === "replaced"
+							? await handle.restart({ reason: "new" }, [
+									step(commitAttempt()),
+									endTurn("done"),
+								])
+							: handle;
+					open();
+					await afterPipelines();
+					await live.prompt("commit it");
+					const commit = toolResults(live.requests.at(-1) ?? [], "bash").at(-1);
+					if (state === "replaced") {
+						expect(commit?.text).not.toContain(GATE_BLOCK);
+						expect(everyText(live.requests)).not.toContain("was abandoned");
+					} else {
+						expect(commit?.text).toContain(GATE_BLOCK);
+						expect(everyText(live.requests)).toContain("was abandoned");
+						expect(everyText(live.requests)).toContain("analysis");
+						if (state === "rejected") {
+							// #5165 F3: the late rejection discloses on the same phase as the
+							// late success, so the undercount is closed; `crash` keeps the two
+							// populations apart. One record for this call.
+							expect(await crashLateRows()).toBe(crashRowsBefore + 1);
+							const crashRow = readNdjsonRows(getLatencyLogPath())
+								.rows.filter(
+									(row) =>
+										row.phase === "withheld_blocker_late_advisory" &&
+										(row.metadata as { crash?: boolean } | undefined)?.crash ===
+											true,
+								)
+								.at(-1);
+							expect(crashRow?.metadata).toMatchObject({
+								late: "inner-bound",
+								notices: 1,
+							});
+						}
+					}
+					expect(live.errors).toEqual([]);
+				} finally {
+					open();
+					release();
+				}
+			},
+		);
+
+		it(
+			"delivers the withheld line once at the next context when the dispatch outlives the bound, and leaves the commit gate open",
+			{ timeout: 90_000 },
+			async () => {
+				hold("opaque.ts", 11_500);
+				try {
+					const repo = initRepo("slow-pipeline");
+					const rowsBefore = await lateAdvisoryRows();
+					const handle = await startPiSession({
+						root: fixture.root,
+						cwd: repo,
+						flags: new Map(GUARDED_FLAGS),
+						inlineFactory: async () => (await import("../index.js")).default,
+						responses: [
+							step(scriptWrite("opaque.ts", BLOCKING_FILE), "writing"),
+							endTurn("turn 1 done"),
+							endTurn("turn 2 done"),
+							step(commitAttempt(), "committing"),
+							endTurn("turn 3 done"),
+						],
+					});
+					await handle.prompt("write the file with a script");
+					const [write] = toolResults(handle.requests.at(-1) ?? [], "bash");
+					expect(write?.text).not.toContain("opaque.ts");
+					await afterPipelines();
+					await handle.prompt("anything else?");
+
+					const surface = everyText(handle.requests);
+					expect(surface).toContain("opaque.ts");
+					expect(surface).toContain("withheld");
+					expect(surface).toMatch(/abandoned/);
+					expect(copiesOfAdvisory(handle.requests)).toBe(1);
+					expect(await lateAdvisoryRows()).toBe(rowsBefore + 1);
+					const rows = readNdjsonRows(getLatencyLogPath()).rows.filter(
+						(row) => row.phase === "withheld_blocker_late_advisory",
+					);
+					expect(rows.at(-1)?.metadata).toMatchObject({
+						late: "inner-bound",
+						notices: 1,
+					});
+
+					// Unauthored bytes never latch the commit gate (#3226, #4137): the
+					// late disclosure is an advisory, not a blocker record.
+					await handle.prompt("commit it");
+					const commit = toolResults(handle.requests.at(-1) ?? [], "bash").at(
+						-1,
+					);
+					expect(commit?.text).not.toContain(GATE_BLOCK);
+					expect(commit?.text).toContain(RAN_MARKER);
+					expect(handle.errors).toEqual([]);
+				} finally {
+					release();
+				}
+			},
+		);
+
+		it(
+			"delivers exactly one copy when the dispatch ends inside the 10 s bound but past the host's",
+			{ timeout: 60_000 },
+			async () => {
+				// Two writers can carry the line (#5114's work.then and the inner-bound
+				// continuation); exactly one of them has the notice for a given call.
+				hold("opaque.ts", 2_000);
+				try {
+					const repo = initRepo("mid-pipeline");
+					const rowsBefore = await lateAdvisoryRows();
+					const handle = await startPiSession({
+						root: fixture.root,
+						cwd: repo,
+						flags: new Map(GUARDED_FLAGS),
+						inlineFactory: async () => (await import("../index.js")).default,
+						responses: [
+							step(scriptWrite("opaque.ts", BLOCKING_FILE), "writing"),
+							endTurn("turn 1 done"),
+							endTurn("turn 2 done"),
+						],
+					});
+					await handle.prompt("write the file with a script");
+					await afterPipelines();
+					await handle.prompt("anything else?");
+
+					expect(everyText(handle.requests)).toContain("withheld");
+					expect(copiesOfAdvisory(handle.requests)).toBe(1);
+					expect(await lateAdvisoryRows()).toBe(rowsBefore + 1);
+					expect(handle.errors).toEqual([]);
+				} finally {
+					release();
+				}
+			},
+		);
+
+		it(
+			"reports no inline delivery when the host wall discarded the result inside the inner bound",
+			{ timeout: 60_000 },
+			async () => {
+				// Recurrence (Greptile on #5196): the host's 500 ms wall for a
+				// non-edit-class tool result discards what pi-lens returns while the
+				// dispatch inside still has its own 10 s bound to run in. A pipeline
+				// that settles at 2 s logged `shownInline: true` for text the model
+				// never saw, so every opaque bash write and third-party write sat in a
+				// band of false rows up to 9.5 s wide. Defect shape 10.
+				hold("authored.ts", 2_000);
+				try {
+					const observedBoundRowsBefore = await innerBoundRows(
+						"observed-tool-result-analysis",
+					);
+					const repo = initRepo("5165-host-wall");
+					const target = path.join(repo, "authored.ts");
+					fs.writeFileSync(target, CLEAN_FILE);
+					const handle = await startPiSession({
+						root: fixture.root,
+						cwd: repo,
+						flags: new Map(GUARDED_FLAGS),
+						inlineFactory: async () => (await import("../index.js")).default,
+						customTools: [
+							{
+								name: "change_module",
+								label: "Change module",
+								description: "Change module",
+								parameters: Type.Object({ path: Type.String() }),
+								async execute() {
+									fs.writeFileSync(target, BLOCKING_FILE);
+									return {
+										content: [{ type: "text", text: "changed" }],
+										details: undefined,
+									};
+								},
+							},
+						],
+						responses: [
+							step(fauxToolCall("read", { path: target })),
+							step(fauxToolCall("change_module", { path: target })),
+							endTurn("write done"),
+							step(commitAttempt()),
+							endTurn("commit done"),
+						],
+					});
+					await handle.prompt("change the module");
+					await afterPipelines();
+					// The inner 10 s bound did NOT fire: the dispatch settled inside it,
+					// after the host's wall. Without that, the case would be testing the
+					// inner bound instead of the host's. Counted, not read: an earlier
+					// case in this file ledgers the same subject once per session.
+					expect(await innerBoundRows("observed-tool-result-analysis")).toBe(
+						observedBoundRowsBefore,
+					);
+					// The text still reaches the model: the settled dispatch recorded the
+					// blocker, so the next turn's commit gate names it.
+					await handle.prompt("commit it");
+					const commit = toolResults(handle.requests.at(-1) ?? [], "bash").at(
+						-1,
+					);
+					expect(commit?.text).toContain(GATE_BLOCK);
+					expect(commit?.text).toContain("\u{1F534} STOP");
+					await getDiagnosticLogger().flush();
+					const read = readNdjsonRows(
+						path.join(
+							getGlobalPiLensLogDir(),
+							"logs",
+							`${new Date().toISOString().slice(0, 10)}.jsonl`,
+						),
+					);
+					expect(read.skipped).toBe(0);
+					const findings = read.rows.filter(
+						(row) =>
+							row.filePath === target && row.ruleId === "debugger-statement",
+					);
+					expect(findings.length).toBeGreaterThan(0);
+					// The row is honest: pi discarded the result, so nothing was inline.
+					expect(findings.every((row) => row.shownInline === false)).toBe(true);
+					expect(handle.errors).toEqual([]);
+				} finally {
+					release();
+				}
+			},
+		);
+
+		it(
+			"queues nothing for a clean file whose dispatch outlives the bound",
+			{ timeout: 90_000 },
+			async () => {
+				hold("tidy.ts", 11_500);
+				try {
+					const repo = initRepo("slow-clean");
+					const rowsBefore = await lateAdvisoryRows();
+					const handle = await startPiSession({
+						root: fixture.root,
+						cwd: repo,
+						flags: new Map(GUARDED_FLAGS),
+						inlineFactory: async () => (await import("../index.js")).default,
+						responses: [
+							step(scriptWrite("tidy.ts", CLEAN_FILE), "writing"),
+							endTurn("turn 1 done"),
+							endTurn("turn 2 done"),
+						],
+					});
+					await handle.prompt("write the file with a script");
+					await afterPipelines();
+					await handle.prompt("anything else?");
+
+					expect(gate.pipelineStartedAt.length).toBeGreaterThan(0);
+					expect(await lateAdvisoryRows()).toBe(rowsBefore);
+					expect(copiesOfAdvisory(handle.requests)).toBe(0);
+					expect(everyText(handle.requests)).not.toContain("abandoned");
+					expect(handle.errors).toEqual([]);
+				} finally {
+					release();
+				}
+			},
+		);
+
+		it(
+			"queues nothing when the session was replaced before the dispatch settled",
+			{ timeout: 90_000 },
+			async () => {
+				// The latch holds the dispatch until the inner bound has fired AND the
+				// session is gone, so the settle is the only thing left to deliver.
+				let open: () => void = () => undefined;
+				gate.pipelineLatch = new Promise<void>((resolve) => {
+					open = resolve;
+				});
+				hold("opaque.ts", 0);
+				try {
+					const repo = initRepo("slow-replaced");
+					const rowsBefore = await lateAdvisoryRows();
+					const boundRowsBefore = await innerBoundRows();
+					const first = await startPiSession({
+						root: fixture.root,
+						cwd: repo,
+						flags: new Map(GUARDED_FLAGS),
+						inlineFactory: async () => (await import("../index.js")).default,
+						responses: [
+							step(scriptWrite("opaque.ts", BLOCKING_FILE), "writing"),
+							endTurn("turn 1 done"),
+						],
+					});
+					await first.prompt("write the file with a script");
+					// Let the 10 s inner bound fire (a live deadline, so a live wait),
+					// with a margin: its timer was armed after the dispatch started.
+					const [startedAt] = gate.pipelineStartedAt;
+					await new Promise((resolve) =>
+						setTimeout(
+							resolve,
+							Math.max(0, (startedAt ?? Date.now()) + 10_800 - Date.now()),
+						),
+					);
+					const next = await first.restart({ reason: "new" }, [
+						endTurn("fresh turn 1 done"),
+						endTurn("fresh turn 2 done"),
+					]);
+					open();
+					await afterPipelines();
+					await next.prompt("start fresh");
+					await next.prompt("anything else?");
+
+					// The ledger row is only written for the deadline, so a bound that
+					// had not fired (an aborted wait) would make this case vacuous.
+					expect(await innerBoundRows()).toBe(boundRowsBefore + 1);
+					expect(copiesOfAdvisory(next.requests)).toBe(0);
+					expect(everyText(next.requests)).not.toContain("opaque.ts");
+					expect(await lateAdvisoryRows()).toBe(rowsBefore);
+					expect(next.errors).toEqual([]);
+				} finally {
+					release();
+				}
+			},
+		);
+	});
+});

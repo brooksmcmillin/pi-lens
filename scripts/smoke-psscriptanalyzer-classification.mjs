@@ -87,6 +87,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scratchHomeEnv } from "./lib/scratch-home-env.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -220,7 +221,7 @@ function runLeg(legName, envOverrides) {
 		...process.env,
 		[LEG_ENV]: legName,
 		[SCRATCH_ENV]: scratch,
-		PI_LENS_HOME: scratch,
+		...scratchHomeEnv(scratch),
 	};
 	// F5: delete, don't just omit -- `...process.env` above already copied any
 	// inherited value, and on a host whose OWN process scope is already

@@ -23,9 +23,12 @@ import {
 	createTmpRootRegistry,
 	formatTmpRootCreators,
 	formatTmpRootSweep,
+	formatTmpRootSweepRecords,
 	getTmpRootRegistry,
 	installTmpRootInterposer,
+	recordedRepoRootDirs,
 	recordedTmpRootCreators,
+	registerRepoRootDir,
 	registerTmpRoot,
 	registerTmpSibling,
 	sampleTmpRoots,
@@ -168,6 +171,69 @@ describe("tmp-root registry decisions (#2912)", () => {
 			"[tmp-hygiene-sweep] tests/a.test.ts via=SIGTERM registered=1 stragglers=1 failed=1 dropped=0\n",
 		);
 	});
+	// #4591: the census must tell "the registry held the root at sweep time and a
+	// deferred writer recreated it" from "the interposer never recorded it". The
+	// per-root record is that evidence; the cells are the four outcomes a sweep
+	// can find, decided from the registry and the sweep alone.
+	it("records what a sweep found at every registered root, one line per root (#4591)", () => {
+		const registry = createTmpRootRegistry();
+		registerTmpRoot(registry, "/tmp/pi-lens-removed", "registered");
+		registerTmpRoot(registry, "/tmp/pi-lens-failed", "registered");
+		registerTmpRoot(registry, "/tmp/pi-lens-gone", "registered");
+		registerTmpRoot(registry, "/tmp/pi-lens-held", "observed");
+		registerTmpRoot(registry, "/tmp/pi-lens-straggler", "observed");
+		const io = memoryIo([
+			"/tmp/pi-lens-removed",
+			"/tmp/pi-lens-failed",
+			"/tmp/pi-lens-held",
+		]);
+		// The straggler was seen absent after its file removed it, then recreated.
+		registry.roots.get("/tmp/pi-lens-straggler")!.sawAbsent = true;
+		io.present.add("/tmp/pi-lens-straggler");
+		const sweep = sweepTmpRoots(registry, {
+			exists: io.exists,
+			remove: (dir) => {
+				if (dir !== "/tmp/pi-lens-failed") io.remove(dir);
+			},
+		});
+		expect(
+			formatTmpRootSweepRecords(registry, sweep, "afterAll", 1234.4),
+		).toEqual([
+			"sweep:afterAll:pi-lens-removed\tregistered,removed,1234",
+			"sweep:afterAll:pi-lens-failed\tregistered,failed,1234",
+			"sweep:afterAll:pi-lens-gone\tregistered,absent,1234",
+			"sweep:afterAll:pi-lens-held\tobserved,held,1234",
+			"sweep:afterAll:pi-lens-straggler\tobserved,removed,1234",
+		]);
+		// A second hook is its own key, so both sweeps stay on record.
+		expect(formatTmpRootSweepRecords(registry, sweep, "SIGTERM", 5)[0]).toBe(
+			"sweep:SIGTERM:pi-lens-removed\tregistered,removed,5",
+		);
+		expect(
+			formatTmpRootSweepRecords(
+				createTmpRootRegistry(),
+				{ removed: [], failed: [] },
+				"afterAll",
+				1,
+			),
+		).toEqual([]);
+	});
+
+	// #4864: the ledger is keyed by NAME, not path -- two workers that build the
+	// same fixture name are the collision it records -- and the first creator
+	// wins, exactly like the tmp-root entries.
+	it("keeps one record per named repository-root directory (#4864)", () => {
+		const registry = createTmpRootRegistry();
+		registerRepoRootDir(registry, "/repo/.probe-a", "a.test.ts");
+		registerRepoRootDir(registry, "/repo/.probe-a", "b.test.ts");
+		registerRepoRootDir(registry, "/repo/.probe-b");
+		expect(recordedRepoRootDirs(registry)).toEqual(
+			new Map([
+				[".probe-a", "a.test.ts"],
+				[".probe-b", undefined],
+			]),
+		);
+	});
 });
 
 describe("tmp-root interposer (#2912)", () => {
@@ -291,6 +357,66 @@ describe("tmp-root interposer (#2912)", () => {
 			]);
 		} finally {
 			env.cleanup();
+		}
+	});
+
+	// #4864: a directory NAMED directly at the repository root is recorded, so the
+	// serialized owner can fail the CREATION even when the cell removes it before
+	// the run ends (the leftover census cannot see a transient tree). #4867: a
+	// `mkdtemp` root at that root is the SAME shape to a repo-walking scan, so it
+	// is recorded too -- its unique name does not shorten the window in which the
+	// scan lists it and the cell removes it.
+	it("records a directory created directly at the watched repository root, whatever made it (#4864, #4867)", async () => {
+		const registry = createTmpRootRegistry();
+		const { target } = fakeTarget();
+		const repoRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-4864-root-"),
+		);
+		try {
+			installTmpRootInterposer(
+				registry,
+				target,
+				"/var/tmp",
+				() => "named.test.ts",
+				repoRoot,
+			);
+			const mkdirSync = target.mkdirSync as (dir: string) => string;
+			mkdirSync(path.join(repoRoot, ".probe-language-roots"));
+			// Not the repository root: a child of that fixture, a tmp-root sibling,
+			// and a `mkdtemp` root INSIDE the fixture all stay out of the ledger.
+			mkdirSync(path.join(repoRoot, ".probe-language-roots", "packages"));
+			mkdirSync("/var/tmp/capture");
+			const sync = target.mkdtempSync as (p: string) => string;
+			sync(path.join(repoRoot, "pi-lens-unique-"));
+			sync(path.join(repoRoot, ".probe-language-roots", "pi-lens-nested-"));
+			// All three `mkdtemp` shapes, because each is its own call site in the
+			// interposer and a fix at one of them leaves the other two open.
+			await new Promise<void>((resolve) =>
+				(target.mkdtemp as (p: string, cb: () => void) => void)(
+					path.join(repoRoot, "pi-lens-cb-"),
+					resolve,
+				),
+			);
+			await (target.promises.mkdtemp as (p: string) => Promise<string>)(
+				path.join(repoRoot, "pi-lens-promise-"),
+			);
+			expect(recordedRepoRootDirs(registry)).toEqual(
+				new Map([
+					[".probe-language-roots", "named.test.ts"],
+					["pi-lens-unique-AAAAAA", "named.test.ts"],
+					["pi-lens-cb-BBBBBB", "named.test.ts"],
+					["pi-lens-promise-CCCCCC", "named.test.ts"],
+				]),
+			);
+			expect(formatTmpRootCreators(registry)).toBe(
+				"capture\tnamed.test.ts\n" +
+					"repo-root:.probe-language-roots\tnamed.test.ts\n" +
+					"repo-root:pi-lens-cb-BBBBBB\tnamed.test.ts\n" +
+					"repo-root:pi-lens-promise-CCCCCC\tnamed.test.ts\n" +
+					"repo-root:pi-lens-unique-AAAAAA\tnamed.test.ts\n",
+			);
+		} finally {
+			fs.rmSync(repoRoot, { recursive: true, force: true });
 		}
 	});
 

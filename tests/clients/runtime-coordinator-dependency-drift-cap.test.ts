@@ -1,9 +1,9 @@
 /**
  * Direct unit coverage for `RuntimeCoordinator`'s #1950 delivery-cap methods
  * (`peekInlineBlockerStaleDeliveryCount`, `incrementInlineBlockerStaleDelivery`,
- * `retireDemotedDependencyDriftBlocker`).
+ * `retireDemotedDriftBlocker`).
  *
- * Fix-round F2: adversarial review found `retireDemotedDependencyDriftBlocker`'s
+ * Fix-round F2: adversarial review found `retireDemotedDriftBlocker`'s
  * own guards (`!existing.stale`, `staleReason !== "dependency-drift"`)
  * unreachable through `runtime-turn.ts`'s only call site, which already
  * pre-filters on `staleReason === "dependency-drift"` before calling. Rather
@@ -56,7 +56,7 @@ describe("RuntimeCoordinator dependency-drift delivery-cap methods (#1950)", () 
 		}
 	});
 
-	it("retireDemotedDependencyDriftBlocker refuses a record that is not stale", () => {
+	it("retireDemotedDriftBlocker refuses a record that is not stale", () => {
 		const env = setupTestEnvironment("pi-lens-1950-notstale-");
 		try {
 			const runtime = new RuntimeCoordinator();
@@ -65,14 +65,16 @@ describe("RuntimeCoordinator dependency-drift delivery-cap methods (#1950)", () 
 			runtime.recordInlineBlockers(target, "🔴 a blocker", 1, ["lsp"]);
 			// Never demoted — `stale` is falsy.
 
-			expect(runtime.retireDemotedDependencyDriftBlocker(target)).toBe(false);
+			expect(
+				runtime.retireDemotedDriftBlocker(target, "dependency-drift"),
+			).toBe(false);
 			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
 		} finally {
 			env.cleanup();
 		}
 	});
 
-	it("retireDemotedDependencyDriftBlocker refuses a past-EOF demotion on the same file", () => {
+	it("retireDemotedDriftBlocker refuses a past-EOF demotion on the same file", () => {
 		const env = setupTestEnvironment("pi-lens-1950-wrongreason-");
 		try {
 			const runtime = new RuntimeCoordinator();
@@ -83,7 +85,9 @@ describe("RuntimeCoordinator dependency-drift delivery-cap methods (#1950)", () 
 
 			// Must not retire a demotion that belongs to the OTHER gate — that
 			// gate's own retirement (`retireDemotedPastEofBlocker`) owns it.
-			expect(runtime.retireDemotedDependencyDriftBlocker(target)).toBe(false);
+			expect(
+				runtime.retireDemotedDriftBlocker(target, "dependency-drift"),
+			).toBe(false);
 			const snapshot = runtime.getInlineBlockersSnapshot();
 			expect(snapshot).toHaveLength(1);
 			expect(snapshot[0]?.staleReason).toBe("past-eof");
@@ -92,7 +96,30 @@ describe("RuntimeCoordinator dependency-drift delivery-cap methods (#1950)", () 
 		}
 	});
 
-	it("retireDemotedDependencyDriftBlocker retires a genuine dependency-drift demotion", () => {
+	it("retireDemotedDriftBlocker retires a genuine self-drift demotion, and refuses it for the other axis", () => {
+		const env = setupTestEnvironment("pi-lens-4990-selfdrift-retire-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			const target = path.join(env.tmpDir, "target.ts");
+			fs.writeFileSync(target, "export const a = 1;\n");
+			runtime.recordInlineBlockers(target, "🔴 a blocker", 1, ["ast-grep"]);
+			runtime.setInlineBlockerSelfDriftStale(target, true);
+
+			// Only the axis that made the demotion may retire it (#4990).
+			expect(
+				runtime.retireDemotedDriftBlocker(target, "dependency-drift"),
+			).toBe(false);
+			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+			expect(runtime.retireDemotedDriftBlocker(target, "self-drift")).toBe(
+				true,
+			);
+			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("retireDemotedDriftBlocker retires a genuine dependency-drift demotion", () => {
 		const env = setupTestEnvironment("pi-lens-1950-retire-");
 		try {
 			const runtime = new RuntimeCoordinator();
@@ -101,7 +128,9 @@ describe("RuntimeCoordinator dependency-drift delivery-cap methods (#1950)", () 
 			runtime.recordInlineBlockers(target, "🔴 a blocker", 1, ["lsp"]);
 			runtime.markInlineBlockerStale(target, "dependency-drift");
 
-			expect(runtime.retireDemotedDependencyDriftBlocker(target)).toBe(true);
+			expect(
+				runtime.retireDemotedDriftBlocker(target, "dependency-drift"),
+			).toBe(true);
 			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
 		} finally {
 			env.cleanup();

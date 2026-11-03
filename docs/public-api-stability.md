@@ -83,10 +83,14 @@ The trailing ` [PILENS_CFG_NNNN]` marker is appended by
 `withConfigDiagnosticCode`, is idempotent, and is always last. Match on it:
 
 ```sh
-# every ignored-config warning this session, from the durable degradation log
+# every config file this session that is unreadable, unparsable, or not a JSON object
 grep 'PILENS_CFG_0001' ~/.pi-lens/latency.log
 
-# suppress one code while keeping every other pi-lens warning
+# every unknown key and rejected value this session (typos, wrong types);
+# latency.log keeps only the first notice's code per file, so read extension.log
+grep -E 'PILENS_CFG_000[45]' ~/.pi-lens/extension.log
+
+# drop only the whole-file notices; typo notices keep PILENS_CFG_0004 and PILENS_CFG_0005
 pi ... 2>&1 | grep -v 'PILENS_CFG_0001'
 ```
 
@@ -99,11 +103,11 @@ this policy explicitly reserves the right to change.
 
 | Code | Meaning | Emitter |
 | --- | --- | --- |
-| `PILENS_CFG_0001` | A config file exists but could not be read or parsed, so it is ignored. | `warnIgnoredConfigOnce` (`clients/config-warn.ts`), the single choke point behind the LSP, global, and project config loaders. |
+| `PILENS_CFG_0001` | A config file exists but is unreadable, unparsable, or not a JSON object, so it is ignored. | `warnIgnoredConfigOnce` (`clients/config-warn.ts`), the single choke point behind the LSP, global, and project config loaders, and its default code for a read or parse failure. |
 | `PILENS_CFG_0002` | A deprecated config **key** was accepted inside its deprecation window. | `deprecationRecords` (`clients/config-resolve.ts`), one record per `(file, key)`, delivered by `reportPiLensConfigRecords` (#2426). |
 | `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Same producer and same delivery path as `PILENS_CFG_0002`. |
-| `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportPiLensConfigRecords` (`clients/config-resolve.ts`) delivers it through `warnIgnoredConfigOnce` (#2426). |
-| `PILENS_CFG_0005` | A config field's value did not match its schema and was dropped. One FIELD; the rest of the file is in effect. | Same producer and same delivery path as `PILENS_CFG_0004`. |
+| `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportPiLensConfigRecords` (`clients/config-resolve.ts`) delivers it through `warnIgnoredConfigOnce` (#2426). The global and project loaders' own unknown-key scans pass the same code (`clients/lens-config.ts`, `clients/project-lens-config.ts`). |
+| `PILENS_CFG_0005` | A config field's value did not match its schema, or one member of a list field was rejected by its id check (`dispatch.disabledRunners`, `lsp.disabledServers`). The rejected field or member is dropped; the rest of the file stays in effect. | Same producer and same delivery path as `PILENS_CFG_0004`, plus the loaders' own value checks (`clients/lens-config.ts`, `clients/project-lens-config.ts`, `clients/tool-config.ts`, `clients/lens-flag-registry.ts`), and the `dispatch.disabledRunners` and `lsp.disabledServers` id checks (`clients/dispatch/disabled-runners.ts`, `clients/lsp/config.ts`). |
 | `PILENS_CFG_0006` | A config key that would modify an object's prototype (`__proto__`, `constructor`, `prototype`) was refused. | Both halves of the config core, through the shared policy in `clients/config-core/safe-object.ts`. |
 | `PILENS_CFG_0007` | Further config notices were suppressed by a bound, and this one carries the count — the WHOLE count, including anything an earlier bound in the same pipeline dropped. Nothing about the config is wrong; the notice list was truncated. | `MigrationRecordCollector.finalize` (`clients/config-core/records.ts`) — the ONE producer, reached through `finalizeRecords` by every record list: the shared resolution, the global loader's unknown-key scan, the project loader's unknown-key scan, and its legacy-document enumeration. Rendered with neutral prose and recorded under the `config-notice-suppressed` degradation kind, never `config-ignored`. |
 | `PILENS_CFG_0008` | Resolving a config failed internally, so the WHOLE file was ignored and pi-lens ran on defaults. | The two guards under the pipeline: `resolveConfig` (`clients/config-core/resolve.ts`) and the global loader's post-parse catch (`clients/lens-config.ts`). Carries the error class only, never its message. |
@@ -375,7 +379,7 @@ are part of the contract, so the predicate is named here** (`refusalMatches` in
 
 Everything else stays a warning and the tool runs, exactly as it did before: a
 misspelled mode name, an abbreviation (`max`), a substring or reverse containment
-(`files` for `maxLspFiles`, `file` for `path`), a leading or middle word
+(`files` for `maxLspFiles`, `pth` for `path`), a leading or middle word
 (`sourcePath` is not `source`), a key whose qualifier retargets the head noun
 (`maxFiles`). Such keys still get the `did you mean` hint, except that a
 retargeted head noun is never the hint (`maxFiles` gets none, `cwdPath` gets
@@ -390,6 +394,22 @@ JSON-RPC `-32602` error; `arguments` absent, `null` or `[]` means no arguments.
 **Rejecting every unknown key outright is deliberately not done:** callers that
 pass extra keys today would break, so it needs a major, through the removal
 checklist in section 4.
+
+### The single-file tool parameter is `path`
+
+Every pi-lens tool that acts on one named file takes it as **`path`** (#5041).
+That is the canonical spelling: new tools declare it, and the description a
+model reads names it. It is also what keeps a call from being answered for the
+wrong scope — a tool that only declares an older name refuses or ignores the
+canonical one, and an ignored file parameter leaves the call running on its
+default scope, whose answer then reads as if it were about the named file.
+
+The MCP tools keep accepting **`file`**, and `lens_diagnostic_mark` keeps
+accepting **`filePath`**, as declared aliases of `path`, so no caller written
+against an older spelling breaks. A call may send any one of them; a call that
+sends two spellings naming different files is refused rather than guessed at.
+Adding a fourth spelling, or dropping one of these, changes this contract
+through section 4.
 
 ## 6. File I/O Lifecycle Bridge (v2)
 
@@ -406,7 +426,7 @@ The compatibility policy and migration path from legacy v1 symbols are documente
 | 2. Append-only `PILENS_CFG_*` codes | `CONFIG_DIAGNOSTIC_CODES` | `tests/clients/config-diagnostic-codes.test.ts` |
 | 3. Reserved `$schema` identity anchor | `CONFIG_SCHEMA_ID`, `CONFIG_SCHEMA_ANCHOR_KEY` | `assertSchemaIdentityAnchor` |
 | 4. Deprecation window + removal checklist | `DEPRECATED_CONFIG_SURFACES` | `tests/clients/config-deprecation-registry.test.ts` |
-| 5. Config core: tiers, deny precedence, ProcessSpec trust | `clients/config-core/` | `tests/clients/config-core/*.test.ts`, `tests/config/config-core-schema-stability.test.ts` |
+| 5. Config core: tiers, deny precedence, ProcessSpec trust | `clients/config-core/` | `tests/clients/config-core/*.test.ts` |
 
 ## Related
 

@@ -53,6 +53,7 @@ interface LspMutationRuntime {
 		source: ProjectChangeSource;
 		cwd?: string;
 		changedRange?: ProjectChangeRange;
+		sessionId?: string | undefined;
 		onAppendError?: (err: unknown) => void;
 	}) => { projectSeq: number; fileSeq: number };
 	telemetrySessionId?: string;
@@ -494,6 +495,8 @@ function bookkeepLspMutation(
 				source: context.source as ProjectChangeSource,
 				cwd: context.cwd,
 				changedRange: detail.range,
+				// #4943: the issuing activation's change-log row.
+				sessionId: context.sessionId,
 				onAppendError: (err) =>
 					context.dbg?.(
 						`lsp mutation project change append failed for ${filePath}: ${err}`,

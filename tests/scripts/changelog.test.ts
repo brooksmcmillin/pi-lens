@@ -91,6 +91,20 @@ describe("changelog lib — parsing", () => {
 	});
 });
 
+// Recurrence prevented: the tag-vs-section contract and the release guard ask
+// `hasSection` whether a version has notes; a bare `## [x.y.z]` heading with no
+// body counted as present (`length > 0` weakened to `>= 0` passed every case).
+describe("changelog lib — an empty section is not a section", () => {
+	it("hasSection is false for a heading with no body and for a whitespace-only body", () => {
+		const text =
+			"# Changelog\n\n## [4.0.0]\n\n## [3.9.0]\n   \n\n## [3.8.0]\n\n- x\n";
+		expect(extractSection(text, "4.0.0")).toBe("");
+		expect(hasSection(text, "4.0.0")).toBe(false);
+		expect(hasSection(text, "3.9.0")).toBe(false);
+		expect(hasSection(text, "3.8.0")).toBe(true);
+	});
+});
+
 describe("changelog lib — summarizeSection", () => {
 	const VERBOSE = [
 		"### Added",
@@ -410,7 +424,6 @@ describe("repo CHANGELOG.md contract", () => {
 			encoding: "utf8",
 		});
 		expect(out).toContain("### Added");
-		expect(out.trim().length).toBeGreaterThan(0);
 	});
 
 	it("changelog-extract.mjs CLI exits non-zero for a missing version", () => {

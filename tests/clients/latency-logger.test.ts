@@ -327,6 +327,46 @@ describe("getLastLoggedPhase (loop_block attribution, #1122/#1123)", () => {
 		expect(getLastLoggedPhase()?.phase).toBe("provider_request");
 	});
 
+	// #4751: `session_handoff_turn_state` is the zero-duration row of a
+	// primary's turn_start claim of the turn-state worklist (read back by
+	// tests/index-4751-newsession-turn-end-scope). Pins the
+	// `LAST_PHASE_EXCLUDED` entry so deleting it reds here.
+	it("does not let the turn-state hand-off record own stall attribution (#4751)", () => {
+		logLatency({
+			type: "phase",
+			phase: "provider_request",
+			filePath: "<pi-lens>",
+			durationMs: 5,
+		});
+		logLatency({
+			type: "phase",
+			phase: "session_handoff_turn_state",
+			filePath: "/repo",
+			durationMs: 0,
+		});
+		expect(getLastLoggedPhase()?.phase).toBe("provider_request");
+	});
+
+	// #4687: `tool_set_decision` is the zero-duration lazy-tools posture row
+	// written at session_start and on a model switch, never work of its own
+	// (its real recorder is read back by tests/index-4687-lazy-tools-per-model).
+	// Pins the `LAST_PHASE_EXCLUDED` entry so deleting it reds here.
+	it("does not let the tool-set decision record own stall attribution (#4687)", () => {
+		logLatency({
+			type: "phase",
+			phase: "provider_request",
+			filePath: "<pi-lens>",
+			durationMs: 5,
+		});
+		logLatency({
+			type: "phase",
+			phase: "tool_set_decision",
+			filePath: "<pi-lens>",
+			durationMs: 0,
+		});
+		expect(getLastLoggedPhase()?.phase).toBe("provider_request");
+	});
+
 	it("does not let auxiliary readiness own stall attribution (#2540)", () => {
 		logLatency({
 			type: "phase",

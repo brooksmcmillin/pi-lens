@@ -1,7 +1,20 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setupTestEnvironment } from "./test-utils.js";
+import { setupTestEnvironment as setupFixtureRoot } from "./test-utils.js";
+
+/**
+ * `formatFile` runs on the file's identity, so a fixture whose tmp root is
+ * itself a link (macOS `/var` -> `/private/var`) must name its paths by their
+ * real spelling to compare with what the formatter is handed.
+ */
+function setupTestEnvironment(prefix: string): {
+	tmpDir: string;
+	cleanup: () => void;
+} {
+	const env = setupFixtureRoot(prefix);
+	return { ...env, tmpDir: fs.realpathSync(env.tmpDir) };
+}
 
 const safeSpawnAsync = vi.fn();
 vi.mock("../../clients/safe-spawn.js", () => ({
@@ -352,6 +365,60 @@ describe("formatFile", () => {
 
 			expect(result.success).toBe(true);
 			expect(result.changed).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Prettier exits 2 on an explicitly specified symlink ("Explicitly specified
+	// pattern ... is a symbolic link"), which surfaced as a failed format on every
+	// agent_end for `AGENTS.md -> CLAUDE.md` (#4675). The file's identity is what
+	// the formatter is handed (#4689), so the double never meets the link.
+	it("hands the formatter the link's target and reports no failure", async () => {
+		const env = setupTestEnvironment("pi-lens-format-symlink-");
+		try {
+			writeNodeAgreementEvidence(env, "prettier");
+			fs.mkdirSync(path.join(env.tmpDir, "node_modules", ".bin"), {
+				recursive: true,
+			});
+			fs.writeFileSync(
+				path.join(env.tmpDir, "node_modules", ".bin", "prettier"),
+				"",
+			);
+			// A repo prettier config keeps the style-preserving refusal (#1144) out
+			// of the way, so the link is the only variable.
+			fs.writeFileSync(path.join(env.tmpDir, ".prettierrc"), "{}\n");
+			const target = path.join(env.tmpDir, "CLAUDE.md");
+			const link = path.join(env.tmpDir, "AGENTS.md");
+			fs.writeFileSync(target, "# title\n");
+			fs.symlinkSync("CLAUDE.md", link);
+			safeSpawnAsync.mockImplementation(
+				async (_cmd: string, args: string[]) => {
+					const file = args[args.length - 1] as string;
+					if (fs.lstatSync(file).isSymbolicLink()) {
+						return {
+							status: 2,
+							stdout: "",
+							stderr: `[error] Explicitly specified pattern "${path.basename(file)}" is a symbolic link.`,
+						};
+					}
+					fs.writeFileSync(file, "# title\n\n");
+					return { status: 0, stdout: "", stderr: "" };
+				},
+			);
+
+			const mod = await loadFormatFile();
+			const result = await mod.formatFile(link, mod.prettier);
+
+			expect(result).toMatchObject({
+				success: true,
+				changed: true,
+				outcome: "formatted",
+			});
+			expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+			expect(safeSpawnAsync.mock.calls[0]?.[1]).toContain(target);
+			expect(fs.readFileSync(target, "utf8")).toBe("# title\n\n");
+			expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
 		} finally {
 			env.cleanup();
 		}

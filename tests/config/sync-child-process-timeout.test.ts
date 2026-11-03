@@ -195,9 +195,12 @@ describe("#1980 every synchronous child-process call bounds the event-loop park"
 	it("actually finds the family (a dead scan must not read as clean)", () => {
 		// Vacuity guard on the DETECTOR, separate from the audit's floors: if
 		// the call-site regex breaks, every assertion below passes for free.
-		// There were 7 sites across 3 files when this landed.
-		expect(sites.length).toBeGreaterThanOrEqual(5);
-		expect(new Set(sites.map((s) => s.file)).size).toBeGreaterThanOrEqual(3);
+		// There were 7 sites across 3 files when this landed. #4530 moved the
+		// LSP launcher's version probe and metrics-history's git probe onto the
+		// spawn seam, leaving the 4 in clients/safe-spawn.ts (the seam's own
+		// sync path, its taskkill teardown and its code-page switch).
+		expect(sites.length).toBeGreaterThanOrEqual(4);
+		expect(new Set(sites.map((s) => s.file)).size).toBeGreaterThanOrEqual(1);
 	});
 
 	it("bounds every site, or exempts it with a reason", () => {

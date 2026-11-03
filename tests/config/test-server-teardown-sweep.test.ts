@@ -83,6 +83,7 @@ import {
 	serverTeardownKey,
 	serverTeardownMechanisms,
 } from "../support/test-server-teardown-gate.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const TESTS_ROOT = path.join(REPO_ROOT, "tests");
@@ -1028,52 +1029,68 @@ describe("#4589 server-teardown detector — the shapes that must red and green"
 describe("#4589 server-teardown ratchet", () => {
 	beforeAll(() => sweepOnce(), 120_000);
 
-	it("reports every unproven start and reds on a new one", () => {
-		const findings = sweepOnce();
-		const problems = unadmittedOffenders(findings, BASELINE);
-		process.stderr.write(
-			`server-teardown-sweep: ${findings.length} live start(s), ${BASELINE.size} baselined, ${problems.length} new\n`,
-		);
-		expect(problems, problems.join("\n")).toEqual([]);
-	}, 60_000);
+	it(
+		"reports every unproven start and reds on a new one",
+		() => {
+			const findings = sweepOnce();
+			const problems = unadmittedOffenders(findings, BASELINE);
+			process.stderr.write(
+				`server-teardown-sweep: ${findings.length} live start(s), ${BASELINE.size} baselined, ${problems.length} new\n`,
+			);
+			expect(problems, problems.join("\n")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("baseline entries remain live", () => {
-		// The shrink-only direction: closing a server anywhere makes its row
-		// stale, and a stale row reds until it is deleted.
-		expect(staleBaselineRows(sweepOnce(), BASELINE)).toEqual([]);
-	}, 60_000);
+	it(
+		"baseline entries remain live",
+		() => {
+			// The shrink-only direction: closing a server anywhere makes its row
+			// stale, and a stale row reds until it is deleted.
+			expect(staleBaselineRows(sweepOnce(), BASELINE)).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("finds the tree's start population (the sweep is not dead)", () => {
-		// A floor on the START population, not on the findings: the tree has
-		// ~20 `.listen` calls, and a walk that stops reaching them must red
-		// rather than report a clean ratchet (shape 10).
-		const files = listSourceFiles(TESTS_ROOT, { extensions: [".ts"] });
-		const listeners = files.filter((file) => {
-			const source = readWalkedFile(file);
-			return source !== undefined && /\.listen\s*\(/.test(source);
-		});
-		assertNonEmptyScan("test files starting a listener", listeners.length, 6);
-	}, 60_000);
+	it(
+		"finds the tree's start population (the sweep is not dead)",
+		() => {
+			// A floor on the START population, not on the findings: the tree has
+			// ~20 `.listen` calls, and a walk that stops reaching them must red
+			// rather than report a clean ratchet (shape 10).
+			const files = listSourceFiles(TESTS_ROOT, { extensions: [".ts"] });
+			const listeners = files.filter((file) => {
+				const source = readWalkedFile(file);
+				return source !== undefined && /\.listen\s*\(/.test(source);
+			});
+			assertNonEmptyScan("test files starting a listener", listeners.length, 6);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("counts the bind spellings under tests/** that the start rule leaves alone (E5)", () => {
-		// The `bind` rule is `bind` on a handle the scan can read; every other
-		// `bind` is `Function.prototype.bind`. This counts every `bind` SPELLING
-		// over stripped source, so it is an upper bound on that population: a real
-		// `socket.bind(0)` start is counted here too. The floor guards against a
-		// dead scan, not against a moved count (#4589 review r3 E5).
-		const files = listSourceFiles(TESTS_ROOT, { extensions: [".ts"] });
-		let sites = 0;
-		for (const { source } of readWalkedFiles(files)) {
-			const code = stripSource(source);
-			sites += [
-				...code.matchAll(/\.\s*bind\s*\(|\[\s*["'`]bind["'`]\s*\]\s*\(/g),
-			].length;
-		}
-		process.stderr.write(
-			`server-teardown-sweep: ${sites} bind spelling(s) in tests/**\n`,
-		);
-		assertNonEmptyScan("bind spellings under tests/**", sites, 30);
-	}, 60_000);
+	it(
+		"counts the bind spellings under tests/** that the start rule leaves alone (E5)",
+		() => {
+			// The `bind` rule is `bind` on a handle the scan can read; every other
+			// `bind` is `Function.prototype.bind`. This counts every `bind` SPELLING
+			// over stripped source, so it is an upper bound on that population: a real
+			// `socket.bind(0)` start is counted here too. The floor guards against a
+			// dead scan, not against a moved count (#4589 review r3 E5).
+			const files = listSourceFiles(TESTS_ROOT, { extensions: [".ts"] });
+			let sites = 0;
+			for (const { source } of readWalkedFiles(files)) {
+				const code = stripSource(source);
+				sites += [
+					...code.matchAll(/\.\s*bind\s*\(|\[\s*["'`]bind["'`]\s*\]\s*\(/g),
+				].length;
+			}
+			process.stderr.write(
+				`server-teardown-sweep: ${sites} bind spelling(s) in tests/**\n`,
+			);
+			assertNonEmptyScan("bind spellings under tests/**", sites, 30);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it.skipIf(!process.env.TEST_SERVER_TEARDOWN_REGEN)(
 		"regenerates the baseline",
@@ -1101,7 +1118,7 @@ describe("#4589 server-teardown ratchet", () => {
 				].join("\n"),
 			);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 });
 

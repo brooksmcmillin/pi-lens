@@ -142,6 +142,11 @@ describe("oxlint runner", () => {
 			// decisions carried to the delivery surface, never a silent clean.
 			"dialect-unsupported",
 			"covered-by-primary",
+			// `dispatch.disabledRunners`: the operator's own decision, so the
+			// dispatcher records it as a stated skip, never a failed run.
+			"disabled-by-config",
+			// #5042: an opt-in runner left off, a stated skip and no failed tool.
+			"not-enabled",
 		]);
 		const valid: RunnerResult = {
 			status: "skipped",
@@ -575,6 +580,13 @@ describe("oxlint runner", () => {
 
 				expect(outcome.status).toBe(expectedStatus);
 				expect(outcome.skipReason).toBe(expectedSkipReason);
+				// #4130: a spawn that produced no result is a runner fault on the skip;
+				// the expected no-files skip and every completed run are not.
+				expect(outcome.skipFault).toBe(
+					expectedDegradation === "runner-empty-result"
+						? "did-not-run"
+						: undefined,
+				);
 				// A parsed-nothing row is finishParsedRun's parse-error arm (#3796).
 				expect(outcome.failureKind).toBe(
 					expectedFailureKind ??
@@ -582,6 +594,12 @@ describe("oxlint runner", () => {
 							? "parser_error"
 							: undefined),
 				);
+				// #4130: a faulted run's one diagnostic is the fault, never a blocker.
+				if (outcome.failureKind !== undefined) {
+					expect(
+						outcome.diagnostics.map((d) => [d.runnerFault, d.semantic]),
+					).toEqual([[true, "warning"]]);
+				}
 				const degradationKinds = logLatency.mock.calls
 					.map(
 						([entry]) =>

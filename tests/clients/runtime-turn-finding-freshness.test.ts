@@ -664,6 +664,65 @@ describe("turn_end demoted-secret rendering (#1622 review M1/M2)", () => {
 		}
 	});
 
+	// Fix-round r1 F4(a): the `logTurnEndRow` nested ternary ships as an if/else
+	// chain, and the rewrite is behaviour-preserving only while a BLOCKER
+	// outranks a stale secret in that chain. An inverted precedence
+	// (`else if` -> `if`) survived every turn-end test on the head, so this is
+	// the one case that pins the ordering: a turn carrying BOTH parts is a
+	// blocker turn, not a "stale secrets pending" one.
+	it("reports blockers_found when the turn carries both a blocker and a stale secret", async () => {
+		const { env, runtime, cacheManager, secretFile } =
+			staleSecretTurn("pi-lens-m2-both-");
+		try {
+			// A live inline blocker: its file is untouched after the record, so the
+			// freshness sweep keeps it authoritative and it reaches `blockerParts`.
+			const blockedFile = path.join(env.tmpDir, "src/blocked.ts");
+			fs.writeFileSync(
+				blockedFile,
+				"export const a = 1;\nexport const b = 2;\n",
+			);
+			runtime.bumpFileSeq(blockedFile);
+			runtime.recordInlineBlockers(
+				blockedFile,
+				"2 issue(s) must be fixed",
+				1,
+				["lsp"],
+				[1, 2],
+			);
+			cacheManager.writeCache(
+				"gitleaks",
+				{
+					success: true,
+					scannedAt: SCANNED_AT,
+					findings: [
+						{
+							ruleId: "generic-api-key",
+							file: secretFile,
+							startLine: 397,
+							description: "Generic API key",
+						},
+					],
+				},
+				env.tmpDir,
+			);
+
+			const content = await turnEndContent(runtime, cacheManager, env.tmpDir);
+
+			// Both parts are in the message, so the telemetry row alone decides
+			// which tier outranks which.
+			expect(content).toContain("Unresolved from this turn");
+			expect(content).toContain("src/stale.ts");
+			const entry = turnEndResult();
+			expect(entry.result).toBe("blockers_found");
+			expect(entry.metadata).toMatchObject({
+				blockerSections: 1,
+				staleSecretSections: 1,
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("still telemetries a genuinely empty turn as clean", async () => {
 		const { env, runtime, cacheManager } = setupSecretTurn("pi-lens-m2-clean-");
 		try {

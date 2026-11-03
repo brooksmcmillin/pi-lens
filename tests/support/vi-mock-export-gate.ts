@@ -442,14 +442,32 @@ function resolveProduction(
 }
 
 function isProductionModule(file: string): boolean {
-	const relative = path.relative(process.cwd(), file).replaceAll(path.sep, "/");
-	// Synthetic detector fixtures live outside the checkout and are allowed to
-	// model production modules without pretending their paths are repository roots.
-	return relative.startsWith("../")
-		? true
-		: relative.startsWith(".probe-vi-mock-")
-			? true
-			: /^(?:clients|tools|mcp|scripts)(?:\/|$)/.test(relative);
+	return isProductionModulePath(path.relative(process.cwd(), file));
+}
+
+/**
+ * The gate's verdict for one already-relative path: may the module it names
+ * stand in for a production module?
+ *
+ * Synthetic detector fixtures live outside the checkout -- since #4867 under
+ * `os.tmpdir()`, so they never sit at the checkout root #4864 guards -- and
+ * are allowed to model production modules without pretending their paths are
+ * repository roots. Inside the checkout only a source root qualifies.
+ * `pathImpl` is a parameter so that a win32 drive pair can be driven on every
+ * lane (AGENTS.md shape 35).
+ */
+export function isProductionModulePath(
+	relative: string,
+	pathImpl: Pick<typeof path, "isAbsolute" | "sep"> = path,
+): boolean {
+	// A path on another drive never turns into `../…`: win32 `path.relative`
+	// leaves it absolute, so it is the same "outside" the `../` arm names
+	// (#4878 F1: reading it as inside made every positive control assert `[]`
+	// on the Windows lane).
+	if (pathImpl.isAbsolute(relative)) return true;
+	const posix = relative.replaceAll(pathImpl.sep, "/");
+	if (posix.startsWith("../")) return true;
+	return /^(?:clients|tools|mcp|scripts)(?:\/|$)/.test(posix);
 }
 
 function exportedValues(source: string): Set<string> {

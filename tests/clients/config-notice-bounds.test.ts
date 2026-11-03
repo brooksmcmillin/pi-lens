@@ -31,12 +31,17 @@ import { MAX_MIGRATION_RECORDS } from "../../clients/config-core/records.js";
 import { PI_LENS_CONFIG_SCHEMA } from "../../clients/config-schema.js";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
 import {
+	resetUserNotifier,
+	wireUserNotifier,
+} from "../../clients/user-notify.js";
+import {
 	assertNonEmptyScan,
 	listSourceFiles,
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
 import { removeTempDirSync } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
 
 const notices: string[] = [];
 const userNotices: string[] = [];
@@ -54,17 +59,6 @@ vi.mock("../../clients/extension-log.js", async (importOriginal) => {
 		...actual,
 		logExtension: (entry: { message: string }) => {
 			notices.push(entry.message);
-		},
-	};
-});
-
-vi.mock("../../clients/user-notify.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/user-notify.js")>();
-	return {
-		...actual,
-		notifyUserDegradation: (message: string) => {
-			userNotices.push(message);
 		},
 	};
 });
@@ -143,21 +137,23 @@ function everyRecognizedKey(): Record<string, unknown> {
 	return value;
 }
 
-let previousConfigPath: string | undefined;
+const setConfigPath = useConfigPath();
 let previousHome: string | undefined;
 
 beforeEach(() => {
 	notices.length = 0;
 	userNotices.length = 0;
+	resetUserNotifier();
+	wireUserNotifier(() => (message) => {
+		userNotices.push(message);
+	});
 	ledgerRows.length = 0;
-	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	previousHome = process.env.PI_LENS_HOME;
 	resetIgnoredConfigWarnCache();
 });
 
 afterEach(async () => {
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
+	resetUserNotifier();
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = previousHome;
 	resetIgnoredConfigWarnCache();
@@ -173,7 +169,7 @@ describe("F1: the suppression count is the TRUE total, across both bounds", () =
 	it("counts what the core's collector dropped, not only the sink's overflow", async () => {
 		const home = tmpRoot("pi-lens-r6f1-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r6f1-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		const file = path.join(projectDir, ".pi-lens.json");
 		fs.mkdirSync(projectDir, { recursive: true });
@@ -261,7 +257,7 @@ describe("F2: a suppression notice never reads as an ignored config", () => {
 	it("keeps a legacy file's overflow out of the ignored/invalid vocabulary", async () => {
 		const home = tmpRoot("pi-lens-r6f2-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r6f2-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		const legacyFile = path.join(projectDir, "pi-lens.json");
 		// Every key is one the canonical schema recognizes, so every one of them
@@ -284,9 +280,29 @@ describe("F2: a suppression notice never reads as an ignored config", () => {
 				message.includes(legacyFile) &&
 				message.includes("further config notices were suppressed"),
 		);
-		expect(suppression, JSON.stringify(notices)).toHaveLength(1);
-		expect(suppression[0]).not.toContain("ignoring invalid");
-		expect(suppression[0]).not.toContain("invalid");
+		// One summary per bounded list the file ends: the legacy moves close with
+		// theirs right after the last move notice, and the refused global-only
+		// settings (#4946 pushed that list past its own bound) with theirs after
+		// that list. Exactly two, told apart by position.
+		expect(suppression, JSON.stringify(notices)).toHaveLength(2);
+		const lastMove = notices.reduce(
+			(last, message, index) =>
+				message.startsWith("deprecated ") && message.includes(legacyFile)
+					? index
+					: last,
+			-1,
+		);
+		expect(notices.indexOf(suppression[0] as string), "legacy summary").toBe(
+			lastMove + 1,
+		);
+		expect(
+			notices.indexOf(suppression[1] as string),
+			"refusal summary",
+		).toBeGreaterThan(lastMove + 1);
+		for (const summary of suppression) {
+			expect(summary).not.toContain("ignoring invalid");
+			expect(summary).not.toContain("invalid");
+		}
 
 		// The SUPPRESSION row, wherever it landed: every ledger row carrying the
 		// truncation reason must be the neutral kind, and none of them the
@@ -308,7 +324,7 @@ describe("F3: the GLOBAL loader's unknown-key scan is bounded like every other",
 	it("summarises past the bound instead of one notification per key", async () => {
 		const home = tmpRoot("pi-lens-r6f3-home-");
 		const globalFile = path.join(home, ".pi-lens", "config.json");
-		process.env.PI_LENS_CONFIG_PATH = globalFile;
+		setConfigPath(globalFile);
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
 		const value: Record<string, unknown> = {};
 		for (let index = 0; index < 100; index += 1) {
@@ -340,7 +356,7 @@ describe("F3: the GLOBAL loader's unknown-key scan is bounded like every other",
 	it("still names every unknown key when the file stays inside the bound", async () => {
 		const home = tmpRoot("pi-lens-r6f3b-home-");
 		const globalFile = path.join(home, ".pi-lens", "config.json");
-		process.env.PI_LENS_CONFIG_PATH = globalFile;
+		setConfigPath(globalFile);
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
 		write(globalFile, { lps: true, ignore: ["dist/**"] });
 
@@ -512,7 +528,7 @@ describe("round 7, F2: ONE buffer-notes-then-finalize seam, not one per loader",
 		for (const tier of ["global", "project"] as const) {
 			const { note, records } = ignoredRecordCollector(file, tier);
 			for (let index = 0; index < MAX_MIGRATION_RECORDS + 5; index += 1) {
-				note(`unknown top-level key "k${index}"`);
+				note(`unknown top-level key "k${index}"`, "PILENS_CFG_0001");
 			}
 			const finalized = records();
 			const detail = `${tier}: ${JSON.stringify(finalized)}`;

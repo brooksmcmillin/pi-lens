@@ -22,7 +22,11 @@ import {
 } from "./degradation-ledger.js";
 import { minimatch } from "./deps/minimatch.js";
 import { createSubsystemLogger } from "./extension-log.js";
-import { detectFileKind, type FileKind } from "./file-kinds.js";
+import {
+	detectFileKind,
+	DOTNET_CSHARP_ROOT_MARKERS,
+	type FileKind,
+} from "./file-kinds.js";
 import { detectFileRole } from "./file-role.js";
 import { resolveLanguageRootForFile } from "./language-profile.js";
 import {
@@ -37,6 +41,7 @@ import {
 	detectPythonEnvironment,
 } from "./python-environment.js";
 import {
+	direntsHaveMarkerGlobMatch,
 	findNearestMarkerRootDetailed,
 	type MarkerRootResult,
 	isRealGitMarker,
@@ -44,7 +49,11 @@ import {
 	normalizeEphemeralMapKey,
 	normalizeMapKey,
 	pathsEqual,
+	isAbsoluteFilePath,
+	realpathOrResolve,
+	relativeInside,
 	toPosix,
+	toProjectRelativePath,
 } from "./path-utils.js";
 import { findNearestDirWithAnyBasename } from "./workspace-topology.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
@@ -421,19 +430,14 @@ export function isExcludedTestTarget(
 	cwd: string,
 ): boolean {
 	const absolute = path.resolve(cwd, toPosix(testFilePath));
-	let rel = toPosix(path.relative(cwd, absolute));
+	let rel = relativeInside(cwd, absolute);
 	// #2522 review round 2, F6: a target that resolves OUTSIDE the project root
 	// yields a `..`-leading relative path (or, across Windows drives, a still
 	// absolute one), which matches none of the globs — so the bare `some()`
 	// below reported it as "not excluded" and turn_end would have auto-spawned a
 	// runner against a file outside the project the turn is running in. An
 	// out-of-tree target, and the project root itself, fail CLOSED.
-	if (
-		rel === "" ||
-		rel === ".." ||
-		rel.startsWith("../") ||
-		path.isAbsolute(rel)
-	) {
+	if (!rel) {
 		// Different aliases can spell an in-tree target as lexically outside cwd.
 		const realTarget = canonicalFailedPath(absolute);
 		const realCwd = canonicalFailedPath(cwd);
@@ -552,7 +556,8 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 	},
 	dotnet: {
 		kinds: ["csharp", "fsharp"],
-		configFiles: ["*.csproj", "*.sln"],
+		// #4806: the .NET marker seam, not a private copy of it.
+		configFiles: [...DOTNET_CSHARP_ROOT_MARKERS],
 		command: "dotnet",
 		args: (_testFile, _cwd) => ["test", "--no-build"],
 		parseJson: false,
@@ -728,27 +733,22 @@ interface TestResultRecord {
 }
 
 function canonicalFailedPath(filePath: string): string {
-	const absolute = path.resolve(filePath);
-	try {
-		return normalizeMapKey(fs.realpathSync.native(absolute));
-	} catch {
-		return normalizeMapKey(absolute);
-	}
+	// The kernel's identity of the spelling as written (#4689): no lexical `..`
+	// fold first, which would name a path the kernel never opens.
+	return normalizeMapKey(realpathOrResolve(filePath));
 }
 
 function canonicalProjectRoot(cwd: string): {
 	key: string;
 	resolved: boolean;
 } {
-	const absolute = path.resolve(cwd);
-	try {
-		return {
-			key: normalizeEphemeralMapKey(fs.realpathSync.native(absolute)),
-			resolved: true,
-		};
-	} catch {
-		return { key: normalizeEphemeralMapKey(absolute), resolved: false };
-	}
+	return {
+		key: normalizeEphemeralMapKey(realpathOrResolve(cwd)),
+		// A cwd that is not on disk still has an identity (its nearest existing
+		// ancestor plus the tail), but is a guess about a path that may later be
+		// a link: `getCanonicalProjectRoot` memoizes only a resolved one (#2077).
+		resolved: fs.existsSync(cwd),
+	};
 }
 
 export const MAX_CANONICAL_ROOT_MEMO_ENTRIES = 512;
@@ -822,7 +822,7 @@ function parsePytestSummary(output: string): PytestSummary {
 	// Rounded, like `jsonRunDurationMs` and PHPUnit's legacy path:
 	// `in 2.01s` is 2009.9999999999998 in binary floating point.
 	const duration = durationMatch
-		? Math.round(Number.parseFloat(durationMatch[1]) * 1000)
+		? toMeasuredDurationMs(Number.parseFloat(durationMatch[1]) * 1000)
 		: undefined;
 	return { passed, failed, skipped, duration };
 }
@@ -837,10 +837,10 @@ export class TestRunnerClient {
 	// never memoized (#2077): the fallback key is a guess about a path that does
 	// not exist yet, so memoizing it would pin an alias probed before its
 	// symlink was created to a stale verdict for the instance's life. Re-probing
-	// costs one failing realpath per call, and only for a cwd that does not
-	// resolve — a state where `detectRunner` already walks node_modules on every
-	// call. Keep the memo bounded so pathological spelling churn cannot grow it
-	// without limit.
+	// costs one failing existence probe plus the ancestor walk per call, and only
+	// for a cwd that does not resolve — a state where `detectRunner` already
+	// walks node_modules on every call. Keep the memo bounded so pathological
+	// spelling churn cannot grow it without limit.
 	private canonicalRootMemo = new BoundedFifoMap<string, string>(
 		MAX_CANONICAL_ROOT_MEMO_ENTRIES,
 	);
@@ -1175,12 +1175,13 @@ export class TestRunnerClient {
 			if (eligible && !eligible.has(name)) continue;
 			const config = RUNNERS[name];
 			const found = config.configFiles.some((cf) => {
-				// Handle glob patterns like *.csproj
+				// Handle glob patterns like *.csproj (#4806: the shared marker matcher,
+				// anchored and files-only, not a private unanchored RegExp)
 				if (cf.includes("*")) {
 					try {
-						const files = fs.readdirSync(cwd);
-						return files.some((f) =>
-							new RegExp(cf.replace(/\*/g, ".*")).test(f),
+						return direntsHaveMarkerGlobMatch(
+							fs.readdirSync(cwd, { withFileTypes: true }),
+							cf,
 						);
 					} catch {
 						return false;
@@ -1266,16 +1267,11 @@ export class TestRunnerClient {
 		cwd: string,
 	): string | null {
 		const dir = path.dirname(sourceFilePath);
-		const relDir = path.relative(cwd, path.resolve(cwd, dir));
-		if (
-			!relDir ||
-			relDir === "." ||
-			relDir.startsWith("..") ||
-			path.isAbsolute(relDir)
-		) {
-			return null;
-		}
-		return relDir;
+		// The shared project-relative display path: relative when `dir` is
+		// strictly inside `cwd`, otherwise the absolute spelling (the root itself
+		// and an outside directory both land there).
+		const relDir = toProjectRelativePath(path.resolve(cwd, dir), cwd);
+		return isAbsoluteFilePath(relDir) ? null : relDir;
 	}
 
 	/**
@@ -1426,9 +1422,9 @@ export class TestRunnerClient {
 		if (runner === "vitest") {
 			const globs = this.parseVitestTestGlobs(cwd);
 			if (globs) {
-				const rel = path
-					.relative(cwd, path.resolve(cwd, sourceFilePath))
-					.replace(/\\/g, "/");
+				const rel = toPosix(
+					path.relative(cwd, path.resolve(cwd, sourceFilePath)),
+				);
 				const matches = (
 					globs_: string[] | undefined,
 					filter?: (g: string) => boolean,
@@ -2309,14 +2305,14 @@ export class TestRunnerClient {
 			}
 		}
 		const span = maxEnd - minStart;
-		if (Number.isFinite(span) && span > 0) return Math.round(span);
-		if (assertionTotal > 0) return Math.round(assertionTotal);
+		if (Number.isFinite(span) && span > 0) return toMeasuredDurationMs(span);
+		if (assertionTotal > 0) return toMeasuredDurationMs(assertionTotal);
 		// Ordering above is unchanged from #1452 on purpose: a positive span
 		// still beats the assertion sum, and the sum still beats a suite pair
 		// that read as zero. Only the terminal case moved. A pair we could
 		// read whose span is 0 is a run that took under a millisecond — report
 		// it. Everything else was never measured.
-		if (Number.isFinite(span) && span === 0) return 0;
+		if (Number.isFinite(span) && span === 0) return toMeasuredDurationMs(span);
 		return undefined;
 	}
 
@@ -2523,7 +2519,9 @@ export class TestRunnerClient {
 			const millis = clockMatch[4]
 				? Number.parseInt(clockMatch[4].padEnd(3, "0"), 10)
 				: 0;
-			duration = ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis;
+			duration = toMeasuredDurationMs(
+				((hours * 60 + minutes) * 60 + seconds) * 1000 + millis,
+			);
 		} else {
 			const legacyMatch = output.match(
 				/^Time:\s*([\d.]+)\s*(seconds?|s|ms|milliseconds?|minutes?)\b/im,
@@ -2538,7 +2536,7 @@ export class TestRunnerClient {
 							? 60_000
 							: 1000;
 				if (Number.isFinite(value) && value > 0) {
-					duration = Math.round(value * scale);
+					duration = toMeasuredDurationMs(value * scale);
 				}
 			}
 		}
@@ -2597,10 +2595,9 @@ export class TestRunnerClient {
 
 		const durationMatch = output.match(/Finished in\s+([\d.]+)\s+seconds?/i);
 		if (durationMatch) {
-			// Rounded for the same reason pytest's is: `2.01` seconds is
-			// 2009.9999999999998 ms unrounded, and that reaches the log.
-			// (Routing this through `toMeasuredDurationMs` is #1484.)
-			duration = Math.round(Number.parseFloat(durationMatch[1]) * 1000);
+			duration = toMeasuredDurationMs(
+				Number.parseFloat(durationMatch[1]) * 1000,
+			);
 		}
 
 		// Individual failures: "  1) test some behavior (MyModuleTest)"
@@ -2815,7 +2812,7 @@ export class TestRunnerClient {
 		// reach the same 0 by finding no tokens, but only by accident, and the
 		// accident is indistinguishable from an unparseable tail — so the case
 		// is spelled out.
-		if (/^\s*</.test(dotnetTime[1])) return 0;
+		if (/^\s*</.test(dotnetTime[1])) return toMeasuredDurationMs(0);
 		let total = 0;
 		let tokens = 0;
 		// "ms" before "m", or "250 ms" scores as 250 minutes.

@@ -951,6 +951,9 @@ describe("handleNotifyOpen", () => {
 						{ file: TEST_FILE, needFileNameList: false },
 					],
 				},
+				// #4801: the probe carries a cancellation token, so a timeout can
+				// send `$/cancelRequest`.
+				expect.anything(),
 			);
 		});
 	});
@@ -983,6 +986,7 @@ describe("handleNotifyOpen", () => {
 			expect(state.connection.sendRequest).toHaveBeenCalledWith(
 				"workspace/executeCommand",
 				expect.objectContaining({ command: "typescript.tsserverRequest" }),
+				expect.anything(),
 			);
 		});
 
@@ -1037,6 +1041,7 @@ describe("handleNotifyOpen", () => {
 			expect(state.connection.sendRequest).toHaveBeenCalledWith(
 				"workspace/executeCommand",
 				expect.objectContaining({ command: "typescript.tsserverRequest" }),
+				expect.anything(),
 			);
 		});
 
@@ -1651,6 +1656,9 @@ describe("clientWaitForDiagnostics", () => {
 			// #1531: advance through the production seam. Assigning the global counter
 			// alone no longer satisfies the gate, which now reads the per-path stamp —
 			// and a test that hand-rolls the bump would stop modelling a real publish.
+			// #4785 F4: a real publish stores before it emits, and the wait settles
+			// only while an answer is stored.
+			state.pushDiagnostics.set(TEST_KEY, []);
 			bumpDiagnosticsVersion(state, TEST_KEY);
 			state.diagnosticEmitter.emit("diagnostics", TEST_FILE);
 		}, 50);
@@ -1728,8 +1736,10 @@ describe("clientWaitForDiagnostics", () => {
 
 		const waitPromise = clientWaitForDiagnostics(state, TEST_FILE, 5000);
 
-		// Simulate diagnostics arriving after a short delay
+		// Simulate diagnostics arriving after a short delay (stored, then
+		// emitted, as the publish handler does: #4785 F4).
 		setTimeout(() => {
+			state.pushDiagnostics.set(TEST_KEY, []);
 			state.diagnosticEmitter.emit("diagnostics", TEST_FILE);
 		}, 50);
 
@@ -1762,8 +1772,10 @@ describe("clientWaitForDiagnostics", () => {
 				state.diagnosticEmitter.emit("diagnostics", "/project/other.ts");
 			}, 50);
 
-			// Emit for the right file after a bit longer
+			// Emit for the right file after a bit longer (stored first, as the
+			// publish handler does: #4785 F4).
 			setTimeout(() => {
+				state.pushDiagnostics.set(TEST_KEY, []);
 				state.diagnosticEmitter.emit("diagnostics", TEST_FILE);
 			}, 100);
 
@@ -2969,10 +2981,11 @@ describe("navRequest — per-request timeout ceiling (#365)", () => {
 			state.connection.sendRequest = vi.fn(() => new Promise<never>(() => {}));
 
 			const start = Date.now();
-			const result = await navRequest(state, method, {}, undefined, 120);
+			await expect(
+				navRequest(state, method, {}, undefined, 120),
+			).rejects.toThrow("LSP request timed out");
 			const elapsed = Date.now() - start;
 
-			expect(result).toBeUndefined();
 			// Went through the timeout, not an instant error return...
 			expect(elapsed).toBeGreaterThanOrEqual(100);
 			// ...and did not hang on the never-resolving request.
@@ -3323,6 +3336,7 @@ describe("applyDynamicCapabilities", () => {
 				rename: false,
 				willRenameFiles: false,
 				didRenameFiles: false,
+				didCreateFiles: false,
 				implementation: false,
 				callHierarchy: false,
 			},

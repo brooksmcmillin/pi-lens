@@ -40,7 +40,7 @@ const COMMIT_PAGE_SIZE = 100;
 const COMMIT_LIST_CAP = 250;
 const COMPARISON_COMMIT_CAP = 10_000;
 // Operator-approved apmantza/pi-lens snapshot; never take this pin from PR input.
-const APPROVED_UPSTREAM = "7f5af3a48ce72a7ad6b2ef712b09aa113541c1ac";
+const APPROVED_UPSTREAM = "52b91eca667a9138d6bc9e925c606d605e56ce2a";
 const PROVENANCE_FORK = "brooksmcmillin/pi-lens";
 
 // Unlike the PR-list endpoint, an explicitly paginated comparison includes

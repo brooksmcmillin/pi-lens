@@ -57,6 +57,7 @@ import {
 	triggersOnPullRequest,
 	type WorkflowFile,
 } from "../support/workflow-pull-request-reachability.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const WORKFLOWS_DIR = resolve(REPO_ROOT, ".github/workflows");
@@ -232,6 +233,8 @@ const EXEMPTIONS: Readonly<Record<string, string>> = {
 		"workflow_run-triggered classifier: it reads a COMPLETED CI run's log, which by definition does not exist while that run is still going. Its own if: truth table is evaluated pre-merge, row by row, in tests/config/ci-infra-kill-rerun-gate.test.ts",
 	".github/workflows/ci-infra-kill-rerun.yml::finalize-rerun":
 		"workflow_run-triggered terminal-label swap, same lane and same reason as classify above; its if: is evaluated pre-merge in tests/config/ci-infra-kill-rerun-gate.test.ts",
+	".github/workflows/ci.yml::strict-install-cold-cache":
+		"left the pull_request trigger (#5112): 1,410 runner minutes in 30 days and no real catch (#3995 slice A). A pull request that changes the manifests still runs the same pinned-npm strict install through install-smoke.yml's `npm-strict`, pinned by tests/config/allow-scripts-ci-gate.test.ts; master pushes and dispatches keep this job (it runs after the merge)",
 	".github/workflows/close-keyword-verification.yml::verify":
 		"pull_request_target gated on github.event.pull_request.merged == true: it verifies what the close keywords DID once the PR is merged, which cannot be observed before the merge",
 	".github/workflows/install-smoke.yml::host-latest-notify":
@@ -241,68 +244,80 @@ const EXEMPTIONS: Readonly<Record<string, string>> = {
 };
 
 describe("every PR-triggerable workflow job is reachable on a pull request (#3043)", () => {
-	it("flags no master-only job that is not registered with a reason", () => {
-		const files = repoWorkflowFiles();
-		const { flagged, jobsExamined } = findPullRequestUnreachableJobs(files);
-		assertSortedRegistry(
-			"workflow-pull-request-reachability exemptions",
-			Object.keys(EXEMPTIONS),
-		);
-		const audit = auditRegistry({
-			sweepName: "workflow pull-request reachability",
-			flagged,
-			registered: [],
-			exemptions: EXEMPTIONS,
-			// Calibration, measured on 2026-09-16 by raising both floors until
-			// the audit printed its own counts, and re-measured in round 2 with
-			// the `on:`-reader fixed: 20 workflow files walked, 9 of them
-			// PR-triggerable (greetings.yml and the former mutation.yml carried no
-			// job-level `if:` at all), 13 job-level `if:` expressions examined
-			// in those 9, 7 of them unreachable from a pull request. Floors are
-			// half, rounded down, so an accidental narrowing of the walk (a
-			// moved directory, a glob that stops matching .yml) fails loudly
-			// instead of reading clean -- AGENTS.md defect shape 10.
-			// Recalibrate from this test's OWN measured numbers, never from a
-			// figure copied out of a comment or a PR body.
-			// Re-measured 2026-09-25 with matrices evaluated (#3085): 20 files,
-			// 19 jobs examined (an `if:` or a matrix), 7 flagged.
-			scannedCount: jobsExamined,
-			minScanned: 9,
-			minFlagged: 3,
-			minReasonLength: 40,
-			remediation:
-				"Give the job a pull_request-eligible cell the way install-smoke's pi-load/smoke/mise-repro do " +
-				"(narrow the matrix on github.event_name instead of gating the job off pull_request), or add it " +
-				"to EXEMPTIONS with the reason a pull request cannot exercise it.",
-		});
-		expect(audit.problems, audit.problems.join("\n")).toEqual([]);
-	});
+	it(
+		"flags no master-only job that is not registered with a reason",
+		() => {
+			const files = repoWorkflowFiles();
+			const { flagged, jobsExamined } = findPullRequestUnreachableJobs(files);
+			assertSortedRegistry(
+				"workflow-pull-request-reachability exemptions",
+				Object.keys(EXEMPTIONS),
+			);
+			const audit = auditRegistry({
+				sweepName: "workflow pull-request reachability",
+				flagged,
+				registered: [],
+				exemptions: EXEMPTIONS,
+				// Calibration, measured on 2026-09-16 by raising both floors until
+				// the audit printed its own counts, and re-measured in round 2 with
+				// the `on:`-reader fixed: 20 workflow files walked, 9 of them
+				// PR-triggerable (greetings.yml and the former mutation.yml carried no
+				// job-level `if:` at all), 13 job-level `if:` expressions examined
+				// in those 9, 7 of them unreachable from a pull request. Floors are
+				// half, rounded down, so an accidental narrowing of the walk (a
+				// moved directory, a glob that stops matching .yml) fails loudly
+				// instead of reading clean -- AGENTS.md defect shape 10.
+				// Recalibrate from this test's OWN measured numbers, never from a
+				// figure copied out of a comment or a PR body.
+				// Re-measured 2026-09-25 with matrices evaluated (#3085): 20 files,
+				// 19 jobs examined (an `if:` or a matrix), 7 flagged.
+				scannedCount: jobsExamined,
+				minScanned: 9,
+				minFlagged: 3,
+				minReasonLength: 40,
+				remediation:
+					"Give the job a pull_request-eligible cell the way install-smoke's pi-load/smoke/mise-repro do " +
+					"(narrow the matrix on github.event_name instead of gating the job off pull_request), or add it " +
+					"to EXEMPTIONS with the reason a pull request cannot exercise it.",
+			});
+			expect(audit.problems, audit.problems.join("\n")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// REACHABLE is not GATING (#3087). A `continue-on-error` job concludes
 	// `success` whatever its steps did, so a PR can satisfy the check above
 	// with a lane that never blocks. Such a job must say so in its check-run
 	// name, the repo's advisory marker (`scripts/lib/ci-checks.mjs`), so that
 	// the check list and `ci-verdict` both read it as advisory.
-	it("names every PR-reachable continue-on-error job as advisory", () => {
-		const { flagged, advisoryJobs } =
-			findUndeclaredAdvisoryJobs(repoWorkflowFiles());
-		// Dead-sweep floor (AGENTS.md shape 10): measured 2 on 2026-09-25
-		// (ci.yml::targeted-tests-advisory, install-smoke.yml::mise-repro).
-		expect(advisoryJobs.length).toBeGreaterThanOrEqual(2);
-		expect(
-			flagged,
-			`PR-reachable continue-on-error job(s) whose check-run name does not end in "(advisory)": ` +
-				`${flagged.join(", ")}. Suffix the job's name: with "(advisory)", or make the job ` +
-				`blocking on pull_request.`,
-		).toEqual([]);
-	});
+	it(
+		"names every PR-reachable continue-on-error job as advisory",
+		() => {
+			const { flagged, advisoryJobs } =
+				findUndeclaredAdvisoryJobs(repoWorkflowFiles());
+			// Dead-sweep floor (AGENTS.md shape 10): measured 2 on 2026-09-25
+			// (ci.yml::changed-tests-shuffled, install-smoke.yml::mise-repro).
+			expect(advisoryJobs.length).toBeGreaterThanOrEqual(2);
+			expect(
+				flagged,
+				`PR-reachable continue-on-error job(s) whose check-run name does not end in "(advisory)": ` +
+					`${flagged.join(", ")}. Suffix the job's name: with "(advisory)", or make the job ` +
+					`blocking on pull_request.`,
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("walks every workflow file in the tree, not a hand-maintained list", () => {
-		const files = repoWorkflowFiles().map((file) => basename(file.path));
-		expect(files.length).toBeGreaterThanOrEqual(15);
-		expect(files).toContain("install-smoke.yml");
-		expect(files).toContain("ci.yml");
-	});
+	it(
+		"walks every workflow file in the tree, not a hand-maintained list",
+		() => {
+			const files = repoWorkflowFiles().map((file) => basename(file.path));
+			expect(files.length).toBeGreaterThanOrEqual(15);
+			expect(files).toContain("install-smoke.yml");
+			expect(files).toContain("ci.yml");
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 
 // The incident, as a fixture: install-smoke.yml's three jobs as they stood on
@@ -339,74 +354,95 @@ describe("the #3043 shape is what this sweep flags", () => {
 		"",
 	].join("\n");
 
-	it("flags all three gated jobs and leaves the ungated one alone", () => {
-		const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/install-smoke.yml", text: preFixInstallSmoke },
-		]);
-		expect(flagged).toEqual([
-			".github/workflows/install-smoke.yml::mise-repro",
-			".github/workflows/install-smoke.yml::pi-load",
-			".github/workflows/install-smoke.yml::smoke",
-		]);
-		// host-range-smoke has no `if:` at all, so it is never examined.
-		expect(jobsExamined).toBe(3);
-	});
+	it(
+		"flags all three gated jobs and leaves the ungated one alone",
+		() => {
+			const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
+				{
+					path: ".github/workflows/install-smoke.yml",
+					text: preFixInstallSmoke,
+				},
+			]);
+			expect(flagged).toEqual([
+				".github/workflows/install-smoke.yml::mise-repro",
+				".github/workflows/install-smoke.yml::pi-load",
+				".github/workflows/install-smoke.yml::smoke",
+			]);
+			// host-range-smoke has no `if:` at all, so it is never examined.
+			expect(jobsExamined).toBe(3);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("stops flagging a job once the gate is replaced by a PR-eligible matrix cell", () => {
-		const fixed = preFixInstallSmoke.replace(
-			"  smoke:\n    if: github.event_name != 'pull_request'\n",
-			"  smoke:\n",
-		);
-		expect(fixed).not.toBe(preFixInstallSmoke);
-		const { flagged } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/install-smoke.yml", text: fixed },
-		]);
-		expect(flagged).not.toContain(".github/workflows/install-smoke.yml::smoke");
-	});
+	it(
+		"stops flagging a job once the gate is replaced by a PR-eligible matrix cell",
+		() => {
+			const fixed = preFixInstallSmoke.replace(
+				"  smoke:\n    if: github.event_name != 'pull_request'\n",
+				"  smoke:\n",
+			);
+			expect(fixed).not.toBe(preFixInstallSmoke);
+			const { flagged } = findPullRequestUnreachableJobs([
+				{ path: ".github/workflows/install-smoke.yml", text: fixed },
+			]);
+			expect(flagged).not.toContain(
+				".github/workflows/install-smoke.yml::smoke",
+			);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// #3941 r3: the old JS-strict evaluation read a mixed-case pull-request
 	// gate as unreachable and demanded a registry exemption for a real PR job.
 	// The fold reads GitHub's case-insensitive equality, so no flag.
-	it("does not flag a mixed-case pull-request gate as unreachable", () => {
-		const file = [
-			"on:",
-			"  pull_request:",
-			"jobs:",
-			"  mixed:",
-			"    if: github.event_name == 'PULL_REQUEST'",
-			"    runs-on: ubuntu-latest",
-			"    steps:",
-			"      - run: echo mixed",
-			"",
-		].join("\n");
-		const { flagged } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/fixture.yml", text: file },
-		]);
-		expect(flagged).toEqual([]);
-	});
+	it(
+		"does not flag a mixed-case pull-request gate as unreachable",
+		() => {
+			const file = [
+				"on:",
+				"  pull_request:",
+				"jobs:",
+				"  mixed:",
+				"    if: github.event_name == 'PULL_REQUEST'",
+				"    runs-on: ubuntu-latest",
+				"    steps:",
+				"      - run: echo mixed",
+				"",
+			].join("\n");
+			const { flagged } = findPullRequestUnreachableJobs([
+				{ path: ".github/workflows/fixture.yml", text: file },
+			]);
+			expect(flagged).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// #3941 r4 (F6): the quoted-prose pair is TRUE on a pull request (two
 	// constant strings differ), so a real PR job must not be flagged
 	// unreachable. The pre-fix raw substitution corrupted the DATA and read it as
 	// false.
-	it("does not flag a true constant quoted-prose pair", () => {
-		const quotedPair = `'github.event_name' != '"pull_request"' && 'github.event_name' != '"pull_request_target"'`;
-		const file = [
-			"on:",
-			"  pull_request:",
-			"jobs:",
-			"  quoted:",
-			`    if: ${JSON.stringify(quotedPair)}`,
-			"    runs-on: ubuntu-latest",
-			"    steps:",
-			"      - run: echo quoted",
-			"",
-		].join("\n");
-		const { flagged } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/fixture.yml", text: file },
-		]);
-		expect(flagged).toEqual([]);
-	});
+	it(
+		"does not flag a true constant quoted-prose pair",
+		() => {
+			const quotedPair = `'github.event_name' != '"pull_request"' && 'github.event_name' != '"pull_request_target"'`;
+			const file = [
+				"on:",
+				"  pull_request:",
+				"jobs:",
+				"  quoted:",
+				`    if: ${JSON.stringify(quotedPair)}`,
+				"    runs-on: ubuntu-latest",
+				"    steps:",
+				"      - run: echo quoted",
+				"",
+			].join("\n");
+			const { flagged } = findPullRequestUnreachableJobs([
+				{ path: ".github/workflows/fixture.yml", text: file },
+			]);
+			expect(flagged).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// Round 2, F1: GitHub Actions accepts THREE spellings of `on:` -- a
 	// mapping (`on:\n  pull_request:`), a bare string (`on: pull_request`)
@@ -418,89 +454,105 @@ describe("the #3043 shape is what this sweep flags", () => {
 	// mapping form today, which is exactly why this was invisible: the
 	// sweep's whole purpose is the NEXT member, and the next member is free
 	// to use any spelling GitHub accepts.
-	it("flags the #3043 shape under the list form of `on:` (round 2, F1)", () => {
-		const listForm = [
-			"name: install smoke",
-			"on: [push, pull_request]",
-			"jobs:",
-			"  smoke:",
-			"    if: github.event_name != 'pull_request'",
-			"    runs-on: ubuntu-latest",
-			"    steps:",
-			"      - run: echo smoke",
-			"",
-		].join("\n");
-		const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/install-smoke.yml", text: listForm },
-		]);
-		expect(jobsExamined).toBe(1);
-		expect(flagged).toEqual([".github/workflows/install-smoke.yml::smoke"]);
-	});
+	it(
+		"flags the #3043 shape under the list form of `on:` (round 2, F1)",
+		() => {
+			const listForm = [
+				"name: install smoke",
+				"on: [push, pull_request]",
+				"jobs:",
+				"  smoke:",
+				"    if: github.event_name != 'pull_request'",
+				"    runs-on: ubuntu-latest",
+				"    steps:",
+				"      - run: echo smoke",
+				"",
+			].join("\n");
+			const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
+				{ path: ".github/workflows/install-smoke.yml", text: listForm },
+			]);
+			expect(jobsExamined).toBe(1);
+			expect(flagged).toEqual([".github/workflows/install-smoke.yml::smoke"]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("flags the #3043 shape under the bare-string form of `on:` (round 2, F1)", () => {
-		const stringForm = [
-			"name: install smoke",
-			"on: pull_request",
-			"jobs:",
-			"  smoke:",
-			"    if: github.event_name != 'pull_request'",
-			"    runs-on: ubuntu-latest",
-			"    steps:",
-			"      - run: echo smoke",
-			"",
-		].join("\n");
-		const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/install-smoke.yml", text: stringForm },
-		]);
-		expect(jobsExamined).toBe(1);
-		expect(flagged).toEqual([".github/workflows/install-smoke.yml::smoke"]);
-	});
+	it(
+		"flags the #3043 shape under the bare-string form of `on:` (round 2, F1)",
+		() => {
+			const stringForm = [
+				"name: install smoke",
+				"on: pull_request",
+				"jobs:",
+				"  smoke:",
+				"    if: github.event_name != 'pull_request'",
+				"    runs-on: ubuntu-latest",
+				"    steps:",
+				"      - run: echo smoke",
+				"",
+			].join("\n");
+			const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
+				{ path: ".github/workflows/install-smoke.yml", text: stringForm },
+			]);
+			expect(jobsExamined).toBe(1);
+			expect(flagged).toEqual([".github/workflows/install-smoke.yml::smoke"]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// A LIST form that does not name pull_request stays out of scope, the
 	// same as the mapping form below -- the fix must widen the reader, not
 	// the scope.
-	it("does not flag a list-form workflow that never names pull_request (round 2, F1)", () => {
-		const nightlyList = [
-			"name: nightly",
-			"on: [schedule, workflow_dispatch]",
-			"jobs:",
-			"  nightly-only:",
-			"    if: github.event_name == 'schedule'",
-			"    runs-on: ubuntu-latest",
-			"    steps:",
-			"      - run: echo nightly",
-			"",
-		].join("\n");
-		const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/nightly.yml", text: nightlyList },
-		]);
-		expect(flagged).toEqual([]);
-		expect(jobsExamined).toBe(0);
-	});
+	it(
+		"does not flag a list-form workflow that never names pull_request (round 2, F1)",
+		() => {
+			const nightlyList = [
+				"name: nightly",
+				"on: [schedule, workflow_dispatch]",
+				"jobs:",
+				"  nightly-only:",
+				"    if: github.event_name == 'schedule'",
+				"    runs-on: ubuntu-latest",
+				"    steps:",
+				"      - run: echo nightly",
+				"",
+			].join("\n");
+			const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
+				{ path: ".github/workflows/nightly.yml", text: nightlyList },
+			]);
+			expect(flagged).toEqual([]);
+			expect(jobsExamined).toBe(0);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// A workflow a pull request cannot trigger at all is deliberately out of
 	// scope (blind spot 1 in the header): the nightly lanes are nightly on
 	// purpose, and flagging all of them would bury the real signal.
-	it("does not flag a job in a workflow with no pull_request trigger", () => {
-		const nightly = [
-			"name: nightly",
-			"on:",
-			"  schedule:",
-			"    - cron: '0 6 * * *'",
-			"jobs:",
-			"  nightly-only:",
-			"    if: github.event_name == 'schedule'",
-			"    runs-on: ubuntu-latest",
-			"    steps:",
-			"      - run: echo nightly",
-			"",
-		].join("\n");
-		const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
-			{ path: ".github/workflows/nightly.yml", text: nightly },
-		]);
-		expect(flagged).toEqual([]);
-		expect(jobsExamined).toBe(0);
-	});
+	it(
+		"does not flag a job in a workflow with no pull_request trigger",
+		() => {
+			const nightly = [
+				"name: nightly",
+				"on:",
+				"  schedule:",
+				"    - cron: '0 6 * * *'",
+				"jobs:",
+				"  nightly-only:",
+				"    if: github.event_name == 'schedule'",
+				"    runs-on: ubuntu-latest",
+				"    steps:",
+				"      - run: echo nightly",
+				"",
+			].join("\n");
+			const { flagged, jobsExamined } = findPullRequestUnreachableJobs([
+				{ path: ".github/workflows/nightly.yml", text: nightly },
+			]);
+			expect(flagged).toEqual([]);
+			expect(jobsExamined).toBe(0);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 
 describe("the reachability model itself", () => {
@@ -524,7 +576,7 @@ describe("the reachability model itself", () => {
 		],
 		// A non-event gate is permissive: an upstream success and a truthy
 		// output are the model's reading.
-		["needs.detect-lockfile-change.outputs.changed == 'true'", true],
+		["needs.upstream.outputs.changed == 'true'", true],
 		["github.event.pull_request.user.login != 'dependabot[bot]'", true],
 		["github.event.workflow_run.conclusion == 'failure'", false],
 	])("%s -> reachable=%s", (expr, expected) => {
@@ -684,6 +736,7 @@ describe("the reachability model itself", () => {
 				/unsupported expression/,
 			);
 		},
+		TREE_WALK_TIMEOUT_MS,
 	);
 
 	// #3941 r6 (F9): `1 == fromJSON('1')` is supported, not refused: the right
@@ -692,26 +745,30 @@ describe("the reachability model itself", () => {
 	// load-bearing -- forcing it false folds the call as a literal and throws a
 	// raw `SyntaxError` from `new Function`. A job gated on the expression is
 	// reachable, and its advisory declaration is still named.
-	it("keeps a comparison whose right operand is a call, not a literal", () => {
-		expect(isPullRequestReachable("1 == fromJSON('1')")).toBe(true);
-		const file: WorkflowFile = {
-			path: ".github/workflows/fixture.yml",
-			text: [
-				"on:",
-				"  pull_request:",
-				"jobs:",
-				"  probe:",
-				"    name: probe (advisory)",
-				"    continue-on-error: true",
-				"    if: 1 == fromJSON('1')",
-			].join("\n"),
-		};
-		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
-		expect(findUndeclaredAdvisoryJobs([file])).toEqual({
-			flagged: [],
-			advisoryJobs: [".github/workflows/fixture.yml::probe"],
-		});
-	});
+	it(
+		"keeps a comparison whose right operand is a call, not a literal",
+		() => {
+			expect(isPullRequestReachable("1 == fromJSON('1')")).toBe(true);
+			const file: WorkflowFile = {
+				path: ".github/workflows/fixture.yml",
+				text: [
+					"on:",
+					"  pull_request:",
+					"jobs:",
+					"  probe:",
+					"    name: probe (advisory)",
+					"    continue-on-error: true",
+					"    if: 1 == fromJSON('1')",
+				].join("\n"),
+			};
+			expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
+			expect(findUndeclaredAdvisoryJobs([file])).toEqual({
+				flagged: [],
+				advisoryJobs: [".github/workflows/fixture.yml::probe"],
+			});
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// #3941 r5 (F8.1): GitHub's expression grammar has single-quoted strings
 	// only. A double-quoted literal is invalid, and the model names the
@@ -831,143 +888,175 @@ describe("reachable and gating are two columns (#3087)", () => {
 		text: ["on:", "  pull_request:", "  push:", "jobs:", jobs].join("\n"),
 	});
 
-	it("flags a PR-reachable continue-on-error job whose name is not advisory", () => {
-		const file = workflow(
-			[
-				"  mise-repro:",
-				"    name: mise repro (#285) · ${{ matrix.os }}",
-				"    continue-on-error: true",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo mise",
-			].join("\n"),
-		);
-		expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::mise-repro",
-		]);
-	});
+	it(
+		"flags a PR-reachable continue-on-error job whose name is not advisory",
+		() => {
+			const file = workflow(
+				[
+					"  mise-repro:",
+					"    name: mise repro (#285) · ${{ matrix.os }}",
+					"    continue-on-error: true",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo mise",
+				].join("\n"),
+			);
+			expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::mise-repro",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("flags an unnamed advisory job, whose check-run name is its key", () => {
-		const file = workflow(
-			[
-				"  drift:",
-				"    continue-on-error: true",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo drift",
-			].join("\n"),
-		);
-		expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::drift",
-		]);
-	});
+	it(
+		"flags an unnamed advisory job, whose check-run name is its key",
+		() => {
+			const file = workflow(
+				[
+					"  drift:",
+					"    continue-on-error: true",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo drift",
+				].join("\n"),
+			);
+			expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::drift",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("does not flag an advisory job that declares it in its name", () => {
-		const file = workflow(
-			[
-				"  mise-repro:",
-				"    name: mise repro (#285) · ${{ matrix.os }} (advisory)",
-				"    continue-on-error: true",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo mise",
-			].join("\n"),
-		);
-		const result = findUndeclaredAdvisoryJobs([file]);
-		expect(result.flagged).toEqual([]);
-		expect(result.advisoryJobs).toEqual([
-			".github/workflows/fixture.yml::mise-repro",
-		]);
-	});
+	it(
+		"does not flag an advisory job that declares it in its name",
+		() => {
+			const file = workflow(
+				[
+					"  mise-repro:",
+					"    name: mise repro (#285) · ${{ matrix.os }} (advisory)",
+					"    continue-on-error: true",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo mise",
+				].join("\n"),
+			);
+			const result = findUndeclaredAdvisoryJobs([file]);
+			expect(result.flagged).toEqual([]);
+			expect(result.advisoryJobs).toEqual([
+				".github/workflows/fixture.yml::mise-repro",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("flags a job whose continue-on-error expression holds on a pull request", () => {
-		const file = workflow(
-			[
-				"  probe:",
-				"    name: probe",
-				"    continue-on-error: ${{ github.event_name == 'pull_request' }}",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo probe",
-			].join("\n"),
-		);
-		expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::probe",
-		]);
-	});
+	it(
+		"flags a job whose continue-on-error expression holds on a pull request",
+		() => {
+			const file = workflow(
+				[
+					"  probe:",
+					"    name: probe",
+					"    continue-on-error: ${{ github.event_name == 'pull_request' }}",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo probe",
+				].join("\n"),
+			);
+			expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::probe",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("does not count a job that blocks on pull_request (option 1's shape)", () => {
-		const file = workflow(
-			[
-				"  mise-repro:",
-				"    name: mise repro (#285)",
-				"    continue-on-error: ${{ github.event_name != 'pull_request' }}",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo mise",
-			].join("\n"),
-		);
-		expect(findUndeclaredAdvisoryJobs([file])).toEqual({
-			flagged: [],
-			advisoryJobs: [],
-		});
-	});
+	it(
+		"does not count a job that blocks on pull_request (option 1's shape)",
+		() => {
+			const file = workflow(
+				[
+					"  mise-repro:",
+					"    name: mise repro (#285)",
+					"    continue-on-error: ${{ github.event_name != 'pull_request' }}",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo mise",
+				].join("\n"),
+			);
+			expect(findUndeclaredAdvisoryJobs([file])).toEqual({
+				flagged: [],
+				advisoryJobs: [],
+			});
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("does not count an advisory job a pull request cannot run", () => {
-		const file = workflow(
-			[
-				"  nightly:",
-				"    if: github.event_name != 'pull_request'",
-				"    continue-on-error: true",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo nightly",
-			].join("\n"),
-		);
-		expect(findUndeclaredAdvisoryJobs([file]).advisoryJobs).toEqual([]);
-	});
+	it(
+		"does not count an advisory job a pull request cannot run",
+		() => {
+			const file = workflow(
+				[
+					"  nightly:",
+					"    if: github.event_name != 'pull_request'",
+					"    continue-on-error: true",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo nightly",
+				].join("\n"),
+			);
+			expect(findUndeclaredAdvisoryJobs([file]).advisoryJobs).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// #3941 r3 caller witness: a mixed-case pull-request gate is a REAL
 	// pull-request job. The old JS-strict evaluation read it as unreachable and
 	// this sweep skipped its missing advisory marker; the fold keeps it in the
 	// population.
-	it("names a mixed-case advisory job instead of skipping it", () => {
-		const file = workflow(
-			[
-				"  probe:",
-				"    name: probe",
-				"    if: github.event_name == 'PULL_REQUEST'",
-				"    continue-on-error: true",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo probe",
-			].join("\n"),
-		);
-		expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::probe",
-		]);
-	});
+	it(
+		"names a mixed-case advisory job instead of skipping it",
+		() => {
+			const file = workflow(
+				[
+					"  probe:",
+					"    name: probe",
+					"    if: github.event_name == 'PULL_REQUEST'",
+					"    continue-on-error: true",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo probe",
+				].join("\n"),
+			);
+			expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::probe",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// #3941 r4 (F6) caller witness: the quoted-prose pair is TRUE on a pull
 	// request, so this job is PR-reachable. Skipping it would drop a real
 	// advisory job from the sweep.
-	it("names an advisory job whose quoted-prose gate is true on a pull request", () => {
-		const quotedPair = `'github.event_name' != '"pull_request"' && 'github.event_name' != '"pull_request_target"'`;
-		const file = workflow(
-			[
-				"  probe:",
-				"    name: probe",
-				`    if: ${JSON.stringify(quotedPair)}`,
-				"    continue-on-error: true",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - run: echo probe",
-			].join("\n"),
-		);
-		expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::probe",
-		]);
-	});
+	it(
+		"names an advisory job whose quoted-prose gate is true on a pull request",
+		() => {
+			const quotedPair = `'github.event_name' != '"pull_request"' && 'github.event_name' != '"pull_request_target"'`;
+			const file = workflow(
+				[
+					"  probe:",
+					"    name: probe",
+					`    if: ${JSON.stringify(quotedPair)}`,
+					"    continue-on-error: true",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - run: echo probe",
+				].join("\n"),
+			);
+			expect(findUndeclaredAdvisoryJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::probe",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 
 // #3085 gap 2: the #3043 exclusion moved out of `if:` and into the matrix.
@@ -981,96 +1070,120 @@ describe("matrix-level evasion is the same unreachability (#3085)", () => {
 		),
 	});
 
-	it("flags a job whose only matrix axis is empty on a pull request", () => {
-		const file = workflow([
-			"  smoke:",
-			"    runs-on: ubuntu-latest",
-			"    strategy:",
-			"      matrix:",
-			"        pm: ${{ github.event_name == 'pull_request' && fromJSON('[]') || fromJSON('[\"npm\"]') }}",
-			"    steps:",
-			"      - run: echo smoke",
-		]);
-		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::smoke",
-		]);
-	});
+	it(
+		"flags a job whose only matrix axis is empty on a pull request",
+		() => {
+			const file = workflow([
+				"  smoke:",
+				"    runs-on: ubuntu-latest",
+				"    strategy:",
+				"      matrix:",
+				"        pm: ${{ github.event_name == 'pull_request' && fromJSON('[]') || fromJSON('[\"npm\"]') }}",
+				"    steps:",
+				"      - run: echo smoke",
+			]);
+			expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::smoke",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("flags a job whose exclude removes every cell on a pull request", () => {
-		const file = workflow([
-			"  smoke:",
-			"    runs-on: ${{ matrix.os }}",
-			"    strategy:",
-			"      matrix:",
-			"        os: [ubuntu-latest, macos-latest]",
-			'        exclude: ${{ github.event_name == \'pull_request\' && fromJSON(\'[{"os":"ubuntu-latest"},{"os":"macos-latest"}]\') || fromJSON(\'[]\') }}',
-			"    steps:",
-			"      - run: echo smoke",
-		]);
-		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::smoke",
-		]);
-	});
+	it(
+		"flags a job whose exclude removes every cell on a pull request",
+		() => {
+			const file = workflow([
+				"  smoke:",
+				"    runs-on: ${{ matrix.os }}",
+				"    strategy:",
+				"      matrix:",
+				"        os: [ubuntu-latest, macos-latest]",
+				'        exclude: ${{ github.event_name == \'pull_request\' && fromJSON(\'[{"os":"ubuntu-latest"},{"os":"macos-latest"}]\') || fromJSON(\'[]\') }}',
+				"    steps:",
+				"      - run: echo smoke",
+			]);
+			expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::smoke",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("does not flag install-smoke's narrowing, which keeps one PR cell", () => {
-		const file = workflow([
-			"  mise-repro:",
-			"    runs-on: ${{ matrix.os }}",
-			"    strategy:",
-			"      matrix:",
-			"        os: [ubuntu-latest, macos-latest]",
-			"        pi_via: ${{ github.event_name == 'pull_request' && fromJSON('[\"mise-node\"]') || fromJSON('[\"mise-node\", \"mise-npm-backend\"]') }}",
-			"        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{\"os\":\"macos-latest\"}]') || fromJSON('[]') }}",
-			"    steps:",
-			"      - run: echo mise",
-		]);
-		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
-	});
+	it(
+		"does not flag install-smoke's narrowing, which keeps one PR cell",
+		() => {
+			const file = workflow([
+				"  mise-repro:",
+				"    runs-on: ${{ matrix.os }}",
+				"    strategy:",
+				"      matrix:",
+				"        os: [ubuntu-latest, macos-latest]",
+				"        pi_via: ${{ github.event_name == 'pull_request' && fromJSON('[\"mise-node\"]') || fromJSON('[\"mise-node\", \"mise-npm-backend\"]') }}",
+				"        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{\"os\":\"macos-latest\"}]') || fromJSON('[]') }}",
+				"    steps:",
+				"      - run: echo mise",
+			]);
+			expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("counts an include-only matrix as its include entries", () => {
-		const file = workflow([
-			"  lanes:",
-			"    runs-on: ubuntu-latest",
-			"    strategy:",
-			"      matrix:",
-			"        include: ${{ github.event_name == 'pull_request' && fromJSON('[{\"lane\":\"linux\"}]') || fromJSON('[]') }}",
-			"    steps:",
-			"      - run: echo lanes",
-		]);
-		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
-	});
+	it(
+		"counts an include-only matrix as its include entries",
+		() => {
+			const file = workflow([
+				"  lanes:",
+				"    runs-on: ubuntu-latest",
+				"    strategy:",
+				"      matrix:",
+				"        include: ${{ github.event_name == 'pull_request' && fromJSON('[{\"lane\":\"linux\"}]') || fromJSON('[]') }}",
+				"    steps:",
+				"      - run: echo lanes",
+			]);
+			expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("keeps an include entry that matches no combination as its own cell", () => {
-		const file = workflow([
-			"  smoke:",
-			"    runs-on: ubuntu-latest",
-			"    strategy:",
-			"      matrix:",
-			"        os: [ubuntu-latest]",
-			"        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{\"os\":\"ubuntu-latest\"}]') || fromJSON('[]') }}",
-			"        include: ${{ github.event_name == 'pull_request' && fromJSON('[{\"os\":\"windows-latest\"}]') || fromJSON('[]') }}",
-			"    steps:",
-			"      - run: echo smoke",
-		]);
-		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
-	});
+	it(
+		"keeps an include entry that matches no combination as its own cell",
+		() => {
+			const file = workflow([
+				"  smoke:",
+				"    runs-on: ubuntu-latest",
+				"    strategy:",
+				"      matrix:",
+				"        os: [ubuntu-latest]",
+				"        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{\"os\":\"ubuntu-latest\"}]') || fromJSON('[]') }}",
+				"        include: ${{ github.event_name == 'pull_request' && fromJSON('[{\"os\":\"windows-latest\"}]') || fromJSON('[]') }}",
+				"    steps:",
+				"      - run: echo smoke",
+			]);
+			expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("requires the if: and a non-empty matrix under the same pull_request context", () => {
-		// synchronize-only if:, and a matrix empty on synchronize only.
-		const file = workflow([
-			"  split:",
-			"    if: github.event.action == 'synchronize'",
-			"    runs-on: ubuntu-latest",
-			"    strategy:",
-			"      matrix:",
-			"        leg: ${{ github.event.action == 'synchronize' && fromJSON('[]') || fromJSON('[\"a\"]') }}",
-			"    steps:",
-			"      - run: echo split",
-		]);
-		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([
-			".github/workflows/fixture.yml::split",
-		]);
-	});
+	it(
+		"requires the if: and a non-empty matrix under the same pull_request context",
+		() => {
+			// synchronize-only if:, and a matrix empty on synchronize only.
+			const file = workflow([
+				"  split:",
+				"    if: github.event.action == 'synchronize'",
+				"    runs-on: ubuntu-latest",
+				"    strategy:",
+				"      matrix:",
+				"        leg: ${{ github.event.action == 'synchronize' && fromJSON('[]') || fromJSON('[\"a\"]') }}",
+				"    steps:",
+				"      - run: echo split",
+			]);
+			expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([
+				".github/workflows/fixture.yml::split",
+			]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 
 // #3085 gap 1: the sweep above judges the JOBS of workflows a pull request can
@@ -1090,29 +1203,33 @@ describe("matrix-level evasion is the same unreachability (#3085)", () => {
 describe("workflow files no pull request executes (#3085 gap 1)", () => {
 	const files = repoWorkflowFiles();
 
-	it("reads every workflow's triggers exactly as js-yaml does", () => {
-		for (const file of files) {
-			const expected = loadWorkflow(file.text).on;
-			const expectedNames = Array.isArray(expected)
-				? expected.map(String)
-				: typeof expected === "string"
-					? [expected]
-					: Object.keys((expected ?? {}) as Record<string, unknown>);
-			const triggers = readWorkflowTriggers(file.text);
-			expect(triggers, file.path).not.toBeNull();
-			expect([...(triggers?.keys() ?? [])].sort(), file.path).toEqual(
-				expectedNames.sort(),
-			);
-			const pr = (expected as Record<string, Record<string, unknown> | null>)
-				?.pull_request;
-			if (pr && typeof pr === "object") {
-				const read = triggers?.get("pull_request");
-				expect(read?.paths, file.path).toEqual(pr.paths);
-				expect(read?.types, file.path).toEqual(pr.types);
-				expect(read?.unparsed, file.path).toBeUndefined();
+	it(
+		"reads every workflow's triggers exactly as js-yaml does",
+		() => {
+			for (const file of files) {
+				const expected = loadWorkflow(file.text).on;
+				const expectedNames = Array.isArray(expected)
+					? expected.map(String)
+					: typeof expected === "string"
+						? [expected]
+						: Object.keys((expected ?? {}) as Record<string, unknown>);
+				const triggers = readWorkflowTriggers(file.text);
+				expect(triggers, file.path).not.toBeNull();
+				expect([...(triggers?.keys() ?? [])].sort(), file.path).toEqual(
+					expectedNames.sort(),
+				);
+				const pr = (expected as Record<string, Record<string, unknown> | null>)
+					?.pull_request;
+				if (pr && typeof pr === "object") {
+					const read = triggers?.get("pull_request");
+					expect(read?.paths, file.path).toEqual(pr.paths);
+					expect(read?.types, file.path).toEqual(pr.types);
+					expect(read?.unparsed, file.path).toBeUndefined();
+				}
 			}
-		}
-	});
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// Recurrence: PR #4020 round 1 read `pull_request: *pr` as an empty trigger
 	// (a `types: [closed]` workflow avoided the rule). Every alias form the
@@ -1162,40 +1279,44 @@ describe("workflow files no pull request executes (#3085 gap 1)", () => {
 		);
 	});
 
-	it("classifies the real tree into PR-executed and not, with the known members on each side", () => {
-		const notExecuting = files
-			.filter((file) => !classifyWorkflowEdit(file.text, file.path).executes)
-			.map((file) => basename(file.path));
-		const executing = files
-			.filter((file) => classifyWorkflowEdit(file.text, file.path).executes)
-			.map((file) => basename(file.path));
-		// Measured 2026-10-07 on 20 files: 6 execute on a PR (ci-infra-kill-rerun,
-		// ci, install-smoke, lint, osv-scan, pr-metadata); 14 do not (12 with no
-		// pull_request trigger, 2 pull_request_target only). Floors, not an exact
-		// registry: a registry of every no-PR workflow is what the issue refused
-		// to build, and a narrowed walk or a reader that stops seeing triggers
-		// must still red (AGENTS.md shape 10).
-		expect(notExecuting.length).toBeGreaterThanOrEqual(14);
-		expect(notExecuting).toEqual(
-			expect.arrayContaining([
-				"tool-smoke.yml",
-				"release.yml",
-				"stale.yml",
-				// pull_request_target only: the base branch's copy runs, not the edit.
-				"greetings.yml",
-				"close-keyword-verification.yml",
-			]),
-		);
-		expect(executing).toEqual(
-			expect.arrayContaining([
-				"ci.yml",
-				"lint.yml",
-				"pr-metadata.yml",
-				"install-smoke.yml",
-			]),
-		);
-		expect(executing.length).toBeGreaterThanOrEqual(6);
-	});
+	it(
+		"classifies the real tree into PR-executed and not, with the known members on each side",
+		() => {
+			const notExecuting = files
+				.filter((file) => !classifyWorkflowEdit(file.text, file.path).executes)
+				.map((file) => basename(file.path));
+			const executing = files
+				.filter((file) => classifyWorkflowEdit(file.text, file.path).executes)
+				.map((file) => basename(file.path));
+			// Measured 2026-10-07 on 20 files: 6 execute on a PR (ci-infra-kill-rerun,
+			// ci, install-smoke, lint, osv-scan, pr-metadata); 14 do not (12 with no
+			// pull_request trigger, 2 pull_request_target only). Floors, not an exact
+			// registry: a registry of every no-PR workflow is what the issue refused
+			// to build, and a narrowed walk or a reader that stops seeing triggers
+			// must still red (AGENTS.md shape 10).
+			expect(notExecuting.length).toBeGreaterThanOrEqual(14);
+			expect(notExecuting).toEqual(
+				expect.arrayContaining([
+					"tool-smoke.yml",
+					"release.yml",
+					"stale.yml",
+					// pull_request_target only: the base branch's copy runs, not the edit.
+					"greetings.yml",
+					"close-keyword-verification.yml",
+				]),
+			);
+			expect(executing).toEqual(
+				expect.arrayContaining([
+					"ci.yml",
+					"lint.yml",
+					"pr-metadata.yml",
+					"install-smoke.yml",
+				]),
+			);
+			expect(executing.length).toBeGreaterThanOrEqual(6);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// The blind spot as a fixture: the job-level sweep reads clean over a
 	// schedule + workflow_dispatch file (stryker-nightly's shape, never on
@@ -1218,17 +1339,21 @@ describe("workflow files no pull request executes (#3085 gap 1)", () => {
 		].join("\n"),
 	};
 
-	it("the job sweep examines nothing in a no-PR-trigger file, the file rule does not", () => {
-		expect(findPullRequestUnreachableJobs([nightly])).toEqual({
-			flagged: [],
-			jobsExamined: 0,
-		});
-		const errors = evaluateWorkflowRunEvidence({
-			changedFiles: [nightly.path],
-			body: "No run quoted.",
-			readWorkflow: () => nightly.text,
-		});
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("it has no pull_request trigger");
-	});
+	it(
+		"the job sweep examines nothing in a no-PR-trigger file, the file rule does not",
+		() => {
+			expect(findPullRequestUnreachableJobs([nightly])).toEqual({
+				flagged: [],
+				jobsExamined: 0,
+			});
+			const errors = evaluateWorkflowRunEvidence({
+				changedFiles: [nightly.path],
+				body: "No run quoted.",
+				readWorkflow: () => nightly.text,
+			});
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toContain("it has no pull_request trigger");
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });

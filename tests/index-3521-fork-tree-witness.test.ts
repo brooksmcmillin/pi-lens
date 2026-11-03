@@ -29,6 +29,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
+	createEditToolDefinition,
 	createReadToolDefinition,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
@@ -42,7 +43,14 @@ import {
 	vi,
 } from "vitest";
 import extension from "../index.js";
+import { waitFor } from "./clients/interleaving-kit.js";
+import { scaledTestTimeout } from "./support/test-timeout-scale.js";
 import { makeLspServiceDouble } from "./support/lsp-service-double.js";
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "./support/lsp-service-seam.js";
+import { readNdjsonRows } from "./support/ndjson-rows.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -87,22 +95,10 @@ import {
 // per-worker PI_LENS_HOME (#3721) keeps those writes off every other worker's
 // sink; the loggers bind their paths at load, so the home is the harness's.
 
-/**
- * #3676: the LSP service is the one process boundary the quick fix's real
- * apply path crosses. Armed only by the #3676 describe; every other test in
- * this file sees the real service.
- */
-const lspDouble = vi.hoisted(() => ({ service: undefined as unknown }));
-vi.mock("../clients/lsp/capabilities.js", async (importOriginal) => {
-	const original =
-		await importOriginal<typeof import("../clients/lsp/capabilities.js")>();
-	return {
-		...original,
-		getLSPService: () =>
-			(lspDouble.service as ReturnType<typeof original.getLSPService>) ??
-			original.getLSPService(),
-	};
-});
+// #4830: `sidecarSettled` waits up to 10s (scaled) for the fire-and-forget
+// sidecar write, which the 5s default test timeout would cut off with a
+// message that names no wait. Keep the test budget above that deadline.
+vi.setConfig({ testTimeout: scaledTestTimeout(30_000) });
 
 /**
  * #3613: the dispatch pipeline is doubled at its boundary for the S4 turn
@@ -166,6 +162,7 @@ const runtimes: AgentSessionRuntime[] = [];
 const extensionErrors: unknown[] = [];
 
 beforeEach(async () => {
+	await installLspServiceDouble();
 	_resetSessionLifecycleForTests();
 	env = setupTestEnvironment(TMP_PREFIX);
 	root = env.tmpDir;
@@ -423,13 +420,12 @@ const ZERO_READ = expect.stringMatching(/^BLOCK: .*Edit without read/);
 
 async function branchRetainedRows(): Promise<Record<string, unknown>[]> {
 	await flushLatencyLog();
-	const text = fs.existsSync(getLatencyLogPath())
-		? fs.readFileSync(getLatencyLogPath(), "utf8")
-		: "";
-	return text
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => JSON.parse(line) as Record<string, unknown>)
+	const read = readNdjsonRows(getLatencyLogPath());
+	// A line this witness cannot parse is not a row it can reason about: red
+	// rather than let a corrupt write lower a count (the old reader threw, which
+	// named no row; `skipped` is the count the throw could not give).
+	expect(read.skipped).toBe(0);
+	return read.rows
 		.filter((row) => row.phase === "read_guard_branch_retained")
 		.map((row) => row.metadata as Record<string, unknown>);
 }
@@ -445,9 +441,20 @@ async function sidecarSettled(sessionId: string): Promise<void> {
 		"sessions",
 		`${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`,
 	);
-	for (let i = 0; i < 5000 && !fs.existsSync(file); i++)
-		await new Promise<void>((resolve) => setImmediate(resolve));
-	expect(fs.existsSync(file), `sidecar ${file}`).toBe(true);
+	// Recurrence: #4830, where a 5000-turn spin ended before the write landed on
+	// a loaded CI runner. Wait on a real-clock deadline instead; the yield stays
+	// `setImmediate` (no timer). That settles only while `setImmediate` and
+	// `Date` stay real: under a default `vi.useFakeTimers()` both are faked and
+	// the wait could neither yield nor reach its deadline. It holds under a
+	// narrow `toFake` list such as `["setTimeout", "clearTimeout"]`.
+	await waitFor(
+		() => (fs.existsSync(file) ? "present" : `sidecar absent: ${file}`),
+		(state) => state === "present",
+		{
+			timeoutMs: 10_000,
+			yieldControl: () => new Promise<void>((resolve) => setImmediate(resolve)),
+		},
+	);
 }
 
 /** pi-lens persists its sidecar at turn_end; emit one the way pi does. */
@@ -680,11 +687,13 @@ describe("#3521 /tree keeps only the reads on the new branch", () => {
 		expect(await c.editLine("post_a", a, 2, "Y", false)).toBe("ALLOW");
 	});
 
-	it("wipes a live concurrent secondary's read on a primary /tree (accepted residual, #3521 F2)", async () => {
-		// Pinned so a later fix flips it deliberately: the read guard is the
-		// module-level runtime's, shared with an in-process subagent, and the
-		// primary's retainBranch drops every id its own branch lacks. The cost
-		// is one re-read in the subagent, never an allow.
+	it("keeps a live concurrent secondary's read across a primary /tree (#3521 F2, closed by #4942)", async () => {
+		// RECURRENCE GUARDED: #3521 F2's residual, pinned until #4942 flipped it.
+		// The read guard was the module-level runtime's, shared with an
+		// in-process subagent, so the primary's retainBranch dropped every id its
+		// own branch lacked, the subagent's read included (one needless re-read).
+		// The subagent now owns a guard of its own (`readGuardFor`), which the
+		// primary's /tree never touches.
 		const primary = conversation(
 			await startRuntime(SessionManager.inMemory(cwd)),
 		);
@@ -704,8 +713,8 @@ describe("#3521 /tree keeps only the reads on the new branch", () => {
 
 		await primary.S().navigateTree(p1);
 
-		expect(await secondary.editLine("sub_edit_post", f, 3, "Y", false)).toEqual(
-			ZERO_READ,
+		expect(await secondary.editLine("sub_edit_post", f, 3, "Y", false)).toBe(
+			"ALLOW",
 		);
 	});
 
@@ -798,7 +807,6 @@ describe("#3676 the quick fix is credited to the branch its report was produced 
 
 	afterEach(() => {
 		for (const flag of ACTIONABLE_FLAGS) FLAGS.delete(flag);
-		lspDouble.service = undefined;
 	});
 
 	/** The LSP boundary: a warning with a preferred quick fix, served while warm. */
@@ -807,32 +815,34 @@ describe("#3676 the quick fix is credited to the branch its report was produced 
 			start: { line: 0, character: 0 },
 			end: { line: 0, character: 5 },
 		};
-		lspDouble.service = makeLspServiceDouble({
-			supportsLSP: () => warm(),
-			openFile: async () => undefined,
-			getLastKnownDiagnostics: () => [
-				{
-					severity: 2,
-					message: "replace this value",
-					code: "fix-value",
-					source: "eslint",
-					serverId: "eslint",
-					range,
-				},
-			],
-			codeAction: async () => [
-				{
-					title: "Fix it",
-					kind: "quickfix",
-					isPreferred: true,
-					edit: {
-						changes: {
-							[pathToFileURL(file).href]: [{ range, newText: "FIXED" }],
+		installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => warm(),
+				openFile: async () => undefined,
+				getLastKnownDiagnostics: () => [
+					{
+						severity: 2,
+						message: "replace this value",
+						code: "fix-value",
+						source: "eslint",
+						serverId: "eslint",
+						range,
+					},
+				],
+				codeAction: async () => [
+					{
+						title: "Fix it",
+						kind: "quickfix",
+						isPreferred: true,
+						edit: {
+							changes: {
+								[pathToFileURL(file).href]: [{ range, newText: "FIXED" }],
+							},
 						},
 					},
-				},
-			],
-		});
+				],
+			}),
+		);
 	}
 
 	const settle = (runtime: AgentSessionRuntime) =>
@@ -1241,13 +1251,11 @@ describe("#3521 a resumed session keeps only its branch's reads", () => {
 /** The `session_scope_transition` rows (#3611), in write order. */
 async function latencyRows(phase: string): Promise<Record<string, unknown>[]> {
 	await flushLatencyLog();
-	const text = fs.existsSync(getLatencyLogPath())
-		? fs.readFileSync(getLatencyLogPath(), "utf8")
-		: "";
-	return text
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => JSON.parse(line) as Record<string, unknown>)
+	const read = readNdjsonRows(getLatencyLogPath());
+	// Same record as `branchRetainedRows`: the exact counts below (`toBe(0)`,
+	// `toBe(2)`) are only truthful when no line was dropped.
+	expect(read.skipped).toBe(0);
+	return read.rows
 		.filter((row) => row.phase === phase)
 		.map((row) => row.metadata as Record<string, unknown>);
 }
@@ -1981,19 +1989,19 @@ describe("#3612 a queued agent advisory follows /reload", () => {
 					.not.toContain("lost edit in a.rs");
 				// A secondary never looks for a slot.
 				expect.soft(missedSubjects()).toEqual([]);
-				// Accepted residual #3613 (S4, TLC `MutSecondaryReadShared`),
-				// pinned so S4 flips it: a secondary's edits are judged by the
-				// primary's read guard, so the primary's read of a.conf allows the
-				// subagent's edit, and the primary's own authorship policy decides
-				// its written file (carried on /reload and, since #3603, on a
-				// /fork whose branch shows the write). These read ZERO_READ before
-				// #3855 only because the subagent's own start wrongly took the
-				// primary slot and reset the guard.
+				// #4942 (closes the #3613 S4 residual this once pinned, TLC
+				// `MutSecondaryReadShared`): a secondary's edits are judged by the
+				// secondary's own read guard. The subagent read neither file, so
+				// the primary's read of a.conf and its authorship of the written
+				// file license nothing here. (These were ALLOW while the guard was
+				// shared.)
 				const s = conversation(subagent);
 				expect
 					.soft(await s.editLine("sub_written", written, 2, "Y", false))
-					.toBe("ALLOW");
-				expect.soft(await s.editLine("sub_a", a, 2, "Y", false)).toBe("ALLOW");
+					.toEqual(ZERO_READ);
+				expect
+					.soft(await s.editLine("sub_a", a, 2, "Y", false))
+					.toEqual(ZERO_READ);
 			});
 		}
 
@@ -3337,8 +3345,9 @@ describe("#3613 a concurrent secondary's turn leaves the primary's turn state al
 		runtime.session.sessionManager.getSessionId();
 
 	/**
-	 * An edit batch with one stale `oldText`: pi-lens applies the edit that
-	 * still matches and runs the post-edit pipeline itself, from tool_call.
+	 * An edit batch with one stale `oldText`: pi-lens narrows the call to the
+	 * edit that still matches (#5120), pi's own edit tool writes it, and the
+	 * post-edit pipeline runs at its tool_result.
 	 */
 	async function partialEdit(runtime: AgentSessionRuntime, file: string) {
 		const c = conversation(runtime);
@@ -3352,9 +3361,24 @@ describe("#3613 a concurrent secondary's turn leaves the primary's turn state al
 				{ oldText: "const gone = 0;", newText: "const gone = 1;" },
 			],
 		};
-		await runtime.session.agent.beforeToolCall?.({
-			toolCall: { type: "toolCall", id, name: "edit", arguments: args },
+		const toolCall = { type: "toolCall", id, name: "edit", arguments: args };
+		const verdict = (await runtime.session.agent.beforeToolCall?.({
+			toolCall,
 			args,
+		} as never)) as { block?: boolean } | undefined;
+		expect(verdict?.block).not.toBe(true);
+		const result = await createEditToolDefinition(cwd).execute(
+			id,
+			args,
+			undefined,
+			undefined,
+			{ cwd } as never,
+		);
+		await runtime.session.agent.afterToolCall?.({
+			toolCall,
+			args,
+			result: { content: result.content, details: result.details },
+			isError: false,
 		} as never);
 	}
 
@@ -3857,11 +3881,9 @@ describe("#3613 a concurrent secondary's turn leaves the primary's turn state al
 
 		await flushLatencyLog();
 		const turnIds = new Set(
-			fs
-				.readFileSync(getLatencyLogPath(), "utf8")
-				.split("\n")
-				.filter(Boolean)
-				.map((line) => (JSON.parse(line) as { turnId?: string }).turnId),
+			readNdjsonRows(getLatencyLogPath()).rows.map(
+				(row) => (row as { turnId?: string }).turnId,
+			),
 		);
 		expect({
 			subagent: turnIds.has(`${sessionIdOf(subagent)}:2`),

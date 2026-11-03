@@ -21,14 +21,6 @@ vi.mock("../../../clients/lsp/launch.js", async (importOriginal) => ({
 	admitProjectSuppliedTsserver: (tsserverPath: string) => tsserverPath,
 }));
 
-vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
-	...(await importActual<
-		typeof import("../../../clients/latency-logger.js")
-	>()),
-	logLatency: vi.fn(),
-	resetLatencyLog: vi.fn(),
-}));
-
 const dirs: string[] = [];
 
 beforeEach(async () => {

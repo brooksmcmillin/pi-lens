@@ -81,8 +81,11 @@ the brief gives.
   checkout the shell happens to sit in, and agent shells reset their working
   directory between calls. Never edit the main checkout: other lanes and the
   orchestrator read it, and its branch must not move under them.
-- **Teardown.** `rm` a symlinked `node_modules` before `git worktree remove`
-  (`ls -ld node_modules` first; unlink the link, never `rm -r` it). Removing the worktree over the link follows it
+- **Teardown.** Run `node scripts/worktree-remove.mjs <path>`: it unlinks a
+  symlinked `node_modules`, refuses a real directory, then runs `git worktree
+  remove` (#5111). By hand: `rm` a symlinked `node_modules` before `git
+  worktree remove` (`ls -ld node_modules` first; unlink the link, never `rm -r`
+  it). Removing the worktree over the link follows it
   and deletes the main checkout's install (#3173; the hook denies the removal
   and `AGENTS.md` "Commands and gates" says how `pr-worktree.mjs close` does
   it). A real `node_modules` directory is removed only after confirming the
@@ -143,10 +146,13 @@ the brief gives.
   is that summary and nothing else: the full evidence (probe transcripts,
   tables, mutation logs) goes in the declared deliverable file or, when there
   is none, `~/.local/share/pi-lens-orchestrator/tmp/<lane>-tmp/REPORT.md`, and
-  the summary names that path. The orchestrator reads the summary alone to
-  route the lane and opens the file only when routing a fix round, so a claim
-  made only in the file does not route. (Full reports pasted into the reply
-  were the largest orchestrator token cost on 2026-10-07.)
+  the summary names that path. The hand-back file a brief names is a required
+  lane record, kept outside the repo; the harness default against report `.md`
+  files does not cover it. A lane that skips the file has not delivered. The
+  orchestrator reads the summary alone to route the lane and opens the file only
+  when routing a fix round, so a claim made only in the file does not route.
+  (Full reports pasted into the reply were the largest orchestrator token cost
+  on 2026-10-07.)
 - **Handbacks between rounds.** Every lane's returned summary for PR #N is
   kept at `~/.local/share/pi-lens-orchestrator/tmp/handbacks/pr-<N>.md` (the
   orchestrator's hooks write it; a fixer may also write it). A reviewer or
@@ -201,7 +207,14 @@ Each pre-push head has a durable result record at
 `$(git rev-parse --git-common-dir)/pi-lens-prepush/<sha>.json`. It contains the
 head/base, timestamp, selected test files and their `changed`, `mirror`,
 `import`, `history`, or `governance` reason, plus passed/failed/skipped
-counts, the Vitest exit code, and wall time. Re-pushes overwrite that head's record; writes prune records
+counts, the Vitest exit code, and wall time. `base` is the ref the selection
+diffed. A `tests-complete` record carries `treeBound` only when the tests ran
+in a clean checkout of exactly that head (HEAD equal to it, no tracked
+edits before or after the run); other heads keep their previous record
+(`tests-not-started` after a pass, the run's own outcome after a failure). A re-push of a head
+whose `treeBound` record passed the same selection skips the build and tests,
+keeps the record and appends one `pre-push-skip` row to `pre-push.log` (#4724);
+any other re-push overwrites it. Writes prune records
 older than fourteen days. The provisional record is written before build and
 self-scan work with outcome `tests-not-started`; preparation failures update it
 to `build-failed` or `self-scan-failed`. The write uses a same-directory
@@ -214,14 +227,27 @@ foreground, push with the targeted and governance suites green and say that
 the full suite was delegated to CI.
 
 Pin `PI_LENS_HOME` and `PILENS_DATA_DIR` to `<worktree>/.probe-home` for
-probes, smoke scripts, and `npm install`/`npm ci` (`AGENTS.md` "Paths, data,
-and operating systems"); a test that inspects the install record also pins
+probes, smoke scripts, and `npm install`/`npm ci` (`docs/invariants/paths-os.md`
+"Paths, data, and operating systems"); a test that inspects the install record also pins
 `PI_LENS_INSTALL_LOG`. Never export them for a Vitest run: the setup keeps
 the real home on purpose (#3178). Kill every language server a probe spawns
 before moving on; the plegma daemon's cgroup holds every worker's children
 (the 2026-09-19 OOM). Never run a full in-place Stryker run in a shared or
 long-lived worktree (#3180); reproduce with `--dryRunOnly`, never under a kill
 timeout.
+
+Stop only the processes you started, by the PIDs you recorded: never `pkill`,
+or a `pgrep -f` match, on a name another lane also runs. One worker killed
+another lane's `lane:check` and one reviewer killed another lane's ast-grep
+that way (2026-11-02). Never unlink, replace or re-point the linked
+`node_modules` to get past a guard; report the refusal in the hand-back. The
+orchestrator owns private installs (2026-11-02, #5199).
+
+A test that copies scripts into a temp root resolves their imports from that
+root upward. Under a `TMPDIR` inside the worktree it finds the worktree's
+`node_modules` and passes, then fails on CI and on any outside `TMPDIR`. Run
+such a test once with `TMPDIR` outside the worktree before the hand-back
+(#5202 r2: `Cannot find module 'marked'`).
 
 A sandboxed worker may find the shared `.git` and the linked `node_modules`
 read-only and the network absent (a write-confined sandbox does this; the
@@ -241,7 +267,7 @@ Fold a review follow-up into the same PR when it shares the seam or files, is
 about one commit, and needs no maintainer decision. Contract-only folds (body,
 comments, wording) are trailing commits; small code folds carry a red-first
 test and are routed per principles §3 "Round routing". A MEDIUM or LOW that
-does not fold is an accepted residual: list it under `## Accepted residuals`,
+does not fold is an accepted residual: list it under `### Accepted residuals`,
 named `p3` with its severity and live population, and file nothing. File only p2 or
 higher work that cannot ride the PR (a HIGH outside its scope, or a MEDIUM
 with a live population), as one consolidated issue per PR. The merge bar is in

@@ -142,6 +142,68 @@ describe("runtime-agent-end deferred formatting", () => {
 		}
 	});
 
+	it("releases only its own session's open captures at agent_end (#4942)", async () => {
+		// RECURRENCE GUARDED: #4942. One guard for every session of the process
+		// let a subagent's agent_end drop the primary's in-flight read capture
+		// (the primary's next edit then lost its licence mid-run), and the
+		// primary's drop the subagent's.
+		const env = setupTestEnvironment("pi-lens-agent-end-own-captures-");
+		try {
+			const own = createTempFile(env.tmpDir, "own.ts", "export const a = 1;\n");
+			const sub = createTempFile(env.tmpDir, "sub.ts", "export const b = 1;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setSessionLifecycle({ sessionId: "primary-session" });
+			const read = (path: string, toolCallId: string, sessionId?: string) =>
+				runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						event: { toolName: "read", toolCallId, input: { path } },
+						ctx: { cwd: env.tmpDir },
+						lensEnabled: true,
+						getFlag: (name: string) =>
+							name === "no-lsp" || name === "no-complexity",
+						dbg: () => {},
+						runtime,
+						cacheManager: new CacheManager(false),
+						ensureLSPConfigInitialized: async () => {},
+						updateLspStatus: () => {},
+						resetLSPService: () => {},
+						sessionId,
+					} as never),
+				);
+			await read(own, "own-read", "primary-session");
+			await read(sub, "sub-read", "subagent-session");
+			const open = () => ({
+				own: runtime.readGuardFor("primary-session").getReadHistory(own).length,
+				sub: runtime.readGuardFor("subagent-session").getReadHistory(sub)
+					.length,
+			});
+			expect(open()).toEqual({ own: 1, sub: 1 });
+
+			const end = (currentSessionId?: string) =>
+				handleAgentEnd({
+					ctxCwd: env.tmpDir,
+					getFlag: (name) => name === "no-lsp",
+					notify: () => {},
+					dbg: () => {},
+					runtime,
+					cacheManager: new CacheManager(false),
+					getFormatService: () => ({ recordRead: () => {} }) as never,
+					currentSessionId,
+				});
+			await end("subagent-session");
+			const afterSubEnd = open();
+			await end("primary-session");
+
+			expect({ afterSubEnd, afterBothEnd: open() }).toEqual({
+				afterSubEnd: { own: 1, sub: 0 },
+				afterBothEnd: { own: 0, sub: 0 },
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	afterEach(cleanupAgentEndTemps);
 	afterAll(cleanupAgentEndTemps);
 
@@ -1088,6 +1150,43 @@ describe("runtime-agent-end deferred formatting", () => {
 			);
 		} finally {
 			applyConservativeActionableWarningFixesMock.mockReset();
+			env.cleanup();
+		}
+	});
+
+	// #4675 (CodeRabbit PRRT_kwDORt8rec6uV2rp): the drain no longer skips links.
+	// A dangling link has no file to format, so it is skipped as `missing` and
+	// never handed to the service. Recurrence: a drain that probes the link's
+	// target with `lstat`-style semantics hands the service a path with nothing
+	// behind it, and the service records a failed format every turn.
+	it("skips a queued dangling symlink as missing and never formats it", async () => {
+		const env = setupTestEnvironment("pi-lens-agent-end-dangling-");
+		try {
+			const link = path.join(env.tmpDir, "link.ts");
+			fs.symlinkSync("gone.ts", link);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.deferFormat(link, env.tmpDir, "edit", env.tmpDir);
+			const formatFile = vi.fn();
+
+			const summary = await handleAgentEnd({
+				ctxCwd: env.tmpDir,
+				getFlag: (name) => name === "no-lsp",
+				notify: () => {},
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: () => {} } as any,
+				getFormatService: () =>
+					({
+						recordRead: () => {},
+						formatFile,
+					}) as any,
+			});
+
+			expect(formatFile).not.toHaveBeenCalled();
+			expect(summary?.skipped).toEqual([{ filePath: link, reason: "missing" }]);
+			expect(summary?.failed).toEqual([]);
+		} finally {
 			env.cleanup();
 		}
 	});
@@ -2242,6 +2341,7 @@ describe("runtime-agent-end deferred formatting", () => {
 					hasBlockers: false,
 					isError: false,
 					fileModified: false,
+					checkedClean: false,
 				});
 
 				const worktreeRoot = path.join(env.tmpDir, "worktree");
@@ -2560,6 +2660,242 @@ describe("runtime-agent-end deferred formatting", () => {
 				} else {
 					process.env.PILENS_DATA_DIR = previousDataDir;
 				}
+				env.cleanup();
+			}
+		});
+	});
+
+	// #4943 R1 (option b): a concurrent in-process secondary drains its own
+	// records at its own settle. Before, its settle skipped the drain, so a
+	// subagent's record waited for the primary's 10-minute stale claim. The
+	// end-to-end witness is tests/index-4943-deferred-drain-owner.test.ts; these
+	// cases pin what the secondary's drain must NOT take.
+	describe("#4943 a concurrent secondary's drain", () => {
+		const formatted = () =>
+			vi.fn(async (fp: string) => {
+				fs.writeFileSync(fp, "const x = 1;\n");
+				return {
+					filePath: fp,
+					formatters: [{ name: "biome", success: true, changed: true }],
+					anyChanged: true,
+					allSucceeded: true,
+				};
+			});
+
+		it("formats only the secondary's own record: never another session's, an ownerless one or a stale orphan", async () => {
+			// RECURRENCE GUARDED: a secondary's settle that read the primary's
+			// claim rules took the primary's ownerless and aged-out records, and
+			// formatted files the primary was still working on.
+			const env = setupTestEnvironment("pi-lens-agent-end-4943-owned-only-");
+			const previousDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+			try {
+				const own = createTempFile(env.tmpDir, "src/own.ts", "const x=1");
+				const foreign = createTempFile(
+					env.tmpDir,
+					"src/foreign.ts",
+					"const x=1",
+				);
+				const ownerless = createTempFile(
+					env.tmpDir,
+					"src/ownerless.ts",
+					"const x=1",
+				);
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.deferFormat(own, env.tmpDir, "edit", env.tmpDir, "session-sub");
+				runtime.deferFormat(
+					foreign,
+					env.tmpDir,
+					"edit",
+					env.tmpDir,
+					"session-parent",
+				);
+				runtime.deferFormat(ownerless, env.tmpDir, "edit", env.tmpDir);
+				const formatFile = formatted();
+
+				const summary = await handleAgentEnd({
+					ctxCwd: env.tmpDir,
+					getFlag: (name) => name === "no-lsp",
+					notify: vi.fn(),
+					dbg: () => {},
+					runtime,
+					cacheManager: { addModifiedRange: vi.fn() } as any,
+					getFormatService: () => ({ recordRead: () => {}, formatFile }) as any,
+					currentSessionId: "session-sub",
+					sessionRole: "concurrent-secondary",
+					// Every foreign record is stale: a primary's drain would claim it.
+					staleAfterMs: -1,
+				});
+
+				expect(formatFile.mock.calls.map(([fp]) => fp)).toEqual([own]);
+				expect(summary?.changed).toEqual([own]);
+				expect(runtime.pendingDeferredFormatCount).toBe(2);
+				// I4: the drain's own write is the draining session's change-log row.
+				expect(
+					readChangesSince(env.tmpDir, 0).map(({ source, sessionId }) => ({
+						source,
+						sessionId,
+					})),
+				).toEqual([{ source: "format", sessionId: "session-sub" }]);
+			} finally {
+				if (previousDataDir === undefined) {
+					delete process.env.PILENS_DATA_DIR;
+				} else {
+					process.env.PILENS_DATA_DIR = previousDataDir;
+				}
+				env.cleanup();
+			}
+		});
+
+		it("claims nothing for a secondary with no stable session id", async () => {
+			// RECURRENCE GUARDED: the primary's fail-safe (no id claims everything)
+			// read by a secondary would drain every session's queue.
+			const env = setupTestEnvironment("pi-lens-agent-end-4943-no-id-");
+			try {
+				const ownerless = createTempFile(env.tmpDir, "src/a.ts", "const x=1");
+				const foreign = createTempFile(env.tmpDir, "src/b.ts", "const x=1");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.deferFormat(ownerless, env.tmpDir, "edit", env.tmpDir);
+				runtime.deferFormat(
+					foreign,
+					env.tmpDir,
+					"edit",
+					env.tmpDir,
+					"session-parent",
+				);
+				const formatFile = formatted();
+
+				const summary = await handleAgentEnd({
+					ctxCwd: env.tmpDir,
+					getFlag: (name) => name === "no-lsp",
+					notify: vi.fn(),
+					dbg: () => {},
+					runtime,
+					cacheManager: { addModifiedRange: vi.fn() } as any,
+					getFormatService: () => ({ recordRead: () => {}, formatFile }) as any,
+					sessionRole: "concurrent-secondary",
+				});
+
+				expect(formatFile).not.toHaveBeenCalled();
+				expect(summary).toBeUndefined();
+				expect(runtime.pendingDeferredFormatCount).toBe(2);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("names the draining secondary on its deferred autofix's change-log row", async () => {
+			// RECURRENCE GUARDED: the drain's change-log rows were written under
+			// the coordinator's id, so a subagent's autofix read as the parent's
+			// edit in the change log.
+			const env = setupTestEnvironment("pi-lens-agent-end-4943-autofix-");
+			const previousDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+			try {
+				const filePath = createTempFile(env.tmpDir, "src/app.ts", "let x=1\n");
+				// The Biome writer's agreement gate: config plus lockfile evidence.
+				fs.writeFileSync(path.join(env.tmpDir, "biome.json"), "{}\n");
+				fs.writeFileSync(
+					path.join(env.tmpDir, "package.json"),
+					JSON.stringify({ devDependencies: { "@biomejs/biome": "^1.0.0" } }),
+				);
+				fs.writeFileSync(
+					path.join(env.tmpDir, "package-lock.json"),
+					JSON.stringify({
+						packages: { "node_modules/@biomejs/biome": { version: "1.0.0" } },
+					}),
+				);
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.deferMutation(
+					filePath,
+					env.tmpDir,
+					"edit",
+					env.tmpDir,
+					"autofix",
+					"session-sub",
+				);
+				const biomeClient = {
+					isSupportedFile: () => true,
+					ensureAvailable: async () => true,
+					fixFileAsync: async (fp: string) => {
+						fs.writeFileSync(fp, "const x = 1;\n");
+						return { success: true, changed: true, fixed: 1 };
+					},
+				};
+
+				await handleAgentEnd({
+					ctxCwd: env.tmpDir,
+					getFlag: (name) => name === "no-lsp",
+					notify: vi.fn(),
+					dbg: () => {},
+					runtime,
+					cacheManager: { addModifiedRange: vi.fn() } as any,
+					biomeClient: biomeClient as any,
+					ruffClient: {} as any,
+					getFormatService: () =>
+						({ recordRead: () => {}, formatFile: vi.fn() }) as any,
+					currentSessionId: "session-sub",
+					sessionRole: "concurrent-secondary",
+				});
+
+				expect(fs.readFileSync(filePath, "utf8")).toBe("const x = 1;\n");
+				expect(
+					readChangesSince(env.tmpDir, 0).map(({ source, sessionId }) => ({
+						source,
+						sessionId,
+					})),
+				).toEqual([{ source: "autofix", sessionId: "session-sub" }]);
+			} finally {
+				if (previousDataDir === undefined) {
+					delete process.env.PILENS_DATA_DIR;
+				} else {
+					process.env.PILENS_DATA_DIR = previousDataDir;
+				}
+				env.cleanup();
+			}
+		});
+
+		it("leaves the per-cwd actionable-warning quick fixes to the primary", async () => {
+			// RECURRENCE GUARDED: the quick-fix pass reads a per-cwd report, not
+			// a record any session owns; a secondary's settle applying it would
+			// rewrite files of the primary's turn.
+			const env = setupTestEnvironment("pi-lens-agent-end-4943-quickfix-");
+			try {
+				const reads: string[] = [];
+				const end = (sessionRole: "primary" | "concurrent-secondary") => {
+					const runtime = new RuntimeCoordinator();
+					runtime.projectRoot = env.tmpDir;
+					return handleAgentEnd({
+						ctxCwd: env.tmpDir,
+						getFlag: (name) =>
+							name === "lens-actionable-warning-autofix" ||
+							name === "lens-actionable-warnings" ||
+							name === "no-lsp",
+						notify: vi.fn(),
+						dbg: () => {},
+						runtime,
+						cacheManager: {
+							readCache: (kind: string) => {
+								reads.push(`${sessionRole}:${kind}`);
+								return undefined;
+							},
+							addModifiedRange: vi.fn(),
+						} as any,
+						getFormatService: () =>
+							({ recordRead: () => {}, formatFile: vi.fn() }) as any,
+						currentSessionId: `session-${sessionRole}`,
+						sessionRole,
+					});
+				};
+
+				await end("concurrent-secondary");
+				await end("primary");
+
+				expect(reads).toEqual(["primary:actionable-warnings"]);
+			} finally {
 				env.cleanup();
 			}
 		});
@@ -3350,7 +3686,11 @@ describe("runtime-agent-end deferred records queued before a /tree (#3521 R2-F1)
 				runtime,
 				...args.secondSettle,
 			});
-			return runtime.readGuard.checkEdit(filePath, [1, 1]).action;
+			// #4942: the verdict is the claiming session's own guard, the one the
+			// drain credits (`currentSessionId`, the coordinator's when omitted).
+			return runtime
+				.readGuardFor(args.secondSettle?.currentSessionId)
+				.checkEdit(filePath, [1, 1]).action;
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
@@ -3460,6 +3800,31 @@ describe("runtime-agent-end deferred records queued before a /tree (#3521 R2-F1)
 					},
 					moved,
 					secondSettle: autofixClients,
+				}),
+			).toBe(verdict);
+		});
+
+		it(`drains a secondary's stale-orphan autofix ${where} as ${verdict}`, async () => {
+			expect(
+				await acrossSettles({
+					onX: async (runtime, filePath, _base, cwd) => {
+						withBiomeProject(cwd);
+						runtime.deferMutation(
+							filePath,
+							cwd,
+							"edit",
+							cwd,
+							"autofix",
+							"secondary",
+						);
+					},
+					moved,
+					// #4942: the claiming session's settle credits its own guard.
+					secondSettle: {
+						...autofixClients,
+						currentSessionId: "primary",
+						staleAfterMs: -1,
+					},
 				}),
 			).toBe(verdict);
 		});

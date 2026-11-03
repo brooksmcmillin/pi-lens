@@ -59,6 +59,7 @@ import type {
 	TurnEndLane,
 	TurnEndLaneContext,
 	TurnEndLaneGates,
+	TurnEndLanePart,
 	TurnEndLaneParts,
 } from "../lane.js";
 
@@ -216,7 +217,7 @@ function render(
 	// `blockerParts`/`staleSecretParts` are the composer's arrays, and a lane
 	// that pushed into one would be a render seam the `@delivery-surface:` tag
 	// scan cannot see (`tests/config/turn-end-lane-boundaries.test.ts`).
-	const blockerSections: string[] = [];
+	const blockerSections: TurnEndLanePart[] = [];
 	if (sessionSecrets.length) {
 		// Fold in ast-grep provenance ONLY where it coincides with a session
 		// secret — don't promote ast-grep-only findings out of their advisory
@@ -239,7 +240,10 @@ function render(
 		if (enriched.length > shown.length) {
 			report += `  … and ${enriched.length - shown.length} more\n`;
 		}
-		blockerSections.push(report);
+		// #4617: the section reports these files' contents, so it carries them as
+		// the stamp's subject (`enriched`, not `shown`: the "and N more" line
+		// speaks for every one of them).
+		blockerSections.push({ part: report, cites: enriched.map((f) => f.file) });
 	}
 
 	// Demoted secrets are addressed by FILE, never by line — the line is the one
@@ -248,11 +252,13 @@ function render(
 	const staleSecretEntries = [
 		...kept.gitleaksStale.map((f) => ({
 			file: toRunnerDisplayPath(ctx.cwd, f.file),
+			filePath: f.file,
 			rule: f.ruleId,
 			source: "gitleaks",
 		})),
 		...kept.trivyStale.map((f) => ({
 			file: toRunnerDisplayPath(ctx.cwd, f.file),
+			filePath: f.file,
 			rule: f.ruleId,
 			source: "trivy",
 		})),
@@ -262,7 +268,7 @@ function render(
 			staleSecretEntries.map((e) => [`${e.file}|${e.rule}|${e.source}`, e]),
 		).values(),
 	];
-	const staleSections: string[] = [];
+	const staleSections: TurnEndLanePart[] = [];
 	if (staleSecrets.length) {
 		const shown = staleSecrets.slice(0, 5);
 		let report =
@@ -274,7 +280,12 @@ function render(
 		if (staleSecrets.length > shown.length) {
 			report += `  … and ${staleSecrets.length - shown.length} more\n`;
 		}
-		staleSections.push(report);
+		// #4617: the tier names the files whose cached line numbers went stale —
+		// every one it reports, the "and N more" set included.
+		staleSections.push({
+			part: report,
+			cites: [...new Set(staleSecrets.map((entry) => entry.filePath))],
+		});
 	}
 
 	return {

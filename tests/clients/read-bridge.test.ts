@@ -76,7 +76,10 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 
-vi.mock("../../clients/read-guard-logger.js", () => ({
+vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/read-guard-logger.js")
+	>()),
 	logReadGuardEvent: vi.fn(),
 	getReadGuardLogPath: vi.fn(() => "/dev/null"),
 }));

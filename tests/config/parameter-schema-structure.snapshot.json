@@ -13,40 +13,14 @@
 					"type": "string"
 				},
 				"lang": {
-					"type": "string",
-					"enum": [
-						"bash",
-						"c",
-						"cpp",
-						"csharp",
-						"css",
-						"elixir",
-						"go",
-						"haskell",
-						"html",
-						"java",
-						"javascript",
-						"json",
-						"kotlin",
-						"lua",
-						"nix",
-						"php",
-						"python",
-						"ruby",
-						"rust",
-						"scala",
-						"swift",
-						"tsx",
-						"typescript",
-						"yaml"
-					]
+					"type": "string"
 				},
 				"paths": {
 					"type": "array",
 					"items": {
 						"type": "string"
 					},
-					"maxItems": 200
+					"maxItems": 100
 				},
 				"selector": {
 					"type": "string"
@@ -128,6 +102,12 @@
 				"path": {
 					"type": "string"
 				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
+					"type": "string"
+				},
 				"concurrency": {
 					"type": "number"
 				},
@@ -195,9 +175,36 @@
 			],
 			"properties": {
 				"operation": {
-					"type": "string"
+					"type": "string",
+					"enum": [
+						"definition",
+						"typeDefinition",
+						"declaration",
+						"references",
+						"hover",
+						"signatureHelp",
+						"documentSymbol",
+						"findSymbol",
+						"workspaceSymbol",
+						"codeAction",
+						"rename",
+						"rename_file",
+						"implementation",
+						"prepareCallHierarchy",
+						"incomingCalls",
+						"outgoingCalls",
+						"executeCommand",
+						"workspaceDiagnostics",
+						"capabilities"
+					]
 				},
 				"path": {
+					"type": "string"
+				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
 					"type": "string"
 				},
 				"line": {
@@ -251,102 +258,7 @@
 				},
 				"callHierarchyItem": {
 					"type": "object",
-					"required": [
-						"name",
-						"kind",
-						"uri",
-						"range",
-						"selectionRange"
-					],
-					"properties": {
-						"name": {
-							"type": "string"
-						},
-						"kind": {
-							"type": "number"
-						},
-						"uri": {
-							"type": "string"
-						},
-						"range": {
-							"type": "object",
-							"required": [
-								"start",
-								"end"
-							],
-							"properties": {
-								"start": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								},
-								"end": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								}
-							}
-						},
-						"selectionRange": {
-							"type": "object",
-							"required": [
-								"start",
-								"end"
-							],
-							"properties": {
-								"start": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								},
-								"end": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								}
-							}
-						}
-					}
+					"properties": {}
 				}
 			}
 		}
@@ -362,40 +274,14 @@
 					"type": "string"
 				},
 				"lang": {
-					"type": "string",
-					"enum": [
-						"bash",
-						"c",
-						"cpp",
-						"csharp",
-						"css",
-						"elixir",
-						"go",
-						"haskell",
-						"html",
-						"java",
-						"javascript",
-						"json",
-						"kotlin",
-						"lua",
-						"nix",
-						"php",
-						"python",
-						"ruby",
-						"rust",
-						"scala",
-						"swift",
-						"tsx",
-						"typescript",
-						"yaml"
-					]
+					"type": "string"
 				},
 				"paths": {
 					"type": "array",
 					"items": {
 						"type": "string"
 					},
-					"maxItems": 200
+					"maxItems": 100
 				},
 				"selector": {
 					"type": "string"
@@ -483,6 +369,12 @@
 				"path": {
 					"type": "string"
 				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
+					"type": "string"
+				},
 				"concurrency": {
 					"type": "number"
 				},
@@ -550,9 +442,36 @@
 			"type": "object",
 			"properties": {
 				"operation": {
-					"type": "string"
+					"type": "string",
+					"enum": [
+						"definition",
+						"typeDefinition",
+						"declaration",
+						"references",
+						"hover",
+						"signatureHelp",
+						"documentSymbol",
+						"findSymbol",
+						"workspaceSymbol",
+						"codeAction",
+						"rename",
+						"rename_file",
+						"implementation",
+						"prepareCallHierarchy",
+						"incomingCalls",
+						"outgoingCalls",
+						"executeCommand",
+						"workspaceDiagnostics",
+						"capabilities"
+					]
 				},
 				"path": {
+					"type": "string"
+				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
 					"type": "string"
 				},
 				"line": {
@@ -606,102 +525,7 @@
 				},
 				"callHierarchyItem": {
 					"type": "object",
-					"required": [
-						"name",
-						"kind",
-						"uri",
-						"range",
-						"selectionRange"
-					],
-					"properties": {
-						"name": {
-							"type": "string"
-						},
-						"kind": {
-							"type": "number"
-						},
-						"uri": {
-							"type": "string"
-						},
-						"range": {
-							"type": "object",
-							"required": [
-								"start",
-								"end"
-							],
-							"properties": {
-								"start": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								},
-								"end": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								}
-							}
-						},
-						"selectionRange": {
-							"type": "object",
-							"required": [
-								"start",
-								"end"
-							],
-							"properties": {
-								"start": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								},
-								"end": {
-									"type": "object",
-									"required": [
-										"line",
-										"character"
-									],
-									"properties": {
-										"line": {
-											"type": "number"
-										},
-										"character": {
-											"type": "number"
-										}
-									}
-								}
-							}
-						}
-					}
+					"properties": {}
 				},
 				"cwd": {
 					"type": "string"

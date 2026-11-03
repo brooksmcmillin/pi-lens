@@ -4,7 +4,7 @@
 // (tests/fixtures/rpc-load-check/fake-pi.mjs); an in-process call of the
 // classifier cannot prove that a pi that exits, or a signal that arrives on the
 // wire, turns the exit code red.
-// lane: wall-clock-budget (serialized); no wall-clock assertion. The 20 runs
+// lane: wall-clock-budget (serialized); no wall-clock assertion. The 22 runs
 // of the script go through a width-5 pool in beforeAll and each case asserts
 // its own settled run.
 /**
@@ -28,6 +28,9 @@ const tmpRoot = fs.mkdtempSync(
 );
 afterAll(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
 const FAKE_PI = path.resolve("tests/fixtures/rpc-load-check/fake-pi.mjs");
+const linkedScripts = path.join(tmpRoot, "scripts");
+fs.symlinkSync(path.dirname(SCRIPT), linkedScripts, "junction");
+const LINKED_SCRIPT = path.join(linkedScripts, "rpc-load-check.mjs");
 
 // Each run owns a mkdtemp scratch, an agent dir inside it and a listen(0)
 // provider port (scripts/rpc-load-check.mjs run()). The shared inputs are
@@ -40,6 +43,7 @@ const RUN_TIMEOUT_MS = 5_000;
 
 type RunSpec = {
 	mode: string;
+	script?: string;
 	args?: string[];
 	stageMs?: number;
 	marker?: string;
@@ -51,6 +55,8 @@ type RunResult = { code: number | null; out: string };
 // assertions.
 const RUNS = {
 	clean: { mode: "clean" },
+	symlinkClean: { mode: "clean", script: LINKED_SCRIPT },
+	symlinkWarning: { mode: "log-warn", script: LINKED_SCRIPT },
 	hostExit: { mode: "host-exit" },
 	extensionError: { mode: "extension-error" },
 	warningNotice: { mode: "warning-notice" },
@@ -78,6 +84,7 @@ type RunName = keyof typeof RUNS;
 
 async function smoke({
 	mode,
+	script = SCRIPT,
 	args = [],
 	stageMs,
 	marker,
@@ -98,7 +105,7 @@ async function smoke({
 	try {
 		const { stdout } = await run(
 			process.execPath,
-			[SCRIPT, FAKE_PI, "--extension", "/unused", ...args],
+			[script, FAKE_PI, "--extension", "/unused", ...args],
 			{ env, timeout: RUN_TIMEOUT_MS },
 		);
 		return { code: 0, out: stdout };
@@ -138,6 +145,22 @@ describe.skipIf(process.platform === "win32")(
 			const result = outcome("clean");
 			expect(result.out).toContain("PASS");
 			expect(result.code).toBe(0);
+		});
+
+		// #4096: a lexical entry guard returned exit 0 with no output through a
+		// symlinked scripts directory. Both outcomes must reach the real driver.
+		it("runs the smoke through a symlinked scripts directory", () => {
+			const result = outcome("symlinkClean");
+			expect(result.out).toContain("PASS: pi-lens loaded and survived");
+			expect(result.code).toBe(0);
+		});
+
+		it("preserves failure reporting through a symlinked scripts directory", () => {
+			const result = outcome("symlinkWarning");
+			expect(result.out).toContain(
+				"FAIL: extension.log warn [lsp]: LSP warm failed",
+			);
+			expect(result.code).toBe(1);
 		});
 
 		it("fails a pi that exits during start-up (#4400)", () => {

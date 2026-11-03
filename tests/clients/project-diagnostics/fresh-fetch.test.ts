@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -687,6 +688,32 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		expect(clients.knipClient.analyze).not.toHaveBeenCalled();
 		expect(cacheManager.writeCache).not.toHaveBeenCalled();
 	});
+
+	// RECURRENCE GUARDED: #4911. The root was a real path but HOME was compared
+	// as spelled, so a HOME spelled through a link let every analyzer walk the
+	// home tree. The root-link direction rides along: it must keep refusing.
+	it.each([["home-link"], ["root-link"]] as const)(
+		"refuses to run anything when the %s spelling names the home directory (#4911)",
+		async (kind) => {
+			const cacheManager = makeCacheManager();
+			const clients = makeClients();
+			const home = path.join(tmp, "home");
+			fs.mkdirSync(home, { recursive: true });
+			const link = path.join(tmp, "link");
+			fs.symlinkSync(home, link, "junction");
+
+			const result = await fetchFreshProjectDiagnostics(
+				cacheManager,
+				kind === "root-link" ? link : home,
+				clients,
+				undefined,
+				{ homeDir: kind === "home-link" ? link : home },
+			);
+
+			expect(result.unsafeRoot).toBe(true);
+			expect(clients.knipClient.analyze).not.toHaveBeenCalled();
+		},
+	);
 
 	it("runs normally for a project directory UNDER the home directory (#747)", async () => {
 		const cacheManager = makeCacheManager();
@@ -2071,6 +2098,25 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 
 		// Generous ceiling: serial execution of 6 x 20ms would be >=120ms.
 		expect(elapsed).toBeLessThan(100);
+	});
+
+	// Shape 4 (an abort listener is a watcher: released on every settle path).
+	// The fetch raced its analyzers against the caller's signal with a private
+	// listener nothing removed, so each completed fetch left one on the turn's
+	// signal.
+	it("a completed fetch leaves no abort listener on the caller's signal", async () => {
+		fs.writeFileSync(path.join(tmp, "tsconfig.json"), "{}");
+		const turn = new AbortController();
+
+		const result = await fetchFreshProjectDiagnostics(
+			makeCacheManager(),
+			tmp,
+			makeClients(),
+			turn.signal,
+		);
+
+		expect(result.aborted).toBeUndefined();
+		expect(getEventListeners(turn.signal, "abort")).toHaveLength(0);
 	});
 
 	it("returns promptly with partial results when the signal aborts mid-scan, instead of waiting for every analyzer (#585 follow-up)", async () => {

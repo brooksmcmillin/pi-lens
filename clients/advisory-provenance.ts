@@ -7,7 +7,13 @@ import { resolveRunnerPath } from "./dispatch/runner-context.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { hashFileBytes } from "./content-stamp.js";
 
-export type AdvisoryFileRole = "source" | "test" | "affected";
+/**
+ * Why a file is in the stamp. `cited` is a file the content only names (a
+ * no-write turn's citations, #4617): a change to it supersedes the content,
+ * and a stamp of cited files alone is never discarded by their deletion
+ * (`allFilesDeleted`, #4954 F6, F8).
+ */
+export type AdvisoryFileRole = "source" | "test" | "affected" | "cited";
 
 interface AdvisoryFileProvenance {
 	path: string;
@@ -26,6 +32,16 @@ export interface AdvisoryProvenance {
 		capturedAt: number;
 	};
 	files: AdvisoryFileProvenance[];
+	/**
+	 * #4617: the message carries at least one part with no file it could be
+	 * stale against (a runner crash note, a disposition count), so the stamp has
+	 * no file subject at all. The shape is well formed on this flag alone — a
+	 * no-write turn whose every part is fileless has nothing to stat — and the
+	 * currency rule is `truncated`: a message that carries such a part AND one
+	 * the stamp does not speak for is stamped `truncated` by the composer and
+	 * never reads current (`validateAdvisoryProvenance`).
+	 */
+	filelessParts?: true;
 	truncated?: boolean;
 }
 
@@ -88,6 +104,7 @@ export function snapshotAdvisoryProvenance(args: {
 	generation: number;
 	files: Array<{ path: string; role: AdvisoryFileRole }>;
 	capturedAt?: number;
+	filelessParts?: true;
 	truncated?: boolean;
 }): AdvisoryProvenance {
 	const seen = new Set<string>();
@@ -107,6 +124,7 @@ export function snapshotAdvisoryProvenance(args: {
 			capturedAt: args.capturedAt ?? Date.now(),
 		},
 		files,
+		...(args.filelessParts ? { filelessParts: true as const } : {}),
 		...(args.truncated ? { truncated: true } : {}),
 	};
 }
@@ -136,14 +154,18 @@ function isWellFormed(value: unknown): value is AdvisoryProvenance {
 		isFiniteNumber(revision.generation) &&
 		isFiniteNumber(revision.capturedAt) &&
 		Array.isArray(record.files) &&
-		record.files.length > 0 &&
+		// #4617: a fileless-only message has no file to capture, so the flag is
+		// its subject. Anything else with no file stays malformed (the released
+		// writers always captured at least one).
+		(record.files.length > 0 || record.filelessParts === true) &&
 		record.files.every(
 			(file) =>
 				!!file &&
 				typeof file.path === "string" &&
 				(file.role === "source" ||
 					file.role === "test" ||
-					file.role === "affected") &&
+					file.role === "affected" ||
+					file.role === "cited") &&
 				isFiniteNumber(file.mtimeMs) &&
 				isFiniteNumber(file.size) &&
 				isCapturedHash(file.sha256),
@@ -175,11 +197,15 @@ export function validateAdvisoryProvenance(
 		if (provenance.revision.sessionId !== runtime.telemetrySessionId)
 			reasons.push("session-mismatch");
 	}
+	// The content goes only when every stamped file is gone, and never on
+	// cited files alone: a cited file supersedes it, it does not discard it.
+	let subjectFiles = 0;
 	let deletedFiles = 0;
 	const changedPaths = new Set<string>();
 	for (const captured of provenance.files) {
 		const resolved = path.resolve(cwd, captured.path);
 		const reasonsBefore = reasons.length;
+		if (captured.role !== "cited") subjectFiles += 1;
 		let stat: fs.Stats;
 		try {
 			stat = fs.statSync(resolved);
@@ -222,7 +248,12 @@ export function validateAdvisoryProvenance(
 		if (reasons.length > reasonsBefore)
 			changedPaths.add(advisoryPathKey(resolved, cwd));
 	}
-	const allFilesDeleted = deletedFiles === provenance.files.length;
+	// A truncated stamp omits cited files, so "every stamped file is gone" does
+	// not mean every file the text names is.
+	const allFilesDeleted =
+		subjectFiles > 0 &&
+		provenance.truncated !== true &&
+		deletedFiles === provenance.files.length;
 	if (unknown)
 		return {
 			status: "unknown",

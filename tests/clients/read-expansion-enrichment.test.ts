@@ -1,12 +1,12 @@
 import * as fs from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { tryExpandRead } from "../../clients/read-expansion.js";
 import { lineContentHash } from "../../clients/read-guard.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
 
 // #951 review finding 2: the read-path enrichment had no positive-path or
@@ -45,11 +45,11 @@ const warmClient = {
 	},
 };
 const getWarmClientForFileMock = vi.fn();
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () =>
-		makeLspServiceDouble({ getWarmClientForFile: getWarmClientForFileMock }),
-	resetLSPService: () => {},
-}));
+beforeEach(async () => {
+	await installLspServiceDouble({
+		getWarmClientForFile: getWarmClientForFileMock,
+	});
+});
 
 const loggedEvents: Array<Record<string, unknown>> = [];
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => {

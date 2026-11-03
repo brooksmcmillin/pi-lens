@@ -1,0 +1,103 @@
+name: Windows repeat probe (manual)
+
+# Manual only, never a PR gate. Runs one Vitest file N times on windows-latest
+# so a flake's rate can be measured on a real Windows host (#4756: the
+# NearestRoot memo's directory-mtime key). The per-run logs go to an artifact;
+# the job summary carries the pass/fail count. The job exits 0 after the loop
+# so a red run is data, not a failed check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_file:
+        description: "Repo-relative Vitest file, e.g. tests/clients/lsp/server-policy.test.ts"
+        required: true
+        type: string
+        default: tests/clients/lsp/server-policy.test.ts
+      repeat:
+        description: "Number of runs (1-30)"
+        required: true
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    name: Windows repeat probe
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # Same probe-home pin and timeout scale as the Windows Vitest lane in
+      # ci.yml, so the repeated runs match the shape CI runs.
+      - name: Pin PI_LENS_HOME under the runner temp dir
+        shell: bash
+        run: echo "PI_LENS_HOME=$RUNNER_TEMP/pi-lens-home" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Validate inputs
+        shell: bash
+        env:
+          TEST_FILE: ${{ inputs.test_file }}
+          REPEAT: ${{ inputs.repeat }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TEST_FILE" =~ ^tests/[A-Za-z0-9_./-]+\.test\.ts$ ]] || [[ "$TEST_FILE" == *..* ]]; then
+            echo "::error::test_file must be a repo-relative tests/**/*.test.ts path: $TEST_FILE"
+            exit 1
+          fi
+          [[ -f "$TEST_FILE" ]] || { echo "::error::no such file: $TEST_FILE"; exit 1; }
+          if [[ ! "$REPEAT" =~ ^[0-9]+$ ]] || (( REPEAT < 1 || REPEAT > 30 )); then
+            echo "::error::repeat must be an integer 1-30: $REPEAT"
+            exit 1
+          fi
+
+      - name: Run the file repeatedly
+        shell: bash
+        env:
+          TEST_FILE: ${{ inputs.test_file }}
+          REPEAT: ${{ inputs.repeat }}
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+        run: |
+          set -u
+          dir="$RUNNER_TEMP/repeat-logs"
+          mkdir -p "$dir"
+          : > "$dir/summary.txt"
+          pass=0
+          fail=0
+          for ((i = 1; i <= REPEAT; i++)); do
+            node_modules/.bin/vitest run "$TEST_FILE" --configLoader runner > "$dir/run-$i.log" 2>&1
+            rc=$?
+            if [[ $rc -eq 0 ]]; then
+              pass=$((pass + 1))
+              echo "run $i/$REPEAT: PASS" | tee -a "$dir/summary.txt"
+            else
+              fail=$((fail + 1))
+              echo "run $i/$REPEAT: FAIL (exit $rc)" | tee -a "$dir/summary.txt"
+            fi
+          done
+          echo "$TEST_FILE: passed=$pass failed=$fail of $REPEAT" | tee -a "$dir/summary.txt"
+          { echo "### Windows repeat probe"; echo; echo '```'; cat "$dir/summary.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-repeat-probe-${{ github.run_id }}
+          path: ${{ runner.temp }}/repeat-logs
+          retention-days: 14
+          if-no-files-found: warn

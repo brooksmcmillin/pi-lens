@@ -46,7 +46,11 @@ import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logExtension } from "./extension-log.js";
-import { findNearestMarkerRoot, isAtOrAboveHomeDir } from "./path-utils.js";
+import {
+	findNearestMarkerRoot,
+	realpathOrResolve,
+	walkUpDirs,
+} from "./path-utils.js";
 
 export async function readTextFileOrUndefined(
 	filePath: string,
@@ -210,17 +214,26 @@ function indexOfArrayEnd(text: string, from: number): number {
  * `key` of `edition`, and a dotted-key inheritance line (`edition.workspace =
  * true`) never matches either — the literal key is immediately followed by
  * `=`, not `.`.
+ *
+ * Shared with the Python syntax-level reader (#4638), whose `target-version`,
+ * `pythonVersion`, and `requires-python` values are the same scalar shape. All
+ * four TOML string spellings read: basic, literal, and their triple-quoted forms.
  */
-function parseTomlScalarString(
+export function parseTomlScalarString(
 	content: string | undefined,
 	key: string,
 ): string | undefined {
 	if (content === undefined) return undefined;
+	// The triple-quoted forms come first: `"""` would otherwise read as the empty
+	// one-line string. TOML trims one newline right after the opening delimiter.
 	const match = content.match(
-		new RegExp(`^[ \\t]*${key}[ \\t]*=[ \\t]*(?:"([^"]*)"|'([^']*)')`, "m"),
+		new RegExp(
+			`^[ \\t]*${key}[ \\t]*=[ \\t]*(?:"""(?:\\r?\\n)?([\\s\\S]*?)"""|'''(?:\\r?\\n)?([\\s\\S]*?)'''|"([^"]*)"|'([^']*)')`,
+			"m",
+		),
 	);
 	if (!match) return undefined;
-	return match[1] ?? match[2];
+	return match[1] ?? match[2] ?? match[3] ?? match[4];
 }
 
 /**
@@ -440,7 +453,8 @@ export async function resolveCargoPackageEdition(
 	filePath: string,
 	homeDir: string = os.homedir(),
 ): Promise<string | undefined> {
-	const startDir = path.dirname(path.resolve(filePath));
+	// The file's identity: a file link's own directory belongs to the link (#4966).
+	const startDir = path.dirname(realpathOrResolve(filePath));
 	const packageDir = findNearestMarkerRoot(startDir, ["Cargo.toml"], {
 		homeDir,
 	});
@@ -473,9 +487,14 @@ export async function resolveCargoPackageEdition(
 		);
 	}
 
-	let current = path.dirname(packageDir);
-	for (let depth = 0; depth < 64; depth++) {
-		if (isAtOrAboveHomeDir(current, homeDir)) return undefined;
+	// #4689 item 6: the climb and its home ceiling are both path identities
+	// (`walkUpDirs`), as `findNearestMarkerRoot`'s are, so `packageDir` and the
+	// ancestors it climbs to sit on one axis; a home that is itself a link
+	// still stops the climb.
+	for (const current of walkUpDirs(path.dirname(packageDir), {
+		homeDir,
+		maxDepth: 64,
+	})) {
 		const ancestorContent = await readTextFileOrUndefined(
 			path.join(current, "Cargo.toml"),
 		);
@@ -493,9 +512,6 @@ export async function resolveCargoPackageEdition(
 				filePath,
 			);
 		}
-		const parent = path.dirname(current);
-		if (parent === current) return undefined;
-		current = parent;
 	}
 	return undefined;
 }

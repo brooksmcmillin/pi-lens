@@ -18,6 +18,7 @@ import { getProjectDataDir } from "./file-utils.js";
 import { HardFailureStamps } from "./hard-failure-summary.js";
 import {
 	findNearestMarkerRoot,
+	isUnderDir,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
 } from "./path-utils.js";
@@ -241,12 +242,9 @@ export function classifyKnipBinary(
 	targetDir: string,
 ): KnipBinarySource {
 	if (binary === null) return "managed-or-path";
-	const relative = path.relative(path.resolve(targetDir), path.resolve(binary));
-	return relative === "" ||
-		relative.startsWith("..") ||
-		path.isAbsolute(relative)
-		? "global"
-		: "project";
+	return isUnderDir(path.resolve(binary), path.resolve(targetDir))
+		? "project"
+		: "global";
 }
 
 /**

@@ -155,13 +155,17 @@ describe("compiled LSP registry trust boundary (#2372)", () => {
 		expect(override?.command).toBeUndefined();
 		expect(override?.env).toBeUndefined();
 		expect(override?.initializationOptions).toBeUndefined();
+		expect(registry.disabledServerIds.has("rust")).toBe(false);
 		expect(logExtension).toHaveBeenCalledTimes(1);
 		expect(ledger.getDegradationSummary()).toContainEqual(
 			expect.objectContaining({ kind: "lsp-registry-decision", count: 3 }),
 		);
 	});
 
-	it("refuses project env and initialization options while retaining global command", async () => {
+	// #5147 r2: a refused project env/initializationOptions used to leave the
+	// global command running without the user's own env and init options. The
+	// merge keeps only the winning tier's value, so the server is not started.
+	it("does not register a global server whose env and initialization options a project sets while untrusted", async () => {
 		const project = tempDir();
 		const globalDir = tempDir();
 		process.env.PI_LENS_HOME = globalDir;
@@ -173,6 +177,7 @@ describe("compiled LSP registry trust boundary (#2372)", () => {
 						name: "Shared",
 						extensions: [".shared"],
 						command: "global-shared",
+						env: { GLOBAL_ONLY: "1" },
 					},
 				},
 			}),
@@ -184,7 +189,6 @@ describe("compiled LSP registry trust boundary (#2372)", () => {
 					servers: {
 						shared: {
 							name: "Shared project fields",
-							extensions: [".shared"],
 							env: { PROJECT_ONLY: "1" },
 							initializationOptions: { projectOnly: true },
 						},
@@ -199,23 +203,11 @@ describe("compiled LSP registry trust boundary (#2372)", () => {
 			await import("../../../clients/lsp/config.js");
 		const config = await loadLSPConfig(project);
 		const registry = compileLspRegistry(config, config.__provenance);
-		const server = registry.customServers.find(
-			(entry) => entry.id === "shared",
-		);
 
-		expect(server).toBeDefined();
-		const spawn = server?.spawn;
-		if (!spawn) throw new Error("global server did not register a spawn seam");
-		const launch = await spawn(project);
-		if (!launch) throw new Error("global server spawn was not admitted");
-		expect(launch.initialization).toBeUndefined();
-		expect(launchLSP).toHaveBeenCalledWith(
-			"global-shared",
-			["--stdio"],
-			expect.objectContaining({
-				env: expect.not.objectContaining({ PROJECT_ONLY: "1" }),
-			}),
-		);
+		expect(
+			registry.customServers.find((entry) => entry.id === "shared"),
+		).toBeUndefined();
+		expect(launchLSP).not.toHaveBeenCalled();
 	});
 
 	it("retains every project override field after pi grants trust", async () => {
@@ -282,5 +274,77 @@ describe("compiled LSP registry trust boundary (#2372)", () => {
 		expect(byId.get("typescript")).toBe(getServerById("typescript"));
 		expect(byId.get("rust")).not.toBe(getServerById("rust"));
 		expect(byId.get("rust")?.spawn).not.toBe(getServerById("rust")?.spawn);
+		// #4758/#4808 F4: the copy keeps the declaration, so a user `command`
+		// override still answers rust-analyzer's `rust-analyzer` pull.
+		expect(byId.get("rust")?.settingsSection).toBe("rust-analyzer");
+	});
+
+	// #4833 (folds #4829 review r1 F3): every measured trait of the catalog
+	// binary, `resendRecheck` included, is reset on a command override's copy
+	// (the field-level half is tests/clients/lsp/lsp-override-traits.test.ts).
+	// What only the spawn can show: a launch from the override reports
+	// `launchVariant: "override"`, and the wait policy keyed by the catalog
+	// server id (`getStrategy`) resets its optimistic claims (silentOnClean,
+	// workspaceIndexing) and keeps its protocol workarounds (reopenOnResync).
+	it("starts a command override on the override wait strategy, not the catalog id's row", async () => {
+		const { LSP_SERVERS } = await import("../../../clients/lsp/server.js");
+		const { getStrategy, SERVER_DIAGNOSTIC_STRATEGIES } =
+			await import("../../../clients/lsp/wait-policy/strategies.js");
+		const withRow = LSP_SERVERS.filter(
+			(server) => SERVER_DIAGNOSTIC_STRATEGIES[server.id],
+		);
+		expect(withRow.length).toBeGreaterThanOrEqual(10);
+		const rows = withRow.map(
+			(server) => SERVER_DIAGNOSTIC_STRATEGIES[server.id],
+		);
+		expect(rows.some((r) => r?.silentOnClean === true)).toBe(true);
+		expect(rows.some((r) => r?.emptyFirstPublish === "indexing")).toBe(true);
+		expect(rows.some((r) => r?.diagnosticsFence === "reply-first")).toBe(true);
+		expect(rows.some((r) => r?.workspaceIndexing === true)).toBe(true);
+
+		const project = tempDir();
+		fs.writeFileSync(
+			path.join(project, ".pi-lens.json"),
+			JSON.stringify({
+				lsp: {
+					serverOverrides: Object.fromEntries(
+						withRow.map((server) => [
+							server.id,
+							{ command: [`other-${server.id}-lsp`, "--stdio"] },
+						]),
+					),
+				},
+			}),
+		);
+		const trust = await import("../../../clients/project-trust.js");
+		trust.setProjectTrustState("trusted");
+		const { loadLSPConfig, compileLspRegistry } =
+			await import("../../../clients/lsp/config.js");
+		const config = await loadLSPConfig(project);
+		const compiled = compileLspRegistry(
+			config,
+			config.__provenance,
+		).registeredServers;
+		const byId = new Map(compiled.map((entry) => [entry.id, entry]));
+		for (const server of withRow) {
+			const spawned = await byId.get(server.id)!.spawn(project);
+			expect(spawned?.launchVariant, server.id).toBe("override");
+			// What `ClientRegistry.spawnClient` hands the client and wait policy.
+			const strategy = getStrategy(server.id, spawned?.launchVariant);
+			expect(strategy.silentOnClean, `${server.id} silentOnClean`).toBe(
+				undefined,
+			);
+			expect(strategy.workspaceIndexing, `${server.id} workspaceIndexing`).toBe(
+				undefined,
+			);
+		}
+		// #4833 review F1: the opengrep override keeps its restrictive
+		// workarounds, or an edit after the first touch is never scanned.
+		const opengrep = await byId.get("opengrep")!.spawn(project);
+		expect(
+			getStrategy("opengrep", opengrep?.launchVariant).reopenOnResync,
+		).toBe(true);
+		// The catalog row itself keeps its measurement.
+		expect(getStrategy("typescript", "classic").silentOnClean).toBe(true);
 	});
 });

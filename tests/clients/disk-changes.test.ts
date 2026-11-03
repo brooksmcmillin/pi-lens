@@ -18,8 +18,9 @@ import {
 } from "../../clients/degradation-ledger.js";
 import {
 	DISK_CHANGE_MAX_RECORDED_PATHS,
+	DISK_CHANGE_ORIGINS,
 	type DiskChange,
-	diskChangeSubscriberIds,
+	diskChangeSubscriberOrigins,
 	publishDiskChange,
 	subscribeDiskChange,
 } from "../../clients/disk-changes.js";
@@ -78,12 +79,46 @@ describe("the disk-change subscriber registry", () => {
 			second.push(change);
 		});
 		expect(
-			diskChangeSubscriberIds().filter((id) => id === "registry-a"),
+			[...diskChangeSubscriberOrigins().keys()].filter(
+				(id) => id === "registry-a",
+			),
 		).toHaveLength(1);
 		await publishDiskChange({ root: tmp, origin: "out-of-band", paths: [] });
 		// The second registration replaced the first: one delivery per publish.
 		expect(first).toHaveLength(0);
 		expect(second).toHaveLength(1);
+	});
+});
+
+describe("a subscriber's declared origins", () => {
+	// Recurrence: slice 2's diagnostics cache dropped three of the four origins
+	// inside its own handler, where no census could read it. The declaration is
+	// the delivery, so what the census reads is what the consumer receives.
+	it("receives the origins it declared and no other, and an undeclared one receives all", async () => {
+		const declared: string[] = [];
+		const everything: string[] = [];
+		cleanups.push(
+			subscribeDiskChange(
+				"origins-declared",
+				(change) => {
+					declared.push(change.origin);
+				},
+				["head-move", "settled-sweep"],
+			),
+		);
+		subscribe("origins-all", (change) => {
+			everything.push(change.origin);
+		});
+
+		for (const origin of DISK_CHANGE_ORIGINS)
+			await publishDiskChange({ root: tmp, origin, paths: [] });
+
+		expect(declared).toEqual(["head-move", "settled-sweep"]);
+		expect(everything).toEqual([...DISK_CHANGE_ORIGINS]);
+		expect(diskChangeSubscriberOrigins().get("origins-declared")).toEqual([
+			"head-move",
+			"settled-sweep",
+		]);
 	});
 });
 

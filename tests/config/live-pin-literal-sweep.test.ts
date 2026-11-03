@@ -9,6 +9,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 // Recurrence #4418 and #4421: a test in tests/config hard-coded the SHA a
 // workflow pins an action to (setup-node 6.5.0 in the Windows and targeted
@@ -77,24 +78,32 @@ export function livePinLiterals(
 describe("tests/config derives live action pins instead of spelling them (#4418, #4421)", () => {
 	const pins = livePins(GITHUB);
 
-	it("spells no live workflow pin in a literal", () => {
-		const files = listSourceFiles(TESTS_CONFIG, { extensions: [".ts"] });
-		assertNonEmptyScan("tests/config sources", files.length, 100);
-		const findings = files.flatMap((file) =>
-			livePinLiterals(readFileSync(file, "utf8"), pins).map(
-				(hit) =>
-					`${relativePosix(ROOT, file)}:${hit}: derive it with siblingPin (tests/support/sibling-pin.ts), or use a fake SHA in fixture text`,
-			),
-		);
-		expect(findings).toEqual([]);
-	});
+	it(
+		"spells no live workflow pin in a literal",
+		() => {
+			const files = listSourceFiles(TESTS_CONFIG, { extensions: [".ts"] });
+			assertNonEmptyScan("tests/config sources", files.length, 100);
+			const findings = files.flatMap((file) =>
+				livePinLiterals(readFileSync(file, "utf8"), pins).map(
+					(hit) =>
+						`${relativePosix(ROOT, file)}:${hit}: derive it with siblingPin (tests/support/sibling-pin.ts), or use a fake SHA in fixture text`,
+				),
+			);
+			expect(findings).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	describe("the sweep reads literals, not prose", () => {
 		const [pin] = [...pins];
-		it("has live pins to compare against", () => {
-			assertNonEmptyScan("live pins under .github", pins.size, 10);
-			expect(pin).toMatch(/^[0-9a-f]{40}$/);
-		});
+		it(
+			"has live pins to compare against",
+			() => {
+				assertNonEmptyScan("live pins under .github", pins.size, 10);
+				expect(pin).toMatch(/^[0-9a-f]{40}$/);
+			},
+			TREE_WALK_TIMEOUT_MS,
+		);
 
 		it.each([
 			["a double-quoted literal", `const a = "actions/checkout@${pin}";\n`, 1],
@@ -104,9 +113,13 @@ describe("tests/config derives live action pins instead of spelling them (#4418,
 				`const a = [\n"@${pin}",\n];\n`,
 				2,
 			],
-		])("reds on %s", (_name, source, line) => {
-			expect(livePinLiterals(source, pins)).toEqual([`${line}:${pin}`]);
-		});
+		])(
+			"reds on %s",
+			(_name, source, line) => {
+				expect(livePinLiterals(source, pins)).toEqual([`${line}:${pin}`]);
+			},
+			TREE_WALK_TIMEOUT_MS,
+		);
 
 		it.each([
 			["a line comment", `// pinned at ${pin}\n`],
@@ -117,9 +130,13 @@ describe("tests/config derives live action pins instead of spelling them (#4418,
 				`const d = "${pin}${"0".repeat(24)}";\n`,
 			],
 			["a tag ref", 'const a = "actions/checkout@v7";\n'],
-		])("stays clean on %s", (_name, source) => {
-			expect(livePinLiterals(source, pins)).toEqual([]);
-		});
+		])(
+			"stays clean on %s",
+			(_name, source) => {
+				expect(livePinLiterals(source, pins)).toEqual([]);
+			},
+			TREE_WALK_TIMEOUT_MS,
+		);
 
 		it("reads only SHA pins out of a workflow, not tags", () => {
 			const doc = workflowDocument(

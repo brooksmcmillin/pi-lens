@@ -6,12 +6,14 @@ import * as vm from "node:vm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../clients/cache-manager.js";
 import { getEffectiveLspIdleResetMs } from "../clients/runtime-turn.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
+import { useGlobalConfig } from "./support/global-config.js";
 import {
 	drainResidentJscpdScans,
 	removeTempDirSync,
 } from "./clients/test-utils.js";
-import { makeLspServiceDouble } from "./support/lsp-service-double.js";
+import { installLspServiceDouble } from "./support/lsp-service-seam.js";
 import {
 	aliveServerHolder,
 	lspStatusRecorder,
@@ -47,13 +49,9 @@ const r6Mocks = vi.hoisted(() => ({
 const INTEGRATION_TIMEOUT_MS = 45_000;
 
 type IntegrationHook = (event: unknown, ctx: unknown) => unknown;
-function createMockPi(overrides: Record<string, boolean> = {}) {
-	const mock = createPiMock({
-		"lens-lsp": true,
-		"no-lsp": false,
-		"lens-guard": false,
-		...overrides,
-	});
+function createMockPi(config: Record<string, unknown> = {}) {
+	if (Object.keys(config).length > 0) setGlobalConfig(config);
+	const mock = createPiMock();
 	return {
 		mock,
 		pi: mock.asExtensionAPI(),
@@ -140,6 +138,10 @@ vi.mock("../clients/read-guard.js", async (importOriginal) => {
 		// #4185: agent_settled's backstop and tool_execution_end release read
 		// captures; this double holds none.
 		dropProvisionalReads = () => 0;
+		// #5146: a session's shutdown forgets its foreign turn keys and releases
+		// the guard's file-time captures; this double holds none. Until a case
+		// ended its session, no path here reached it.
+		releaseFileTime = () => {};
 		dropProvisionalReadByCall = () => false;
 		getSummary = () => ({
 			totalEdits: 0,
@@ -177,8 +179,10 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 // "../clients/runtime-coordinator.js" mock` (#4405: 64 member rows over three
 // seeds).
 afterEach(async () => {
+	// #5146: end the case's sessions (this root hook runs after the describes').
+	await endMockSessions();
 	vi.doUnmock("../clients/bootstrap.js");
-	vi.doUnmock("../clients/bus-events-logger.js");
+	vi.doUnmock("../clients/bus-event-rollup.js");
 	vi.doUnmock("../clients/cache-observability.js");
 	vi.doUnmock("../clients/debug-handles.js");
 	vi.doUnmock("../clients/degradation-ledger.js");
@@ -187,7 +191,6 @@ afterEach(async () => {
 	vi.doUnmock("../clients/extension-log.js");
 	vi.doUnmock("../clients/installer/index.js");
 	vi.doUnmock("../clients/latency-logger.js");
-	vi.doUnmock("../clients/lsp/capabilities.js");
 	vi.doUnmock("../clients/pipeline.js");
 	vi.doUnmock("../clients/quiet-window.js");
 	vi.doUnmock("../clients/runtime-agent-end.js");
@@ -243,6 +246,8 @@ const forceCollect = resolveForcedCollector();
 afterEach(() => {
 	forceCollect();
 });
+
+const setGlobalConfig = useGlobalConfig();
 
 describe("index.ts integration", () => {
 	let tmpDir: string;
@@ -1125,11 +1130,9 @@ describe("index.ts integration", () => {
 		"session_shutdown uses fast LSP reset so teardown does not wait on graceful shutdown",
 		async () => {
 			const resetLSPService = vi.fn();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1159,16 +1162,14 @@ describe("index.ts integration", () => {
 			const resetLSPService = vi.fn(() => {
 				order.push("reset_lsp_service");
 			});
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 			vi.doMock("../clients/debug-handles.js", () => ({
 				dumpActiveHandles: (label: string) => {
 					order.push(`dump:${label}`);
 				},
 			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1188,10 +1189,6 @@ describe("index.ts integration", () => {
 			// The recurrence: the retire ran last and unguarded, so a throw from
 			// any teardown step above it left the scope live. After a /reload that
 			// re-evaluated the entry, nothing else ever ends the old scope.
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			vi.doMock("../clients/debug-handles.js", () => ({
 				dumpActiveHandles: () => {
 					throw new Error("teardown step failed");
@@ -1205,6 +1202,8 @@ describe("index.ts integration", () => {
 				return { ...actual, retireScope };
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1232,19 +1231,15 @@ describe("index.ts integration", () => {
 	it(
 		"session_shutdown emits the bus-event session-end rollup (S2d gap 5, #1432 review)",
 		async () => {
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			const emitBusEventRollupAtSessionEnd = vi.fn();
-			vi.doMock("../clients/bus-events-logger.js", async (importActual) => {
+			vi.doMock("../clients/bus-event-rollup.js", async (importActual) => {
 				const actual =
-					await importActual<
-						typeof import("../clients/bus-events-logger.js")
-					>();
+					await importActual<typeof import("../clients/bus-event-rollup.js")>();
 				return { ...actual, emitBusEventRollupAtSessionEnd };
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1325,11 +1320,7 @@ describe("index.ts integration", () => {
 			const telemetry =
 				await import("../clients/path-attribution-telemetry.js");
 			const { default: registerExtension } = await import("../index.js");
-			const primary = createPiMock({
-				"lens-lsp": true,
-				"no-lsp": false,
-				"lens-guard": false,
-			});
+			const primary = createPiMock();
 			registerExtension(primary.asExtensionAPI());
 			await primary.emit(
 				"session_start",
@@ -1341,11 +1332,7 @@ describe("index.ts integration", () => {
 			lspServer._markDirectLspCommandUnavailableForTests(
 				"secondary-must-not-reset",
 			);
-			const secondary = createPiMock({
-				"lens-lsp": true,
-				"no-lsp": false,
-				"lens-guard": false,
-			});
+			const secondary = createPiMock();
 			registerExtension(secondary.asExtensionAPI());
 			await secondary.emit(
 				"session_start",
@@ -1652,10 +1639,6 @@ describe("index.ts integration", () => {
 			// agent_settled itself queues is already in flight, so the dump must
 			// fire after runQuietWindow is invoked, not before.
 			const order: string[] = [];
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			vi.doMock("../clients/quiet-window.js", () => ({
 				registerQuietWindowTask: () => {},
 				registerBuiltinQuietWindowTasks: () => {},
@@ -1669,6 +1652,8 @@ describe("index.ts integration", () => {
 				},
 			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1687,10 +1672,6 @@ describe("index.ts integration", () => {
 
 	describe("#1654 deferred-mutation drain runs at agent_settled, not agent_end", () => {
 		function mockDrainDeps(handleAgentEndMock: ReturnType<typeof vi.fn>) {
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			vi.doMock("../clients/quiet-window.js", () => ({
 				registerQuietWindowTask: () => {},
 				registerBuiltinQuietWindowTasks: () => {},
@@ -1707,6 +1688,8 @@ describe("index.ts integration", () => {
 				const handleAgentEndMock = vi.fn(async () => undefined);
 				mockDrainDeps(handleAgentEndMock);
 
+				// The seam install goes after the doMocks above: it evaluates the graph.
+				await installLspServiceDouble();
 				const { default: registerExtension } = await import("../index.js");
 				const { pi, handlers } = createMockPi();
 				registerExtension(pi as any);
@@ -1875,11 +1858,7 @@ describe("index.ts integration", () => {
 			// The idle reset releases the warm servers from a detached timer with no pi
 			// event in flight; without the wrapped reset the footer would keep showing a
 			// stale "LSP Active" until the next turn. Assert the timer firing repaints it.
-			const { resetLSPService, service } = aliveServerHolder();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: service,
-				resetLSPService,
-			}));
+			const { resetLSPService, overrides } = aliveServerHolder();
 			vi.doMock("../clients/bootstrap.js", async () => {
 				const { bootstrapSeamMock } =
 					await import("./support/bootstrap-mock.js");
@@ -1897,8 +1876,12 @@ describe("index.ts integration", () => {
 				}));
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble(overrides, {
+				beforeReset: resetLSPService,
+			});
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": false });
+			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
 
 			const turnEnd = handlers.turn_end?.[0];
@@ -2196,6 +2179,10 @@ describe("index.ts integration", () => {
 					complexityBaselines = new Set();
 					cachedExports = new Map();
 					readGuard = mockReadGuard;
+					// #4942: the session's guard; one session here, so the one guard.
+					readGuardFor() {
+						return this.readGuard;
+					}
 					shouldWarmLspOnRead() {
 						return true;
 					}
@@ -2254,7 +2241,7 @@ describe("index.ts integration", () => {
 			});
 
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": true });
+			const { pi, handlers } = createMockPi({ lsp: { enabled: false } });
 			registerExtension(pi as any);
 
 			const toolCall = handlers.tool_call?.[0];
@@ -2308,6 +2295,10 @@ describe("index.ts integration", () => {
 						checkEdit,
 						contentMatchesLastRead: () => undefined,
 					};
+					// #4942: the session's guard; one session here, so the one guard.
+					readGuardFor() {
+						return this.readGuard;
+					}
 					shouldWarmLspOnRead() {
 						return false;
 					}
@@ -2366,7 +2357,7 @@ describe("index.ts integration", () => {
 			});
 
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": true });
+			const { pi, handlers } = createMockPi({ lsp: { enabled: false } });
 			registerExtension(pi as any);
 
 			const toolCall = handlers.tool_call?.[0];
@@ -2424,6 +2415,10 @@ describe("index.ts integration", () => {
 						checkEdit,
 						contentMatchesLastRead: () => undefined,
 					};
+					// #4942: the session's guard; one session here, so the one guard.
+					readGuardFor() {
+						return this.readGuard;
+					}
 					shouldWarmLspOnRead() {
 						return false;
 					}
@@ -2482,7 +2477,7 @@ describe("index.ts integration", () => {
 			});
 
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": true });
+			const { pi, handlers } = createMockPi({ lsp: { enabled: false } });
 			registerExtension(pi as any);
 
 			const toolCall = handlers.tool_call?.[0];
@@ -2555,6 +2550,10 @@ describe("index.ts integration", () => {
 						checkEdit: () => ({ action: "allow" as const }),
 						contentMatchesLastRead: () => undefined,
 					};
+					// #4942: the session's guard; one session here, so the one guard.
+					readGuardFor() {
+						return this.readGuard;
+					}
 					shouldWarmLspOnRead = shouldWarmLspOnRead;
 					markLspReadWarmStarted = markLspReadWarmStarted;
 					markLspReadWarmCompleted = markLspReadWarmCompleted;
@@ -2609,13 +2608,11 @@ describe("index.ts integration", () => {
 					},
 				}));
 			});
-			vi.doMock("../clients/lsp/capabilities.js", async () => ({
-				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
-				resetLSPService: () => {},
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({ touchFile: touchFileMock });
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": false });
+			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
 
 			const toolCall = handlers.tool_call?.[0];
@@ -2667,6 +2664,10 @@ describe("index.ts integration", () => {
 						checkEdit: () => ({ action: "allow" as const }),
 						contentMatchesLastRead: () => undefined,
 					};
+					// #4942: the session's guard; one session here, so the one guard.
+					readGuardFor() {
+						return this.readGuard;
+					}
 					shouldWarmLspOnRead = shouldWarmLspOnRead;
 					markLspReadWarmStarted() {}
 					markLspReadWarmCompleted() {}
@@ -2721,13 +2722,11 @@ describe("index.ts integration", () => {
 					},
 				}));
 			});
-			vi.doMock("../clients/lsp/capabilities.js", async () => ({
-				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
-				resetLSPService: () => {},
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({ touchFile: touchFileMock });
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": false });
+			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
 
 			const toolCall = handlers.tool_call?.[0];
@@ -2774,6 +2773,10 @@ describe("index.ts integration", () => {
 						checkEdit: () => ({ action: "allow" as const }),
 						contentMatchesLastRead: () => undefined,
 					};
+					// #4942: the session's guard; one session here, so the one guard.
+					readGuardFor() {
+						return this.readGuard;
+					}
 					shouldWarmLspOnRead = shouldWarmLspOnRead;
 					markLspReadWarmStarted() {}
 					markLspReadWarmCompleted() {}
@@ -2828,13 +2831,11 @@ describe("index.ts integration", () => {
 					},
 				}));
 			});
-			vi.doMock("../clients/lsp/capabilities.js", async () => ({
-				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
-				resetLSPService: () => {},
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({ touchFile: touchFileMock });
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": false });
+			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
 
 			const toolCall = handlers.tool_call?.[0];
@@ -2889,17 +2890,6 @@ describe("index.ts integration", () => {
 						recordRead: () => {},
 					};
 				},
-			}));
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () =>
-					makeLspServiceDouble({
-						getAliveClientCount: () => 1,
-						getAliveServerIds: () => ["typescript"],
-						getStatus: () => [
-							{ serverId: "typescript", root: tmpDir, connected: true },
-						],
-					}),
-				resetLSPService: () => {},
 			}));
 			vi.doMock("../clients/dispatch/integration.js", async () => ({
 				getDispatchSlopScoreLine: () => "Slop score: 12/100",
@@ -2980,6 +2970,14 @@ describe("index.ts integration", () => {
 				}));
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({
+				getAliveClientCount: () => 1,
+				getAliveServerIds: () => ["typescript"],
+				getStatus: () => [
+					{ serverId: "typescript", root: tmpDir, connected: true },
+				],
+			});
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, commands } = createMockPi();
 			registerExtension(pi as any);
@@ -3103,7 +3101,6 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		vi.doUnmock("../clients/runtime-coordinator.js");
 		vi.doUnmock("../clients/installer/index.js");
 		vi.doUnmock("../clients/runtime-session.js");
-		vi.doUnmock("../clients/lsp/capabilities.js");
 		quietTasks = [];
 		handleTurnEndHook = undefined;
 		_resetProcessSingletonsForTests();
@@ -3564,7 +3561,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers, sentMessages } = createMockPi({
-				"lens-turn-summary": true,
+				turnSummary: { enabled: true },
 			});
 			registerExtension(pi as any);
 
@@ -3621,7 +3618,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers, sentMessages } = createMockPi({
-				"lens-turn-summary": true,
+				turnSummary: { enabled: true },
 			});
 			registerExtension(pi as any);
 
@@ -3654,7 +3651,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers, sentMessages } = createMockPi({
-				"lens-turn-summary": true,
+				turnSummary: { enabled: true },
 			});
 			registerExtension(pi as any);
 
@@ -3718,7 +3715,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			fs.writeFileSync(filePath, "export const x = 1;\n");
 
 			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "lens-turn-summary": true });
+			const { pi, handlers } = createMockPi({ turnSummary: { enabled: true } });
 			// Simulate an older host lacking both APIs entirely — registerExtension
 			// feature-detects registerMessageRenderer at setup time, and the
 			// quiet-window task feature-detects sendMessage at emit time.
@@ -3746,7 +3743,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers, sentMessages } = createMockPi({
-				"lens-turn-summary": true,
+				turnSummary: { enabled: true },
 			});
 			registerExtension(pi as any);
 
@@ -3863,34 +3860,6 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	);
 
 	it(
-		"session_start resets repeated-finding identities for the owned role (#2841)",
-		async () => {
-			const resetCacheFindingIdentitiesSession = vi.fn();
-			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
-				...(await importActual<
-					typeof import("../clients/cache-observability.js")
-				>()),
-				resetCacheFindingIdentitiesSession,
-			}));
-
-			const { default: registerExtension } = await import("../index.js");
-			const primary = createMockPi();
-			registerExtension(primary.pi as any);
-			await primary.trigger(
-				"session_start",
-				{},
-				makeCtx({ cwd: tmpDir, sessionId: "reset-cache" }),
-			);
-
-			expect(resetCacheFindingIdentitiesSession).toHaveBeenCalledWith(
-				"reset-cache",
-				"primary",
-			);
-		},
-		INTEGRATION_TIMEOUT_MS,
-	);
-
-	it(
 		"a missing-id secondary keeps its activation-owned role through context, usage, and shutdown (#1996 review)",
 		async () => {
 			const observeCacheContext = vi.fn();
@@ -3909,11 +3878,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				clearCachePrefixSession,
 			}));
 			const resetLSPService = vi.fn();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const primary = createMockPi();
 			registerExtension(primary.pi as any);
@@ -3985,11 +3952,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				logCacheUsage,
 			}));
 			const resetLSPService = vi.fn();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const primary = createMockPi();
 			registerExtension(primary.pi as any);
@@ -4153,11 +4118,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				>()),
 				incrementDegradationCount: r6Mocks.incrementDegradationCount,
 			}));
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const primary = createMockPi();
 			registerExtension(primary.pi as any);

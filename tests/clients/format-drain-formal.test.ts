@@ -45,6 +45,7 @@ import { retireScope } from "../../clients/session-scope.js";
 import { waitFor } from "./interleaving-kit.js";
 import { createMockState } from "./lsp/mock-client-state.js";
 import { setupTestEnvironment } from "./test-utils.js";
+import { _setServersForFileForTests } from "../../clients/lsp/config.js";
 
 function gate() {
 	let open!: () => void;
@@ -137,11 +138,6 @@ const lsp = vi.hoisted(() => ({
 	realService: undefined as undefined | (() => unknown),
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
-}));
-vi.mock("../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig: lsp.getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 vi.mock("../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/lsp/client.js")>()),
@@ -339,6 +335,7 @@ function postExitResyncSubjects(): string[] {
 }
 
 beforeEach(() => {
+	_setServersForFileForTests(lsp.getServersForFileWithConfig);
 	logLatency.mockClear();
 	setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
 	setAmbientAbortSignal(undefined);

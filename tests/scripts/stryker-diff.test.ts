@@ -40,6 +40,7 @@ import {
 	decideMutationOutcome,
 	dedupePatterns,
 	describePartialMutationOutcome,
+	describeSampledMutants,
 	describeStrykerFailure,
 	describeZeroMutantOutcome,
 	DEFAULT_MAX_RANGES,
@@ -47,6 +48,7 @@ import {
 	DEFAULT_MUTATION_FIXED_OVERHEAD_MS,
 	estimateAffordableMutants,
 	extractSnippet,
+	fitSampleToMutantAllowance,
 	formatCapNotice,
 	formatQueueEntry,
 	isCompiledMutationSource,
@@ -127,6 +129,15 @@ const underStryker = isInstrumented(driver);
 const repositoryRoot = resolve(import.meta.dirname, "../..");
 const driverPath = join(repositoryRoot, "scripts", "stryker-diff.mjs");
 
+/** A throwaway fixture root for a real `git` repo (#4867). It lives inside the
+ *  checkout under the git-ignored `.probe-home`, never at the checkout root
+ *  (#4864): the plegma Bash guard refuses a git write outside the worker's
+ *  worktree, and a checkout fixture does not belong on tmpfs (AGENTS.md, #3526). */
+function strykerFixtureDir(prefix: string): string {
+	mkdirSync(join(repositoryRoot, ".probe-home"), { recursive: true });
+	return mkdtempSync(join(repositoryRoot, ".probe-home", prefix));
+}
+
 /** git in a throwaway fixture repo, with an identity so a commit works. */
 function fixtureGit(cwd: string, args: string[]) {
 	return gitExecFileSync(
@@ -151,11 +162,17 @@ function runDriver(cwd: string, args: string[], timeout: number) {
 }
 
 /** A real driver run that is allowed to exit non-zero (the partial path). */
-function runDriverResult(cwd: string, args: string[], timeout: number) {
+function runDriverResult(
+	cwd: string,
+	args: string[],
+	timeout: number,
+	env?: NodeJS.ProcessEnv,
+) {
 	return spawnSync(process.execPath, [driverPath, ...args], {
 		cwd,
 		encoding: "utf8",
 		timeout,
+		...(env ? { env } : {}),
 	});
 }
 
@@ -219,6 +236,14 @@ let control = {};
 try {
 	control = JSON.parse(fs.readFileSync(".fake-stryker/control.json", "utf8"));
 } catch {}
+// #4989: a pass the driver's kill bound must reach (control.dryRunHangMs), and a
+// first real run that spends budget so the admission after it sees a budget too
+// small to afford a mutant (control.firstRealRunClockSkewMs). The spend is a
+// clock offset the driver's test-only preload adds to Date.now (#3801), not a
+// real sleep: the driver reads its budget from Date.now alone.
+const sleep = (ms) => {
+	if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
 // The two dry-run failures Stryker 10.0.0 logs at ERROR (3-dry-run-executor.js
 // logTimeoutInitialRun / logFailedTestsInInitialRun), then exits 1.
 const DRY_RUN_ERRORS = {
@@ -239,11 +264,16 @@ DRY_RUN_ERRORS.testsQuotingTimeout = [
 	DRY_RUN_ERRORS.timeout,
 ].join("\n");
 if (dryRun) {
+	sleep(control.dryRunHangMs || 0);
 	if (control.dryRunFails) {
 		console.error(DRY_RUN_ERRORS[control.dryRunFails]);
 		process.exit(1);
 	}
-	console.log("Instrumented 3 source file(s) with " + patterns.length * 3 + " mutant(s)");
+	// #4171: control.density maps a pattern to the mutants it holds (default 3), so
+	// a fixture can give ranges the uneven density a real Stryker run measures.
+	const density = control.density || {};
+	const mutantTotal = patterns.reduce((sum, pattern) => sum + (density[pattern] ?? 3), 0);
+	console.log("Instrumented 3 source file(s) with " + mutantTotal + " mutant(s)");
 	console.log("Initial test run succeeded. Ran 1 tests in 1 seconds (net 12 ms, overhead 0 ms).");
 	process.exit(0);
 }
@@ -251,10 +281,21 @@ if (control.realRunFails) {
 	fs.writeFileSync("stryker.log", DRY_RUN_ERRORS[control.realRunFails] + "\n");
 	process.exit(1);
 }
+// #4989: only the FIRST real run spends the budget, so the retry after it faces
+// what is left.
+const countFile = ".fake-stryker/real-runs";
+let realRuns = 1;
+try {
+	realRuns = Number(fs.readFileSync(countFile, "utf8")) + 1;
+} catch {}
+fs.writeFileSync(countFile, String(realRuns));
+if (realRuns === 1 && control.firstRealRunClockSkewMs)
+	fs.writeFileSync(".fake-stryker/clock-offset-ms", String(control.firstRealRunClockSkewMs));
 const files = {};
 for (const pattern of patterns) {
 	const match = /^(.*):(\d+)-(\d+)$/.exec(pattern);
 	if (!match) continue;
+	if ((control.density || {})[pattern] === 0) continue;
 	const file = match[1];
 	const start = Number(match[2]);
 	if (!files[file]) files[file] = { mutants: [] };
@@ -400,6 +441,8 @@ type DriverFixtureOptions = {
 	corruptCompiled?: boolean;
 	/** true: a changed `scripts/ws.mjs` whose only change is whitespace. */
 	whitespaceCovered?: boolean;
+	/** N: a covered `scripts/many.mjs` with N separate one-line changed hunks. */
+	manyRanges?: number;
 };
 
 /**
@@ -416,8 +459,9 @@ function buildDriverFixture({
 	skippedCompiled = false,
 	corruptCompiled = false,
 	whitespaceCovered = false,
+	manyRanges = 0,
 }: DriverFixtureOptions) {
-	const root = mkdtempSync(join(repositoryRoot, ".tmp-stryker-diff-fixture-"));
+	const root = strykerFixtureDir("stryker-diff-fixture-");
 	mkdirSync(join(root, "scripts"));
 	mkdirSync(join(root, "src"));
 	mkdirSync(join(root, "tests", "scripts"), { recursive: true });
@@ -523,6 +567,24 @@ function buildDriverFixture({
 			'import { it } from "vitest";\nit("sibling", () => {});\n',
 		);
 	}
+	// #4171: N one-line exports, a kept line between each so `git diff -U0`
+	// yields N separate ranges; one test calls them all so every range is covered.
+	const manyBody = (value: (index: number) => number) =>
+		Array.from(
+			{ length: manyRanges },
+			(_, index) =>
+				`export const f${index} = () => ${value(index)};\n// keep\n`,
+		).join("");
+	if (manyRanges > 0) {
+		writeFileSync(
+			join(root, "scripts", "many.mjs"),
+			manyBody((i) => i),
+		);
+		writeFileSync(
+			join(root, "tests", "scripts", "many.test.ts"),
+			`import { expect, it } from "vitest";\nimport * as many from "../../scripts/many.mjs";\nit("calls every function", () => {\n\texpect(Object.values(many).map((f) => (f as () => number)())).toHaveLength(${manyRanges});\n});\n`,
+		);
+	}
 	linkRealNodeModules(join(root, "node_modules"), { fakeVitest });
 	const git = (args: string[]) => fixtureGit(root, args);
 	git(["init", "-q", "-b", "main"]);
@@ -570,6 +632,12 @@ function buildDriverFixture({
 	}
 	if (whitespaceCovered) {
 		writeFileSync(join(root, "scripts", "ws.mjs"), "  export const ws = 1;\n");
+	}
+	if (manyRanges > 0) {
+		writeFileSync(
+			join(root, "scripts", "many.mjs"),
+			manyBody((i) => i + 100),
+		);
 	}
 	git(["commit", "-qam", "change the function"]);
 	return {
@@ -850,9 +918,7 @@ describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
 	// script against a real, throwaway git repo -- no relative import,
 	// mock, or source-text substitute reproduces a temporal-dead-zone crash.
 	it("exits 0 with a zero-mutant report when no changed line falls under a mutated glob, instead of crashing on costEstimate's TDZ", () => {
-		const fixtureRepo = mkdtempSync(
-			join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
-		);
+		const fixtureRepo = strykerFixtureDir("stryker-diff-fixture-");
 		try {
 			// One commit, no files under scripts/**/*.mjs, clients/**/*.ts,
 			// tools/**/*.ts, mcp/**/*.ts, or index.ts -- `--base HEAD` then diffs
@@ -902,9 +968,7 @@ describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
 // repo: the flag is read in the driver's own top-level flow.
 describe.skipIf(underStryker)("--runtime-only (#4005)", () => {
 	const reasonFor = (extraArgs: string[]) => {
-		const fixtureRepo = mkdtempSync(
-			join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
-		);
+		const fixtureRepo = strykerFixtureDir("stryker-diff-fixture-");
 		try {
 			writeFileSync(join(fixtureRepo, "README.md"), "fixture\n");
 			fixtureGit(fixtureRepo, ["init", "-q"]);
@@ -939,9 +1003,7 @@ describe.skipIf(underStryker)("--runtime-only (#4005)", () => {
 	// edit; the driver must take the valid existing runtime entries, in order,
 	// and nothing else, before the cap.
 	it("mutates queued files first and drops every invalid or vanished queue entry", () => {
-		const fixtureRepo = mkdtempSync(
-			join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
-		);
+		const fixtureRepo = strykerFixtureDir("stryker-diff-fixture-");
 		try {
 			mkdirSync(join(fixtureRepo, "clients"));
 			mkdirSync(join(fixtureRepo, "scripts"));
@@ -987,9 +1049,7 @@ describe.skipIf(underStryker)("--runtime-only (#4005)", () => {
 	// its own entry carries (the sha reaches git), take a well-formed entry
 	// whose base git knows, and refuse a malformed base suffix outright.
 	it("reads each queued file against its own entry's base", () => {
-		const fixtureRepo = mkdtempSync(
-			join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
-		);
+		const fixtureRepo = strykerFixtureDir("stryker-diff-fixture-");
 		try {
 			mkdirSync(join(fixtureRepo, "clients"));
 			for (const file of ["clients/q1.ts", "clients/q2.ts"])
@@ -1240,9 +1300,7 @@ describe("driver selection stage, spawned for real (#3810)", () => {
 	// coverage probe (one process, v8, source-mapped), the real selector, and
 	// the file cap reading the real `git diff -w`.
 	it("probes real coverage, keeps no test when none executes a changed line, and reports a zero-mutant run instead of running the suite", () => {
-		const fixtureRepo = mkdtempSync(
-			join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
-		);
+		const fixtureRepo = strykerFixtureDir("stryker-diff-fixture-");
 		try {
 			mkdirSync(join(fixtureRepo, "scripts"));
 			mkdirSync(join(fixtureRepo, "src"));
@@ -1467,6 +1525,267 @@ describe("driver Stryker stage, spawned for real (#3856 F3)", () => {
 		// implicit 5s expires this new case (#3978); use the mutation-comparable 30s,
 		// without changing the campaign, per-mutant, or coverage-probe budgets.
 	}, 30_000);
+	// Recurrence this guards (#4171, run 40847865852, 2026-10-29): the sampler
+	// kept floor(ranges x allowance / mutants) ranges, assuming every range holds
+	// the same number of mutants; 3 of 172 ranges held 55 against an allowance of
+	// ~24, the budget expired after 48 of 1197 mutants, and the job exited 1.
+	// Fixture: 13 ranges, the 2 densest rank first.
+	it("holds a sampled run to the mutant allowance when range density is uneven (#4171)", () => {
+		const fixture = buildDriverFixture({
+			covering: true,
+			includeCompiled: false,
+			manyRanges: 12,
+		});
+		try {
+			const head = String(fixture.git(["rev-parse", "HEAD"])).trim();
+			const ranges = [
+				"scripts/thing.mjs:5-6",
+				...Array.from(
+					{ length: 12 },
+					(_, i) => `scripts/many.mjs:${2 * i + 1}-${2 * i + 1}`,
+				),
+			];
+			const allowance = 10;
+			const binary = join(fixture.root, "node_modules", ".bin", "stryker");
+			// (3_600_000 - 300_000 fixed overhead) x 0.7 / 220_000 ms = 10.5, so 10
+			// mutants however many seconds the run has already spent.
+			writeFileSync(
+				binary,
+				readFileSync(binary, "utf8").replace(
+					"in 1 seconds (net 12 ms",
+					"in 220 seconds (net 220000 ms",
+				),
+			);
+			const densest = sampleRangesDeterministically(ranges, 2, head).selected;
+			const density = Object.fromEntries(
+				ranges.map((range) => [range, densest.includes(range) ? 8 : 2]),
+			);
+			const total = Object.values(density).reduce((a, b) => a + b, 0);
+			// The uniform estimate keeps floor(13 x 10 / 38) = 3 ranges: 8 + 8 + 2 = 18
+			// mutants against an allowance of 10.
+			expect(Math.floor((ranges.length * allowance) / total)).toBe(3);
+			mkdirSync(join(fixture.root, ".fake-stryker"), { recursive: true });
+			writeFileSync(
+				join(fixture.root, ".fake-stryker", "control.json"),
+				JSON.stringify({ density }),
+			);
+			const output = runDriver(fixture.root, ["--base", "main"], 120_000);
+			const calls = fakeStrykerInvocations(fixture.root);
+			const measured = calls.find((call) => call.dryRun);
+			expect([...measured.patterns].sort()).toEqual([...ranges].sort());
+			const real = calls.find((call) => !call.dryRun);
+			const held = real.patterns.reduce(
+				(sum: number, range: string) => sum + density[range],
+				0,
+			);
+			expect(held).toBeLessThanOrEqual(allowance);
+			expect(real.patterns).toHaveLength(1);
+			expect(output).toContain(
+				`sampled mutants ${held} of ${allowance} allowed`,
+			);
+			// Counting a sample must not run the related tests: every dry run after
+			// the measurement is a no-test pass (3 s each, not a 1-minute dry run).
+			const countPasses = calls.filter((call) => call.dryRun).slice(1);
+			expect(countPasses.length).toBeGreaterThan(0);
+			for (const pass of countPasses) {
+				expect(pass.command).not.toContain("vitest");
+			}
+		} finally {
+			fixture.cleanup();
+		}
+	}, 60_000);
+	// Recurrence this guards (#4171): the resample retry after a zero-mutant sample
+	// kept `keepRangeCount` untried ranges with no mutant bound, so it could
+	// overshoot the allowance the first sample was held to.
+	it("holds the resample retry to the mutant allowance too (#4171)", () => {
+		const fixture = buildDriverFixture({
+			covering: true,
+			includeCompiled: false,
+			manyRanges: 12,
+		});
+		try {
+			const head = String(fixture.git(["rev-parse", "HEAD"])).trim();
+			const ranges = [
+				"scripts/thing.mjs:5-6",
+				...Array.from(
+					{ length: 12 },
+					(_, i) => `scripts/many.mjs:${2 * i + 1}-${2 * i + 1}`,
+				),
+			];
+			const allowance = 10;
+			const binary = join(fixture.root, "node_modules", ".bin", "stryker");
+			writeFileSync(
+				binary,
+				readFileSync(binary, "utf8").replace(
+					"in 1 seconds (net 12 ms",
+					"in 220 seconds (net 220000 ms",
+				),
+			);
+			// The 2 best-ranked ranges hold no mutants, so the first sample runs
+			// empty and the driver retries. The retry ranks the untried ranges under
+			// its own seed; its 2 best hold 8 each, so its uniform estimate (2
+			// ranges, 16 mutants) overshoots 10. Every other range holds 4.
+			const empty = sampleRangesDeterministically(ranges, 2, head).selected;
+			const untried = ranges.filter((range) => !empty.includes(range));
+			const heavy = sampleRangesDeterministically(
+				untried,
+				2,
+				`${head}:retry0`,
+			).selected;
+			const density = Object.fromEntries(
+				ranges.map((range) => [
+					range,
+					empty.includes(range) ? 0 : heavy.includes(range) ? 8 : 4,
+				]),
+			);
+			const total = Object.values(density).reduce((a, b) => a + b, 0);
+			expect(Math.floor((ranges.length * allowance) / total)).toBe(2);
+			mkdirSync(join(fixture.root, ".fake-stryker"), { recursive: true });
+			writeFileSync(
+				join(fixture.root, ".fake-stryker", "control.json"),
+				JSON.stringify({ density }),
+			);
+			const output = runDriver(fixture.root, ["--base", "main"], 120_000);
+			const realRuns = fakeStrykerInvocations(fixture.root).filter(
+				(call) => !call.dryRun,
+			);
+			expect(realRuns[0].patterns.slice().sort()).toEqual(empty.slice().sort());
+			const retry = realRuns[1];
+			expect(retry.patterns).toHaveLength(1);
+			expect(density[retry.patterns[0]]).toBeLessThanOrEqual(allowance);
+			expect(output).toContain(
+				"retry sample of 1 range(s); sampled mutants 8 of 10 allowed",
+			);
+		} finally {
+			fixture.cleanup();
+		}
+	}, 60_000);
+	// Recurrence this guards (#4989 F1): `remainingBudgetMs()` bottoms out at
+	// exactly 0 and `spawnSync` reads `timeout: 0` as NO timeout, so a spent
+	// budget launched the measurement pass with no kill bound. Probe:
+	// `timeout:1 -> error=ETIMEDOUT` against `timeout:0 -> ` a 20 s child that
+	// ran to completion. The fake Stryker hangs its dry run, so only a real kill
+	// bound ends this driver run instead of the harness timeout.
+	it("kills a Stryker child a spent budget would leave unbounded (#4989 F1)", () => {
+		const fixture = buildDriverFixture({
+			covering: true,
+			includeCompiled: false,
+		});
+		try {
+			mkdirSync(join(fixture.root, ".fake-stryker"), { recursive: true });
+			writeFileSync(
+				join(fixture.root, ".fake-stryker", "control.json"),
+				JSON.stringify({ dryRunHangMs: 20_000 }),
+			);
+			// A 0-minute budget is spent before the first Stryker child.
+			const result = runDriverResult(
+				fixture.root,
+				["--base", "main", "--budget-minutes", "0"],
+				10_000,
+			);
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe(1);
+			expect(`${result.stdout}${result.stderr}`).toContain(
+				"the 0-minute mutation budget expired before Stryker produced a result",
+			);
+		} finally {
+			fixture.cleanup();
+		}
+	}, 60_000);
+	// Recurrence this guards (#4989, "skip the retry when the retry allowance is
+	// zero"): the first sample stops when the remaining budget affords no mutant
+	// (`allowedMutants === 0`), but the retry did not -- it spawned its count
+	// passes and another full run the budget could not pay for. The fake Stryker
+	// spends the first real run's wall clock, so the budget that reaches the
+	// retry is below the fixed run overhead.
+	it("spends no retry when the remaining budget affords no mutant (#4989)", () => {
+		const fixture = buildDriverFixture({
+			covering: true,
+			includeCompiled: false,
+			manyRanges: 12,
+		});
+		try {
+			const head = String(fixture.git(["rev-parse", "HEAD"])).trim();
+			const ranges = [
+				"scripts/thing.mjs:5-6",
+				...Array.from(
+					{ length: 12 },
+					(_, i) => `scripts/many.mjs:${2 * i + 1}-${2 * i + 1}`,
+				),
+			];
+			const binary = join(fixture.root, "node_modules", ".bin", "stryker");
+			// 5 minutes of fixed overhead, and a 220 s dry run: the remaining budget
+			// (5.5 minutes minus what the run has spent) affords exactly one mutant,
+			// so the sample keeps the one range that holds none.
+			writeFileSync(
+				binary,
+				readFileSync(binary, "utf8").replace(
+					"in 1 seconds (net 12 ms",
+					"in 220 seconds (net 220000 ms",
+				),
+			);
+			const empty = sampleRangesDeterministically(ranges, 1, head).selected;
+			const density = Object.fromEntries(
+				ranges.map((range) => [range, empty.includes(range) ? 0 : 4]),
+			);
+			const total = Object.values(density).reduce((a, b) => a + b, 0);
+			// The uniform estimate keeps no range at all: 13 x 1 / 48 = 0, floored up
+			// to the one range that holds the sample's whole mutant count.
+			expect(Math.floor((ranges.length * 1) / total)).toBe(0);
+			mkdirSync(join(fixture.root, ".fake-stryker"), { recursive: true });
+			writeFileSync(
+				join(fixture.root, ".fake-stryker", "control.json"),
+				JSON.stringify({ density, firstRealRunClockSkewMs: 40_000 }),
+			);
+			// #3801: the first real run used to sleep 40 s of real time. The preload
+			// (the driver process only, not its tsc/vitest/Stryker children) adds the
+			// offset the fake Stryker writes to Date.now, which is all the driver's
+			// budget reads (scripts/stryker-diff.mjs remainingBudgetMs).
+			const preload = join(fixture.root, ".fake-stryker", "clock-skew.mjs");
+			writeFileSync(
+				preload,
+				[
+					'import { readFileSync } from "node:fs";',
+					'import { basename } from "node:path";',
+					'if (basename(process.argv[1] ?? "") === "stryker-diff.mjs") {',
+					"	const realNow = Date.now.bind(Date);",
+					"	let offset = 0;",
+					"	Date.now = () => {",
+					"		if (offset === 0) {",
+					"			try {",
+					'				offset = Number(readFileSync(".fake-stryker/clock-offset-ms", "utf8")) || 0;',
+					"			} catch {}",
+					"		}",
+					"		return realNow() + offset;",
+					"	};",
+					"}",
+					"",
+				].join("\n"),
+			);
+			const result = runDriverResult(
+				fixture.root,
+				["--base", "main", "--budget-minutes", "5.5"],
+				120_000,
+				{
+					...process.env,
+					NODE_OPTIONS: `--import ${pathToFileURL(preload).href}`,
+				},
+			);
+			expect(result.error).toBeUndefined();
+			const calls = fakeStrykerInvocations(fixture.root);
+			const firstReal = calls.findIndex((call) => !call.dryRun);
+			expect(firstReal).toBeGreaterThan(0);
+			// Nothing is spawned after the zero-mutant run: no count pass, no retry.
+			expect(calls).toHaveLength(firstReal + 1);
+			expect(result.status).toBe(0);
+			expect(result.stdout).toContain(
+				`sampled 1 of ${ranges.length} ranges deterministically`,
+			);
+			expect(result.stdout).not.toContain("retry sample of");
+		} finally {
+			fixture.cleanup();
+		}
+	}, 120_000);
 	// Recurrence this guards (#3810 F3): the driver's fingerprint, incremental
 	// decision, generated Stryker config and run loop sat past the zero-mutant
 	// exits, so mutants on those added lines survived. This fixture installs a
@@ -2801,12 +3120,15 @@ describe("stryker diff wall-clock budget", () => {
 		// inert -- the runner still cancels the job. The executable proof is the
 		// quoted budget-expiry transcript in the PR body; this pins the wiring in
 		// the driver, which is a top-level script and cannot be imported. Round 2:
-		// the literal `timeout: budgetMs` this pinned before is gone -- the
-		// driver now bounds each Stryker child by the BUDGET REMAINING after
-		// time already spent (the dry-run cost measurement, the build), via
-		// `remainingBudgetMs()` -- so this now pins that function's own use as
-		// the timeout, not the removed literal.
-		expect(driver).toContain("timeout: remainingBudgetMs()");
+		// each Stryker child is killed at the budget REMAINING after time already
+		// spent (the dry-run cost measurement, the build), via `childBudgetMs()`,
+		// which floors a spent budget at the 1 ms `spawnSync` accepts -- it reads
+		// `timeout: 0` as NO timeout (#4989 F1; the spawned case above kills a
+		// hanging child at a 0-minute budget). Pinned over the WHOLE population:
+		// a fourth Stryker child, or one site reverted to the bare remaining
+		// budget, reds here as well as in the spawned case.
+		expect(driver.match(/timeout: childBudgetMs\(\),/g) ?? []).toHaveLength(3);
+		expect(driver).not.toContain("timeout: remainingBudgetMs(),");
 		expect(driver).toContain("--budget-minutes");
 		expect(driver).toContain("mutationRangePatterns");
 		expect(driver).toContain("describeStrykerFailure");
@@ -3632,6 +3954,205 @@ describe("decideMutationOutcome (#3531 round 3 R2-2: the driver's three outcome 
 	});
 });
 
+describe("fitSampleToMutantAllowance (#4171)", () => {
+	// Recurrence these cases guard: run 40847865852 (2026-10-29) sampled by range
+	// count, kept 3 of 172 ranges for an allowance of ~24 of 1197 measured
+	// mutants, and those 3 held 55; the budget expired after 48 mutants.
+	const seed = "22b094239254d3983395f220d417d81ac6dd3a9e";
+	const patterns = Array.from(
+		{ length: 172 },
+		(_, index) => `clients/f${index}.js:1-1`,
+	);
+	/** The `count` highest-ranked ranges, best first (the sampler's own order). */
+	const topRanked = (count: number, pool = patterns) => {
+		const ranked: string[] = [];
+		for (let limit = 1; limit <= count; limit += 1) {
+			const next = sampleRangesDeterministically(pool, limit, seed).selected;
+			ranked.push(next.find((pattern) => !ranked.includes(pattern)) as string);
+		}
+		return ranked;
+	};
+	const counter = (density: Map<string, number>, fallback: number) => {
+		const calls: string[][] = [];
+		const countMutants = (selection: string[]) => {
+			calls.push(selection);
+			return selection.reduce(
+				(sum, pattern) => sum + (density.get(pattern) ?? fallback),
+				0,
+			);
+		};
+		return { calls, countMutants };
+	};
+	/** 172 ranges holding 1197 mutants, the 3 best-ranked holding 55 (20+20+15). */
+	const productionDensity = () => {
+		const [first, second, third] = topRanked(3);
+		const density = new Map([
+			[first, 20],
+			[second, 20],
+			[third, 15],
+		]);
+		const rest = patterns.filter((pattern) => !density.has(pattern));
+		rest.forEach((pattern, index) => density.set(pattern, index < 128 ? 7 : 6));
+		return { density, first, second, third };
+	};
+
+	it("keeps the sample inside the allowance where the uniform estimate overshoots it", () => {
+		const { density, first } = productionDensity();
+		const { countMutants } = counter(density, 0);
+		const all = countMutants(patterns);
+		const estimate = Math.floor((patterns.length * 24) / all);
+		expect([all, estimate]).toEqual([1197, 3]);
+		const oldSample = sampleRangesDeterministically(patterns, estimate, seed);
+		expect(countMutants(oldSample.selected)).toBe(55);
+
+		const fit = fitSampleToMutantAllowance({
+			patterns,
+			startCount: estimate,
+			allowedMutants: 24,
+			seed,
+			countMutants,
+		});
+
+		expect(fit.selected).toEqual([first]);
+		expect(fit.mutants).toBe(20);
+		expect(fit).toMatchObject({ exceedsAllowance: false, unverified: false });
+	});
+
+	it("keeps the largest prefix that fits, never fewer ranges than the allowance affords", () => {
+		const { density, first, second } = productionDensity();
+		const { countMutants } = counter(density, 0);
+		// 20 + 20 = 40 fits an allowance of 40; the third range (15) would not.
+		const fit = fitSampleToMutantAllowance({
+			patterns,
+			startCount: 3,
+			allowedMutants: 40,
+			seed,
+			countMutants,
+		});
+		expect(new Set(fit.selected)).toEqual(new Set([first, second]));
+		expect(fit.mutants).toBe(40);
+	});
+
+	it("takes one count pass when the uniform estimate already fits", () => {
+		const { calls, countMutants } = counter(new Map(), 1);
+		const fit = fitSampleToMutantAllowance({
+			patterns,
+			startCount: 24,
+			allowedMutants: 24,
+			seed,
+			countMutants,
+		});
+		expect(fit.selected).toHaveLength(24);
+		expect(fit.mutants).toBe(24);
+		expect(fit.passes).toBe(1);
+		expect(calls).toHaveLength(1);
+	});
+
+	it("bounds the count passes by the logarithm of the starting sample", () => {
+		const { calls, countMutants } = counter(new Map(), 1);
+		const fit = fitSampleToMutantAllowance({
+			patterns,
+			startCount: 40,
+			allowedMutants: 5,
+			seed,
+			countMutants,
+		});
+		expect(fit.selected).toHaveLength(5);
+		expect(fit.passes).toBe(calls.length);
+		expect(fit.passes).toBeLessThanOrEqual(1 + Math.ceil(Math.log2(40)));
+	});
+
+	it("selects the same ranges for the same seed and different ranges for another", () => {
+		const run = (runSeed: string) =>
+			fitSampleToMutantAllowance({
+				patterns,
+				startCount: 3,
+				allowedMutants: 60,
+				seed: runSeed,
+				countMutants: counter(new Map(), 7).countMutants,
+			}).selected;
+		expect(run(seed)).toEqual(run(seed));
+		expect(run(seed)).not.toEqual(run("another-head"));
+	});
+
+	it("keeps one range and says so when a single range alone exceeds the allowance", () => {
+		const { calls, countMutants } = counter(new Map(), 50);
+		const fit = fitSampleToMutantAllowance({
+			patterns,
+			startCount: 3,
+			allowedMutants: 24,
+			seed,
+			countMutants,
+		});
+		expect(fit.selected).toEqual(topRanked(1));
+		expect(fit).toMatchObject({
+			mutants: 50,
+			exceedsAllowance: true,
+			unverified: false,
+		});
+		expect(calls.length).toBe(fit.passes);
+	});
+
+	it("keeps one range and flags it unverified when the first count pass fails", () => {
+		const fit = fitSampleToMutantAllowance({
+			patterns,
+			startCount: 3,
+			allowedMutants: 24,
+			seed,
+			countMutants: () => null,
+		});
+		expect(fit.selected).toEqual(topRanked(1));
+		expect(fit).toMatchObject({ mutants: null, unverified: true });
+	});
+
+	it("falls back to the largest sample already proven to fit when a later pass fails", () => {
+		const { density, first } = productionDensity();
+		const { countMutants } = counter(density, 0);
+		let pass = 0;
+		const fit = fitSampleToMutantAllowance({
+			patterns,
+			startCount: 3,
+			allowedMutants: 24,
+			seed,
+			// Pass 1 (k=3) overshoots, pass 2 (k=1) fits, pass 3 (k=2) fails.
+			countMutants: (selection) => {
+				pass += 1;
+				return pass === 3 ? null : countMutants(selection);
+			},
+		});
+		expect(fit.selected).toEqual([first]);
+		expect(fit).toMatchObject({ mutants: 20, unverified: true });
+	});
+});
+
+describe("describeSampledMutants (#4171)", () => {
+	it("states the sampled mutants against the allowance in every outcome", () => {
+		const fit = {
+			selected: ["a.js:1-1"],
+			mutants: 20,
+			passes: 3,
+			exceedsAllowance: false,
+			unverified: false,
+		};
+		expect(describeSampledMutants(fit, 24)).toBe(
+			"sampled mutants 20 of 24 allowed (3 count pass(es))",
+		);
+		expect(
+			describeSampledMutants(
+				{ ...fit, mutants: 50, exceedsAllowance: true },
+				24,
+			),
+		).toBe(
+			"sampled mutants 50 of 24 allowed (3 count pass(es)); over the allowance because one range alone holds more",
+		);
+		expect(
+			describeSampledMutants({ ...fit, mutants: null, unverified: true }, 24),
+		).toBe(
+			"sampled mutants unverified against the allowance of 24 (a count pass failed; kept one range)",
+		);
+	});
+});
+
 describe("planResample (#3531 round 3 R2-1 fix #3)", () => {
 	it("resamples from only the ranges not yet tried, excluding every proven-empty one", () => {
 		const plan = planResample({
@@ -3649,6 +4170,28 @@ describe("planResample (#3531 round 3 R2-1 fix #3)", () => {
 		for (const pattern of plan.patterns) {
 			expect(["b.js:2-2", "c.js:3-3", "d.js:4-4"]).toContain(pattern);
 		}
+	});
+
+	it("draws the retry from the injected sampler, with the retry seed and the untried pool (#4171)", () => {
+		// Recurrence: a retry kept `keepRangeCount` ranges with no mutant bound, so
+		// it could overshoot the allowance the first sample was held to.
+		const calls: Array<[string[], number, string]> = [];
+		const plan = planResample({
+			allPatterns: ["a.js:1-1", "b.js:2-2", "c.js:3-3", "d.js:4-4"],
+			triedPatterns: ["a.js:1-1"],
+			keepRangeCount: 5,
+			seed: "deadbeef",
+			attemptsSoFar: 1,
+			maxAttempts: 3,
+			sample: (pool, limit, seed) => {
+				calls.push([pool, limit, seed]);
+				return { selected: ["c.js:3-3"] };
+			},
+		});
+		expect(plan).toEqual({ retry: true, patterns: ["c.js:3-3"] });
+		expect(calls).toEqual([
+			[["b.js:2-2", "c.js:3-3", "d.js:4-4"], 3, "deadbeef:retry1"],
+		]);
 	});
 
 	it("gives up once every range has been tried", () => {
@@ -3853,9 +4396,7 @@ describe("shared test-suite slot (#3853)", () => {
 		// run. A full-suite (exclusive) holder must make it wait and then refuse,
 		// never run concurrently: a real in-process store plus the real spawned
 		// CLI, no mocked lock.
-		const fixtureRepo = mkdtempSync(
-			join(repositoryRoot, ".tmp-stryker-diff-lock-"),
-		);
+		const fixtureRepo = strykerFixtureDir("stryker-diff-lock-");
 		const home = join(fixtureRepo, "home");
 		mkdirSync(home, { recursive: true });
 		const previousHome = process.env.PI_LENS_HOME;

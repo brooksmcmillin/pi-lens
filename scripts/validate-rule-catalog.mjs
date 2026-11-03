@@ -11,6 +11,8 @@ const astGrepRoot = path.join(root, "rules", "ast-grep-rules", "rules");
 const TRACKED_AST_GREP_IDS = new Set([
 	"no-sql-in-code",
 	"no-sql-in-code-js",
+	"no-sql-in-code-execute",
+	"no-sql-in-code-execute-js",
 	"no-open-redirect",
 	"no-open-redirect-js",
 	"no-javascript-url",

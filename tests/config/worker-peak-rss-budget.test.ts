@@ -44,6 +44,7 @@ function reportOn(
 		file?: string;
 		platform?: NodeJS.Platform;
 		admissions?: Readonly<Record<string, PeakRssAdmission>>;
+		ceilingMb?: number;
 	} = {},
 ): string[] {
 	const sink = capture();
@@ -55,6 +56,7 @@ function reportOn(
 		write: sink.write,
 		platform: options.platform ?? "linux",
 		admissions: options.admissions ?? {},
+		ceilingMb: options.ceilingMb,
 	});
 	return sink.lines;
 }
@@ -126,6 +128,24 @@ describe("#3058 per-file peak RSS is registered or fails", () => {
 		expect(reportOn(10)).toEqual([
 			"[mem-file] peakRssMb=10 heapUsedMb=12 externalMb=3 tests/fixture/heavy.test.ts\n",
 		]);
+	});
+
+	// Recurrence (#4736 review F1): silent-catch-sweep's own 1,600 MB case
+	// divided `maxRSS` itself and enforced on every platform, so a legitimate
+	// macOS run (`ru_maxrss` in bytes) would have redded on a unit artifact.
+	it("enforces a per-file ceiling on linux only and never raises the budget (#4736)", () => {
+		expect(() => reportOn(1601, { ceilingMb: 1600 })).toThrow(
+			"over its own 1600 MB ceiling",
+		);
+		expect(reportOn(1600, { ceilingMb: 1600 })).toHaveLength(1);
+		// darwin reports bytes: ~250 MB reads as 262,144,000 "MB" there.
+		expect(
+			reportOn(250 * 1024 * 1024, { platform: "darwin", ceilingMb: 1600 }),
+		).toHaveLength(1);
+		// A ceiling above the budget is not an admission.
+		expect(() => reportOn(OVER_BUDGET, { ceilingMb: 99_999 })).toThrow(
+			`over the ${WORKER_PEAK_RSS_BUDGET_MB} MB per-worker budget`,
+		);
 	});
 
 	it("warns inside the headroom band before the gate goes red (#3565)", () => {

@@ -159,6 +159,7 @@ describe("evaluateWorkflowRunEvidence: the quoted branch run (#3085)", () => {
 			body,
 			readWorkflow: (file) => (file in files ? files[file] : text),
 			readBaseWorkflow: () => base,
+			repository: "o/r",
 		});
 	// A workflow with no workflow_dispatch trigger cannot be run on a branch.
 	const noDispatch = { [FILE]: wf("  push:") };
@@ -194,6 +195,90 @@ describe("evaluateWorkflowRunEvidence: the quoted branch run (#3085)", () => {
 		).toEqual([]);
 	});
 
+	// Recurrence (#4756): the PR adding windows-repeat-probe.yml (workflow_dispatch
+	// only) could not satisfy this rule. GitHub registers dispatch only from the
+	// default branch, so `gh workflow run <file> --ref <branch>` answered 404 and
+	// the only branch run was a temporary push-trigger run. An ADDED file (the
+	// reader confirmed it absent on the base) accepts ONE line naming it with a
+	// run of this repository; an edited existing file keeps the dispatch rule.
+	describe("an added file quotes a push-triggered branch run (#4756)", () => {
+		const url = "https://github.com/o/r/actions/runs/40131910781";
+		const pushRun = `Run: ${url} (stryker-nightly.yml, push trigger)`;
+		it("accepts a line naming the added file with this repository's run URL", () => {
+			expect(run(pushRun)).toEqual([]);
+		});
+		it("accepts the full path and a `gh run view <id>` on one line", () => {
+			expect(
+				run(
+					".github/workflows/stryker-nightly.yml, push trigger: $ gh run view 40131910781",
+				),
+			).toEqual([]);
+		});
+		it("reds the same push-run form for an edited existing file", () => {
+			expect(run(pushRun, [FILE], {}, text)).toHaveLength(1);
+		});
+		it("reds a run URL that names a different workflow", () => {
+			expect(run(`Run: ${url} (compat-smoke.yml, push trigger)`)).toHaveLength(
+				1,
+			);
+		});
+		// Recurrence (review of #4827, F2): the added form kept the dispatch
+		// form's window but dropped the command that bound name to run, so any
+		// nearby run URL vouched for the file.
+		it("reds another repository's run URL on the name's line", () => {
+			expect(
+				run(
+					"stryker-nightly.yml https://github.com/other/repo/actions/runs/40131910781",
+				),
+			).toHaveLength(1);
+		});
+		it("reds a run URL on a later line than the name", () => {
+			for (const gap of ["\n", "\nunrelated\nunrelated\n"])
+				expect(
+					run(`stryker-nightly.yml, push trigger:${gap}${url}`),
+				).toHaveLength(1);
+		});
+		it("scopes `gh run view` to this repository", () => {
+			const name = "stryker-nightly.yml gh run view";
+			expect(run(`${name} -R other/repo 40131910781`)).toHaveLength(1);
+			expect(run(`${name} --repo=other/repo 40131910781`)).toHaveLength(1);
+			expect(run(`${name} -R O/R 40131910781`)).toEqual([]);
+		});
+		it("reds an added file when the caller supplies no repository", () => {
+			expect(
+				evaluateWorkflowRunEvidence({
+					changedFiles: [FILE],
+					body: pushRun,
+					readWorkflow: () => text,
+					readBaseWorkflow: () => null,
+				}),
+			).toHaveLength(1);
+		});
+		// Recurrence (review of #4827, F3): an omitted reader answered "added".
+		it("reds the push-run form when no base reader is supplied", () => {
+			expect(
+				evaluateWorkflowRunEvidence({
+					changedFiles: [FILE],
+					body: pushRun,
+					readWorkflow: () => text,
+					repository: "o/r",
+				}),
+			).toHaveLength(1);
+		});
+		it("reds a file-name token that is part of another path or name", () => {
+			for (const line of [
+				`x/stryker-nightly.yml ${url}`,
+				`my-stryker-nightly.yml ${url}`,
+				`stryker-nightly.yml.bak ${url}`,
+			])
+				expect(run(line)).toHaveLength(1);
+		});
+		it("reds prose `run id` for the bare-name form and a URL with no file name", () => {
+			expect(run("stryker-nightly.yml run id: 40131910781")).toHaveLength(1);
+			expect(run(url)).toHaveLength(1);
+		});
+	});
+
 	it("reds the command with no run id", () => {
 		expect(run("gh workflow run stryker-nightly.yml --ref b")).toHaveLength(1);
 	});
@@ -208,6 +293,9 @@ describe("evaluateWorkflowRunEvidence: the quoted branch run (#3085)", () => {
 		expect(
 			run(
 				"gh workflow run stryker-nightly.yml\nhttps://github.com/o/r/actions/runs/12345678901",
+				[FILE],
+				{},
+				text,
 			),
 		).toHaveLength(1);
 	});

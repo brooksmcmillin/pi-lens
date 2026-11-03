@@ -5,8 +5,8 @@ maintainer does not have to. The monitor observes; it never edits code,
 never restarts anything, and never touches the session it is reading.
 
 Read first: the engineering principles (`docs/engineering-principles.md`),
-then `AGENTS.md` (the "Recurring defect shapes" catalog, especially shape 41:
-a fixed bound reached at p50 is a design defect), then
+then `AGENTS.md` and the defect-shape catalog (`docs/defect-shapes.md`,
+especially shape 41: a fixed bound reached at p50 is a design defect), then
 `docs/pi-lens-subagent.md` and `docs/pi-lens-investigator.md` for the
 forensics conventions this role inherits. This contract adds the standing
 readout.
@@ -34,6 +34,11 @@ memory growth:
   row in latency.log records the release and its trigger).
 - samplerDurationMs measures the sampler's own record-assembly wall time,
   excluding the surrounding turn.
+- idle is false on the periodic sample. It is true on the one sample written
+  at a session's first turn start after its own turn end, when that gap is
+  longer than the TS idle-evict window (`getLspIdleEvictMs()`, 20 minutes by
+  default). That record also carries idleMs, the measured gap. The heap
+  reading is process-wide; the gap belongs to the session whose turn started.
 
 All fields are in the existing record and are O(1) reads or latest-value
 snapshots; no additional telemetry sink is created.
@@ -130,6 +135,15 @@ the requested window.
    `filePath` even for a formatter that never settles or an Escape; a chained
    file with no later `*_format_late_resync` row on the same `filePath` is the
    anti-join to report.
+   `withheld_blocker_late_advisory` (#5108) is the same hand-off for a
+   tool_result handler the host bound abandoned while a run without authorship
+   withheld blockers: one row per abandoned call that queued its disclosure
+   for the calling session's next context call, with `metadata.notices` (the
+   withheld lines; the advisory shows five) and `metadata.budgetMs`, and the
+   tool name as `filePath`. The row is written even when the advisory never
+   reaches the agent: a full queue or a session that ended before its next
+   context call drops it as the `agent-advisory-dropped` degradation (`cap`
+   or `scope-retired`), so report the pair.
    **Session decisions** (#3873; each row is one lifecycle event, none is per
    occurrence in a loop): `session_handoff_slot` (`op`: `stashed`, `replaced`,
    `taken`, `key-mismatch-left` (once per stale slot), `forwarded`,
@@ -145,7 +159,12 @@ the requested window.
    displaced is another; a subagent beside a live primary writes none)
    transitions,
    `session_end_fence_rollup` (one per primary shutdown: `sources[]` with
-   `guarded` and `dropped`, plus totals), `lsp_created_import_scan_rollup`
+   `guarded` and `dropped`, plus totals), `session_handoff_turn_state` (#4751:
+   one per primary that takes the turn-state worklist at its turn_start;
+   `arm` `predecessor` (from an in-process predecessor: `from`, its files kept
+   as `filesKept`), `evicted` (from a predecessor past the stale bound: `from`,
+   its files dropped as `filesDropped`) or `empty`, and `to`),
+   `lsp_created_import_scan_rollup`
    (one per primary shutdown when the created-module producer ran: `calls`,
    `importers`, `targets`, `capped`, `oversized`, `totalMs`, `maxMs`). Read `read_guard_branch_retained` with
    `payloadReads`: `kept 0, dropped 0` is a missing payload when `payloadReads`

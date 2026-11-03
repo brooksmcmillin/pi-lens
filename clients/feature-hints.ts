@@ -1,4 +1,5 @@
 import { escapeRegExp } from "./string-utils.js";
+import { toPosix } from "./path-utils.js";
 
 export type FeatureHintKind = "service" | "cli-command" | "library";
 
@@ -13,7 +14,7 @@ export type TrustBoundary =
 	| "user-input";
 
 function normalizeHintInput(value: string): string {
-	return value.replace(/\\/g, "/");
+	return toPosix(value);
 }
 
 function hasHintToken(value: string, tokens: readonly string[]): boolean {

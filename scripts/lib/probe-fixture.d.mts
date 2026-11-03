@@ -54,3 +54,11 @@ export function createProbeFixture(deps: {
 	dst: string,
 	row: ProbeRow,
 ) => Promise<void>;
+
+/**
+ * The trailing-comment prefix for a file's syntax (`#`, `//`, `--`, `;;`), used
+ * by the clean-signal probe's diagnostic-neutral edit and by the save-verdict
+ * probe's `savedWrite` arm. Both need bytes that differ while the finding set
+ * does not, so it is one comment-syntax table, not a sibling per probe.
+ */
+export function commentFor(file: string): string;

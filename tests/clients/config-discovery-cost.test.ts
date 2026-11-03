@@ -29,6 +29,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FRESHNESS_CADENCE_MS } from "../../clients/freshness-cadence.js";
+import { useConfigPath } from "../support/global-config.js";
 
 const counter = vi.hoisted(() => ({ stats: 0, counting: false }));
 
@@ -70,18 +71,15 @@ function statsFor(run: () => void): number {
 	return counter.stats;
 }
 
-let previousConfigPath: string | undefined;
+const setConfigPath = useConfigPath();
 let previousHome: string | undefined;
 
 beforeEach(() => {
-	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	previousHome = process.env.PI_LENS_HOME;
 });
 
 afterEach(async () => {
 	vi.useRealTimers();
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = previousHome;
 	const { resetProjectLensConfigCache } =
@@ -101,7 +99,7 @@ describe("#2426 F-C: a warm project-config load is O(1) in filesystem stats", ()
 	it("spends the same, small stat budget on every one of 500 warm loads", async () => {
 		const home = tmpRoot("pi-lens-cost-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		write(path.join(projectDir, ".pi-lens.json"), { ignore: ["dist/**"] });
 		write(path.join(projectDir, "pi-lens.json"), { maxProjectFiles: 500 });
@@ -127,7 +125,7 @@ describe("#2426 F-C: a warm project-config load is O(1) in filesystem stats", ()
 	it("does not re-walk when an ancestor ABOVE the bearing directory churns", async () => {
 		const home = tmpRoot("pi-lens-cost2-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost2-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const ancestor = path.join(home, "workspace");
 		const projectDir = path.join(ancestor, "pkg");
 		write(path.join(projectDir, ".pi-lens.json"), { ignore: ["dist/**"] });
@@ -151,7 +149,7 @@ describe("#2426 F-C: a warm project-config load is O(1) in filesystem stats", ()
 	it("still notices an EDIT to a legacy document above the bearing directory", async () => {
 		const home = tmpRoot("pi-lens-cost3-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost3-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const ancestor = path.join(home, "workspace");
 		const projectDir = path.join(ancestor, "pkg");
 		const legacyAbove = path.join(ancestor, "pi-lens.json");
@@ -181,7 +179,7 @@ describe("#2483: a warm load with NO config found anywhere is bearing-scoped too
 	it("spends the same, small stat budget on every one of 500 warm loads", async () => {
 		const home = tmpRoot("pi-lens-cost4-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost4-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		// Several ancestor levels between the project and the ceiling, so a
 		// pre-fix full-chain freshness key has room to show its cost.
 		const projectDir = path.join(home, "a", "b", "c", "proj");
@@ -207,7 +205,7 @@ describe("#2483: a warm load with NO config found anywhere is bearing-scoped too
 	it("does not re-walk when an ancestor ABOVE startDir churns", async () => {
 		const home = tmpRoot("pi-lens-cost5-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost5-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const ancestor = path.join(home, "workspace");
 		const projectDir = path.join(ancestor, "pkg");
 		fs.mkdirSync(projectDir, { recursive: true });
@@ -230,7 +228,7 @@ describe("#2483: a warm load with NO config found anywhere is bearing-scoped too
 	it("notices a config file newly created directly in startDir", async () => {
 		const home = tmpRoot("pi-lens-cost6-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost6-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		fs.mkdirSync(projectDir, { recursive: true });
 
@@ -254,7 +252,7 @@ describe("#2483: a warm load with NO config found anywhere is bearing-scoped too
 	it("invalidates discovery when a recorded directory mtime becomes stale", async () => {
 		const home = tmpRoot("pi-lens-stale-dir-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-stale-dir-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		fs.mkdirSync(projectDir, { recursive: true });
 
@@ -273,7 +271,7 @@ describe("#2483 round 2: a no-config entry re-checks the full ancestor chain at 
 	it("does not notice a config created two levels above startDir within the cadence window, but does once it elapses", async () => {
 		const home = tmpRoot("pi-lens-cost7-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost7-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		// The reviewer's probe shape: a repo-root config created above a nested
 		// worktree's startDir (clients/file-utils.ts:783-784's nested-worktree
 		// case) — two levels up, well outside what `bearingDirMtimes`'s no-`info`

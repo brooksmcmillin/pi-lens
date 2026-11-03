@@ -100,6 +100,20 @@ describe("go-vet runner", () => {
 		expect(safeSpawnAsync.mock.calls[0][1]).toEqual(["vet", "."]);
 	});
 
+	it("vets '.' for a file outside the module root", async () => {
+		// Recurrence (#2556, shape 83): the containment answer is `relativeInside`'s,
+		// so an out-of-tree file never becomes `./../x`.
+		safeSpawnAsync.mockResolvedValue(goResult());
+		await runner.default.run(makeCtx("/elsewhere/sub/b.go", "/m"));
+		expect(safeSpawnAsync.mock.calls[0][1]).toEqual(["vet", "."]);
+	});
+
+	it("vets a package directory whose name starts with '..' from inside the root", async () => {
+		safeSpawnAsync.mockResolvedValue(goResult());
+		await runner.default.run(makeCtx("/m/..pkg/b.go", "/m"));
+		expect(safeSpawnAsync.mock.calls[0][1]).toEqual(["vet", "./..pkg"]);
+	});
+
 	it("keeps diagnostics for the edited file but drops sibling-file lines", async () => {
 		// Package vetting reports siblings too; only the edited file must be attributed.
 		safeSpawnAsync.mockResolvedValue(

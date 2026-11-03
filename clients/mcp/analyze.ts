@@ -12,7 +12,7 @@
  * + perf impact first-hand rather than inferring it from pasted logs.
  */
 
-import { resolveAnalysisRoot } from "../analysis-root.js";
+import { canWriteAnalysisRoot, resolveAnalysisRoot } from "../analysis-root.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CacheManager, MCP_TURN_STATE_OWNER_ID } from "../cache-manager.js";
@@ -20,6 +20,7 @@ import {
 	CASCADE_GRAPH_KINDS,
 	dispatchLintWithResult,
 } from "../dispatch/integration.js";
+import { emitBounded } from "../bounded-telemetry.js";
 import { FactStore } from "../dispatch/fact-store.js";
 import type { Diagnostic, DispatchResult } from "../dispatch/types.js";
 import { detectFileKind } from "../file-kinds.js";
@@ -534,6 +535,10 @@ export async function analyzeFile(
 	// analysis's first read (the warm-up's, whose diagnostics the dispatch can
 	// serve), so a write that lands while the analysis runs is newer than it.
 	const observedAt = Date.now();
+	// #4242: the file's analysis-root class, asked once. It decides the dispatch
+	// plan below, and whether this call may write SESSION state for the file —
+	// an adopted (foreign) root is served read-only here too.
+	const analysisRootMode = resolveAnalysisRoot(absPath, cwd);
 	if (options.warmLsp !== false) {
 		await warmLspForFile(absPath, host);
 	}
@@ -551,7 +556,7 @@ export async function analyzeFile(
 		undefined,
 		{
 			blockingOnly: options.blockingOnly ?? false,
-			analysisRootMode: resolveAnalysisRoot(absPath, cwd),
+			analysisRootMode,
 			// #3791: this is a pull surface. Each call is an independent question,
 			// so the synthetic coverage notice must come back on every call rather
 			// than being latched once per session by the dispatcher — otherwise a
@@ -634,29 +639,52 @@ export async function analyzeFile(
 		// (#2067 AC4), so this seam no longer holds the event loop for a whole
 		// replacement either; a successful update schedules the SAME debounced persist
 		// (`scheduleWordIndexPersist`, `PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS`)
-		// pi's path uses — no second persist mechanism.
+		// pi's path uses — no second persist mechanism. And (#4242) the index is
+		// SESSION state, so `canWriteAnalysisRoot` refuses an adopted root's file
+		// exactly as the pi cascade seam does — the class is resolved against
+		// `cwd`, the workspace this warm index belongs to, never against what
+		// `pilens_analyze` was pointed at.
 		//
 		// Key shape: `absPath` (`path.resolve` of the tool-input path). Since #1025
 		// the word index's path maps fold every key through `wordIndexKey`
 		// INTERNALLY (PathKeyedMap), so this edit-form key and the build path's
 		// walk-derived key converge on the same entry regardless of casing/
 		// separator — the old duplicate-orphan hazard is gone at the map layer.
+		// The refusal is recorded only once a write was otherwise going to happen:
+		// no warm index, or unreadable content, return first (the cascade seam's
+		// order), so a cold process never logs a skipped write that had no target.
 		const warmLease = acquireWarmWordIndex(cwd);
 		const warmIndex = warmLease.index;
 		try {
 			if (warmIndex) {
 				try {
 					const content = fs.readFileSync(absPath, "utf8");
-					const byteLength = Buffer.byteLength(content, "utf-8");
-					if (byteLength > WORD_INDEX_MAX_BYTES) {
-						await removeWordIndexDocumentAsync(warmIndex, absPath);
+					if (!canWriteAnalysisRoot(analysisRootMode)) {
+						emitBounded(
+							"adopted_root_writer_skipped",
+							`${absPath}:word-index`,
+							{
+								filePath: absPath,
+								durationMs: 0,
+								metadata: { writer: "word-index" },
+							},
+							{
+								ledgerKind: "adopted-root-writer-skipped",
+								risingEdgePer: "identity",
+							},
+						);
 					} else {
-						await updateWordIndexDocumentForEdit(warmIndex, {
-							path: absPath,
-							content,
-						});
+						const byteLength = Buffer.byteLength(content, "utf-8");
+						if (byteLength > WORD_INDEX_MAX_BYTES) {
+							await removeWordIndexDocumentAsync(warmIndex, absPath);
+						} else {
+							await updateWordIndexDocumentForEdit(warmIndex, {
+								path: absPath,
+								content,
+							});
+						}
+						scheduleWordIndexPersist(cwd, warmIndex);
 					}
-					scheduleWordIndexPersist(cwd, warmIndex);
 				} catch {
 					// unreadable/deleted, or an update failure — best-effort, same as the
 					// graph update above.

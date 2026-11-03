@@ -31,6 +31,7 @@
 // Kept as a side-effect-free function so it can be unit-tested without spawning
 // a server (see tests/scripts/clean-signal.test.ts). #240/#460.
 
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isAuxiliary } from "../../dist/clients/lsp/server-traits.js";
@@ -45,6 +46,18 @@ import { MEASURED_CLEAN_BEHAVIORS } from "./md-matrix.mjs";
 export const DRIFT_SUMMARY_PATH = path.join(
 	os.tmpdir(),
 	"pilens-clean-signal-drift-summary.json",
+);
+
+// #4512: the raised stale cells' tracking-issue body and its verdict (`drift`
+// or `clean`; absent when the matrix refresh did not run). Same-job runner
+// tmpdir, staged by the notifier-inputs step like the drift summary above.
+export const STALE_CELLS_BODY_PATH = path.join(
+	os.tmpdir(),
+	"pilens-stale-cells-body.md",
+);
+export const STALE_CELLS_STATE_PATH = path.join(
+	os.tmpdir(),
+	"pilens-stale-cells-state",
 );
 
 /**
@@ -643,4 +656,86 @@ export const LANG_TO_STRATEGY_KEY = {
 /** Resolve a matrix/fixture lang to its strategy-table key. */
 export function strategyKeyForLang(lang) {
 	return LANG_TO_STRATEGY_KEY[lang] ?? lang;
+}
+
+export const STALE_CELLS_ISSUE_TITLE =
+	"nightly: LSP capability probe missed (stale matrix cells)";
+
+/**
+ * #4512: the tracking issue body for matrix cells the probe has not
+ * re-observed for `MISSED_PROBE_RAISE_RUNS` consecutive nights. The matrix
+ * keeps each cell's last known value and marks it stale; this body names them
+ * so a dead probe is read by a person instead of standing in the doc.
+ *
+ * @param {Array<{ lang: string, server: string, cleanBehavior: string, firstPublish: string, since: string, misses: number }>} cells
+ * @param {{ runUrl?: string | null }} [opts]
+ * @returns {string}
+ */
+export function buildStaleCellsBody(cells, opts = {}) {
+	const lines = [
+		"Auto-filed/updated by the nightly `tool-smoke` workflow's `probe-clean-signal.mjs` step (#4512).",
+		"",
+		"Each row below is a matrix cell the nightly probe did not re-observe on two or more consecutive nights. `docs/lsp-capability-matrix.md` keeps the last known value and marks the row `stale` with the date of the first miss; it is never rewritten to `unknown`. A cell stays stale until a night observes the server again.",
+		"",
+		"| lang | server | clean-behavior (last known) | first-publish (last known) | stale since | consecutive misses |",
+		"|---|---|---|---|---|---|",
+		...cells.map(
+			(c) =>
+				`| ${c.lang} | ${c.server} | ${c.cleanBehavior} | ${c.firstPublish} | ${c.since} | ${c.misses} |`,
+		),
+	];
+	if (opts.runUrl) lines.push("", `Workflow run: ${opts.runUrl}`);
+	lines.push(
+		"",
+		"This issue is closed automatically once no cell has missed two consecutive nights.",
+	);
+	return lines.join("\n");
+}
+
+/**
+ * #4512: the stale-cells notifier's verdict for one full probe run. `drift`
+ * carries the tracking-issue body; `clean` closes the issue. Pure, so the
+ * recorded-run tests read exactly what the workflow stages.
+ *
+ * @param {Parameters<typeof buildStaleCellsBody>[0]} cells  the raised cells
+ * @param {{ runUrl?: string | null }} [opts]
+ * @returns {{ state: "drift", body: string } | { state: "clean" }}
+ */
+export function staleCellsVerdict(cells, opts = {}) {
+	return cells.length
+		? { state: "drift", body: buildStaleCellsBody(cells, opts) }
+		: { state: "clean" };
+}
+
+/**
+ * #4512: write the stale-cells tracking-issue body and verdict for the
+ * notifier. A subset probe (`fullRun: false`) cannot say a streak ended, so it
+ * writes nothing and leaves the last full run's verdict standing. Best-effort
+ * like the drift summary: a write failure is logged and never escalates, the
+ * probe's own exit-0 contract stands.
+ *
+ * @param {Parameters<typeof staleCellsVerdict>[0]} cells
+ * @param {{ fullRun: boolean, env?: NodeJS.ProcessEnv, bodyPath?: string, statePath?: string }} opts
+ * @returns {"drift" | "clean" | "skipped" | "unwritten"}
+ */
+export function writeStaleCellsVerdict(cells, opts) {
+	if (!opts.fullRun) return "skipped";
+	const env = opts.env ?? process.env;
+	const bodyPath = opts.bodyPath ?? STALE_CELLS_BODY_PATH;
+	const statePath = opts.statePath ?? STALE_CELLS_STATE_PATH;
+	try {
+		const verdict = staleCellsVerdict(cells, {
+			runUrl:
+				env.GITHUB_SERVER_URL && env.GITHUB_REPOSITORY && env.GITHUB_RUN_ID
+					? `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`
+					: null,
+		});
+		if (verdict.state === "drift") fs.writeFileSync(bodyPath, verdict.body);
+		else fs.rmSync(bodyPath, { force: true });
+		fs.writeFileSync(statePath, verdict.state);
+		return verdict.state;
+	} catch (e) {
+		console.error(`stale-cells verdict write skipped: ${e?.message ?? e}`);
+		return "unwritten";
+	}
 }

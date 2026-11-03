@@ -30,6 +30,16 @@
  *                    `createWorkspaceDiagnosticsCacheContext` loading a
  *                    persisted cache of 200 / 2000 entries, then one `lookup`
  *                    per file.
+ *   tool_call_bash_home_overcap
+ *                    three consecutive `bash` calls through the registered
+ *                    `tool_call` handler, in a session whose cwd is a non-git
+ *                    home folder holding more files than the opaque prescan's
+ *                    cap (#4905: every call walked the home to the cap and got
+ *                    no baseline, about 2 s each on the reporter's machine).
+ *                    HOME is pinned to that folder, under `--scratch`, for the
+ *                    row only. The row checks that three `opaque_mutation_prescan`
+ *                    rows reached the latency log, so a tree whose handler skips
+ *                    the prescan is a harness failure, not a fast row.
  *
  * Fixtures are generated deterministically here, so base and head see the
  * same bytes. The host is a recording stub: it is the one boundary a script
@@ -46,11 +56,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
+import { scratchHomeEnv } from "./lib/scratch-home-env.mjs";
 
 const SMALL_LINES = 40;
 const LARGE_LINES = 4000;
 const REPLAY_SMALL = 200;
 const REPLAY_LARGE = 2000;
+/** Files of the over-cap home: more than the prescan's 2000-file cap. */
+const OVERCAP_FILES = 2100;
+const TOOL_CALLS = 3;
 
 /**
  * Deterministic TypeScript of at least `lines` lines: whole six-line functions
@@ -233,7 +247,78 @@ async function sample(tree, scratch) {
 			throw new Error(`${metric}: replay served ${served} of ${count} entries`);
 		}
 	}
+	result.tool_call_bash_home_overcap = await timeToolCallsAtOvercapHome(
+		imp,
+		handlers,
+		scratch,
+	);
 	return result;
+}
+
+/**
+ * Time {@link TOOL_CALLS} `bash` calls through the registered `tool_call`
+ * handler with the session cwd set to a non-git folder of {@link OVERCAP_FILES}
+ * files that is also `$HOME`. An empty `.git` file ends the walk's ignore-root
+ * search at the folder and, being no repository to git, leaves it non-git;
+ * `GIT_CEILING_DIRECTORIES` keeps git from finding a checkout above `--scratch`.
+ */
+async function timeToolCallsAtOvercapHome(imp, handlers, scratch) {
+	const handler = handlers.get("tool_call")?.[0];
+	if (!handler) throw new Error("no tool_call handler registered");
+	const root = path.join(scratch, "overcap-home");
+	fs.mkdirSync(root, { recursive: true });
+	fs.writeFileSync(path.join(root, ".git"), "");
+	for (let i = 0; i < OVERCAP_FILES; i++) {
+		const dir = path.join(root, `dir${i % 50}`);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(dir, `f${i}.ts`),
+			`export const v${i} = ${i};\n`,
+		);
+	}
+	const latency = await imp("clients/latency-logger.js");
+	await latency.flushLatencyLog();
+	const logPath = latency.getLatencyLogPath();
+	const before = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
+	const pinned = ["HOME", "USERPROFILE", "GIT_CEILING_DIRECTORIES"].map(
+		(name) => [name, process.env[name]],
+	);
+	process.env.HOME = root;
+	process.env.USERPROFILE = root;
+	process.env.GIT_CEILING_DIRECTORIES = path.dirname(root);
+	let elapsed;
+	try {
+		elapsed = await timed(async () => {
+			for (let n = 0; n < TOOL_CALLS; n++) {
+				await handler(
+					{
+						type: "tool_call",
+						toolName: "bash",
+						toolCallId: `hot-path-bash-${n}`,
+						input: { command: "node -e ''" },
+					},
+					makeCtx(root),
+				);
+			}
+		});
+	} finally {
+		for (const [name, value] of pinned) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+	await latency.flushLatencyLog();
+	const rows = fs
+		.readFileSync(logPath, "utf8")
+		.slice(before)
+		.split("\n")
+		.filter((line) => line.includes('"opaque_mutation_prescan"')).length;
+	if (rows !== TOOL_CALLS) {
+		throw new Error(
+			`tool_call_bash_home_overcap: ${rows} opaque_mutation_prescan rows for ${TOOL_CALLS} calls`,
+		);
+	}
+	return elapsed;
 }
 
 const tree = argValue("tree");
@@ -244,7 +329,7 @@ if (!tree || !scratch) {
 }
 const home = path.join(path.resolve(scratch), "home");
 fs.mkdirSync(home, { recursive: true });
-process.env.PI_LENS_HOME = home;
+Object.assign(process.env, scratchHomeEnv(home));
 process.env.PILENS_DATA_DIR = home;
 process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
 const result = await sample(path.resolve(tree), path.resolve(scratch));

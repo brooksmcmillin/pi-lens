@@ -6,7 +6,7 @@
  * server lookup read as "no compiler". Only the child-process boundary is
  * doubled; the output is the CRLF text `where` prints.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeFakeChild } from "../support/fake-child.js";
 
 const WHERE_OUTPUT =
@@ -22,10 +22,20 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 const { findCommand, findCommandAsync } =
 	await import("../../clients/safe-spawn.js");
+const { resetProjectTrust, setProjectTrustState } =
+	await import("../../clients/project-trust.js");
 
 beforeEach(() => {
+	// #4530: a Windows-shaped answer is a relative path to this host's trust
+	// judgment (under the session cwd), so the session's trust is adopted; the
+	// answer's trust judgment is pinned in session-repository-trust-4530.
+	setProjectTrustState("trusted");
 	spawnMock.mockReset();
 	spawnSyncMock.mockReset();
+});
+
+afterEach(() => {
+	resetProjectTrust();
 });
 
 describe("findCommand keeps the first match free of CRLF (#4414)", () => {

@@ -1,0 +1,6 @@
+{"ts":"2026-10-22T12:05:04.961Z","pid":2148440,"turnId":"turn:0","level":"debug","subsystem":"lsp-pub","message":"server=terraform pubVersion=undefined docVersion=undefined diags=0","metadata":{"path":"/proj/terraform-burst"}}
+{"ts":"2026-10-22T12:05:04.962Z","pid":2148440,"turnId":"turn:0","level":"debug","subsystem":"lsp-pub","message":"server=terraform pubVersion=undefined docVersion=0 diags=1","metadata":{"path":"/proj/terraform-burst/bad.tf"}}
+{"ts":"2026-10-22T12:05:05.062Z","pid":2148440,"turnId":"turn:0","level":"debug","subsystem":"lsp-pub","message":"server=terraform pubVersion=undefined docVersion=undefined diags=0","metadata":{"path":"/proj/terraform-burst"}}
+{"ts":"2026-10-22T12:05:05.062Z","pid":2148440,"turnId":"turn:0","level":"debug","subsystem":"lsp-pub","message":"server=terraform pubVersion=undefined docVersion=0 diags=1","metadata":{"path":"/proj/terraform-burst/bad.tf"}}
+{"ts":"2026-10-22T12:05:06.586Z","pid":2148440,"turnId":"turn:0","level":"debug","subsystem":"lsp-pub","message":"server=terraform pubVersion=undefined docVersion=undefined diags=0","metadata":{"path":"/proj/terraform-burst"}}
+{"ts":"2026-10-22T12:05:06.586Z","pid":2148440,"turnId":"turn:0","level":"debug","subsystem":"lsp-pub","message":"server=terraform pubVersion=undefined docVersion=1 diags=1","metadata":{"path":"/proj/terraform-burst/bad.tf"}}

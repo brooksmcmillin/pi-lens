@@ -63,24 +63,24 @@ does not ship.
 | A new `it(` or `test(` title, or a case added to a table test | Red first: the case fails on the pre-fix source, with the failure the defect names (principles §2 "Red first") | The pre-fix transcript, with its `Tests N failed` line naming the new titles | #4577 (Greptile, 2026-10-17: round-4 cases shipped with no red) |
 | A new guard, branch, filter, cap or fallback | Mutation red on that predicate, both directions, in a compile-valid change (principles §2 "Mutation output is quoted") | The `scripts/mutate.mjs` transcript and its `RED` status line, with the one test it reds | #4575 (Greptile r4304045025: no mutation red for the saveOnly rule) |
 | A file under `clients/lsp/`, `formal/`, or any path `formal/switch-pins.json` names | The model moves with the code: a `.tla`/`.cfg` hunk and its TLC verdict, or a `TLA+ unaffected:` line; a flipped constant flips its config and its pin (AGENTS shape 68) | The line, or the model diff plus the verdict, and the pin's test name for a flipped constant | #4575 (Greptile r4304045020: the model did not move with the code), #4387, #4393 |
-| A spawn, shell or path seam: `clients/package-manager.ts`, `clients/lsp/launch.ts`, `clients/path-utils.ts`, `clients/safe-spawn.ts`, or any `trySpawn` caller | Read the Windows lane, and keep a shim cell that asserts the platform command (AGENTS "Test requirements"; "Dispatch, runners, formatters, and installers") | The `Unit tests Windows` row on the head, or the shim cell's platform assertion | #4566 (Greptile r4304149666: the `.cmd` cells), #4356, #4263 |
-| A rung that can execute project code | Judge the rung by the resolved target under every trust state, never by the name it was called with (AGENTS "LSP, trust, and process execution") | The target table: each spelling, its resolved path, and the verdict under trusted, unknown and denied | #4566 (an empty `PATH` and a global link each ran project code), #4530 |
+| A spawn, shell or path seam: `clients/package-manager.ts`, `clients/lsp/launch.ts`, `clients/path-utils.ts`, `clients/safe-spawn.ts`, or any `trySpawn` caller | Read the Windows lane, and keep a shim cell that asserts the platform command (AGENTS "Test requirements"; `docs/invariants/dispatch-runners.md` "Dispatch, runners, formatters, and installers") | The `Unit tests Windows` row on the head, or the shim cell's platform assertion | #4566 (Greptile r4304149666: the `.cmd` cells), #4356, #4263 |
+| A rung that can execute project code | Judge the rung by the resolved target under every trust state, never by the name it was called with (`docs/invariants/lsp-trust-exec.md` "LSP, trust, and process execution") | The target table: each spelling, its resolved path, and the verdict under trusted, unknown and denied | #4566 (an empty `PATH` and a global link each ran project code), #4530 |
 | A new shared helper | Net-count rule: delete a same-shape sibling in this change (principles §1 "Net-count rule for shared helpers") | The deleted sibling in `Change outline`, or the unsafe-to-fold reason with its follow-up link | #2585 r1, #2617 r1 (an existing override and scan set bypassed or recopied), #3064, #3065, #3066, #3068 (a fold's newly sole predicate left untested) |
 | A second writer, reader or mirror of one shared record | Design shared state once, with a reason or kind discriminator per writer (principles §1 "Design shared state once"; AGENTS shape 24) | The writers-by-axis table, and the discriminator each writer carries | #1631/#1641 (the `stale` collision that was green alone), #1633, #1703 |
 | A durable record whose shape changes, or a new version of one | Keep the fixture corpus: every version that produced the record still parses (principles §2 "Keep fixture corpora") | The fixture path and the parser test that replays it | #3594 R2-F1 (AGENTS shape 57) |
 | A cache or memo key | Key every input the value depends on, trust scope and install state included (AGENTS shape 6) | The key's input list beside the value's dependencies, and the mutation that changes one input | #4562 (a large update left a cached answer), #4566 (a trust change left tools missing) |
 | A test-side source scan, census, ratchet or detector | Detectors match code, not prose, and fail closed on an unlisted spelling (principles §2 "Detectors match code"; AGENTS shape 69) | The blanked-source read, and three plants the author did not design for: an alias, an indirect call, a value through another binding | #2693 (a ratchet counted four sites where six existed), #4439 |
 | A workflow, action or job | The edited lane runs on a pull request, or a branch run is quoted with its run id (AGENTS "Commands and gates") | `gh workflow run <file> --ref <branch>` with its run id, or the PR-eligible cell's name | #3043, #3085 |
-| A `continue-on-error` producer or a nightly floor | The producer reports to `scripts/assert-evaluated.mjs`, and its floor reds below the measured count (AGENTS "LSP, trust, and process execution") | The floor value beside the run's evaluated count | #4518 |
+| A `continue-on-error` producer or a nightly floor | The producer reports to `scripts/assert-evaluated.mjs`, and its floor reds below the measured count (`docs/invariants/lsp-trust-exec.md` "LSP, trust, and process execution") | The floor value beside the run's evaluated count | #4518 |
 | A path a host tool was given (a `~`, an `@` prefix, a `file://` URL), or a path re-resolved after it left disk | Resolve by provenance, one seam per provenance; a generated or recovered path is never re-resolved (AGENTS shape 74) | The resolver the caller uses, and the path form it accepts, before and after | #4576, #4577 (a bash operand resolved on the host-argument ladder, then an absolute spelling rewritten) |
 | A path recovered from disk, a synthetic write event, or a path pi-lens generates | The path carries its provenance, host argument, shell token, recovered or generated, and nothing re-derives it (AGENTS shape 58) | The provenance the caller states at the injection point, and the resolver it therefore skips | #4577 (a recovered name was re-folded), #4558 |
 | A path-keyed map, normalizer or path comparison | Normalize on write, read, delete and rehydrate, and test Windows separators and casing (AGENTS shape 1) | The writer and reader table, with the normalizer each one calls | #3178 (four rounds, two inverted arms, one unmeasured swap) |
-| A session, lifecycle, generation or turn-end seam | Capture the generation before the await, and key the state by the session that owns it (AGENTS shapes 21 and 22; "Session, telemetry, and delivery") | The captured scope or generation the write checks, and the test that races it | #4258 (a stale activation rebinding a held bridge), #4154 |
+| A session, lifecycle, generation or turn-end seam | Capture the generation before the await, and key the state by the session that owns it (AGENTS shapes 21 and 22; `docs/invariants/session-telemetry.md` "Session, telemetry, and delivery") | The captured scope or generation the write checks, and the test that races it | #4258 (a stale activation rebinding a held bridge), #4154 |
 | A lifecycle, ownership or queue-ordering change | Name a cell and a mutation per axis: owner and identity, last leave, and queue ordering (principles §1 "Identity and lifecycle rules"; AGENTS shapes 21 and 22) | The state table with one row per axis, and the mutation transcript for each cell | #4563 (seven lifecycle findings), #4575 (a slow send overwrote a newer edit), #4562 |
-| A lifecycle change | The TLA+ model moves with the code, and `docs/pi-lens-monitor.md` gains the row for a new store or hand-off branch (AGENTS shape 68; "Session, telemetry, and delivery") | The model diff or `TLA+ unaffected:` line, and the monitor-doc row | #4563, #4569 (held documents undercounted), #4575 |
+| A lifecycle change | The TLA+ model moves with the code, and `docs/pi-lens-monitor.md` gains the row for a new store or hand-off branch (AGENTS shape 68; `docs/invariants/session-telemetry.md` "Session, telemetry, and delivery") | The model diff or `TLA+ unaffected:` line, and the monitor-doc row | #4563, #4569 (held documents undercounted), #4575 |
 | A delivery surface, or a bound on findings that reach the model | A bound discloses its truncation on the rendered surface, and a skipped or unavailable result is not clean (AGENTS shape 10) | The rendered truncation line, or the skip reason from `RUNNER_SKIP_REASONS` | #3166 r2 (an 80-finding input bound zeroed a neighbour's errors) |
 | A relaxed or rewritten existing assertion | Mutate the behaviour the test is named for; a rewrite that stays green is a deleted test (AGENTS "Issue and PR design contract"; principles §2) | The red on the new assertion, with that behaviour broken | #4390 (the eviction smoke's rewrite passed with root re-registration broken) |
-| A new decision branch on a session, lifecycle or delivery seam | Name its record, sink plus kind, and read it back through the real seam (AGENTS "Session, telemetry, and delivery"; shape 31) | The record literal, and the test that reads it back | #3873 (a fix that could not be shown to fire live), #3875 |
+| A new decision branch on a session, lifecycle or delivery seam | Name its record, sink plus kind, and read it back through the real seam (`docs/invariants/session-telemetry.md` "Session, telemetry, and delivery"; shape 31) | The record literal, and the test that reads it back | #3873 (a fix that could not be shown to fire live), #3875 |
 | A new failure path, catch or silent return | One bounded record per distinct event, in a stream a monitor reads without asking (principles §1 "Every new failure path gets bounded observability"; shape 31) | The record literal and its sink, or `none:` with its reason | #4562 (a failed log write stayed silent), #4575 (a failed save left no trace) |
 | Every diff, every changed file, tests included | Read the whole diff file by file. Check each PR-body claim against the diff, and look in the body for proof before calling it missing (principles §3 "Reviewing and delegating") | The body line or transcript quoted beside a claim the diff cannot show, or the finding names the body line that lacks it | #4574 F2, #4582 F1; 3 of Greptile's 4 false positives were a transcript already in the body (#4572, #4573, #4577) |
 
@@ -124,6 +124,13 @@ real seam. Check that every gate the diff adds is exercised through that path.
   *follow-up issue* (p2 or higher only, with its seam group), or *stay
   specific* (with the reason). A missing verdict is a finding (#3622; the
   optional ast-grep assist is #3684).
+- **A new test's layer.** A registration question (flags, tools, commands,
+  declarations) belongs on tier 1 (`tests/support/pi-runner.ts`), a
+  session-flow case on tier 2 (`tests/support/pi-session.ts`), and a
+  JSON-lines sink on `readNdjsonRows` (`tests/support/ndjson-rows.ts`), with
+  `skipped === 0` asserted when the claim needs the complete output. A fake of
+  an in-process store or registry is a finding; other doubles only where
+  `AGENTS.md` admits them, which holds the detail.
 - Review the pre-push self-scan with `npm run astgrep:self-scan`; `pr-preflight`
   runs the same gate after its build.
 - Require the exact-pin rule in `docs/pi-lens-subagent.md` on the MERGE of
@@ -139,9 +146,21 @@ real seam. Check that every gate the diff adds is exercised through that path.
   required hand-mutation proof.
 - Repeat the pattern and population sweeps. Check blast radius, bounded
   observability, changelog, commit, and PR-body requirements.
-- Re-run the PR's `## Class sweep` search yourself and widen it when the
+- Re-run the PR's `### Class sweep` search yourself and widen it when the
   named shape is broader than the touched seam (#4273, #4268).
-- On a bug-closing PR, check the `## Detection` lesson: the layer named under
+- Read the `### Fold check` against the open issues and pull requests the PR's
+  mechanism has: the lint checks the form (candidate, decision, reason), not
+  that every candidate was found, so decide whether the section's search was
+  wide enough and whether each `not folded` reason holds (#4711). Open each
+  candidate's diff (`gh pr diff <n>`) or the files its issue names: a
+  `not folded` line is a finding when the candidate edits the same hunk or
+  symbol, or owns a rule this PR re-derives, and a member your own search finds
+  that the `### Class sweep` missed is a finding too. The gates check form only
+  and the author writes these lines, so this read is the only judgment they
+  get. Recurrence: #4713 wrote "shares no clients/ file" beside #4712, and the
+  review then re-derived a `clients/analysis-root.ts` rule #4712 edits, while
+  the class sweep missed a single-scan-root member.
+- On a bug-closing PR, check the `### Detection` lesson: the layer named under
   `Should have been caught by:` must be one that would actually have caught
   the bug, and `Gap:` must be a real issue, test, or reason (#4288). Judge
   `Shape:` and `Enforcer:` too: the lint checks the catalog number and that the
@@ -301,7 +320,10 @@ the reproduction command or probe output, expected and observed behaviour, the
 root cause, cost, and a concrete remedy, and whether it is an
 issue-acceptance or a repository-standard finding. Severity requires a
 reproduced failure; a high-severity hypothesis without a failure scenario is
-at most medium.
+at most medium. A remedy that adds mechanism for an unreproduced race or edge
+case is filed as a hypothesis with its trigger path and cost, for the
+maintainer to decide, not prescribed to the fixer (principles §1, speculative
+robustness).
 
 Start with one verdict: `merge-ready`, `needs changes`, `redesign`, or
 `conflicted`. Then give spec-compliance and standards-compliance findings under
@@ -328,12 +350,37 @@ merge-order interactions with other open PRs, plus:
   (`:34`, `:81`). Recurrence: #4566 and #4575 (2026-10-17), where the threads
   outlived the rounds that should have read them.
 
+Beside the prose report, write `FINDINGS_<pr>.json` at the worktree root, and
+never commit it. The orchestrator's validator reads it before routing the
+round. Shape:
+
+```json
+{"pr": 4710, "head": "<40-hex sha reviewed>", "verdict": "merge-ready|needs changes|redesign|conflicted", "oneWayDoors": ["..."], "findings": [{"id": "F1", "severity": "<one of the five severity words>", "file": "path", "line": 1, "claim": "one sentence", "probe": "command or probe name whose output proves it", "remedy": "the prescribed change, or null", "addsMechanism": true, "class": "fold|accepted residual|file"}]}
+```
+
+Write one entry per finding, with the same ids as the prose. `remedy: null`
+means the fixer must design the change. `addsMechanism` is true when the
+remedy adds a guard, branch, state, record, or lifecycle step, rather than a
+fix to an existing line. The prose report stays the record a human reads;
+the JSON is what routing reads, so the two must agree. This exists because
+the orchestrator re-typed each finding into a fix brief by hand, and routed
+rounds by judgment instead of by the review's own data.
+
+State the change's rollback cost as a required summary line. Name every
+one-way door it ships: something users or other code can come to depend on,
+which a revert does not undo. Examples are a config key or flag users set, a
+durable record shape already written to disk, a public tool, MCP or CLI
+surface, or a migration. Each one-way door needs its proof in the PR: an
+old-record parse fixture, a deprecation path, or a stated reason it is safe.
+`none` is a valid answer, and state it. The JSON's `oneWayDoors` lists the
+same items.
+
 Use short, active, plain prose.
 
 ## Documentation and prose standard
 
 Apply this standard to PR and issue bodies, review comments, commit messages, documentation, and changelog entries. Lead with the outcome. Remove words that do no work. Use active voice and present tense. Use second person for instructions, and use the imperative for steps. Keep one idea per sentence, with about 20–25 words and no more than 30 words. Use consistent terminology and sentence-case headings. Define acronyms on first use. Prefer plain words over jargon. Avoid `please`, filler, noun piles, nested parentheticals, and em-dash chains. Use the Oxford comma.
 
-The mechanical rules are checked by `scripts/check-prose.mjs`. The checker ignores fenced code, inline code, URLs, quoted log lines, blockquotes, and tables. It blocks long sentences, filler, and title-case headings. It warns on passive voice. The CLI accepts a body file or standard input and supports `--json`.
+The mechanical rules are checked by `scripts/check-prose.mjs`. The checker ignores fenced code, inline code, URLs, quoted log lines, blockquotes, and tables. It warns on long sentences, filler, and passive voice, and it blocks title-case headings (#5110). The CLI accepts a body file or standard input and supports `--json`.
 
 Reviewers judge clarity, terminology, active voice, sentence structure, and whether each list uses parallel grammar. Treat a mechanically clean result as necessary, not sufficient. Report prose that obscures the outcome or makes a user infer the action.

@@ -274,6 +274,22 @@ function nightlyFindings(text: string): string[] {
 	);
 	if (dist < 0 || dist > mutateSteps.indexOf(driver ?? {}))
 		findings.push("the mutate job does not build dist/ before the driver");
+	// Recurrence (nightly triage 2026-10-29, #4171): a bare
+	// `node scripts/stryker-diff.mjs` has no node_modules/.bin on PATH (only
+	// `npm run` adds it), so the ast-grep and formatter tests the mutation runs
+	// execute looked their CLI up on PATH and redded the initial run. The same
+	// export shuffle-census-nightly.yml's census step carries.
+	const driverRun = run(driver ?? {});
+	const pathExport = driverRun.indexOf(
+		'export PATH="$GITHUB_WORKSPACE/node_modules/.bin:$PATH"',
+	);
+	if (
+		pathExport < 0 ||
+		pathExport > driverRun.indexOf("node scripts/stryker-diff.mjs")
+	)
+		findings.push(
+			"the mutate job does not put node_modules/.bin on PATH before the driver",
+		);
 	// Recurrence (#4038 r4, the re-run cell): a shard artifact an earlier
 	// attempt left must not stand in for this night's shard, and a re-run
 	// attempt must be able to replace it.
@@ -469,6 +485,28 @@ describe("stryker-nightly.yml (#4005)", () => {
 			(text) =>
 				text.replace("cancel-in-progress: false", "cancel-in-progress: true"),
 			/concurrency is not/,
+		],
+		[
+			"dropping node_modules/.bin from the mutate PATH (#4171)",
+			(text) =>
+				text.replace(
+					'          export PATH="$GITHUB_WORKSPACE/node_modules/.bin:$PATH"\n',
+					"",
+				),
+			/does not put node_modules\/\.bin on PATH/,
+		],
+		[
+			"exporting node_modules/.bin only after the driver ran (#4171)",
+			(text) => {
+				const exportLine = /^ +export PATH="[^"]*"\n/m.exec(text)?.[0] ?? "";
+				return text
+					.replace(exportLine, "")
+					.replace(
+						/(node scripts\/stryker-diff\.mjs [^\n]*\n)/,
+						(line) => `${line}${exportLine}`,
+					);
+			},
+			/does not put node_modules\/\.bin on PATH/,
 		],
 		[
 			"the driver loses --runtime-only",

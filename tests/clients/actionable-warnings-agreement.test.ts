@@ -11,7 +11,7 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { applyWorkspaceEdit } from "../../clients/lsp/edits.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
@@ -32,19 +32,6 @@ const getLastKnownDiagnostics = vi.fn(
 	(): import("../../clients/lsp/client.js").LSPDiagnostic[] | undefined =>
 		undefined,
 );
-const fakeService = makeLspServiceDouble({
-	supportsLSP: () => true,
-	openFile: async () => undefined,
-	codeAction,
-	getLastKnownDiagnostics,
-});
-
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => fakeService,
-}));
 
 function report(filePath: string): ActionableWarningsReport {
 	return {
@@ -90,7 +77,13 @@ function report(filePath: string): ActionableWarningsReport {
 describe("actionable warning quickfix agreement (#3005)", () => {
 	let env: ReturnType<typeof setupTestEnvironment>;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		await installLspServiceDouble({
+			supportsLSP: () => true,
+			openFile: async () => undefined,
+			codeAction,
+			getLastKnownDiagnostics,
+		});
 		env = setupTestEnvironment("pi-lens-actionable-agreement-");
 		resetDegradationLedger();
 		codeAction.mockClear();
@@ -313,7 +306,13 @@ describe("actionable warning quickfix agreement (#3005)", () => {
 describe("#3576: a quickfix pass whose session was replaced", () => {
 	let env: ReturnType<typeof setupTestEnvironment>;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		await installLspServiceDouble({
+			supportsLSP: () => true,
+			openFile: async () => undefined,
+			codeAction,
+			getLastKnownDiagnostics,
+		});
 		env = setupTestEnvironment("pi-lens-3576-quickfix-");
 		resetDegradationLedger();
 		codeAction.mockReset();

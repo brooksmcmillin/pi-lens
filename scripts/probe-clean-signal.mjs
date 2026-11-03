@@ -47,6 +47,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { writeEvaluatedRecord } from "./lib/assert-evaluated.mjs";
 import {
 	DRIFT_SUMMARY_PATH,
+	writeStaleCellsVerdict,
 	buildMatrixObservations,
 	createPublishTraceDrainer,
 	describeFirstPublishAuthors,
@@ -62,7 +63,10 @@ import {
 	withScratchHome,
 } from "./lib/lsp-fixture-workspace.mjs";
 import { createProbeFixture } from "./lib/probe-fixture.mjs";
-import { refreshCapabilityMatrix } from "./lib/md-matrix.mjs";
+import {
+	describeRaisedCells,
+	refreshCapabilityMatrix,
+} from "./lib/md-matrix.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -462,11 +466,19 @@ function updateMatrix(measuredRows) {
 	if (out !== text) {
 		fs.writeFileSync(docPath, out);
 		console.error(
-			`Updated docs/lsp-capability-matrix.md (committed: ${nameList(result.committedLangs)}; pending: ${nameList(result.pendingLangs)}; expired: ${nameList(result.expiredLangs)}).`,
+			`Updated docs/lsp-capability-matrix.md (committed: ${nameList(result.committedLangs)}; pending: ${nameList(result.pendingLangs)}; stale: ${nameList(result.staleLangs)}; raised: ${nameList(result.raisedLangs)}).`,
 		);
 	} else {
 		console.error("matrix clean-behavior column: no changes.");
 	}
+	// #4512: raise the cells two consecutive nights missed, AFTER the matrix is
+	// saved: a failed write throws past this line, so no verdict stands for a
+	// matrix that was not persisted (the notifier leaves the issue as it is). A
+	// subset probe (`langs`) cannot say a streak ended, so only a full run writes
+	// a verdict.
+	writeStaleCellsVerdict(describeRaisedCells(result.text, result.raisedLangs), {
+		fullRun: !langs.length,
+	});
 }
 
 // Replace the `## silentOnClean drift (nightly-generated)` section (own the

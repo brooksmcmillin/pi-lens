@@ -1,0 +1,308 @@
+## Why
+
+Quoted AGENTS.md section citations named headings that no longer exist, so a reader who follows one reaches no rule.
+
+Refs #4361
+
+## Notes for the reviewer
+
+- Citation fix only. No rule text changes in AGENTS.md or docs/pi-lens-*.md.
+- No shape-catalog move, and none of the other section 2 checks.
+- Live homes: "Probe hygiene" and "Detectors match code, not prose" go to docs/engineering-principles.md.
+- The incident-history names go to HISTORY.md: "Runner process model", "Session-start critical path" and "Test assessment and removal".
+- "Windows path shapes" goes to docs/pi-lens-reviewer.md.
+- "Testing" goes to AGENTS.md "Test requirements".
+- "Analysis-root invariant" goes to AGENTS.md "What it is".
+- "Issue triage (standing rule)" goes to AGENTS.md "Issue triage & labels".
+- The sweep found 27 dangling quoted citations, but PLAN_4361 named 12 call sites.
+- The rest carry the same defect shape on this tree, so they are fixed in the same change.
+- Merge order: none. This PR does not depend on #4364, because item 1 is not gated.
+- Round 2 (review r1): the sweep now reads clients/, .changelog/ and the repo-root config files. It found 13 more dangling citations. The trailing commit repoints all of them.
+- Round 3 (Greptile and CodeRabbit threads on 9e2f74767): the sweep reuses the shared walker listSourceFiles and drops its private walker. The matcher also reads single-quoted names, and it found one more dangling citation (pi-mock-importer-sweep remediation string). Swept extensions widen to .mts, .json, .txt, .toml and .sh. A planted case proves the matcher and resolver report a real miss.
+- Round 2 also repoints the merge-policy sentence. It no longer claims the triage rule lives in AGENTS.md.
+
+## Change outline
+
+- tests/config/agents-citation-sweep.test.ts (new): check C8.
+- C8 requires every quoted AGENTS.md section citation under tests/, scripts/, .github/, docs/, clients/, .changelog/ and the repo-root config files to name a live heading.
+- Round 2 adds a citation-count floor of 15, so a matcher neutered to match nothing reds.
+- 19 files under tests/ and 7 under scripts/ and docs/ change citation text only.
+- The text changes are in comments, JSDoc, one string literal in tests/support/pi-mock-importers.ts, and the deny messages in scripts/hooks/guard-bash.mjs.
+- .changelog/4361-agents-citations.md: internal fragment.
+
+## Summary
+
+The change repoints all 27 dangling quoted citations that the sweep reports.
+It also repoints the unquoted and single-quoted forms in the same files.
+The new sweep is check C8. It reds on any quoted AGENTS.md section that is not a live heading.
+It also reds on an empty sweep.
+
+## Behavior equivalence
+
+| Site | Before | After |
+|---|---|---|
+| scripts/hooks/guard-bash.mjs deny messages (probe and TMPDIR reasons) | `(AGENTS.md Probe hygiene)` | `(docs/engineering-principles.md Probe hygiene)` |
+
+No runtime logic changes.
+The deny message points at a different file for the same rule.
+
+## Type of change
+
+- [ ] Bug fix
+- [ ] New feature (net-new capability)
+- [ ] Enhancement (improvement to existing capability)
+- [x] Documentation
+
+## Area
+
+- [ ] area:lsp
+- [ ] area:dispatch
+- [ ] area:installer
+- [ ] area:diagnostics
+- [ ] area:read-guard
+- [ ] area:project-intelligence
+- [ ] area:perf
+- [ ] area:observability
+- [ ] area:session
+- [ ] area:config
+- [ ] area:security
+- [x] area:tests
+
+## Checklist
+
+- [x] I have read [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md)
+- [x] The change has tests (happy path, edge cases, regression test for bugs)
+- [x] Targeted test files for the touched seams pass locally after `npm run build`; the full suite is CI's job.
+- [x] Every NEW regression test is proven RED on pre-fix code; the red output is quoted in this PR
+- [x] New guards/branches/filters/caps/fallbacks have compile-valid hand-mutation proof (AGENTS.md, one PR mutation layer)
+- [x] PR title carries the conventional prefix and the issue ref
+- [ ] `npm run lint` passes (not run by this lane; CI runs it)
+- [ ] `npm run build:dist` succeeds if I changed code under `clients/`, `commands/`, `tools/`, or `index.ts` (not applicable: none of those paths changed)
+- [ ] `package-lock.json` is in sync with `package.json` (not applicable: not touched)
+- [ ] `AGENTS.md` is updated if this PR changes behavior, commands, conventions, or invariants documented there (not applicable: AGENTS.md is not edited)
+- [x] `.changelog/<branch-or-slug>-<short-desc>.md` has one valid entry **in this PR** for any user-facing change (Added/Changed/Deprecated/Removed/Fixed/Security), with `audience: user` or `audience: internal` (internal: tests and docs only)
+- [x] Commit subject includes the issue number: `(refs #4361)`
+
+## Tests
+
+New: tests/config/agents-citation-sweep.test.ts.
+It pins check C8 over every file under tests/, scripts/, .github/ and docs/.
+It reads the raw text, because the citation is prose or a string literal.
+It joins continuation lines in comments and markdown.
+It excludes tests/fixtures/ (recorded captures) and itself.
+
+Edited: the 26 files listed under Change outline, citation text only. No assertion changed.
+
+Red first, on a clean archive of the base commit (b245eb8fa, before any repoint), running the final test file:
+
+```
+ FAIL  |default| tests/config/agents-citation-sweep.test.ts > AGENTS.md section citations resolve (#4361 C8) > every quoted AGENTS.md section cited under tests/ scripts/ .github/ docs/ is a live heading
+AssertionError: dangling AGENTS.md section citations: expected [ …(27) ] to deeply equal []
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
++ [
++   "tests/clients/cargo-manifest.test.ts:280 AGENTS.md \"the one Cargo.toml reader\"",
++   "tests/clients/flake-shape-ratchet.test.ts:1727 AGENTS.md \"mutation-proof\"",
++   "tests/clients/hook-await-fold-bounds.test.ts:58 AGENTS.md \"Vacuous and trivial tests are deleted in the PR that touches them\"",
++   "tests/clients/lsp/out-of-band-client-root-4532.test.ts:187 AGENTS.md \"Analysis-root invariant\"",
++   "tests/clients/lsp/out-of-band-client-root-4532.test.ts:240 AGENTS.md \"Analysis-root invariant\"",
++   "tests/clients/pi-lens-home-hermeticity.test.ts:158 AGENTS.md \"Detectors match code, not prose\"",
++   "tests/clients/runtime-turn-test-runner-bounds.test.ts:809 AGENTS.md \"Test assessment and removal\"",
++   "tests/clients/workspace-glob-nonbacktracking-budget.test.ts:36 AGENTS.md \"loose bound\"",
++   "tests/config/git-fixture-governance.test.ts:309 AGENTS.md \"Detectors match code, not prose\"",
++   "tests/config/lsp-advertised-capability-senders.test.ts:22 AGENTS.md \"detectors match code, not prose\"",
++   "tests/config/pi-mock-importer-sweep.test.ts:12 AGENTS.md \"Testing\"",
++   "tests/config/reported-path-attribution-sweep.test.ts:958 AGENTS.md \"detectors match code, not prose\"",
++   "tests/config/tla-models-shard-workflow.test.ts:175 AGENTS.md \"Windows path shapes\"",
++   "tests/config/tool-smoke-notify-gate.test.ts:338 AGENTS.md \"mutate both ways\"",
++   "tests/host-sdk-type-only.test.ts:14 AGENTS.md \"Dependencies & install constraints\"",
++   "tests/scripts/guard-bash-hook.test.ts:499 AGENTS.md \"Probe hygiene\"",
++   "tests/support/pi-session.ts:34 AGENTS.md \"Testing\"",
++   "tests/support/tmp-root-registry.ts:268 AGENTS.md \"A core-domain rule lives in its owning module\"",
++   "scripts/check-pr-body.mjs:4128 AGENTS.md \"Test assessment and removal\"",
++   "scripts/check-tla-models.mjs:209 AGENTS.md \"Windows path shapes\"",
++   "scripts/compat-contracts.mjs:94 AGENTS.md \"Runner process model\"",
++   "scripts/compat-smoke-behavioral.mjs:18 AGENTS.md \"Session-start critical path\"",
++   "scripts/hooks/guard-bash.mjs:34 AGENTS.md \"Probe hygiene\"",
++   "scripts/hooks/guard-bash.mjs:37 AGENTS.md \"Probe hygiene\"",
++   "scripts/hooks/guard-bash.mjs:2562 AGENTS.md \"Probe hygiene\"",
++   "docs/pi-lens-merge-policy.md:189 AGENTS.md \"Issue triage (standing rule)\"",
++   "docs/subagent-compat.md:114 AGENTS.md \"Session-start critical path\"",
++ ]
+```
+
+After the repoint, the same file reports `Test Files 1 passed (1)` and `Tests 1 passed (1)`.
+
+Round 3 red, single-quote matcher on head 9e2f74767, before the round-3 repoint (the one remaining site the widened matcher finds):
+
+```
+ FAIL  |default| tests/config/agents-citation-sweep.test.ts > AGENTS.md section citations resolve (#4361 C8)
+AssertionError: dangling AGENTS.md section citations: expected [ Array(1) ] to deeply equal []
++   "tests/config/pi-mock-importer-sweep.test.ts:134 AGENTS.md \"Testing\"",
+```
+
+Round 2 red, widened roots, before the round-2 repoints (the 13 sites the wider sweep found):
+
+```
+ FAIL  |default| tests/config/agents-citation-sweep.test.ts > AGENTS.md section citations resolve (#4361 C8)
++   "clients/analysis-root.ts:276 AGENTS.md \"Analysis-root invariant\"",
++   "clients/cascade-format.ts:196 AGENTS.md \"bounded observability\"",
++   "clients/config-core/provenance.ts:84 AGENTS.md \"Project trust is CONSUMED, never answered\"",
++   "clients/debug-handles.ts:31 AGENTS.md \"resource bounded along one axis but unbounded along another\"",
++   "clients/dispatch/integration.ts:1912 AGENTS.md \"bounded observability\"",
++   "clients/lsp/client.ts:2836 AGENTS.md \"generation\"",
++   "clients/project-diagnostics/runner-adapters/runner-findings.ts:131 AGENTS.md \"Known identity carried forward\"",
++   "clients/runtime-tool-result.ts:2620 AGENTS.md \"Analysis-root invariant\"",
++   "clients/widget-state.ts:1103 AGENTS.md \"bounded observability\"",
++   ".changelog/test-4632-pi-tier-docs.md:6 AGENTS.md \"Testing\"",
++   ".gitignore:221 AGENTS.md \"Probe hygiene\"",
++   ".yamllint:11 AGENTS.md \"Rule catalogs\"",
++   "typos.toml:40 AGENTS.md \"Rule catalogs\"",
+```
+
+Mutation rows.
+Each row is one compile-valid change.
+The sweep reads source directly, so no rebuild was needed between rows.
+Each test-file mutation was restored and checked with `cmp`.
+
+| Row | Mutation | Result |
+|---|---|---|
+| M1 | a planted file with `// see AGENTS.md "Nonexistent Section"` | RED, listing `…:1 AGENTS.md "Nonexistent Section"` |
+| M2 | a planted file with a wrapped citation (`AGENTS.md,` then `// "Wrapped Missing Section"`) | RED, listing `…:1 AGENTS.md "Wrapped Missing Section"` |
+| M3 | M2 planted; the continuation join neutered so no line joins | GREEN, by design: without the join the wrapped citation is invisible. M2 is the red that proves the join. |
+| M4 | code lines join onto the next line (the string-literal guard removed) | RED, `tests/support/pi-mock-importers.ts:129 AGENTS.md "+"` (the false positive the code-only rule prevents) |
+| M5 | headings parsed as an empty set | RED, `AGENTS.md headings read: scanned/matched 0, below the declared floor of 20` |
+| M7 | round 2: the matcher suffixed with `ZZNEVER` (matches nothing) | RED, `AGENTS.md citations read: scanned/matched 0, below the declared floor of 15` |
+| M8 | round 3: resolver neutered (`.filter(() => false)`); the real sweep stays green, the planted case reds | RED, `reports a planted dangling citation through the same matcher and resolver` |
+| M9 | round 3: single-quote branch dropped from the matcher; the planted case reds | RED, the same planted case |
+| M6 | sweep roots emptied | RED, `citation sweep files: scanned/matched 0, below the declared floor of 500` |
+
+Targeted runs, after `npm run build`:
+
+- 11 files by `vitest run`: `Test Files 11 passed (11)`, `Tests 1783 passed (1783)`.
+- 9 governance files by `npm run test:targeted`: `Test Files 9 passed (9)`, `Tests 174 passed (174)`.
+- `oxfmt --check` on the 25 touched .ts and .mjs files: "All matched files use the correct format."
+- The changelog fragment check: "changelog fragments OK (68 entries in .changelog/)".
+
+Not run by this lane: the full suite and `npm run lint`. CI runs both.
+
+## Test assessment
+
+- tests/clients/cargo-manifest.test.ts: pins the Cargo reader. Citation comment only. Nothing removed.
+- tests/clients/flake-shape-ratchet.test.ts: pins the flake-shape guard. Citation comment only.
+- tests/clients/hook-await-fold-bounds.test.ts: pins the await-fold bound. Citation comment only.
+- tests/clients/lsp/out-of-band-client-root-4532.test.ts: pins the out-of-band client root. Citation comments only.
+- tests/clients/pi-lens-home-hermeticity.test.ts: pins home hermeticity. Citation comment only.
+- tests/clients/runtime-turn-test-runner-bounds.test.ts: pins the runner bounds. Citation comment only.
+- tests/clients/workspace-glob-nonbacktracking-budget.test.ts: pins the glob budget. Citation comment only.
+- tests/config/git-fixture-governance.test.ts: pins the git fixture guard. Citation comment only.
+- tests/config/lsp-advertised-capability-senders.test.ts: pins LSP capability senders. Citation comment only.
+- tests/config/pi-mock-importer-sweep.test.ts: pins the pi-mock admit list. The remediation string in its failure message changes its citation to "Test requirements". No assertion changed.
+- tests/config/reported-path-attribution-sweep.test.ts: pins path attribution. Citation comment only.
+- tests/config/tla-models-shard-workflow.test.ts: pins the TLA shard workflow. Citation comment only.
+- tests/config/tool-smoke-notify-gate.test.ts: pins the tool-smoke notify gate. Citation comment only.
+- tests/host-sdk-type-only.test.ts: pins the host SDK type-only imports. Citation comment only.
+- tests/scripts/classify-ci-failure-cli.test.ts: pins the CI failure classifier CLI. Citation comment only.
+- tests/scripts/guard-bash-hook.test.ts: pins the guard-bash hook. Citation comment only.
+- tests/support/pi-mock-importers.ts, tests/support/pi-session.ts, tests/support/tmp-root-registry.ts: support modules. Citation text in a string or comment only.
+- No test file is removed. No assertion is changed.
+
+## Accepted residuals
+
+- p3 (LOW): unquoted or wrapped-prose section names fall outside the C8 form.
+- Live population: 328 unquoted `AGENTS.md` mentions in the swept roots.
+- Most of them name the file, not a section. The section-naming subset was not counted.
+- Not filed: LOW gaps fold or stay accepted.
+- p3 (LOW): nine repoints target HISTORY.md, which the sweep does not read. Every target exists today; a rename there is not caught.
+
+## Blast radius
+
+The hook deny messages in scripts/hooks/guard-bash.mjs name a different file for the same rule, so the user-visible text changes.
+No code path, regex or threshold changes.
+
+TLA+ unaffected: cascade-delivery. The only change in clients/cascade-format.ts is a citation comment; no lifecycle, timing or identity behaviour changes. The other clients/ edits are comments too, so no family model moves.
+Every other change is a comment or a test-support string.
+
+TLA+ unaffected: cascade-delivery — clients/cascade-format.ts changes a citation comment or string only; no lifecycle, timing or identity behaviour changes.
+TLA+ unaffected: session-straddle — clients/dispatch/integration.ts changes a citation comment or string only; no lifecycle, timing or identity behaviour changes.
+TLA+ unaffected: session-lifecycle — clients/widget-state.ts changes a citation comment or string only; no lifecycle, timing or identity behaviour changes.
+
+## Observability
+
+No new failure path; no record added.
+
+## Class sweep
+
+Class: dangling AGENTS.md section citations. A citation outlives the heading it names.
+
+Population search, the sweep's own form, fixtures excluded: `grep -rnoP 'AGENTS\.md,? "[^"]+"' tests scripts .github docs`.
+
+Class 10 (group agent-contract). Members and dispositions:
+
+| Member | State | Disposition |
+|---|---|---|
+| #4361 | open | fixed here (item 1: repoint and C8 sweep) |
+| #2128 | closed, not planned | stay specific: closed not planned, no open work |
+| #2791 | closed, not planned | stay specific: closed not planned, no open work |
+| #2797 | closed, not planned | stay specific: closed not planned, no open work |
+| #3259 | open | stay specific: the glossary umbrella owns terms; C8 checks section headings only |
+| #3260 | open | stay specific: the ADR umbrella; no docs/adr entry is created here |
+| #3815 | open | stay specific: the owner-map umbrella; no owner map is built here |
+| #4364 | open | stay specific: the eval gates the rewrite (item 5), not item 1 |
+| #4536 | closed | stay specific: closed; its primitive census is not touched |
+| #4565 | closed | stay specific: closed; the principles digest is not touched |
+
+The class-check tool also lists same-file issues. I did not read those individually. They share files with this change, not this defect shape. The class verdict is the ten members above.
+
+## Fold check
+
+- #4364 not folded: the known-answer eval gates the rewrite (maintainer decision 2026-10-22, item 5); this PR is the ungated item 1.
+- #3815 not folded: the owner map is its own umbrella; this PR changes citation text only.
+- #3260 not folded: the ADR umbrella creates docs/adr entries; none are created here.
+- #3259 not folded: the glossary umbrella owns terms; C8 checks AGENTS.md section headings, not glossary terms.
+- #4769 not folded: the root aux scanner fix for loose files is an LSP behaviour change; this PR edits one comment in tests/clients/flake-shape-ratchet.test.ts only.
+- #4766 not folded: the nodeAgreement lockfile test (C5) is its own lane on tests/clients/tool-agreement-node.test.ts; this PR edits no file that test touches.
+- #4758 not folded: the pyright and rust-analyzer settings bug is an LSP behaviour change; this PR edits one citation comment in clients/lsp/client.ts.
+- #4535 not folded: the disk-change publisher is a freshness redesign; this PR edits one citation comment in clients/lsp/client.ts only.
+- #4242 not folded: the out-of-session-root umbrella owns adoption and delivery; this PR edits one citation comment in clients/dispatch/integration.ts.
+- #4171 not folded: the Stryker nightly report is a CI lane; this PR edits no workflow and no test.
+- #3878 not folded: TLA+ coverage matching is a formal-model change; this PR edits one citation comment in a script and a test.
+- #3650 not folded: pluggable shape adapters are a mutating-tool redesign; this PR edits one citation comment in clients/runtime-tool-result.ts.
+- #3405 not folded: the didSave advertisement is a behaviour fix in clients/lsp; this PR edits one citation comment in clients/lsp/client.ts.
+- #2556 not folded: the path-containment predicate fold is a seam refactor; this PR edits one citation comment, no path logic.
+- #2074 not folded: the review-graph rebuild cost is a performance change; this PR edits no graph code.
+- #2066 not folded: the per-send document sync is a performance change on the edit path; this PR edits one citation comment.
+- #2050 not folded: sibling-worktree findings are a dispatch feature; this PR edits one citation comment in clients/dispatch/integration.ts.
+- #1459 not folded: the cascade backpressure fix changes breaker behaviour; this PR edits one citation comment in clients/lsp/client.ts.
+- #4714 not folded: TLC distinct-state counts are a formal-model gate; this PR touches a comment in scripts/check-tla-models.mjs only.
+- #4709 not folded: the in-process vi.mock audit is a test-double change; this PR touches a comment in tests/clients/flake-shape-ratchet.test.ts only.
+- #4606 not folded: the structural-eviction coverage audit is its own test scope; this PR edits one citation comment in tests/clients/ only.
+- #4602 not folded: plant results for a changed scanner belong to the body lint; this PR edits no check-pr-body.mjs logic, only one citation comment.
+- #4591 not folded: the Windows root teardown is a tmp-fixture change; this PR edits one citation comment in tests/support/tmp-root-registry.ts only.
+- #4025 not folded: the substitution-bypass hook fix changes guard-bash logic; this PR changes only the deny-message pointer and comments.
+- #3875 not folded: the observability template and decision-branch probe are a separate contract change; this PR edits no check-pr-body.mjs logic.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+<!-- greptile_comment -->
+
+<!-- greptile_summary -->
+
+<h2><a href="https://app.greptile.com/api/retrigger?id=86317074"><picture><source media="(prefers-color-scheme: dark)" srcset="https://greptile-static-assets.s3.amazonaws.com/badges/RetriggerDark.svg?v=2"><source media="(prefers-color-scheme: light)" srcset="https://greptile-static-assets.s3.amazonaws.com/badges/Retrigger.svg?v=2"><img alt="Retrigger" src="https://greptile-static-assets.s3.amazonaws.com/badges/Retrigger.svg?v=2" align="right"></picture></a><a href="https://app.greptile.com/project-blt/github/apmantza/pi-lens/-/pull/4767"><picture><source media="(prefers-color-scheme: dark)" srcset="https://greptile-static-assets.s3.amazonaws.com/badges/ViewInGreptileDark.svg?v=2"><source media="(prefers-color-scheme: light)" srcset="https://greptile-static-assets.s3.amazonaws.com/badges/ViewInGreptile.svg?v=2"><img alt="View in Greptile" src="https://greptile-static-assets.s3.amazonaws.com/badges/ViewInGreptile.svg?v=2" align="right"></picture></a>Confidence Score: 5/5</h2>
+
+<!-- greptile-impact-verdict --> The PR appears safe to merge; both earlier findings are fixed, and no new blocking issue was found.
+
+<details open><summary><h3>Summary</h3></summary>
+
+Repoints stale citations and adds a check for quoted `AGENTS.md` section names.
+
+- Rule citations now point to current headings and documents.
+- Check C8 flags quoted AGENTS.md citations that name no live heading.
+</details>
+
+<!-- greptile_confidence_score:5 -->
+
+<sub>Reviews (2) · Last reviewed commit: ["test: sweep uses shared walker (refs #43..."](https://github.com/apmantza/pi-lens/commit/7f7ee11276fc4b0cdda6f399260b643e49a9343a) · [Reviewed by Greptile](https://www.greptile.com/?utm_source=greptile_review&utm_medium=github&utm_campaign=review_public&utm_content=apmantza/pi-lens)</sub>
+
+<!-- /greptile_comment -->

@@ -26,36 +26,22 @@ import { removeTempDirSync } from "../clients/test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 const mocked = vi.hoisted(() => ({ service: null as unknown }));
-const { getServersForFileWithConfig } = vi.hoisted(() => ({
-	getServersForFileWithConfig: vi.fn(),
-}));
-vi.mock("../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-	// #646: `primaryServerId` moved here from `tools/lsp-diagnostics.ts` — this
-	// mock's fake server list has no `role`, so every entry is non-auxiliary
-	// (matching the real getServersForFileWithConfig contract this test fakes).
-	primaryServerId: (fp: string) => getServersForFileWithConfig(fp)[0]?.id,
-}));
 
-// Real `groupFilesByPrimaryServer`/`runPerServerGroups` — only `getLSPService`
-// is faked. Using the real scheduling primitives is the whole point: a fake
-// scheduler would trivially satisfy the property under test either way.
-vi.mock("../../clients/lsp/capabilities.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/capabilities.js")
-	>("../../clients/lsp/capabilities.js");
-	return {
-		...actual,
-		getLSPService: () => mocked.service,
-	};
-});
-
-vi.mock("../../clients/widget-state.js", () => ({
-	reconcileScanDiagnostics: vi.fn().mockReturnValue(true),
-}));
+// Real `groupFilesByPrimaryServer`/`runPerServerGroups` — only the service the
+// singleton hands out is a double (lifecycle seam). Using the real scheduling
+// primitives is the whole point: a fake scheduler would trivially satisfy the
+// property under test either way.
 
 import { createLspDiagnosticsTool } from "../../tools/lsp-diagnostics.js";
+import { clearWidgetState } from "../../clients/widget-state.js";
+import { installLspService } from "../support/lsp-service-seam.js";
+
+beforeEach(() => {
+	clearWidgetState();
+});
+afterEach(() => {
+	clearWidgetState();
+});
 
 function serverIdForFile(file: string): string {
 	if (file.endsWith(".py")) return "python";
@@ -74,11 +60,6 @@ describe("lsp_diagnostics batch — per-server serialization (#631)", () => {
 		tmpDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-lsp-diag-pergroup-"),
 		);
-		getServersForFileWithConfig.mockReset();
-		getServersForFileWithConfig.mockImplementation((fp: string) => {
-			const id = serverIdForFile(fp);
-			return id === "none" ? [] : [{ id }];
-		});
 
 		live = new Map();
 		maxPerServer = new Map();
@@ -97,12 +78,14 @@ describe("lsp_diagnostics batch — per-server serialization (#631)", () => {
 			return [];
 		});
 
-		mocked.service = makeLspServiceDouble({
-			touchFile,
-			getDiagnostics: vi.fn().mockResolvedValue([]),
-			getDiagnosticsHealth: vi.fn().mockReturnValue(undefined),
-			getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
-		});
+		mocked.service = installLspService(
+			makeLspServiceDouble({
+				touchFile,
+				getDiagnostics: vi.fn().mockResolvedValue([]),
+				getDiagnosticsHealth: vi.fn().mockReturnValue(undefined),
+				getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
+			}),
+		);
 	});
 
 	afterEach(() => {

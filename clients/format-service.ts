@@ -13,6 +13,9 @@
 
 import { logExtension } from "./extension-log.js";
 import * as path from "node:path";
+import { canWriteAnalysisRoot, resolveAnalysisRoot } from "./analysis-root.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
+import { realpathOrResolve } from "./path-utils.js";
 import { recordFormatter } from "./widget-state.js";
 import { FileTime } from "./file-time.js";
 import type {
@@ -46,6 +49,12 @@ export interface FormatOptions {
 	 * its command is resolved (see `formatters.formatFile`).
 	 */
 	writeHold?: FileMutationHold;
+	/**
+	 * The session root the file is classified against (#4689). A file whose
+	 * identity is not in a writable root (`session`, `linked-worktree`) is
+	 * refused and nothing is written, whichever spelling named it.
+	 */
+	sessionRoot: string;
 }
 
 export interface FormatSummary {
@@ -89,13 +98,33 @@ export class FormatService {
 	 */
 	async formatFile(
 		filePath: string,
-		options: FormatOptions = {},
+		options: FormatOptions,
 	): Promise<FormatSummary> {
-		const absolutePath = path.resolve(filePath);
+		// The file a formatter writes is the identity, not the link that named it
+		// (#4689): `AGENTS.md -> CLAUDE.md` formats CLAUDE.md.
+		const absolutePath = realpathOrResolve(filePath);
 		const cwd = path.dirname(absolutePath);
 
 		// Skip if disabled
 		if (options.skip || !this.enabled) {
+			return {
+				filePath: absolutePath,
+				formatters: [],
+				anyChanged: false,
+				allSucceeded: true,
+			};
+		}
+
+		// A link inside the session can lead outside it; the class is decided on
+		// the identity, so the target of such a link is never rewritten here.
+		const mode = resolveAnalysisRoot(absolutePath, options.sessionRoot);
+		if (!canWriteAnalysisRoot(mode)) {
+			recordDegradationOnce({
+				kind: "adopted-root-writer-skipped",
+				subject: `${absolutePath}:format`,
+				reason: `formatter refused: the file's identity is outside the session's writable roots (${mode})`,
+				metadata: { writer: "format", mode },
+			});
 			return {
 				filePath: absolutePath,
 				formatters: [],
@@ -151,6 +180,9 @@ export class FormatService {
 		this.fileTime.read(absolutePath);
 
 		for (const [index, result] of results.entries()) {
+			// The widget keys syntactically (#1020), so its writers pass the path
+			// identity; this method resolved it at its entry (`absolutePath`), the
+			// key the pipeline's own record for the same file uses (#4689 item 3).
 			recordFormatter(
 				absolutePath,
 				formatters[index]?.name ?? "unknown",
@@ -284,21 +316,21 @@ export class FormatService {
 	 * Throws FileTimeError if file modified externally
 	 */
 	assertUnchanged(filePath: string): void {
-		this.fileTime.assert(filePath);
+		this.fileTime.assert(realpathOrResolve(filePath));
 	}
 
 	/**
 	 * Check if file has changed externally
 	 */
 	hasChanged(filePath: string): boolean {
-		return this.fileTime.hasChanged(filePath);
+		return this.fileTime.hasChanged(realpathOrResolve(filePath));
 	}
 
 	/**
 	 * Record file read (after agent reads file)
 	 */
 	recordRead(filePath: string): void {
-		this.fileTime.read(filePath);
+		this.fileTime.read(realpathOrResolve(filePath));
 	}
 
 	/**

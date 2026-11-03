@@ -27,11 +27,11 @@ import {
  *
  * Where the two disagree depends on the host. Windows `normalizeMapKey` is
  * `realpathSync.native`, which expands 8.3 names, junctions and subst drives.
- * The POSIX arm adopts only the on-disk CASING (`adoptCanonicalCasing`) and
- * never resolves a symlink, so on POSIX the divergence exists only on a
- * case-insensitive mount (macOS APFS, `nocase` vfat/ntfs3), which no Linux
- * test box has. The second case below uses the real-filesystem stand-in
- * documented there.
+ * Since #4689 the POSIX key of an absolute path is its path identity too, so a
+ * symlinked root disagrees with its keys on every POSIX host, and a mis-cased
+ * spelling on a case-insensitive mount (macOS APFS, `nocase` vfat/ntfs3) does
+ * as well. The case-alias cases below use the real-filesystem stand-in
+ * documented at `createCaseAliasFixture`.
  */
 async function directImportersOf(
 	cwd: string,
@@ -204,11 +204,11 @@ describe("review graph with a project root spelled differently from the canonica
 		}
 	});
 
-	// Guard against the tempting wrong fix: canonicalizing the root with
-	// `fs.realpathSync` alone. POSIX keys keep a symlinked root's own spelling,
-	// so a resolved root would NOT contain them and this edge would be lost on
-	// every symlinked checkout (macOS `/var` -> `/private/var`). Passes on the
-	// pre-fix code by design: it pins the boundary the fix must not cross.
+	// Recurrence (#4689): POSIX keys are path identities, so a containment
+	// check that kept the caller's spelling of a symlinked root (macOS `/var`
+	// -> `/private/var`, a linked checkout) contained none of them and lost
+	// this edge. The root is compared by its identity
+	// (`localImportToFile`'s `root`).
 	it.skipIf(process.platform === "win32")(
 		"keeps the import edge when cwd is a symlink to the real root on POSIX",
 		async () => {
@@ -223,6 +223,43 @@ describe("review graph with a project root spelled differently from the canonica
 					linkRoot,
 					[aPath, bPath],
 					aPath,
+				);
+				expect(importers).toContain(normalizeMapKey(bPath));
+			} finally {
+				holder.cleanup();
+				real.cleanup();
+			}
+		},
+	);
+
+	// Recurrence (#4689), the `isWithin` sibling: the tsconfig-paths branch
+	// resolves from the importer's identity key, and `isWithin` held the
+	// caller's spelling of a symlinked root, so the alias edge was dropped.
+	it.skipIf(process.platform === "win32")(
+		"keeps a tsconfig-paths alias edge when cwd is a symlink to the real root on POSIX",
+		async () => {
+			const real = setupTestEnvironment("pi-lens-rg-symlink-alias-real-");
+			const holder = setupTestEnvironment("pi-lens-rg-symlink-alias-link-");
+			try {
+				const linkRoot = path.join(holder.tmpDir, "project-link");
+				fs.symlinkSync(real.tmpDir, linkRoot, "dir");
+				createTempFile(
+					linkRoot,
+					"tsconfig.json",
+					JSON.stringify({
+						compilerOptions: { baseUrl: ".", paths: { "@app/*": ["src/*"] } },
+					}),
+				);
+				const aPath = createTempFile(linkRoot, "src/a.ts", SRC_A);
+				const bPath = createTempFile(
+					linkRoot,
+					"src/b.ts",
+					SRC_B.replace("'./a'", "'@app/a'"),
+				);
+				const importers = await directImportersOf(
+					linkRoot,
+					[aPath, bPath],
+					normalizeMapKey(aPath),
 				);
 				expect(importers).toContain(normalizeMapKey(bPath));
 			} finally {

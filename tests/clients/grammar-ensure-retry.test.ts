@@ -22,6 +22,10 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
+import {
+	resetUserNotifier,
+	wireUserNotifier,
+} from "../../clients/user-notify.js";
 
 /**
  * A valid wasm module header (magic + version). Any body standing in for a
@@ -33,8 +37,12 @@ const WASM_HEADER = new Uint8Array([
 	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
 ]);
 
-const notifyUserDegradation = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/user-notify.js", () => ({ notifyUserDegradation }));
+const notifyUserDegradation = vi.fn();
+beforeEach(() => {
+	resetUserNotifier();
+	wireUserNotifier(() => notifyUserDegradation);
+});
+afterEach(() => resetUserNotifier());
 
 type EnsureGrammarClient = {
 	ensureGrammar(file: string): Promise<boolean>;

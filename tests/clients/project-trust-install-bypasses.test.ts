@@ -10,16 +10,24 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import {
+	resetUserNotifier,
+	wireUserNotifier,
+} from "../../clients/user-notify.js";
 
 const { safeSpawnAsync } = vi.hoisted(() => ({
 	safeSpawnAsync: vi.fn(async () => ({ status: 0, stdout: "", stderr: "" })),
 }));
-const notifyUserDegradation = vi.hoisted(() => vi.fn());
+const notifyUserDegradation = vi.fn();
+beforeEach(() => {
+	resetUserNotifier();
+	wireUserNotifier(() => notifyUserDegradation);
+});
+afterEach(() => resetUserNotifier());
 vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/safe-spawn.js")>()),
 	safeSpawnAsync,
 }));
-vi.mock("../../clients/user-notify.js", () => ({ notifyUserDegradation }));
 
 beforeEach(() => {
 	resetDegradationLedger();

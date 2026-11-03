@@ -19,11 +19,7 @@ import {
 } from "./degradation-ledger.js";
 import { createFileTime, type FileTime } from "./file-time.js";
 import { hashContentBytes, hashFileBytes } from "./content-stamp.js";
-import {
-	normalizeEphemeralMapKey,
-	normalizeFilePath,
-	realpathOrResolve,
-} from "./path-utils.js";
+import { normalizeEphemeralMapKey, normalizeFilePath } from "./path-utils.js";
 import {
 	logReadGuardEvent,
 	sanitizeCorrelationId,
@@ -984,9 +980,9 @@ export class ReadGuard {
 	// Existence-independent index for hasKnownPath/forgetPath (#1668 review
 	// F1). `this.key()` (normalizeFilePath) branches on whether `filePath`
 	// currently exists on disk, on EVERY platform since #3098 — an existing
-	// file resolves to its on-disk casing (win32: `realpathSync.native`;
-	// POSIX: the on-disk casing of the trailing segments), a missing one to a
-	// lowercased tail on win32 and to the caller's own spelling on POSIX.
+	// file resolves to its path identity (`realpathSync.native` on both, #4689
+	// on POSIX), a missing one to its nearest existing ancestor's identity
+	// plus a lowercased tail on win32 and the caller's own tail on POSIX.
 	// recordRead/recordWritten always key while the file is still on disk
 	// (real casing); hasKnownPath/forgetPath are queried AFTER an external
 	// delete already landed, when the path no longer exists — recomputing
@@ -1042,21 +1038,15 @@ export class ReadGuard {
 	 * Keying the reads/edits/exemptions maps on the raw path made a read recorded
 	 * under one form invisible to an edit checked under another, producing a false
 	 * `zero_read` block despite the file having been read. `normalizeFilePath`
-	 * folds separators and Windows casing to one key, so record and lookup always
-	 * agree. Every map access in this class MUST key through here.
+	 * folds separators and Windows casing to one key and, for an absolute path,
+	 * answers its path identity (#4689), so a read through a link credits an
+	 * edit of its target and the reverse. Every map access in this class MUST
+	 * key through here, the tool_call license included: before #4689 the
+	 * license had its own realpath key (`licenseKey`) while the read credit kept
+	 * the spelling, so one class held two identities for one file.
 	 */
 	private key(filePath: string): string {
 		return normalizeFilePath(filePath);
-	}
-
-	/**
-	 * License keys compare paths independently resolved by the tool_call and
-	 * the writer. Unlike the general map key, this identity must collapse a
-	 * symlink spelling to the file it names; missing files retain an absolute
-	 * resolved fallback so the comparison still fails closed.
-	 */
-	private licenseKey(filePath: string): string {
-		return normalizeFilePath(realpathOrResolve(filePath));
 	}
 
 	private idleEvictMs(): number {
@@ -1489,7 +1479,7 @@ export class ReadGuard {
 		}
 		for (const rawPath of rawPaths) {
 			if (checked.size >= READ_GUARD_MAX_CHECKED_PATHS_PER_CALL) return;
-			checked.add(this.licenseKey(rawPath));
+			checked.add(this.key(rawPath));
 		}
 	}
 
@@ -1505,7 +1495,7 @@ export class ReadGuard {
 		const callId = sanitizeCorrelationId(toolCallId);
 		if (callId === undefined) return false;
 		const checked = this.checkedPathsByCall.get(callId);
-		const licensedPath = this.licenseKey(filePath);
+		const licensedPath = this.key(filePath);
 		if (checked?.has(licensedPath) !== true) return false;
 		checked.delete(licensedPath);
 		if (checked.size === 0) this.checkedPathsByCall.delete(callId);
@@ -2363,6 +2353,16 @@ export class ReadGuard {
 		this.fileTime.clear();
 		moveBranch(this.scope);
 		return result;
+	}
+
+	/**
+	 * #4942 review F8: drop this guard's own {@link FileTime} bucket, which
+	 * lives in a process-global map keyed by session id and outlives the
+	 * guard object. Called when the owning session is forgotten. Unlike
+	 * {@link retainBranch} it leaves the shared branch epoch alone.
+	 */
+	releaseFileTime(): void {
+		this.fileTime.clear();
 	}
 
 	/** The epoch a deferred writer captures before it awaits (#3521). */

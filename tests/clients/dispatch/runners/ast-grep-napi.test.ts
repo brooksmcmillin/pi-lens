@@ -5,6 +5,7 @@ import {
 	makeRunnerCtx,
 	type RunnerCtxOverrides,
 } from "../../../support/runner-ctx.js";
+import { installLspServiceDouble } from "../../../support/lsp-service-seam.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const { mockAuxiliaryLspPublished, fsSyncOverrides } = vi.hoisted(() => ({
@@ -18,10 +19,6 @@ const { mockAuxiliaryLspPublished, fsSyncOverrides } = vi.hoisted(() => ({
 		statSync: undefined as ((...args: unknown[]) => unknown) | undefined,
 		readFileSync: undefined as ((...args: unknown[]) => unknown) | undefined,
 	},
-}));
-
-vi.mock("../../../../clients/lsp/capabilities.js", () => ({
-	hasAuxiliaryLspPublishedForRoot: mockAuxiliaryLspPublished,
 }));
 
 vi.mock("node:fs", async () => {
@@ -99,6 +96,18 @@ function mockWorkingSgLoad(): void {
 	}));
 }
 
+/**
+ * `vi.resetModules()` re-evaluates `clients/lsp/index.ts`, whose import-time
+ * configure replaces the lifecycle, so the double goes in AFTER every reset and
+ * before the subject import (tests/support/lsp-service-seam.ts, step 2).
+ */
+async function resetModulesWithAuxiliaryPublished(): Promise<void> {
+	vi.resetModules();
+	await installLspServiceDouble({
+		hasServerPublishedForFileRoot: mockAuxiliaryLspPublished,
+	});
+}
+
 // Every case installs its own @ast-grep/napi double; resetModules does not clear
 // the mock registry, so drop it after each case (#2883).
 afterEach(() => {
@@ -107,8 +116,8 @@ afterEach(() => {
 });
 
 describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 
@@ -172,8 +181,8 @@ describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
 });
 
 describe("ast-grep-napi runner — late-auxiliary dedupe (#2324 F3/R2)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 
@@ -263,8 +272,8 @@ describe("ast-grep-napi runner — late-auxiliary dedupe (#2324 F3/R2)", () => {
 });
 
 describe("ast-grep-napi runner — skip paths", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 	});
 
 	it("skips unsupported file extensions", async () => {
@@ -369,7 +378,7 @@ describe("ast-grep-napi runner — skip paths", () => {
 
 describe("ast-grep-napi rule-policy scan admission", () => {
 	it("does not evaluate a rule on an ignored path", async () => {
-		vi.resetModules();
+		await resetModulesWithAuxiliaryPublished();
 		const findAll = vi.fn().mockReturnValue([]);
 		vi.doMock("../../../../clients/dispatch/ast-grep-catalog.js", () => ({
 			buildEffectiveAstGrepCatalog: () => {
@@ -411,6 +420,11 @@ describe("ast-grep-napi runner — real shipped rule", () => {
 		// Earlier skip-path cases install per-test NAPI mocks. Replace any
 		// lingering doMock registration with the package's real implementation.
 		vi.doMock("@ast-grep/napi", async (importOriginal) => importOriginal());
+		// The seam install evaluates the facade's graph, so it comes AFTER the
+		// unmocks above: a graph evaluated under a lingering mock caches it.
+		await installLspServiceDouble({
+			hasServerPublishedForFileRoot: mockAuxiliaryLspPublished,
+		});
 		const env = setupTestEnvironment("pi-lens-ast-grep-real-rule-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
@@ -438,7 +452,7 @@ describe("ast-grep-napi runner — real shipped rule", () => {
 
 describe("ast-grep-napi runner — metadata", () => {
 	it("has expected runner id and appliesTo", async () => {
-		vi.resetModules();
+		await resetModulesWithAuxiliaryPublished();
 		const mod =
 			await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
 		const runner = mod.default;
@@ -453,8 +467,8 @@ describe("ast-grep-napi runner — metadata", () => {
 // caught was that no test referenced the record at all, so the branch could
 // be deleted with the suite staying green.
 describe("ast-grep-napi runner — aux-runner-findings-lost degradation (#2324 R2-C)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 
@@ -727,8 +741,8 @@ describe("ast-grep-napi runner — aux-runner-findings-lost degradation (#2324 R
 // after a manually pre-marked pair), so no-opping the producer write left
 // every existing test green — this pins the write directly.
 describe("ast-grep-napi runner — napiFallbackCoveredSince producer pin (#2324 R3-B)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 

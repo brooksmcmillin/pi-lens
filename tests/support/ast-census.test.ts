@@ -2,8 +2,8 @@
  * The census seam's own guard (#4606 S0).
  *
  * `tests/support/ast-census.ts` is the ONE place the AST governance sweeps
- * parse a source text, walk an AST, and enumerate the census files. Five
- * consumers load it:
+ * parse a source text, walk an AST, and enumerate the census files. Its
+ * consumers keep separate predicates:
  *
  * - `tests/config/bounded-eviction-idiom-sweep.test.ts` asks "is this an
  *   eviction program?" (#2442);
@@ -12,7 +12,9 @@
  * - `tests/clients/socket-error-listener-sweep.test.ts` and
  *   `tests/support/silent-catch-scan.ts` are further folds of the same walk
  *   (#4603, #4596);
- * - `tests/support/worker-message-scan.ts` folds it too (#4402).
+ * - `tests/support/worker-message-scan.ts` folds it too (#4402);
+ * - `tests/config/runner-group-id-census.test.ts` resolves literal runner ids
+ *   against the live registry (#4312).
  *
  * Each sweep keeps its own root list; they share the seam and nothing else.
  * The tests below are the properties that make that sharing real rather than
@@ -77,10 +79,18 @@ const SEAM_PATH = path.join(REPO_ROOT, SEAM);
  * census (#4618 V1).
  */
 const CONSUMERS = [
+	"tests/clients/abort-listener-release-sweep.test.ts",
 	"tests/clients/socket-error-listener-sweep.test.ts",
 	"tests/config/bounded-container-guard.test.ts",
 	"tests/config/bounded-eviction-idiom-sweep.test.ts",
+	"tests/config/flag-read-registry-sweep.test.ts",
+	"tests/config/lsp-override-copy-census.test.ts",
+	"tests/config/runner-group-id-census.test.ts",
+	"tests/config/spawn-chokepoint-sweep.test.ts",
+	"tests/config/tree-census-timeout.test.ts",
 	"tests/support/eviction-programs.ts",
+	"tests/support/factory-flag-read-scan.ts",
+	"tests/support/flag-read-scan.ts",
 	"tests/support/silent-catch-scan.ts",
 	"tests/support/worker-message-scan.ts",
 ];
@@ -164,6 +174,40 @@ interface AccessorAdmission {
  */
 const ADMITTED_ACCESSOR_SITES: readonly AccessorAdmission[] = [
 	{
+		file: "tests/support/flag-read-scan.ts",
+		text: 'call.field("arguments")?.namedChildren()[0];',
+		count: 1,
+		reason:
+			"#4946: `firstArgument` indexes ONE call's argument list; nothing is visited",
+	},
+	{
+		file: "tests/support/flag-read-scan.ts",
+		text: "const inner = current.namedChildren()[0];",
+		count: 1,
+		reason:
+			"#4946: `unwrap` steps through one parenthesized or asserted expression to its single child",
+	},
+	{
+		file: "tests/support/flag-read-scan.ts",
+		text: 'for (const param of fn.field("parameters")?.namedChildren() ?? []) {',
+		count: 1,
+		reason:
+			"#4946: `parameterNames` reads one function's parameter list; nothing is visited",
+	},
+	{
+		file: "tests/clients/abort-listener-release-sweep.test.ts",
+		text: "if (node.children().length > 0) return undefined;",
+		count: 1,
+		reason:
+			"a leaf test on one node (no children means a token); nothing is visited",
+	},
+	{
+		file: "tests/clients/abort-listener-release-sweep.test.ts",
+		text: 'const args: SgNode[] = node.field("arguments")?.namedChildren() ?? [];',
+		count: 1,
+		reason: "reads one call's argument list; nothing is visited",
+	},
+	{
 		file: "tests/clients/socket-error-listener-sweep.test.ts",
 		text: 'const handler = node.field("arguments")?.namedChildren()[0];',
 		count: 1,
@@ -206,6 +250,26 @@ const ADMITTED_ACCESSOR_SITES: readonly AccessorAdmission[] = [
 		text: '(value.field("arguments")?.namedChildren().length ?? 0) >= 2',
 		count: 1,
 		reason: "measures a call's argument count; nothing is visited",
+	},
+	{
+		file: "tests/config/tree-census-timeout.test.ts",
+		text: "const named = args.children().filter((node) => node.isNamed());",
+		count: 1,
+		reason:
+			"enumerates one call's direct argument nodes to find its callback and budget; no recursive traversal",
+	},
+	{
+		file: "tests/config/runner-group-id-census.test.ts",
+		text: "? raw.children().find((node) => node.isNamed())",
+		count: 1,
+		reason: "unwraps one computed property key; no recursive traversal",
+	},
+	{
+		file: "tests/config/runner-group-id-census.test.ts",
+		text: "const elements = value.children().filter((node) => node.isNamed());",
+		count: 1,
+		reason:
+			"enumerates one runnerIds array's direct elements for classification",
 	},
 	{
 		file: "tests/support/silent-catch-scan.ts",

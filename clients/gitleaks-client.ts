@@ -58,14 +58,17 @@
 import type { AnalysedRootSignal } from "./analysed-root.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { mkdtempSync } from "node:fs";
 import {
 	collectTrackedFiles,
 	collectUntrackedIgnoredIds,
 } from "./git-tracked-ignore.js";
-import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
+import {
+	normalizeEphemeralMapKey,
+	normalizeMapKey,
+	relativeInside,
+	walkUpDirs,
+} from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
-import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 import {
 	getSecretsLaneAllowlistPaths,
@@ -396,81 +399,47 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
 	}
 
-	private async runScan(cwd: string): Promise<GitleaksResult> {
-		const scannedAt = new Date().toISOString();
+	private runScan(cwd: string): Promise<GitleaksResult> {
 		const bin = this.binaryPath ?? "gitleaks";
-		const outDir = mkdtempSync(
-			path.join(scannerReportParentDir(), "pi-lens-gitleaks-"),
-		);
-		const reportPath = path.join(outDir, "gitleaks-report.json");
-		try {
-			const configPath = writeScopedGitleaksConfig(outDir, cwd);
-			const result = await safeSpawnAsync(
-				bin,
-				[
-					"detect",
-					"--no-git",
-					"--source",
-					cwd,
-					"--config",
-					configPath,
-					"--report-format",
-					"json",
-					"--report-path",
-					reportPath,
-					"--exit-code",
-					"0",
-					"--no-banner",
-				],
-				{ cwd, timeout: SCAN_TIMEOUT_MS },
-			);
-
-			if (result.error) {
-				this.log(`Scan error: ${result.error.message}`);
+		return this.runReportScan({
+			spawn: ({ outDir, reportPath }) => {
+				const configPath = writeScopedGitleaksConfig(outDir, cwd);
+				return safeSpawnAsync(
+					bin,
+					[
+						"detect",
+						"--no-git",
+						"--source",
+						cwd,
+						"--config",
+						configPath,
+						"--report-format",
+						"json",
+						"--report-path",
+						reportPath,
+						"--exit-code",
+						"0",
+						"--no-banner",
+					],
+					{ cwd, timeout: SCAN_TIMEOUT_MS },
+				);
+			},
+			// gitleaks writes the report file even when nothing is found, so a
+			// missing file (the seam's no-report outcome) means the scan stopped
+			// before writing it.
+			parse: async (raw, scannedAt) => {
+				const rawFindings = parseGitleaksReport(raw);
+				const findings = await classifyAndFilterFindings(rawFindings, cwd);
+				// #2154: the one gitleaks site that parsed a scan of this root.
 				return {
-					...EMPTY_RESULT,
-					scannedAt,
-					summary: result.error.message.slice(0, 200),
-				};
-			}
-
-			if (!fs.existsSync(reportPath)) {
-				// gitleaks writes the report file even when nothing is found.
-				// If the file is missing the scan likely errored before
-				// writing it — surface a summary line from stderr.
-				return {
-					...EMPTY_RESULT,
 					success: true,
+					analyzed: true,
+					findings,
 					scannedAt,
-					summary:
-						(result.stderr ?? "").trim().split("\n")[0] || "no report produced",
 				};
-			}
-
-			const rawFindings = parseGitleaksReport(
-				fs.readFileSync(reportPath, "utf-8"),
-			);
-			const findings = await classifyAndFilterFindings(rawFindings, cwd);
-			// #2154: the one gitleaks site that parsed a scan of this root.
-			return {
-				success: true,
-				analyzed: true,
-				findings,
-				scannedAt,
-			};
-		} catch (err) {
-			return {
-				...EMPTY_RESULT,
-				scannedAt,
-				summary: err instanceof Error ? err.message.slice(0, 200) : String(err),
-			};
-		} finally {
-			try {
-				fs.rmSync(outDir, { recursive: true, force: true });
-			} catch {
-				// non-fatal
-			}
-		}
+			},
+			fail: (failure) => ({ ...EMPTY_RESULT, ...failure }),
+		});
 	}
 }
 
@@ -510,24 +479,19 @@ function isInsideNestedGitRepository(file: string, cwd: string): boolean {
 	const absoluteFile = path.isAbsolute(file)
 		? path.resolve(file)
 		: path.resolve(root, file);
-	const relative = path.relative(root, absoluteFile);
-	if (
-		relative === ".." ||
-		relative.startsWith(`..${path.sep}`) ||
-		path.isAbsolute(relative)
-	)
-		return false;
+	if (relativeInside(root, absoluteFile) === undefined) return false;
 
-	let directory = path.dirname(absoluteFile);
-	while (directory !== root) {
+	// The ceiling is the caller's spelling of `cwd`, so the climb stays on the
+	// spelling too: a nested checkout is judged on the chain the finding names.
+	for (const directory of walkUpDirs(path.dirname(absoluteFile), {
+		spelling: true,
+	})) {
+		if (directory === root) return false;
 		try {
 			if (fs.existsSync(path.join(directory, ".git"))) return true;
 		} catch {
 			return false;
 		}
-		const parent = path.dirname(directory);
-		if (parent === directory) return false;
-		directory = parent;
 	}
 	return false;
 }

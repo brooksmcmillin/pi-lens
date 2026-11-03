@@ -26,6 +26,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 // Same reason as tests/clients/lsp/config.test.ts: the extension log is an
 // ndjson sink, not the terminal. Silenced here so a layout that deliberately
@@ -279,9 +281,8 @@ async function captureLayout(layout: Layout): Promise<unknown> {
 	fs.mkdirSync(startDir, { recursive: true });
 
 	const previousHome = process.env.PI_LENS_HOME;
-	const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
-	process.env.PI_LENS_CONFIG_PATH = path.join(home, ".pi-lens", "config.json");
+	setConfigPath(path.join(home, ".pi-lens", "config.json"));
 
 	const { loadLSPConfig, resetLSPConfigWarnCache } =
 		await import("../../clients/lsp/config.js");
@@ -305,9 +306,6 @@ async function captureLayout(layout: Layout): Promise<unknown> {
 	} finally {
 		if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 		else process.env.PI_LENS_HOME = previousHome;
-		if (previousConfigPath === undefined)
-			delete process.env.PI_LENS_CONFIG_PATH;
-		else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	}
 }
 

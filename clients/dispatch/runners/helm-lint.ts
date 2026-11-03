@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { PathKeyedMap } from "../../path-keyed-map.js";
-import { normalizeMapKey } from "../../path-utils.js";
+import { isWithinIdentity, normalizeMapKey } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { truncatedByOutputCap } from "../../spawn-output-cap.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
@@ -37,19 +37,6 @@ const SKIPPED: RunnerResult = {
 	semantic: "none",
 };
 
-function isWithin(root: string, candidate: string): boolean {
-	const relative = path.relative(
-		normalizeMapKey(root),
-		normalizeMapKey(candidate),
-	);
-	return (
-		relative === "" ||
-		(!relative.startsWith(`..${path.sep}`) &&
-			relative !== ".." &&
-			!path.isAbsolute(relative))
-	);
-}
-
 function diagnosticLocation(
 	message: string,
 	chartRoot: string,
@@ -73,7 +60,7 @@ function diagnosticLocation(
 	const relative = embedded ? found.slice(found.indexOf("/") + 1) : found;
 	const candidate = path.resolve(chartRoot, relative);
 	return {
-		filePath: isWithin(chartRoot, candidate)
+		filePath: isWithinIdentity(candidate, chartRoot)
 			? candidate
 			: path.join(chartRoot, "Chart.yaml"),
 		line: rawLine ? Number(rawLine) : undefined,
@@ -221,7 +208,7 @@ const helmLintRunner: RunnerDefinition = {
 		const discovered = findNearestDirWithMarker(startDir, "chartYamlPath");
 		if (!discovered) return SKIPPED;
 		const chartRoot = path.resolve(discovered);
-		if (!isWithin(workspaceRoot, chartRoot)) return SKIPPED;
+		if (!isWithinIdentity(chartRoot, workspaceRoot)) return SKIPPED;
 		const existing = inFlightByChartRoot.get(chartRoot);
 		if (existing) return existing;
 		const promise = lintChart(chartRoot, cwd).finally(() => {

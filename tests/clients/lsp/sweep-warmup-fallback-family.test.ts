@@ -271,7 +271,17 @@ describe("sweep warm-up treats a fallbackFor pair as one family (#3939 F1)", () 
 					const { results, service } = await sweep(family, arm);
 					expect(results).toHaveLength(1);
 					expect(results[0]?.skippedWarmupFailure).toBeUndefined();
-					expect(results[0]?.timedOut).toBeFalsy();
+					if (arm === "fallback-only") {
+						// #5014 (shape 10): the group is served, but the alternate's
+						// answer is not the preferred server's, so the file reads
+						// unconfirmed with the preferred named, never clean.
+						expect(results[0]).toMatchObject({
+							timedOut: true,
+							unconfirmedReason: "primary_unavailable",
+						});
+					} else {
+						expect(results[0]?.timedOut).toBeFalsy();
+					}
 					await service.shutdown();
 				});
 			}

@@ -18,6 +18,13 @@ import {
 	isEffectiveFileViewError,
 } from "../clients/lens-engine.js";
 import { compactRenderResult } from "./render-compact.js";
+import { readFilePath } from "./shared.js";
+
+/** How many decisions a config denial decided (`disabled-by-config`). */
+function countDenied(entries: readonly { reason: string }[]): number {
+	return entries.filter((entry) => entry.reason === "disabled-by-config")
+		.length;
+}
 
 /** One line per decision, for the compact renderer. */
 function summarize(view: EffectiveConfigView): string {
@@ -27,19 +34,20 @@ function summarize(view: EffectiveConfigView): string {
 		return `effective_config — ${documents} · ${view.file.error}`;
 	}
 	const selected = view.file.servers.filter((entry) => entry.selected).length;
-	const denied = view.file.servers.filter(
-		(entry) => entry.reason === "disabled-by-config",
-	).length;
+	const denied = countDenied(view.file.servers);
 	const tools = view.file.tools.filter((entry) => entry.selected).length;
+	const deniedTools = countDenied(view.file.tools);
 	// The denial clause is built first rather than nested inside the summary
 	// template: a conditional expression inside a template inside a template is
 	// the S3358/nested-template shape SonarCloud flags, and it hid the one
 	// number a reader is looking for (#2427 review round 2, F3).
 	const deniedClause = denied > 0 ? `, ${denied} denied by config` : "";
+	const deniedToolsClause =
+		deniedTools > 0 ? `, ${deniedTools} denied by config` : "";
 	return (
 		`effective_config ${view.file.path} — ${documents} · ` +
 		`${selected} server(s) selected${deniedClause} · ` +
-		`${tools} tool(s)`
+		`${tools} tool(s)${deniedToolsClause}`
 	);
 }
 
@@ -60,7 +68,7 @@ export function createEffectiveConfigTool(
 					: (details?.summary ?? "effective_config"),
 		),
 		parameters: Type.Object({
-			file: Type.Optional(
+			path: Type.Optional(
 				Type.String({
 					description:
 						"Path to explain: adds the resolved language plus the per-server and " +
@@ -70,18 +78,28 @@ export function createEffectiveConfigTool(
 						"re-query with `cwd` set to that file's own workspace instead.",
 				}),
 			),
+			file: Type.Optional(Type.String({ description: "Alias for `path`." })),
 		}),
 		async execute(
 			_toolCallId: string,
-			params: { file?: string },
+			params: { path?: string; file?: string },
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
 			const cwd = getProjectRoot() || ctx.cwd || ".";
+			// #5041: `path` is canonical, `file` the older spelling.
+			const fileRead = readFilePath(params);
+			if (fileRead.refusal) {
+				return {
+					content: [{ type: "text" as const, text: fileRead.refusal }],
+					isError: true,
+					details: { summary: "effective_config — failed" },
+				};
+			}
 			const view = await effectiveConfig({
 				cwd,
-				...(params.file === undefined ? {} : { file: params.file }),
+				...(fileRead.path ? { file: fileRead.path } : {}),
 				redact: true,
 				noTools: getNoTools?.(),
 			});

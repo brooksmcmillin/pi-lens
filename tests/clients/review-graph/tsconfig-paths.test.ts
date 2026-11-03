@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveImportToFiles } from "../../../clients/review-graph/import-resolvers.js";
 import {
 	clearTsconfigPathsCache,
+	parseJsonc,
 	parseTsconfigPaths,
 	referencedProjectImportTarget,
 } from "../../../clients/review-graph/tsconfig-paths.js";
@@ -48,6 +49,13 @@ describe("tsconfig paths import resolution (#775 R2)", () => {
 		);
 		write("src/utils/x.ts");
 		expect(resolve("@app/utils/x")).toEqual(["src/utils/x.ts"]);
+	});
+
+	it("keeps a string value that contains a brace and a comma (#4638 F8)", () => {
+		// The trailing-comma strip is string-aware: only real separators go.
+		expect(parseJsonc('{ "include": ["a, }.ts"], }')).toEqual({
+			include: ["a, }.ts"],
+		});
 	});
 
 	it("uses the longest matching prefix", () => {

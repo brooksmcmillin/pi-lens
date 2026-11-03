@@ -174,6 +174,8 @@ function listTypeScriptFiles(target: string): string[] {
  * migrated or deleted turns this map red instead of leaving a stale claim.
  */
 export const UNBOUNDED_FAILURE_PHASE_REASONS: Record<string, string> = {
+	sections_dropped:
+		"One record per basis per rewrite of the `turn-end-findings` row that removes the sections it names (a write, a settled turn end, or the turn-end composer's write), logged by the write and never by a read, so each dropped section is recorded once and volume follows the row's writes (#4738, #4750).",
 	agent_end_concurrent_secondary_skip:
 		"One record per `agent_end`, which fires at most once per turn.",
 	astgrep_napi_unsupported_rules_skipped:

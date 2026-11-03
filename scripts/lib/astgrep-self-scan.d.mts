@@ -1,7 +1,20 @@
-export function repoRoot(): string;
-export function rulesDir(root?: string): string;
+export interface ScanSuite {
+	dir: string[];
+	sgConfig: string;
+	baseline: string;
+	category: string | undefined;
+	scanPaths: string[];
+	contentKeyed: boolean;
+	reasonedIgnores?: boolean;
+}
 
-export function selfScanRuleIds(root?: string): string[];
+export const SUITES: Record<string, ScanSuite>;
+export function suiteByName(name: string): ScanSuite;
+
+export function repoRoot(): string;
+export function rulesDir(root?: string, suite?: ScanSuite): string;
+
+export function selfScanRuleIds(root?: string, suite?: ScanSuite): string[];
 
 export interface SelfScanFinding {
 	ruleId?: string;
@@ -21,6 +34,7 @@ export interface SelfScanResult {
 
 export function runSelfScan(options?: {
 	root?: string;
+	suite?: ScanSuite;
 	scanPaths?: string[];
 	ruleIds?: string[];
 	sgConfigPath?: string;
@@ -28,12 +42,36 @@ export function runSelfScan(options?: {
 
 export function findingSignature(finding: SelfScanFinding): string;
 
-export function loadBaseline(root?: string): Set<string>;
+export function findingSignatures(
+	findings: SelfScanFinding[],
+	suite?: ScanSuite,
+): string[];
+
+export function runRuleTests(
+	root?: string,
+	suite?: ScanSuite,
+): { status: number | null; stdout?: string; stderr?: string; error?: Error };
+
+export function loadBaseline(root?: string, suite?: ScanSuite): Set<string>;
 
 export function writeBaseline(
 	signatures: Iterable<string>,
 	root?: string,
+	suite?: ScanSuite,
+	findings?: SelfScanFinding[],
 ): string;
+
+export const REASONED_IGNORE: RegExp;
+
+export function findUnreasonedIgnores(
+	files: string[],
+	root?: string,
+): { file: string; line: number; text: string }[];
+
+export function filesMentioningIgnore(
+	root?: string,
+	roots?: string[],
+): string[];
 
 export function changedFilesSince(base: string, cwd?: string): Set<string>;
 

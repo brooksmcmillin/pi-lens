@@ -85,12 +85,13 @@
  * a Gradle project, which this module does not do.
  */
 
+import { existsSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readTextFileOrUndefined } from "./cargo-manifest.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
-import { findNearestMarkerRoot } from "./path-utils.js";
+import { realpathOrResolve, walkUpDirs } from "./path-utils.js";
 import {
 	gradleBlockRanges,
 	type NamedGradleBlockRange,
@@ -368,17 +369,21 @@ export async function resolveKtfmtGradleStyle(
 	filePath: string,
 	homeDir: string = os.homedir(),
 ): Promise<string | undefined> {
-	let searchDir = path.dirname(path.resolve(filePath));
-
-	for (let hop = 0; hop < MAX_GRADLE_ANCESTOR_HOPS; hop += 1) {
-		const gradleDir = findNearestMarkerRoot(
-			searchDir,
-			KTFMT_GRADLE_ROOT_FILES,
-			{
-				homeDir,
-			},
-		);
-		if (!gradleDir) return undefined;
+	// One climb from the file's identity (a file link roots in its target's
+	// project); each Gradle build above it is one hop.
+	let hop = 0;
+	for (const gradleDir of walkUpDirs(
+		path.dirname(realpathOrResolve(filePath)),
+		{
+			homeDir,
+		},
+	)) {
+		if (
+			!KTFMT_GRADLE_ROOT_FILES.some((marker) =>
+				existsSync(path.join(gradleDir, marker)),
+			)
+		)
+			continue;
 
 		const styles = await stylesForGradleDir(gradleDir);
 		const style = hop === 0 ? styles.own : styles.descendants;
@@ -404,9 +409,8 @@ export async function resolveKtfmtGradleStyle(
 		}
 		if (style) return KTFMT_STYLE_CLI_FLAG[style];
 
-		const parent = path.dirname(gradleDir);
-		if (parent === gradleDir) return undefined;
-		searchDir = parent;
+		hop += 1;
+		if (hop >= MAX_GRADLE_ANCESTOR_HOPS) return undefined;
 	}
 	return undefined;
 }

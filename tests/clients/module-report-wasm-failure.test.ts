@@ -16,6 +16,7 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { loadWebTreeSitter } from "../../clients/deps/web-tree-sitter.js";
+import { readSymbol } from "../../clients/module-report.js";
 import { _resetSharedTreeSitterClientForTests } from "../../clients/tree-sitter-shared.js";
 import { TreeSitterSymbolExtractor } from "../../clients/tree-sitter-symbol-extractor.js";
 import {
@@ -228,5 +229,28 @@ describe("read_symbol / read_enclosing contain a wasm trap in the callback trave
 		expect((result.details as { warnings?: string[] }).warnings).toEqual([
 			"Callback extraction failed: tree-sitter wasm runtime failure (memory access out of bounds)",
 		]);
+	});
+});
+
+describe("read_symbol keeps the syntax-error caveat when the callback traversal fails (#4949)", () => {
+	it("returns the recovered-parse warning on the callback-error miss", async () => {
+		// Recurrence: #4949 round 3 -- the callbackError early return in readSymbol
+		// dropped extractionWarnings, so a recovered parse lost its caveat exactly
+		// when the traversal also failed.
+		const marker = "MARK_SYNTAX";
+		const { cwd } = project(
+			"skill-router.ts",
+			`${SOURCE(marker)}\nconst x = importOriginal<typeof import("./t.js")>();\n`,
+		);
+		const probe = await trapCallbackTraversalOnce(marker);
+
+		const result = await readSymbol("skill-router.ts", "missingHandler", cwd);
+
+		expect(probe.trapped()).toBe(1);
+		expect(result.found).toBe(false);
+		expect(result.error).toContain("Callback extraction failed");
+		expect(result.warnings).toContain(
+			"tree-sitter could not parse part of this file; the symbol list may be incomplete.",
+		);
 	});
 });

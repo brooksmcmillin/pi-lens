@@ -31,7 +31,15 @@ import {
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
-import { isFullyQualifiedWin32 } from "./path-utils.js";
+import { isFullyQualifiedWin32, realpathOrResolve } from "./path-utils.js";
+import { getProjectTrustState } from "./project-trust.js";
+import {
+	admittedLookupAnswer,
+	isSessionRepositoryPath,
+	recordProjectCommandRefusal,
+	sessionRepositoryJudge,
+} from "./session-repository.js";
+import { windowsExe } from "./process-snapshot.js";
 import { startSpawnUsageSampler } from "./resource-sampler.js";
 import { DEFAULT_MAX_OUTPUT_BYTES } from "./spawn-output-cap.js";
 import { compareOrdinal } from "./string-utils.js";
@@ -651,7 +659,7 @@ export function isOwnLiveChild(
 function killPidTreeSync(pid: number): void {
 	if (process.platform === "win32") {
 		try {
-			const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
+			const taskkill = windowsExe("taskkill.exe");
 			spawnSync(taskkill, ["/F", "/T", "/PID", String(pid)], {
 				shell: false,
 				windowsHide: true,
@@ -816,7 +824,7 @@ export function buildWindowsShellCommand(
 				"that cannot be safely escaped on a cmd.exe /c command line (CWE-78).",
 		);
 	}
-	const chcp = `${systemRoot}\\System32\\chcp.com`;
+	const chcp = windowsExe("chcp.com");
 	const payload = `${cmdEscapeArg(chcp)} 65001 >nul 2>&1 & ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
 	return payload.startsWith('"') ? `"${payload}"` : payload;
 }
@@ -902,15 +910,25 @@ export function mergeWindowsEnvironment(
 	return merged;
 }
 
+/**
+ * Every spelling of `name` in `env`, in insertion order: Windows compares
+ * environment names case-insensitively, so `PATH` and `Path` are one variable
+ * and the last spelling is the one a child sees.
+ */
+function windowsEnvironmentKeys(
+	env: NodeJS.ProcessEnv,
+	name: string,
+): string[] {
+	const folded = name.toLowerCase();
+	return Object.keys(env).filter((key) => key.toLowerCase() === folded);
+}
+
 function getWindowsEnvironmentValue(
 	env: NodeJS.ProcessEnv,
 	name: string,
 ): string | undefined {
-	let value: string | undefined;
-	for (const [key, entry] of Object.entries(env)) {
-		if (key.toLowerCase() === name.toLowerCase()) value = entry;
-	}
-	return value;
+	const key = windowsEnvironmentKeys(env, name).at(-1);
+	return key === undefined ? undefined : env[key];
 }
 
 function driveLetter(value: string): string | undefined {
@@ -1163,7 +1181,8 @@ function getPathExts(env: NodeJS.ProcessEnv): string[] {
 		.filter(Boolean);
 }
 
-function statIsFile(candidate: string): boolean {
+/** Whether `candidate` is a regular file, following links; any stat failure reads false. */
+export function statIsFile(candidate: string): boolean {
 	try {
 		return fs.statSync(candidate).isFile();
 	} catch {
@@ -1327,10 +1346,15 @@ function getSpawnEnvironment(
 	overrides: NodeJS.ProcessEnv | undefined,
 	stripNpmConfig: boolean | undefined,
 ): NodeJS.ProcessEnv {
+	// #4930: `git status` writes a refreshed index back under `index.lock`, and a
+	// read killed mid-write orphans the lock. The seam, not each caller, opts out
+	// of that optional write. Ambient does not win (the guarantee is that pi-lens
+	// never takes the lock); a caller override does.
+	const ambient = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
 	const merged =
 		process.platform === "win32"
-			? mergeWindowsEnvironment(process.env, overrides)
-			: { ...process.env, ...overrides };
+			? mergeWindowsEnvironment(ambient, overrides)
+			: { ...ambient, ...overrides };
 	if (!stripNpmConfig) return merged;
 	// A copy loop rather than `Object.fromEntries(…filter(…))`: `filter` is a
 	// retired glossary identifier and a new use would move the census. This runs
@@ -1341,6 +1365,206 @@ function getSpawnEnvironment(
 		if (!/^npm_config_/i.test(key)) stripped[key] = value;
 	}
 	return stripped;
+}
+
+// ============================================================================
+// TRUST ADMISSION (#4530): the session repository's bytes never answer a lookup
+// ============================================================================
+
+/**
+ * Whether `command` is a LOOKUP: a bare name the child's search path resolves,
+ * rather than a file the caller named by spelling a path. #4530 covers the
+ * lookups: the search path is where a project substitutes its own bytes for a
+ * global tool. A caller that spells a path chose that file itself. A
+ * drive-relative `D:tool.exe` is a path on Windows, not a search. The
+ * separators are the platform's own: on POSIX a backslash is a name
+ * character, so `tool\name` is a bare name the search path resolves (#4776).
+ */
+function isSpawnLookup(command: string): boolean {
+	if (process.platform !== "win32") return !command.includes("/");
+	return !/[\\/]/.test(command) && driveLetter(command) === undefined;
+}
+
+/** The directory a search-path entry names for a child running in `cwd`. */
+function searchPathEntryDir(
+	entry: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): string | undefined {
+	if (process.platform === "win32") {
+		if (entry === "") return undefined;
+		return resolveWindowsPathEntry(
+			entry,
+			resolveEffectiveWindowsCwd(cwd, env),
+			env,
+		);
+	}
+	return posixSearchPathEntryDir(entry, cwd);
+}
+
+/**
+ * The kernel's rule for one POSIX search-path entry: an empty entry is the
+ * cwd, a relative one is relative to it. Joined as text, never `path.resolve`:
+ * `link/..` must reach the kernel unfolded, because the kernel follows the
+ * link before the `..`.
+ */
+function posixSearchPathEntryDir(entry: string, cwd: string): string {
+	if (entry === "") return cwd;
+	return path.isAbsolute(entry) ? entry : `${cwd}${path.sep}${entry}`;
+}
+
+/**
+ * `pathValue` without the entries that are the session repository's own
+ * directories, while pi has not trusted the project (`isSessionRepositoryPath`,
+ * `clients/session-repository.ts`). A trusted project gets `pathValue` back
+ * unchanged. `undefined` means "no search path": an absent value stays absent,
+ * and a value that loses every entry is removed rather than emptied, because an
+ * empty PATH makes the kernel search the child's cwd (measured: `PATH=""` ran a
+ * planted `git` from the cwd, an absent PATH ran the system one). Each removed
+ * directory is recorded once per session.
+ */
+export function trustScopedSearchPath(
+	pathValue: string | undefined,
+	cwd: string = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+	if (pathValue === undefined) return undefined;
+	const trust = getProjectTrustState();
+	if (trust === "trusted") return pathValue;
+	const owned = sessionRepositoryJudge();
+	const kept: string[] = [];
+	for (const entry of pathValue.split(path.delimiter)) {
+		const dir = searchPathEntryDir(entry, cwd, env);
+		if (dir === undefined || !owned(dir)) {
+			kept.push(entry);
+			continue;
+		}
+		const real = realpathOrResolve(dir);
+		if (
+			recordDegradationOnce({
+				kind: "trust-refusal",
+				subject: `project-path-entry:${real}`,
+				reason: `search-path entry inside the project ignored: pi project trust is ${trust}`,
+			})
+		) {
+			logExtension({
+				subsystem: "project-trust",
+				level: "warn",
+				message:
+					"search-path entry inside the project ignored: mark the project trusted in pi or upgrade pi",
+				metadata: { entry, dir: real, trust },
+			});
+		}
+	}
+	return kept.length > 0 ? kept.join(path.delimiter) : undefined;
+}
+
+/**
+ * `env` with its search path passed through {@link trustScopedSearchPath} for
+ * a child running in `cwd`. Every spelling of the key is rewritten (Windows
+ * reads `PATH` case-insensitively), and a search path that lost every entry is
+ * deleted. Returns `env` itself when nothing changes.
+ */
+export function trustScopedEnvironment(
+	env: NodeJS.ProcessEnv,
+	cwd: string = process.cwd(),
+): NodeJS.ProcessEnv {
+	// POSIX names the key exactly; only Windows needs the scan for spellings.
+	// An absent value scopes to itself, so it returns `env` below.
+	const keys =
+		process.platform === "win32"
+			? windowsEnvironmentKeys(env, "PATH")
+			: ["PATH"];
+	const lastKey = keys.at(-1);
+	if (lastKey === undefined) return env;
+	const value = env[lastKey];
+	const scoped = trustScopedSearchPath(value, cwd, env);
+	if (scoped === value) return env;
+	const next: NodeJS.ProcessEnv = { ...env };
+	for (const key of keys) {
+		if (scoped === undefined) delete next[key];
+		else next[key] = scoped;
+	}
+	return next;
+}
+
+/**
+ * The file the kernel would exec for the bare `command` on POSIX: each
+ * search-path entry in order (empty = the cwd, relative = under the cwd,
+ * joined as text so the kernel resolves any link before a `..`), the first
+ * regular executable file wins. `undefined` when the search path is absent or
+ * nothing matches; an absent PATH is the system default path, never the cwd.
+ */
+export function resolveSearchPathCommand(
+	command: string,
+	pathValue: string | undefined,
+	cwd: string,
+): string | undefined {
+	if (pathValue === undefined) return undefined;
+	for (const entry of pathValue.split(path.delimiter)) {
+		const dir = posixSearchPathEntryDir(entry, cwd);
+		const candidate = `${dir}${path.sep}${command}`;
+		try {
+			if (!fs.statSync(candidate).isFile()) continue;
+			fs.accessSync(candidate, fs.constants.X_OK);
+			return candidate;
+		} catch {
+			// none: a miss in this entry is the kernel moving to the next one.
+		}
+	}
+	return undefined;
+}
+
+type SpawnAdmission =
+	| { readonly admitted: true; readonly env: NodeJS.ProcessEnv }
+	| { readonly admitted: false; readonly executable: string };
+
+/**
+ * THE chokepoint (#4530). Every `safeSpawnAsync`/`safeSpawn` start passes it,
+ * after the environment is effective and before anything resolves or starts.
+ *
+ * - Trusted pi trust (and every MCP host): admit, unchanged, no filesystem work.
+ * - Otherwise the child's search path loses the session repository's
+ *   directories ({@link trustScopedEnvironment}), for every start: a named
+ *   file still runs lookups of its own (`#!/usr/bin/env node`).
+ * - A lookup is then resolved in that environment, by the same resolver the
+ *   spawn uses on Windows and by the kernel's rule on POSIX; a target whose
+ *   kernel-real path is still the session repository's (a global dir holding a
+ *   link into it) is refused and recorded once.
+ */
+function admitSpawn(
+	command: string,
+	cwd: string | undefined,
+	env: NodeJS.ProcessEnv,
+): SpawnAdmission {
+	if (getProjectTrustState() === "trusted") return { admitted: true, env };
+	const childCwd = cwd ?? process.cwd();
+	const scoped = trustScopedEnvironment(env, childCwd);
+	if (!isSpawnLookup(command)) return { admitted: true, env: scoped };
+	const executable =
+		process.platform === "win32"
+			? resolveWindowsCommandForEnvironment(command, cwd, scoped)?.resolvedPath
+			: resolveSearchPathCommand(command, scoped.PATH, childCwd);
+	if (executable === undefined || !isSessionRepositoryPath(executable))
+		return { admitted: true, env: scoped };
+	recordProjectCommandRefusal(executable);
+	return { admitted: false, executable };
+}
+
+/** The `SpawnResult` a refused start settles with: typed, never thrown. */
+function trustRefusalResult(command: string, executable: string): SpawnResult {
+	const message =
+		`Refusing to run "${command}": ${executable} is inside the project, ` +
+		`which pi has not trusted (${getProjectTrustState()})`;
+	const cause = Object.assign(new Error(message), { code: "EACCES" });
+	return {
+		stdout: "",
+		stderr: message,
+		status: null,
+		error: cause,
+		failure: "spawn",
+		spawnFailure: new SpawnFailureError("trust-refused", message, cause),
+	};
 }
 
 /**
@@ -1394,7 +1618,7 @@ function ensureUtf8ConsoleCodePageOnce(): void {
 	if (utf8ConsoleCodePageApplied) return;
 	utf8ConsoleCodePageApplied = true;
 	try {
-		const cmdExe = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+		const cmdExe = windowsExe("cmd.exe");
 		spawnSync(cmdExe, ["/d", "/s", "/c", "chcp 65001 >nul 2>&1"], {
 			shell: false,
 			windowsHide: true,
@@ -1770,7 +1994,20 @@ export async function safeSpawnAsync(
 		//   - unresolvable → synthesize an ENOENT-shaped error instead of
 		//     letting cmd.exe report "not recognized" from inside a shell.
 		const isWindows = process.platform === "win32";
-		const spawnEnv = getSpawnEnvironment(options?.env, options?.stripNpmConfig);
+		const admission = admitSpawn(
+			command,
+			options?.cwd,
+			getSpawnEnvironment(options?.env, options?.stripNpmConfig),
+		);
+		// #4530: the chokepoint runs once the environment is effective and
+		// before anything resolves or starts, so no later branch can reach
+		// `spawn` with the judgment skipped. A refusal settles with the typed
+		// `trust-refused` result, the same contract as every other failure here.
+		if (!admission.admitted) {
+			resolve(trustRefusalResult(command, admission.executable));
+			return;
+		}
+		const spawnEnv = admission.env;
 		// The cwd handed to the CHILD process doesn't need OUR validation —
 		// Windows resolves it natively, exactly as it did before #817 ever
 		// touched this file. A drive-relative cwd (`D:work`) without a
@@ -1807,7 +2044,7 @@ export async function safeSpawnAsync(
 				try {
 					// Pin the interpreter — never trust ComSpec/COMSPEC (#18): an
 					// env-controlled ComSpec could point anywhere.
-					spawnCmd = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+					spawnCmd = windowsExe("cmd.exe");
 					spawnArgs = [
 						"/d",
 						"/s",
@@ -1990,7 +2227,7 @@ export async function safeSpawnAsync(
 		// as an orphan. Use taskkill /F /T to kill the full process tree instead.
 		const killTree = async (phase: KillPhase): Promise<void> => {
 			if (isWindows && child.pid && child.pid > 0) {
-				const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
+				const taskkill = windowsExe("taskkill.exe");
 				try {
 					await new Promise<void>((done) => {
 						const killer = spawn(
@@ -2608,7 +2845,7 @@ export async function findCommandAsync(
 	if (result.status !== 0 || result.error) return null;
 
 	// Take the first line (first match). `where` ends lines with CRLF.
-	return result.stdout.trim().split(/\r?\n/)[0] || null;
+	return admittedLookupAnswer(result.stdout);
 }
 
 // ============================================================================
@@ -2640,7 +2877,16 @@ export function safeSpawn(
 	args: string[],
 	options?: SafeSpawnOptions,
 ): SpawnResult {
-	const spawnEnv = getSpawnEnvironment(options?.env, options?.stripNpmConfig);
+	// #4530: the same chokepoint the async seam runs, before either platform
+	// branch, so the sync path cannot be the one that skips it.
+	const admission = admitSpawn(
+		command,
+		options?.cwd,
+		getSpawnEnvironment(options?.env, options?.stripNpmConfig),
+	);
+	if (!admission.admitted)
+		return trustRefusalResult(command, admission.executable);
+	const spawnEnv = admission.env;
 	if (process.platform === "win32") {
 		// See the matching comment in safeSpawnAsync: the child's cwd doesn't
 		// need OUR validation (Windows resolves it natively), so an unprovable
@@ -2673,7 +2919,7 @@ export function safeSpawn(
 
 		if (resolved.ext === ".cmd" || resolved.ext === ".bat") {
 			try {
-				spawnCmd = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+				spawnCmd = windowsExe("cmd.exe");
 				spawnArgs = [
 					"/d",
 					"/s",
@@ -2772,5 +3018,5 @@ export function findCommand(command: string): string | null {
 
 	if (result.status !== 0) return null;
 
-	return result.stdout.trim().split(/\r?\n/)[0] || null;
+	return admittedLookupAnswer(result.stdout);
 }

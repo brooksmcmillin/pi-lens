@@ -27,6 +27,7 @@ import {
 } from "../../support/fault-injection.js";
 import { waitFor } from "../interleaving-kit.js";
 import { createMockState } from "./mock-client-state.js";
+import { _setServersForFileForTests } from "../../../clients/lsp/config.js";
 
 const { getServersForFileWithConfig, createLSPClient, logLatency } = vi.hoisted(
 	() => ({
@@ -43,11 +44,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency,
 }));
 
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -168,6 +164,16 @@ async function setup() {
 		).documentDrift.peek(FILE)?.fingerprint;
 	return { state, wire, gates, touch, pendingQueued, recordFp, service };
 }
+
+// #4709: the setter is module state. It is armed per case at file scope and
+// dropped after each case, so no describe reads a list an earlier describe
+// armed (a shuffled run orders the describes freely).
+beforeEach(() => {
+	_setServersForFileForTests(getServersForFileWithConfig);
+});
+afterEach(() => {
+	_setServersForFileForTests(undefined);
+});
 
 describe("#3481 — the notify queue sends the latest read, not the latest enqueued", () => {
 	beforeEach(() => {

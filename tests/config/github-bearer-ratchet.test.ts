@@ -8,6 +8,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 // Recurrence #4422 review F3 (#4427): five request blocks in `scripts/` each
 // built their own GitHub header set after #4422 had already folded four other
@@ -55,30 +56,38 @@ describe("a GitHub Bearer header is built in one place (#4427, #4422 F3)", () =>
 		]),
 	);
 
-	it("spells Bearer only in the helper and the named exceptions", () => {
-		assertNonEmptyScan("scripts/ sources", files.length, 50);
-		const stray = [...hits]
-			.filter(([file, lines]) => lines.length > 0 && file !== HELPER)
-			.filter(([file]) => !(file in ALLOWED_BEARER_FILES))
-			.map(
-				([file, lines]) =>
-					`${file}:${lines.join(",")}: build the header with githubHeaders/githubFetcher from scripts/lib/github-rest.mjs, or admit the file in ALLOWED_BEARER_FILES with the reason the helper cannot serve it`,
-			);
-		expect(stray).toEqual([]);
-	});
+	it(
+		"spells Bearer only in the helper and the named exceptions",
+		() => {
+			assertNonEmptyScan("scripts/ sources", files.length, 50);
+			const stray = [...hits]
+				.filter(([file, lines]) => lines.length > 0 && file !== HELPER)
+				.filter(([file]) => !(file in ALLOWED_BEARER_FILES))
+				.map(
+					([file, lines]) =>
+						`${file}:${lines.join(",")}: build the header with githubHeaders/githubFetcher from scripts/lib/github-rest.mjs, or admit the file in ALLOWED_BEARER_FILES with the reason the helper cannot serve it`,
+				);
+			expect(stray).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("keeps the helper as the real home and every exception live", () => {
-		// A helper that stopped spelling Bearer, or an exception whose file
-		// folded, would leave the ratchet guarding nothing.
-		expect(hits.get(HELPER)?.length, HELPER).toBeGreaterThan(0);
-		for (const [file, reason] of Object.entries(ALLOWED_BEARER_FILES)) {
-			expect(
-				hits.get(file)?.length,
-				`${file}: stale exception`,
-			).toBeGreaterThan(0);
-			expect(reason.length, `${file}: reason`).toBeGreaterThan(40);
-		}
-	});
+	it(
+		"keeps the helper as the real home and every exception live",
+		() => {
+			// A helper that stopped spelling Bearer, or an exception whose file
+			// folded, would leave the ratchet guarding nothing.
+			expect(hits.get(HELPER)?.length, HELPER).toBeGreaterThan(0);
+			for (const [file, reason] of Object.entries(ALLOWED_BEARER_FILES)) {
+				expect(
+					hits.get(file)?.length,
+					`${file}: stale exception`,
+				).toBeGreaterThan(0);
+				expect(reason.length, `${file}: reason`).toBeGreaterThan(40);
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	describe("the scan reads code, not prose", () => {
 		it.each([

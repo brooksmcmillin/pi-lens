@@ -6,7 +6,8 @@
  * docs/servercapabilities.md.
  *
  * Per server it records: diagnostic mode (pull/push-only), the 12 navigation/
- * edit operations pi-lens parses (operationSupport), the executeCommand
+ * edit operations pi-lens parses (operationSupport) and its didCreate file
+ * operation (#4787), the executeCommand
  * allowlist, and the raw top-level ServerCapabilities keys (the FULL advertised
  * surface, including providers pi-lens does not yet consume).
  *
@@ -80,6 +81,7 @@ const OPS = [
 	["rename", "rnm"],
 	["implementation", "impl"],
 	["callHierarchy", "cHir"],
+	["didCreateFiles", "dCre"],
 ];
 
 for (const fx of fixtures) {

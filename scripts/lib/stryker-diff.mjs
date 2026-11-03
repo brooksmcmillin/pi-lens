@@ -442,6 +442,112 @@ export function sampleRangesDeterministically(patterns, limit, seed) {
 }
 
 /**
+ * Bound a deterministic range sample by the MUTANT count it instruments, not by
+ * its range count (#4171). `sampleRangesDeterministically` keeps `limit`
+ * ranges, and the driver derived `limit` as ranges x allowance / mutants, which
+ * assumes every range holds the same number of mutants. Run 40847865852
+ * (2026-10-29) measured 1197 mutants over 172 ranges with ~24 affordable, kept
+ * floor(172 x 24 / 1197) = 3 ranges, and those 3 held 55 mutants: the budget
+ * expired after 48 of 1197 and the job exited 1.
+ *
+ * Stryker's console reports only a TOTAL, never a per-range count, so the exact
+ * count of a selection costs one more `--dryRunOnly` pass (a no-op test
+ * command, ~3 s). The ranking is a total order by `sha256(seed:pattern)`, so
+ * the sample of `k` ranges is a prefix of the sample of `k + 1`: the count only
+ * grows with `k`, and the largest `k` that fits is found by bisection in
+ * O(log startCount) passes. `startCount` (the uniform-density estimate) is
+ * tried first, so a sample the estimate got right costs one pass.
+ *
+ * When even one range exceeds `allowedMutants` the one-range sample is
+ * returned with `exceedsAllowance: true`: a range is the finest unit
+ * `--mutate` takes, and the run's wall-clock budget kill still bounds its time.
+ * When a count pass fails (`countMutants` returns null) the smallest sample
+ * known to fit, else one range, is returned unverified rather than the
+ * unchecked estimate.
+ *
+ * @param {{
+ *   patterns: string[],
+ *   startCount: number,
+ *   allowedMutants: number,
+ *   seed: string,
+ *   countMutants: (selection: string[]) => number | null,
+ * }} args
+ * @returns {{
+ *   selected: string[],
+ *   mutants: number | null,
+ *   passes: number,
+ *   exceedsAllowance: boolean,
+ *   unverified: boolean,
+ * }}
+ */
+export function fitSampleToMutantAllowance({
+	patterns,
+	startCount,
+	allowedMutants,
+	seed,
+	countMutants,
+}) {
+	let passes = 0;
+	const measure = (limit) => {
+		passes += 1;
+		const { selected } = sampleRangesDeterministically(patterns, limit, seed);
+		return { selected, mutants: countMutants(selected) };
+	};
+	const unverified = (known) => ({
+		selected:
+			known?.selected ??
+			sampleRangesDeterministically(patterns, 1, seed).selected,
+		mutants: known?.mutants ?? null,
+		passes,
+		exceedsAllowance: false,
+		unverified: true,
+	});
+	const start = measure(startCount);
+	if (start.mutants === null) return unverified(null);
+	if (start.mutants <= allowedMutants) {
+		return { ...start, passes, exceedsAllowance: false, unverified: false };
+	}
+	let fit = null;
+	let smallest = start;
+	let low = 1;
+	let high = startCount - 1;
+	while (low <= high) {
+		const mid = Math.floor((low + high) / 2);
+		const probe = measure(mid);
+		if (probe.mutants === null) return unverified(fit);
+		if (probe.mutants <= allowedMutants) {
+			fit = probe;
+			low = mid + 1;
+		} else {
+			smallest = probe;
+			high = mid - 1;
+		}
+	}
+	if (fit)
+		return { ...fit, passes, exceedsAllowance: false, unverified: false };
+	return { ...smallest, passes, exceedsAllowance: true, unverified: false };
+}
+
+/**
+ * The mutant half of the one "mutation diff: measured …" line (#4171): the
+ * sampled population against the allowance, so a reader sees whether the bound
+ * held without opening Stryker's output.
+ *
+ * @param {ReturnType<typeof fitSampleToMutantAllowance>} fit
+ * @param {number} allowedMutants
+ * @returns {string}
+ */
+export function describeSampledMutants(fit, allowedMutants) {
+	if (fit.unverified) {
+		return `sampled mutants unverified against the allowance of ${allowedMutants} (a count pass failed; kept ${fit.mutants === null ? "one range" : "the largest sample known to fit"})`;
+	}
+	const counted = `sampled mutants ${fit.mutants} of ${allowedMutants} allowed (${fit.passes} count pass(es))`;
+	return fit.exceedsAllowance
+		? `${counted}; over the allowance because one range alone holds more`
+		: counted;
+}
+
+/**
  * The pre-mutation source text a mutant's location spans, read from the
  * (by the time the driver calls this, restored-to-original) source file --
  * Stryker's own report schema stores only the replacement, never what it
@@ -895,7 +1001,10 @@ export function decideMutationOutcome({
  *   seed: string,
  *   attemptsSoFar: number,
  *   maxAttempts: number,
- * }} args
+ *   sample?: (patterns: string[], limit: number, seed: string) => {selected: string[]},
+ * }} args `sample` picks the retry's ranges; the driver passes the
+ *   mutant-bounded `fitSampleToMutantAllowance` so a retry cannot overshoot
+ *   the allowance the first sample was held to (#4171)
  * @returns {{retry: false} | {retry: true, patterns: string[]}}
  */
 export function planResample({
@@ -905,12 +1014,13 @@ export function planResample({
 	seed,
 	attemptsSoFar,
 	maxAttempts,
+	sample = sampleRangesDeterministically,
 }) {
 	if (attemptsSoFar >= maxAttempts) return { retry: false };
 	const tried = new Set(triedPatterns);
 	const remaining = allPatterns.filter((pattern) => !tried.has(pattern));
 	if (remaining.length === 0) return { retry: false };
-	const { selected } = sampleRangesDeterministically(
+	const { selected } = sample(
 		remaining,
 		Math.min(keepRangeCount, remaining.length),
 		`${seed}:retry${attemptsSoFar}`,

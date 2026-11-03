@@ -19,8 +19,17 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { removeTempDirSync } from "./test-utils.js";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { pinFixtureHome, removeTempDirSync } from "./test-utils.js";
 import { withEnv } from "../support/with-env.js";
 
 const { classicTsc } = vi.hoisted(() => ({
@@ -71,13 +80,14 @@ const pids = new Set<number>();
 describe.skipIf(SKIP_REASON !== "")(
 	`cascade over a real classic TypeScript server (#1712, #4485)${SKIP_REASON ? ` [skipped: ${SKIP_REASON}]` : ""}`,
 	() => {
+		let restoreHome: () => void = () => {};
+
 		beforeAll(() => {
 			classicTsc.value = TSC ?? "";
 			tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cascade-live-"));
 			const childTmp = path.join(tmp, "os-temp");
 			fs.mkdirSync(childTmp);
 			restoreEnv = withEnv({
-				HOME: path.join(tmp, "home"),
 				TMPDIR: childTmp,
 				TEMP: childTmp,
 				TMP: childTmp,
@@ -87,6 +97,18 @@ describe.skipIf(SKIP_REASON !== "")(
 				PI_LENS_DISABLE_TOOL_INSTALL: "1",
 				PI_LENS_DISABLE_LSP_INSTALL: "1",
 			});
+		});
+
+		// HOME lives in the worker's scratch root beside its worker home, never
+		// under `tmp`, which afterAll deletes (AGENTS "Test requirements": #2912,
+		// #4591). A child that writes to its inherited HOME after teardown would
+		// re-create the deleted tree.
+		beforeEach(() => {
+			restoreHome = pinFixtureHome("1712-cascade-live").restore;
+		});
+
+		afterEach(() => {
+			restoreHome();
 		});
 
 		afterAll(async () => {

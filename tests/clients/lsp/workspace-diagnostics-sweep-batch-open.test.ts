@@ -52,10 +52,6 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 function makeServer(id: string, ext: string) {
@@ -72,8 +68,11 @@ function makeServer(id: string, ext: string) {
 describe("runWorkspaceDiagnostics — batch-open restores #271 coalescing for a full sweep (#608)", () => {
 	let tmp: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-batchopen-"));
@@ -217,8 +216,11 @@ describe("runWorkspaceDiagnostics — pre-open is bounded, not just fast (#615)"
 	const ORIGINAL_WARMUP_RETRY_BACKOFF_MS =
 		process.env.PI_LENS_LSP_WARMUP_RETRY_BACKOFF_MS;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-preopen-bound-"));

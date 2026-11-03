@@ -24,6 +24,14 @@ import {
 	runSelfScan,
 	selfScanRuleIds,
 } from "../../scripts/lib/astgrep-self-scan.mjs";
+import { setProjectTrustState } from "../../clients/project-trust.js";
+
+// #4530: the ast-grep CLI under test is this checkout's own devDependency, found
+// through the test runner's `node_modules/.bin` PATH entry. That entry is the
+// session repository's own bytes, which a bare lookup refuses until pi trusts
+// the project. This file tests the tool, not trust, so it adopts trust the way
+// the maintenance hosts do; the trust rule has its own suite.
+setProjectTrustState("trusted");
 
 /** Every #1727 anti-slop rule and the tier it is meant to ship at. */
 const ANTI_SLOP_TIERS: ReadonlyArray<readonly [string, string]> = [

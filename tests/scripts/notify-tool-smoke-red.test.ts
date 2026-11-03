@@ -71,12 +71,16 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LSP_HANDSHAKE_LOG: writeLog(dir, "lsp-handshake.log", REPLAY_LOG),
 			LSP_GATE_OUTCOME: "skipped",
 			LSP_GATE_LOG: writeLog(dir, "lsp-gate.log", ""),
+			LSP_CASCADE_OUTCOME: "skipped",
+			LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 			LENS_FULL_OUTCOME: "skipped",
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "format-layer.log", ""),
 			EVALUATED_FLOOR_OUTCOME: "skipped",
 			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+			SAVE_VERDICT_OUTCOME: "skipped",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -106,6 +110,7 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			...ok("TOOL_LAYER"),
 			...ok("LSP_HANDSHAKE"),
 			...ok("LSP_GATE"),
+			...ok("LSP_CASCADE"),
 			...ok("LENS_FULL"),
 			...ok("FORMAT_LAYER"),
 			...ok("RESOLUTION_LAYER"),
@@ -115,6 +120,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"floor.log",
 				"✗  characterize-lsp  evaluated floor  21  evaluated 21, below the floor of 35\n",
 			),
+			SAVE_VERDICT_OUTCOME: "success",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 		});
 		expect(out).toContain("action=file-or-refresh");
 		expect(out).toContain("Failing layer: **LSP evaluated floor**");
@@ -123,7 +130,71 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 		);
 	});
 
-	it("plans a close when all six gating layers succeeded", () => {
+	// #1712: the live cascade layer is a gating step. A night where only it
+	// failed must file under its own name with its log, not as "(outside the
+	// tracked layers)" (the #2723 shape).
+	it("files a tracker naming the LSP cascade layer when only that step failed (#1712)", () => {
+		const dir = mkTempDir("pi-lens-tool-smoke-cascade-");
+		const ok = (name: string) => ({
+			[`${name}_OUTCOME`]: "success",
+			[`${name}_LOG`]: writeLog(dir, `${name}.log`, ""),
+		});
+		const out = runDryRun({
+			...ok("TOOL_LAYER"),
+			...ok("LSP_HANDSHAKE"),
+			...ok("LSP_GATE"),
+			...ok("LENS_FULL"),
+			...ok("FORMAT_LAYER"),
+			...ok("RESOLUTION_LAYER"),
+			...ok("EVALUATED_FLOOR"),
+			...ok("SAVE_VERDICT"),
+			LSP_CASCADE_OUTCOME: "failure",
+			LSP_CASCADE_LOG: writeLog(
+				dir,
+				"lsp-cascade.log",
+				"✗  java         jdtls                        0     src/app/B.java unconfirmed after 31 attempt(s), 61000 ms\n",
+			),
+		});
+		expect(out).toContain("action=file-or-refresh");
+		expect(out).toContain("Failing layer: **LSP cascade layer**");
+	});
+
+	// #3405/#4999 F5: the save-verdict probe is the eighth step outside
+	// `continue-on-error`. Before it was a tracked layer, a night where only it
+	// failed filed "Failing layer: (outside the tracked layers)" and attached no
+	// log, exactly as #2723 recorded for the other layers.
+	it("files a tracker naming the LSP save verdict when only that step failed (#3405)", () => {
+		const dir = mkTempDir("pi-lens-tool-smoke-save-verdict-");
+		const ok = (name: string) => ({
+			[`${name}_OUTCOME`]: "success",
+			[`${name}_LOG`]: writeLog(
+				dir,
+				`${name}.log`,
+				"40 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
+			),
+		});
+		const out = runDryRun({
+			...ok("TOOL_LAYER"),
+			...ok("LSP_HANDSHAKE"),
+			...ok("LSP_GATE"),
+			...ok("LSP_CASCADE"),
+			...ok("LENS_FULL"),
+			...ok("FORMAT_LAYER"),
+			...ok("RESOLUTION_LAYER"),
+			...ok("EVALUATED_FLOOR"),
+			SAVE_VERDICT_OUTCOME: "failure",
+			SAVE_VERDICT_LOG: writeLog(
+				dir,
+				"save-verdict.log",
+				"save-verdict: measured NO row — no save-declaring server was reached; nothing was written\n",
+			),
+		});
+		expect(out).toContain("action=file-or-refresh");
+		expect(out).toContain("Failing layer: **LSP save verdict**");
+		expect(out).not.toContain("outside the tracked layers");
+	});
+
+	it("plans a close when all eight gating layers succeeded", () => {
 		const dir = mkTempDir("pi-lens-tool-smoke-clean-");
 		const out = runDryRun({
 			TOOL_LAYER_OUTCOME: "success",
@@ -144,6 +215,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"lsp-gate.log",
 				"38 passed · 0 failed · 0 setup-failed · 0 skipped\n",
 			),
+			LSP_CASCADE_OUTCOME: "success",
+			LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 			LENS_FULL_OUTCOME: "success",
 			LENS_FULL_LOG: writeLog(
 				dir,
@@ -158,6 +231,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			),
 			EVALUATED_FLOOR_OUTCOME: "success",
 			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+			SAVE_VERDICT_OUTCOME: "success",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "success",
 			RESOLUTION_LAYER_LOG: writeLog(
 				dir,
@@ -189,12 +264,16 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"lsp-gate.log",
 				"✗  lua          lua-language-server          0     lens_diagnostics returned 0 diagnostic(s) but 0 primary findings\n1 passed · 1 failed · 0 setup-failed · 0 skipped\n",
 			),
+			LSP_CASCADE_OUTCOME: "skipped",
+			LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 			LENS_FULL_OUTCOME: "skipped",
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
 			EVALUATED_FLOOR_OUTCOME: "skipped",
 			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+			SAVE_VERDICT_OUTCOME: "skipped",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -223,6 +302,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"lsp-gate.log",
 				"1 passed · 0 failed · 0 setup-failed · 0 skipped\n",
 			),
+			LSP_CASCADE_OUTCOME: "success",
+			LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 			LENS_FULL_OUTCOME: "failure",
 			LENS_FULL_LOG: writeLog(
 				dir,
@@ -237,6 +318,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			),
 			EVALUATED_FLOOR_OUTCOME: "success",
 			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+			SAVE_VERDICT_OUTCOME: "success",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "success",
 			RESOLUTION_LAYER_LOG: writeLog(
 				dir,
@@ -262,12 +345,16 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LSP_HANDSHAKE_LOG: writeLog(dir, "lsp.log", ok),
 			LSP_GATE_OUTCOME: "success",
 			LSP_GATE_LOG: writeLog(dir, "lsp-gate.log", ok),
+			LSP_CASCADE_OUTCOME: "success",
+			LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 			LENS_FULL_OUTCOME: "success",
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ok),
 			FORMAT_LAYER_OUTCOME: "success",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ok),
 			EVALUATED_FLOOR_OUTCOME: "skipped",
 			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+			SAVE_VERDICT_OUTCOME: "skipped",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "failure",
 			RESOLUTION_LAYER_LOG: writeLog(
 				dir,
@@ -297,12 +384,16 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LSP_HANDSHAKE_LOG: writeLog(dir, "lsp.log", ""),
 			LSP_GATE_OUTCOME: "skipped",
 			LSP_GATE_LOG: writeLog(dir, "lsp-gate.log", ""),
+			LSP_CASCADE_OUTCOME: "skipped",
+			LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 			LENS_FULL_OUTCOME: "skipped",
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
 			EVALUATED_FLOOR_OUTCOME: "skipped",
 			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+			SAVE_VERDICT_OUTCOME: "skipped",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -328,12 +419,16 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LSP_HANDSHAKE_LOG: writeLog(dir, "lsp.log", ""),
 			LSP_GATE_OUTCOME: "skipped",
 			LSP_GATE_LOG: writeLog(dir, "lsp-gate.log", ""),
+			LSP_CASCADE_OUTCOME: "skipped",
+			LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 			LENS_FULL_OUTCOME: "skipped",
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
 			EVALUATED_FLOOR_OUTCOME: "skipped",
 			EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+			SAVE_VERDICT_OUTCOME: "skipped",
+			SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 			RESOLUTION_LAYER_OUTCOME: "skipped",
 			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
@@ -348,6 +443,7 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				TOOL_LAYER_OUTCOME: undefined as unknown as string,
 				LSP_HANDSHAKE_OUTCOME: undefined as unknown as string,
 				LSP_GATE_OUTCOME: undefined as unknown as string,
+				LSP_CASCADE_OUTCOME: undefined as unknown as string,
 				LENS_FULL_OUTCOME: undefined as unknown as string,
 				FORMAT_LAYER_OUTCOME: undefined as unknown as string,
 				RESOLUTION_LAYER_OUTCOME: undefined as unknown as string,
@@ -435,12 +531,16 @@ const RED_ENV = (dir: string) => ({
 	LSP_HANDSHAKE_LOG: writeLog(dir, "lsp.log", REPLAY_LOG),
 	LSP_GATE_OUTCOME: "skipped",
 	LSP_GATE_LOG: writeLog(dir, "lsp-gate.log", ""),
+	LSP_CASCADE_OUTCOME: "skipped",
+	LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 	LENS_FULL_OUTCOME: "skipped",
 	LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 	FORMAT_LAYER_OUTCOME: "skipped",
 	FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
 	EVALUATED_FLOOR_OUTCOME: "skipped",
 	EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+	SAVE_VERDICT_OUTCOME: "skipped",
+	SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 	RESOLUTION_LAYER_OUTCOME: "skipped",
 	RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 });
@@ -464,6 +564,8 @@ const GREEN_ENV = (dir: string) => ({
 		"lsp-gate.log",
 		"38 passed · 0 failed · 0 setup-failed · 0 skipped\n",
 	),
+	LSP_CASCADE_OUTCOME: "success",
+	LSP_CASCADE_LOG: writeLog(dir, "lsp-cascade.log", ""),
 	LENS_FULL_OUTCOME: "success",
 	LENS_FULL_LOG: writeLog(
 		dir,
@@ -478,6 +580,8 @@ const GREEN_ENV = (dir: string) => ({
 	),
 	EVALUATED_FLOOR_OUTCOME: "success",
 	EVALUATED_FLOOR_LOG: writeLog(dir, "evaluated-floor.log", ""),
+	SAVE_VERDICT_OUTCOME: "success",
+	SAVE_VERDICT_LOG: writeLog(dir, "save-verdict.log", ""),
 	RESOLUTION_LAYER_OUTCOME: "success",
 	RESOLUTION_LAYER_LOG: writeLog(
 		dir,

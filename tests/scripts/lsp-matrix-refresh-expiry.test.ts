@@ -28,14 +28,24 @@
  * run inputs, an injected clock and no LSP spawn.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { strategyKeyForLang } from "../../scripts/lib/clean-signal.mjs";
+import { afterAll, describe, expect, it } from "vitest";
+import {
+	STALE_CELLS_ISSUE_TITLE,
+	staleCellsVerdict,
+	writeStaleCellsVerdict,
+	strategyKeyForLang,
+} from "../../scripts/lib/clean-signal.mjs";
 import { SERVER_DIAGNOSTIC_STRATEGIES } from "../../clients/lsp/wait-policy/strategies.js";
 import {
 	FIRST_PUBLISH_EXPIRY_DAYS,
+	MISSED_PROBE_RAISE_RUNS,
 	TIER_CHANGE_AGREE_RUNS,
+	describeRaisedCells,
+	ensureMatrixColumns,
+	mergeCharacterization,
 	mergeRows,
 	parseRefreshState,
 	parseTable,
@@ -134,7 +144,7 @@ function nightly(
 	});
 }
 
-describe("#3401 first-publish expiry (date-based)", () => {
+describe("#3401/#4512 first-publish misses (date-based, never expired)", () => {
 	it("preserves a stale first-publish cell through the plain merge guard (the pre-fix defect)", () => {
 		// The pre-fix production path: the merge guard writes only the columns a
 		// run measured, so a run with no first-publish observation leaves the
@@ -158,25 +168,29 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		expect(cellOf(preFix, "vue", "first-publish")).toBe("direct");
 	});
 
-	it("keeps the stale cell until FIRST_PUBLISH_EXPIRY_DAYS have elapsed, then expires it to unknown", () => {
+	it("keeps the last known value past FIRST_PUBLISH_EXPIRY_DAYS and marks it stale with the first-miss date (#4512)", () => {
+		// Recurrence: #4338 turned five `direct` cells into `unknown` once five days
+		// had passed since `firstMissed: 2026-10-10`, erasing the last known value
+		// with nothing raised. A missed probe now keeps the value for any number of
+		// nights and names the date it was last seen.
 		let text = FIXTURE;
-		for (let n = 0; n < FIRST_PUBLISH_EXPIRY_DAYS; n++) {
-			text = nightly(text, n).text;
-			expect(
-				cellOf(text, "vue", "first-publish"),
-				`night ${n} is ${n} elapsed days after the first miss: the cell must still stand`,
-			).toBe("direct");
+		for (let n = 0; n < FIRST_PUBLISH_EXPIRY_DAYS * 3; n++) {
+			const run = nightly(text, n);
+			text = run.text;
+			expect(cellOf(text, "vue", "first-publish"), `night ${n}`).toBe("direct");
+			expect(cellOf(text, "ast-grep", "first-publish"), `night ${n}`).toBe(
+				"direct",
+			);
+			expect(cellOf(text, "vue", "stale"), `night ${n}`).toBe(
+				`since ${day(0)}`,
+			);
 		}
-		const final = nightly(text, FIRST_PUBLISH_EXPIRY_DAYS);
-		expect(cellOf(final.text, "vue", "first-publish")).toBe("unknown");
-		expect(cellOf(final.text, "ast-grep", "first-publish")).toBe("unknown");
-		expect(final.expired).toBe(2);
-		expect(final.expiredLangs).toEqual(["vue", "ast-grep"]);
-		// The expired cells' bookkeeping is gone, so a settled doc is stable. The
-		// only entry left is the `empty-first` cell's miss stamp (#4615): the cell
-		// itself never expires.
-		expect(parseRefreshState(final.text)["first-publish"]).toEqual({
+		// The first-miss stamps stay: they are the date the `stale` mark reads
+		// and the #4615 census's evidence for a marker-backed `empty-first` cell.
+		expect(parseRefreshState(text)["first-publish"]).toEqual({
+			"ast-grep": { firstMissed: day(0) },
 			php: { firstMissed: day(0) },
+			vue: { firstMissed: day(0) },
 		});
 	});
 
@@ -192,14 +206,15 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		});
 	});
 
-	it("counts elapsed days, not runs: a run after skipped nights expires a stale cell", () => {
+	it("dates the stale mark from the first miss, not from a run after skipped nights", () => {
 		// Night 0 is the only run; nights 1-8 were skipped (the bot PR sat, the
-		// workflow was disabled). The next run, on day 9, is 9 elapsed days.
+		// workflow was disabled). The next run, on day 9, keeps the value and the
+		// day-0 date: it neither expires the cell nor restarts its date.
 		const first = nightly(FIXTURE, 0).text;
 		expect(cellOf(first, "vue", "first-publish")).toBe("direct");
 		const later = nightly(first, 9);
-		expect(cellOf(later.text, "vue", "first-publish")).toBe("unknown");
-		expect(later.expired).toBe(2);
+		expect(cellOf(later.text, "vue", "first-publish")).toBe("direct");
+		expect(cellOf(later.text, "vue", "stale")).toBe(`since ${day(0)}`);
 	});
 
 	it("does not advance on extra runs the same day", () => {
@@ -218,14 +233,14 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		expect(parseRefreshState(text)["first-publish"]?.vue).toBeUndefined();
 		// The next miss is a NEW first miss on day 5: elapsed time is measured
 		// from it, not from day 0.
+		expect(cellOf(text, "vue", "stale")).toBe("—");
 		text = nightly(text, 5).text;
 		expect(parseRefreshState(text)["first-publish"]?.vue).toEqual({
 			firstMissed: day(5),
 		});
-		text = nightly(text, 5 + FIRST_PUBLISH_EXPIRY_DAYS - 1).text;
-		expect(cellOf(text, "vue", "first-publish")).toBe("direct");
+		expect(cellOf(text, "vue", "stale")).toBe(`since ${day(5)}`);
 		text = nightly(text, 5 + FIRST_PUBLISH_EXPIRY_DAYS).text;
-		expect(cellOf(text, "vue", "first-publish")).toBe("unknown");
+		expect(cellOf(text, "vue", "first-publish")).toBe("direct");
 	});
 
 	it("treats a garbage or future firstMissed as a fresh first miss, never an expiry", () => {
@@ -241,11 +256,12 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		}
 	});
 
-	it("never expires a pull row's n/a (pull) cell", () => {
+	it("never marks a pull row's n/a (pull) cell stale", () => {
 		let text = FIXTURE;
 		for (let n = 0; n < FIRST_PUBLISH_EXPIRY_DAYS + 7; n++)
 			text = nightly(text, n).text;
 		expect(cellOf(text, "rust", "first-publish")).toBe("n/a (pull)");
+		expect(cellOf(text, "rust", "stale")).toBe("—");
 		expect(parseRefreshState(text)["first-publish"]?.rust).toBeUndefined();
 	});
 
@@ -256,11 +272,12 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		for (let n = 0; n < FIRST_PUBLISH_EXPIRY_DAYS + 3; n++)
 			text = nightly(text, n).text;
 		expect(cellOf(text, "svelte", "first-publish")).toBe("unknown");
+		expect(cellOf(text, "svelte", "stale")).toBe("—");
 		expect(parseRefreshState(text)["first-publish"]?.svelte).toBeUndefined();
 	});
 
 	it("never expires an empty-first cell, but stamps its first unobserved night (#4615)", () => {
-		// Recurrence (review F2, mutation M7b): php/terraform `empty-first` back a
+		// Recurrence (review F2, mutation M7b): php `empty-first` backs a
 		// LIVE `emptyFirstPublish: "indexing"` marker. Expiring the cell erases the
 		// measurement behind the marker while the first-publish census stays green
 		// (it ignores `unknown`). Only a stale `direct` -- the no-op default -- may
@@ -279,9 +296,9 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		expect(parseRefreshState(text)["first-publish"]?.php).toEqual({
 			firstMissed: day(0),
 		});
-		// ...while the `direct` cells in the same doc did expire, so the loop
-		// genuinely ran the expiry.
-		expect(cellOf(text, "vue", "first-publish")).toBe("unknown");
+		// ...and the `direct` cells in the same doc keep their value too (#4512):
+		// nothing in the refresh writes `unknown` over a measured cell.
+		expect(cellOf(text, "vue", "first-publish")).toBe("direct");
 	});
 
 	it("clears an empty-first cell's miss stamp when the axis is observed again", () => {
@@ -328,24 +345,39 @@ describe("#3401 first-publish expiry (date-based)", () => {
 });
 
 describe("#3401 subset probe", () => {
-	it("does not advance or expire the state of a lang it did not probe", () => {
+	it("does not advance the state of a lang it did not probe", () => {
 		// Recurrence (review F4): `probe-clean-signal.mjs typescript` used to tick
-		// every unprobed first-publish cell, so a dev's one-lang run expired cells.
+		// every unprobed first-publish cell, so a dev's one-lang run aged cells.
+		// #4512: the same run must not advance a missed-probe streak either, or one
+		// dev run on top of a nightly would raise a lang that missed one night.
 		const first = nightly(FIXTURE, 0).text;
 		const subset = nightly(first, 30, [], { probedLangs: ["rust"] });
-		expect(subset.expired).toBe(0);
+		expect(subset.staleLangs).toEqual([]);
+		expect(subset.raisedLangs).toEqual([]);
 		expect(cellOf(subset.text, "vue", "first-publish")).toBe("direct");
 		expect(parseRefreshState(subset.text)["first-publish"]?.vue).toEqual({
 			firstMissed: day(0),
 		});
-		// The bookkeeping survived intact: the next FULL run expires it.
-		expect(cellOf(nightly(subset.text, 30).text, "vue", "first-publish")).toBe(
-			"unknown",
-		);
+		expect(
+			parseRefreshState(subset.text)["missed-probe"]?.vue?.["first-publish"],
+		).toEqual({
+			since: day(0),
+			last: day(0),
+			misses: 1,
+		});
+		// The bookkeeping survived intact: the next FULL run is its second miss.
+		const full = nightly(subset.text, 31);
+		expect(
+			parseRefreshState(full.text)["missed-probe"]?.vue?.["first-publish"]
+				?.misses,
+		).toBe(2);
+		expect(full.raisedLangs).toContain("vue");
 	});
 
 	it("does not start a clock for an unprobed lang either", () => {
-		const subset = nightly(FIXTURE, 0, [], { probedLangs: ["rust"] });
+		const subset = nightly(ensureMatrixColumns(FIXTURE), 0, [], {
+			probedLangs: ["rust"],
+		});
 		expect(parseRefreshState(subset.text)["first-publish"]).toBeUndefined();
 		expect(subset.changed).toBe(false);
 	});
@@ -353,7 +385,12 @@ describe("#3401 subset probe", () => {
 	it("still processes the langs it did probe", () => {
 		const first = nightly(FIXTURE, 0).text;
 		const subset = nightly(first, 30, [], { probedLangs: ["vue"] });
-		expect(cellOf(subset.text, "vue", "first-publish")).toBe("unknown");
+		expect(subset.staleLangs).toEqual(["vue"]);
+		expect(cellOf(subset.text, "vue", "stale")).toBe(`since ${day(0)}`);
+		expect(
+			parseRefreshState(subset.text)["missed-probe"]?.vue?.["first-publish"]
+				?.misses,
+		).toBe(2);
 		// ast-grep was not probed: still direct, clock kept.
 		expect(cellOf(subset.text, "ast-grep", "first-publish")).toBe("direct");
 		expect(
@@ -495,7 +532,7 @@ describe("#3401 refresh state block", () => {
 	it("records a state-only change so the refresh PR can persist it", () => {
 		const result = nightly(FIXTURE, 0);
 		expect(result.changed).toBe(true);
-		expect(result.expired).toBe(0);
+		expect(result.committed).toBe(0);
 		expect(parseRefreshState(result.text)["first-publish"]?.vue).toEqual({
 			firstMissed: day(0),
 		});
@@ -508,9 +545,15 @@ describe("#3401 refresh state block", () => {
 			// #4615: php's `empty-first` cell is measured here too — an unobserved
 			// `empty-first` cell earns a `firstMissed` stamp, which would make the
 			// first run a change.
-			observation("php", { firstPublish: "empty-first" }),
+			observation("php", {
+				firstPublish: "empty-first",
+				cleanBehavior: "publishes-unversioned",
+				tier: "2*",
+			}),
 		];
-		const first = refreshCapabilityMatrix(FIXTURE, steady, { src: "ci" });
+		// A doc that predates the #4512 columns gains them once (covered below).
+		const settled = ensureMatrixColumns(FIXTURE);
+		const first = refreshCapabilityMatrix(settled, steady, { src: "ci" });
 		expect(first.changed).toBe(false);
 		const second = refreshCapabilityMatrix(first.text, steady, { src: "ci" });
 		expect(second.text).toBe(first.text);
@@ -810,5 +853,362 @@ describe("#3401 refresh entry edges", () => {
 		expect(first.committed).toBe(0);
 		expect(first.pending).toBe(1);
 		expect(refreshCapabilityMatrix(first.text, [a], opts).committed).toBe(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// #4512: a missed probe keeps the last known value, marked stale with its date,
+// and two consecutive misses raise it. Replayed over a recorded matrix (the
+// doc at origin/master 23aebcc2c) and observation rows derived from it.
+// ---------------------------------------------------------------------------
+
+const FIVE = ["python", "yaml", "shell", "dockerfile", "prisma"];
+const recorded = JSON.parse(
+	fs.readFileSync(
+		path.join(repoRoot, "tests/fixtures/lsp-nightly/4338-missed-probes.json"),
+		"utf8",
+	),
+) as {
+	missedLangs: string[];
+	nights: { day: string; observations: MatrixObservation[] }[];
+};
+const RECORDED_DOC = fs.readFileSync(
+	path.join(repoRoot, "tests/fixtures/lsp-nightly/matrix-before-4338.md"),
+	"utf8",
+);
+
+function replay(upTo: number) {
+	let text = RECORDED_DOC;
+	const runs = [];
+	for (const night of recorded.nights.slice(0, upTo)) {
+		const run = refreshCapabilityMatrix(text, night.observations, {
+			src: "ci",
+			now: night.day,
+		});
+		text = run.text;
+		runs.push(run);
+	}
+	return { text, runs };
+}
+
+describe("#4512 a missed probe keeps the last known value and marks it stale", () => {
+	it("names the five #4338 servers and the replay actually misses them", () => {
+		expect(recorded.missedLangs.sort()).toEqual([...FIVE].sort());
+		for (const lang of FIVE) {
+			expect(cellOf(RECORDED_DOC, lang, "first-publish"), lang).toBe("direct");
+		}
+	});
+
+	it("keeps all five `direct` cells through seven missed nights (the pre-fix replay turned them unknown)", () => {
+		// Recurrence: #4338 rewrote pyright, yaml-language-server,
+		// bash-language-server, docker-langserver and @prisma/language-server from
+		// `direct` to `unknown`, all `firstMissed: 2026-10-10`, and nothing raised it.
+		const { text } = replay(7);
+		for (const lang of FIVE) {
+			expect(cellOf(text, lang, "first-publish"), lang).toBe("direct");
+			expect(cellOf(text, lang, "stale"), lang).toBe("since 2026-10-10");
+		}
+		// The re-observed rows are not stale.
+		expect(cellOf(text, "typescript", "stale")).toBe("—");
+		expect(cellOf(text, "typescript", "first-publish")).toBe("direct");
+	});
+
+	it("raises the five on the second consecutive miss and not on the first", () => {
+		const { runs } = replay(3);
+		expect(runs[0].staleLangs.sort()).toEqual([...FIVE].sort());
+		expect(runs[0].raisedLangs).toEqual([]);
+		expect(MISSED_PROBE_RAISE_RUNS).toBe(2);
+		expect(runs[1].raisedLangs.sort()).toEqual([...FIVE].sort());
+		expect(runs[2].raisedLangs.sort()).toEqual([...FIVE].sort());
+	});
+
+	it("clears the mark and the streak the night the probe observes the server again", () => {
+		const { text, runs } = replay(8);
+		expect(runs[7].staleLangs).toEqual([]);
+		expect(runs[7].raisedLangs).toEqual([]);
+		for (const lang of FIVE) {
+			expect(cellOf(text, lang, "stale"), lang).toBe("—");
+			expect(
+				parseRefreshState(text)["missed-probe"]?.[lang],
+				lang,
+			).toBeUndefined();
+		}
+	});
+
+	it("does not raise a lang whose misses are not consecutive", () => {
+		const miss = [] as MatrixObservation[];
+		const seen = [measured("ast-grep", "publishes-versioned", "2")];
+		let r = nightly(FIXTURE, 0, miss);
+		r = nightly(r.text, 1, seen);
+		r = nightly(r.text, 2, miss);
+		expect(
+			parseRefreshState(r.text)["missed-probe"]?.["ast-grep"]?.["first-publish"]
+				?.misses,
+		).toBe(1);
+		expect(r.raisedLangs).not.toContain("ast-grep");
+	});
+
+	it("does not raise a lang whose misses alternate between the two axes", () => {
+		// Recurrence (PR #4980 thread on md-matrix.mjs): one streak per lang counted
+		// a clean-behavior miss on night 0 and a first-publish miss on night 1 as two
+		// consecutive misses, though neither axis was missed two nights running.
+		const doc = ensureMatrixColumns(FIXTURE).replace(
+			"| vue | @vue/language-server | push-only | unknown |",
+			"| vue | @vue/language-server | push-only | silent |",
+		);
+		const cbOnly = [observation("vue", { firstPublish: "direct" })];
+		const fpOnly = [
+			observation("vue", { cleanBehavior: "silent", tier: "2/3?" }),
+		];
+		// Scoped to vue so the fixture's other measured rows do not mix in.
+		const only = { probedLangs: ["vue"] };
+		let r = nightly(doc, 0, cbOnly, only);
+		expect(r.staleLangs).toEqual(["vue"]);
+		r = nightly(r.text, 1, fpOnly, only);
+		expect(r.staleLangs).toEqual(["vue"]);
+		expect(r.raisedLangs).toEqual([]);
+		// The clean-behavior streak ended the night it was observed.
+		r = nightly(r.text, 2, cbOnly, only);
+		expect(r.raisedLangs).toEqual([]);
+		const streaks = parseRefreshState(r.text)["missed-probe"]?.vue;
+		expect(streaks?.["clean-behavior"]?.misses).toBe(1);
+		expect(streaks?.["first-publish"]).toBeUndefined();
+		// The same axis two nights running still raises.
+		r = nightly(r.text, 3, cbOnly, only);
+		expect(r.raisedLangs).toEqual(["vue"]);
+	});
+
+	it("does not count a second run on the same day as a second miss", () => {
+		let r = nightly(FIXTURE, 4);
+		r = nightly(r.text, 4);
+		expect(
+			parseRefreshState(r.text)["missed-probe"]?.vue?.["first-publish"]?.misses,
+		).toBe(1);
+		expect(r.raisedLangs).toEqual([]);
+	});
+
+	it("marks a measured clean-behavior cell stale and keeps its value (the axis nothing stamped before)", () => {
+		// A `silent` cell the probe stops observing used to stand with no mark at
+		// all: `unknown` observations are never written, and nothing recorded the
+		// miss.
+		const doc = ensureMatrixColumns(FIXTURE).replace(
+			"| vue | @vue/language-server | push-only | unknown |",
+			"| vue | @vue/language-server | push-only | silent |",
+		);
+		let r = nightly(doc, 0, [observation("vue", { firstPublish: "direct" })]);
+		expect(cellOf(r.text, "vue", "clean-behavior")).toBe("silent");
+		expect(cellOf(r.text, "vue", "stale")).toBe(`since ${day(0)}`);
+		r = nightly(r.text, 1, [observation("vue", { firstPublish: "direct" })]);
+		expect(r.raisedLangs).toContain("vue");
+		expect(cellOf(r.text, "vue", "clean-behavior")).toBe("silent");
+	});
+
+	it("gives an older doc the version/install/stale columns once, with — in every row", () => {
+		const migrated = ensureMatrixColumns(FIXTURE);
+		const table = parseTable(migrated, MARKER)!;
+		expect(table.header.slice(-3)).toEqual(["version", "install", "stale"]);
+		expect(table.rows.every((c) => c.slice(-3).join() === "—,—,—")).toBe(true);
+		expect(ensureMatrixColumns(migrated)).toBe(migrated);
+		// The refresh itself migrates, so the first nightly after the change
+		// writes the columns without a hand edit.
+		expect(
+			parseTable(nightly(FIXTURE, 0).text, MARKER)!.header.slice(-3),
+		).toEqual(["version", "install", "stale"]);
+	});
+
+	it("drops a malformed or pre-per-axis missed-probe streak from the state block", () => {
+		// `vue` is the single per-lang streak shape this key held before it shipped
+		// (no axis level): an old block must restart, never raise on a guessed axis.
+		const doc = `${ensureMatrixColumns(FIXTURE)}\n## Capability matrix refresh state (nightly-generated)\n\n\`\`\`json\n${JSON.stringify(
+			{
+				"missed-probe": {
+					vue: { since: day(0), last: day(2), misses: 5 },
+					php: {
+						"first-publish": { since: "not-a-date", last: day(0), misses: 5 },
+					},
+					"ast-grep": {
+						"first-publish": { since: day(0), last: day(0), misses: 0 },
+					},
+				},
+			},
+		)}\n\`\`\`\n`;
+		const r = nightly(doc, 3);
+		// Garbage restarts the streak at one miss rather than raising on bad data.
+		expect(
+			parseRefreshState(r.text)["missed-probe"]?.vue?.["first-publish"],
+		).toEqual({
+			since: day(3),
+			last: day(3),
+			misses: 1,
+		});
+		expect(r.raisedLangs).toEqual([]);
+	});
+});
+
+describe("#4512 the raised set reaches the tracking issue", () => {
+	it("describes each raised row with its last known values and streak", () => {
+		const { text } = replay(2);
+		const cells = describeRaisedCells(text, ["python", "prisma"]);
+		expect(cells.map((c) => c.lang)).toEqual(["python", "prisma"]);
+		expect(cells[0]).toMatchObject({
+			server: "pyright",
+			firstPublish: "direct",
+			since: "2026-10-10",
+			misses: 2,
+		});
+	});
+
+	it("files a drift verdict with the raised rows, and a clean verdict when none", () => {
+		const { text } = replay(2);
+		const verdict = staleCellsVerdict(describeRaisedCells(text, FIVE), {
+			runUrl: "https://example.test/run/1",
+		});
+		expect(verdict.state).toBe("drift");
+		if (verdict.state !== "drift") throw new Error("unreachable");
+		expect(verdict.body).toContain("| python | pyright |");
+		expect(verdict.body).toContain("stale since");
+		expect(verdict.body).toContain("https://example.test/run/1");
+		expect(staleCellsVerdict([])).toEqual({ state: "clean" });
+		expect(STALE_CELLS_ISSUE_TITLE).toBe(
+			"nightly: LSP capability probe missed (stale matrix cells)",
+		);
+	});
+
+	// Recurrence: the notifier reads the verdict files the probe leaves in the
+	// runner tmpdir. A subset probe (`probe-clean-signal.mjs python`) that wrote
+	// "clean" would close the tracking issue the last full run raised.
+	describe("writeStaleCellsVerdict", () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-stale-verdict-"),
+		);
+		afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+		const paths = {
+			bodyPath: path.join(dir, "body.md"),
+			statePath: path.join(dir, "state"),
+		};
+		const cells = describeRaisedCells(replay(2).text, FIVE);
+
+		it("writes the body and a drift state on a full run with raised cells", () => {
+			const state = writeStaleCellsVerdict(cells, {
+				fullRun: true,
+				env: {
+					GITHUB_SERVER_URL: "https://example.test",
+					GITHUB_REPOSITORY: "o/r",
+					GITHUB_RUN_ID: "7",
+				},
+				...paths,
+			});
+			expect(state).toBe("drift");
+			expect(fs.readFileSync(paths.statePath, "utf8")).toBe("drift");
+			expect(fs.readFileSync(paths.bodyPath, "utf8")).toContain(
+				"https://example.test/o/r/actions/runs/7",
+			);
+		});
+
+		it("a clean full run removes the body and writes clean", () => {
+			expect(
+				writeStaleCellsVerdict([], { fullRun: true, env: {}, ...paths }),
+			).toBe("clean");
+			expect(fs.existsSync(paths.bodyPath)).toBe(false);
+			expect(fs.readFileSync(paths.statePath, "utf8")).toBe("clean");
+		});
+
+		it("a subset run writes nothing and leaves the last verdict standing", () => {
+			fs.writeFileSync(paths.statePath, "drift");
+			expect(
+				writeStaleCellsVerdict([], { fullRun: false, env: {}, ...paths }),
+			).toBe("skipped");
+			expect(fs.readFileSync(paths.statePath, "utf8")).toBe("drift");
+		});
+
+		it("an unwritable path is logged and never throws", () => {
+			expect(
+				writeStaleCellsVerdict(cells, {
+					fullRun: true,
+					env: {},
+					bodyPath: path.join(dir, "no-such-dir", "body.md"),
+					statePath: paths.statePath,
+				}),
+			).toBe("unwritten");
+		});
+	});
+});
+
+describe("#4512 each row records the server version and install source", () => {
+	const ROWS = [
+		{ lang: "vue", mode: "push-only" },
+		{ lang: "rust", mode: "pull" },
+		{ lang: "svelte", mode: "unknown" },
+	];
+
+	it("writes version and install for the rows the run resolved, next to the measured mode", () => {
+		const provenance = new Map([
+			["rust", { install: "pi-lens-auto", version: "2026-10-12" }],
+			["vue", { install: "npm-global", version: "3.0.9" }],
+		]);
+		const result = mergeCharacterization(FIXTURE, ROWS, provenance, "ci")!;
+		expect(cellOf(result.text, "rust", "version")).toBe("2026-10-12");
+		expect(cellOf(result.text, "rust", "install")).toBe("pi-lens-auto");
+		expect(cellOf(result.text, "vue", "version")).toBe("3.0.9");
+		expect(cellOf(result.text, "vue", "install")).toBe("npm-global");
+		expect(cellOf(result.text, "rust", "mode")).toBe("pull");
+	});
+
+	it("keeps the last known version when a night resolves the install but cannot read a version", () => {
+		const first = mergeCharacterization(
+			FIXTURE,
+			ROWS,
+			new Map([["vue", { install: "npm-global", version: "3.0.9" }]]),
+			"ci",
+		)!;
+		const second = mergeCharacterization(
+			first.text,
+			ROWS,
+			new Map([["vue", { install: "pi-lens-auto" }]]),
+			"ci",
+		)!;
+		expect(cellOf(second.text, "vue", "version")).toBe("3.0.9");
+		expect(cellOf(second.text, "vue", "install")).toBe("pi-lens-auto");
+	});
+
+	it("leaves the cells of a server the run could not resolve untouched, and never appends a row", () => {
+		const first = mergeCharacterization(
+			FIXTURE,
+			ROWS,
+			new Map([
+				["vue", { install: "npm-global", version: "3.0.9" }],
+				["not-in-the-matrix", { install: "global-path", version: "1.0.0" }],
+			]),
+			"ci",
+		)!;
+		const second = mergeCharacterization(first.text, ROWS, new Map(), "ci")!;
+		expect(cellOf(second.text, "vue", "version")).toBe("3.0.9");
+		expect(cellOf(second.text, "svelte", "version")).toBe("—");
+		expect(parseTable(second.text, MARKER)!.rows).toHaveLength(
+			parseTable(FIXTURE, MARKER)!.rows.length,
+		);
+	});
+
+	it("writes provenance for a row whose mode read unknown, but not the unknown mode", () => {
+		const result = mergeCharacterization(
+			FIXTURE,
+			ROWS,
+			new Map([["svelte", { install: "pi-lens-auto", version: "0.7.0" }]]),
+			"ci",
+		)!;
+		expect(cellOf(result.text, "svelte", "version")).toBe("0.7.0");
+		expect(cellOf(result.text, "svelte", "mode")).toBe("push-only");
+	});
+
+	it("keeps a version change out of the probe-owned clean-behavior cells", () => {
+		const bumped = mergeCharacterization(
+			FIXTURE,
+			[],
+			new Map([["ast-grep", { install: "pi-lens-auto", version: "0.40.0" }]]),
+			"ci",
+		)!;
+		expect(cellOf(bumped.text, "ast-grep", "clean-behavior")).toBe(
+			"publishes-versioned",
+		);
 	});
 });

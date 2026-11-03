@@ -97,6 +97,10 @@ const PINNED_LSP_LANGUAGE_IDS = [
 	"svelte",
 	"swift",
 	"terraform",
+	// terraform-ls validates a .tfvars file only under this id; announced as
+	// "terraform" every assignment reads as an unexpected attribute
+	// (hashicorp/vscode-terraform#1672).
+	"terraform-vars",
 	"toml",
 	"typescript",
 	"typescriptreact",

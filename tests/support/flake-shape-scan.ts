@@ -62,6 +62,12 @@
  *   not create or truncate call sites. It separately uses `codeMatches` for
  *   helper calls and mock declarations, while `strings: "keep"` remains only
  *   for the intentional `"vitest"` argv evidence.
+ * - Detector 1's real-module read (#5064) reads an `importActual` call by its
+ *   name and its first argument. A bound copy of the function (`const load =
+ *   vi.importActual; load(...)`), a `require` of child_process, and a zero-
+ *   argument passthrough in a mock factory (`importOriginal()`) are not read.
+ *   No such call exists in the tree today (grep); a binding-following read is
+ *   the follow-up if one appears.
  * - Detector 1 recognizes known spawn-helper names at their test call sites —
  *   the support-module helpers plus the one production seam that wraps the
  *   child, `collectUntrackedIgnoredIds` (#4598) — and ignores calls whose
@@ -239,6 +245,12 @@ const CHILD_PROCESS_IMPORT =
 	/(?:^\s*import\b.*\bfrom\s*["'](?:node:)?child_process["']|\brequire\(\s*["'](?:node:)?child_process["']\s*\))/;
 const SYNC_TRIAD = new Set(["execFileSync", "spawnSync", "execSync"]);
 const VITEST_IN_ARGV = /\bvitest\b/i;
+// #5064: a same-file `vi.mock`/`vi.doMock` of child_process hides the import
+// and the triad above, but `vi.importActual("node:child_process")` returns the
+// REAL module behind that mock, so the spawns started through it are real.
+const CHILD_PROCESS_SPECIFIER = /^(?:node:)?child_process$/;
+const FIRST_STRING_ARGUMENT = /^(["'`])([^"'`]*)\1/;
+const IMPORT_ACTUAL_CALL = /\bimportActual\b\s*(?:<[^;]*?>)?\s*\(/g;
 // These helpers are the test-side routes to real child processes. Keep this
 // list beside the support-module census: matching the CALL in a test catches
 // a helper that hides `node:child_process` behind another module boundary.
@@ -246,7 +258,7 @@ const VITEST_IN_ARGV = /\bvitest\b/i;
 // it as a production seam, and its call site spawns the real `git ls-files`
 // child that decides which fixture inputs survive a fresh checkout.
 const SUPPORT_SPAWN_HELPER_CALL =
-	/\b(gitFixtureSpawnAsync|gitExecFileSync|gitExecSync|execFileSync|execSync|spawnWedgedChild|safeSpawnAsync|collectUntrackedIgnoredIds|withRealPi)\s*\(/g;
+	/\b(gitFixtureSpawnAsync|gitExecFileSync|gitExecSync|execFileSync|execSync|spawnWedgedChild|safeSpawnAsync|collectUntrackedIgnoredIds|withRealPi|installPathProbeStub)\s*\(/g;
 const MOCK_CALL = /\bvi\.(?:mock|doMock|hoisted)\s*\(\s*["']([^"']+)["']/g;
 const HELPER_MODULE_SUFFIXES: Record<string, readonly string[]> = {
 	gitFixtureSpawnAsync: ["/git-fixture-env", "/git-fixture-env.js"],
@@ -259,6 +271,13 @@ const HELPER_MODULE_SUFFIXES: Record<string, readonly string[]> = {
 		"/real-pi-harness",
 		"/real-pi-harness.js",
 		"/real-pi-harness.ts",
+	],
+	// The stub spawns nothing itself: it puts executable stand-ins first on PATH
+	// so the production package-manager lookup spawns them for real (#4709).
+	installPathProbeStub: [
+		"/path-probe-stub",
+		"/path-probe-stub.js",
+		"/path-probe-stub.ts",
 	],
 	execFileSync: ["node:child_process", "child_process"],
 	execSync: ["node:child_process", "child_process"],
@@ -278,10 +297,135 @@ function helperIsMocked(name: string, modules: ReadonlySet<string>): boolean {
 	);
 }
 
+// #3801 (review F2): the test-side helpers of the two kits that spawn real
+// children. `lane-check-kit` runs the lane-check CLI and real git; the
+// `head-move-resync-kit` runs real git. The names are generic: `git`, `runGit`,
+// `makeRepo` and `runLane` are also local helpers in 34 other test files that
+// import no kit, so a bare-name entry in SUPPORT_SPAWN_HELPER_CALL would count
+// those files too. A call therefore counts only in a file that names its kit
+// module, or imports one of its helpers by name from any module (a barrel that
+// re-exports it). That file also takes a hit on its import line, so an aliased
+// import (`runLane as run`) cannot pass unseen.
+const SPAWNING_KIT_HELPERS: Readonly<Record<string, readonly string[]>> = {
+	"lane-check-kit": ["runLane", "makeLane", "git", "worktreeCount"],
+	"head-move-resync-kit": ["runGit", "makeRepo"],
+};
+// A kit module named as a whole string: an import, a re-export, a dynamic
+// import or a require. Read over the stripped source, which keeps strings.
+const KIT_MODULE_SPECIFIER =
+	/(["'])(?:[^"'\n]*\/)?(lane-check-kit|head-move-resync-kit)(?:\.[jt]s)?\1/g;
+// An import clause, read whole: a kit helper imported by name from any module
+// (a barrel that re-exports it) names its kit too. Only the six split files
+// import these names, so the clause form reads no other file.
+const IMPORT_CLAUSE = /\bimport\s+(?:type\s+)?\{([^{}]*)\}\s*from\s*["']/g;
+
+function kitIsMocked(kit: string, modules: ReadonlySet<string>): boolean {
+	return [...modules].some(
+		(module) =>
+			module === kit ||
+			module.endsWith(`/${kit}`) ||
+			module.endsWith(`/${kit}.js`) ||
+			module.endsWith(`/${kit}.ts`),
+	);
+}
+
+/**
+ * The kit hits of one file (#3801 F2). A kit is named when the file names its
+ * module or imports one of its helpers by name; each named kit is a hit on that
+ * import line, and each call of one of its helpers is a hit on its call line.
+ * A file that mocks a kit module gets nothing for that kit: its helpers are the
+ * mock's fakes.
+ */
+function kitSpawnHits(
+	source: string,
+	stripped: string,
+	mocks: ReadonlySet<string>,
+): FlakeHit[] {
+	const sourceLines = source.split("\n");
+	const hits = new Map<number, FlakeHit>();
+	const named = new Set<string>();
+	const hitImport = (kit: string, index: number): void => {
+		const lineIdx = stripped.slice(0, index).split("\n").length - 1;
+		hits.set(lineIdx, {
+			line: lineIdx + 1,
+			text: (sourceLines[lineIdx] ?? "").trim(),
+			reason: `${kit} import (its helpers spawn real children)`,
+		});
+	};
+	for (const match of stripped.matchAll(KIT_MODULE_SPECIFIER)) {
+		const kit = match[2];
+		if (kitIsMocked(kit, mocks)) continue;
+		named.add(kit);
+		hitImport(kit, match.index ?? 0);
+	}
+	for (const match of stripped.matchAll(IMPORT_CLAUSE)) {
+		const imported = match[1].split(",").map(
+			(item) =>
+				item
+					.trim()
+					.replace(/^type\s+/, "")
+					.split(/\s+as\s+/)[0],
+		);
+		for (const [kit, helpers] of Object.entries(SPAWNING_KIT_HELPERS)) {
+			if (kitIsMocked(kit, mocks)) continue;
+			if (!imported.some((name) => helpers.includes(name ?? ""))) continue;
+			named.add(kit);
+			// The module quote closes the match, on the `from` line the specifier
+			// rule also reads, so one import statement takes one hit.
+			hitImport(kit, (match.index ?? 0) + match[0].length - 1);
+		}
+	}
+	for (const [kit, names] of Object.entries(SPAWNING_KIT_HELPERS)) {
+		if (!named.has(kit)) continue;
+		const calls = new RegExp(`\\b(${names.join("|")})\\s*\\(`, "g");
+		for (const match of codeMatches(source, calls)) {
+			const lineIdx = source.slice(0, match.index ?? 0).split("\n").length - 1;
+			if (hits.has(lineIdx)) continue;
+			hits.set(lineIdx, {
+				line: lineIdx + 1,
+				text: (sourceLines[lineIdx] ?? "").trim(),
+				reason: `${match[1]}( kit spawn helper (${kit})`,
+			});
+		}
+	}
+	return [...hits.values()];
+}
+
+/**
+ * An `importActual` call (any receiver, optional type arguments) that reads
+ * the real child_process module (#5064): its first argument names
+ * child_process, or is not a plain string literal (an unknown specifier is
+ * refused, not passed). A plain literal is read as the whole specifier only when
+ * it is the whole argument (followed by `,` or `)`) and holds no `${}` and no
+ * escape; a `+` concatenation, a template interpolation or an escape is
+ * unresolved and read (#5064 r3, fail closed). A literal naming another module,
+ * or no argument, is not read. Lexical rather than AST, because tree-sitter
+ * parses the type arguments of `importActual<typeof import("…")>(…)` as an
+ * expression, so the call is no call_expression there.
+ */
+function importActualReadsChildProcess(
+	source: string,
+	match: RegExpMatchArray,
+): boolean {
+	const rest = source.slice((match.index ?? 0) + match[0].length).trimStart();
+	if (rest.startsWith(")")) return false;
+	const literal = FIRST_STRING_ARGUMENT.exec(rest);
+	if (literal === null) return true;
+	const [whole, , name = ""] = literal;
+	if (!/^\s*[,)]/.test(rest.slice(whole.length))) return true;
+	if (name.includes("${") || name.includes("\\")) return true;
+	return CHILD_PROCESS_SPECIFIER.test(name);
+}
+
 /**
  * A real child process: a `child_process` import, a call-shaped
- * `execFileSync`/`spawnSync`/`execSync`, or ANY spawn flavor whose argv
- * mentions `vitest` — a test file re-launching the suite inside itself.
+ * `execFileSync`/`spawnSync`/`execSync`, a call of a spawning kit helper in a
+ * file that names its kit (`SPAWNING_KIT_HELPERS`, #3801 F2), ANY spawn
+ * flavor whose argv mentions `vitest` — a test file re-launching the suite
+ * inside itself —
+ * or a `vi.importActual` of `child_process` behind a same-file mock (#5064):
+ * the mock hides the first three forms only, so this one is read even in a
+ * mocking file.
  *
  * `strings: "keep"` is required to see `"vitest"` inside an argv array;
  * comments are still blanked so a doc comment naming these calls cannot
@@ -335,6 +479,19 @@ export function scanRealProcessSpawn(
 		}
 	}
 
+	if (/child_process/.test(stripped)) {
+		for (const match of codeMatches(source, IMPORT_ACTUAL_CALL)) {
+			if (!importActualReadsChildProcess(source, match)) continue;
+			const lineIdx = source.slice(0, match.index ?? 0).split("\n").length - 1;
+			if (hits.has(lineIdx)) continue;
+			hits.set(lineIdx, {
+				line: lineIdx + 1,
+				text: (lines[lineIdx] ?? "").trim(),
+				reason: "importActual( reaches the real child_process module",
+			});
+		}
+	}
+
 	for (const match of codeMatches(source, SUPPORT_SPAWN_HELPER_CALL)) {
 		if (childProcessMocked || helperIsMocked(match[1], mocks)) continue;
 		const lineIdx = source.slice(0, match.index ?? 0).split("\n").length - 1;
@@ -344,6 +501,11 @@ export function scanRealProcessSpawn(
 				text: source.split("\n")[lineIdx]?.trim() ?? "",
 				reason: `${match[1]}( support spawn helper`,
 			});
+		}
+	}
+	if (!childProcessMocked) {
+		for (const hit of kitSpawnHits(source, stripped, mocks)) {
+			if (!hits.has(hit.line - 1)) hits.set(hit.line - 1, hit);
 		}
 	}
 	return [...hits.values()].sort((a, b) => a.line - b.line);
@@ -816,6 +978,9 @@ export function scanInProcessMock(
  * so a method added to the service widens the detector in the same commit.
  * `factories` are the shared double factories: an object passed to one, or
  * spreading one's result, is seeded from it and is not hand-rolled.
+ * `argumentOnlyFactories` are the entry points whose ARGUMENT is a factory's
+ * overrides but whose RESULT is not a double (an async installer resolves a
+ * `Promise`), so only the argument spelling is seeded (#4720 review F3).
  *
  * #4344 round 3 (G5) is the recurrence: one method added to `LSPClientInfo`
  * and `LSPService` had to be added by hand to doubles in 40 test files (34
@@ -825,7 +990,16 @@ export interface ServiceSurface {
 	name: string;
 	/** Repo-relative production file that declares `name`. */
 	file: string;
+	/**
+	 * Factories that seed in BOTH directions: the object literal is their
+	 * argument, or it spreads their result.
+	 */
 	factories: readonly string[];
+	/**
+	 * Factories that seed as an ARGUMENT only. Their result is not a double, so
+	 * a spread of it seeds nothing; absent means none.
+	 */
+	argumentOnlyFactories?: readonly string[];
 }
 
 export const SERVICE_SURFACES: readonly ServiceSurface[] = [
@@ -833,7 +1007,19 @@ export const SERVICE_SURFACES: readonly ServiceSurface[] = [
 	{
 		name: "LSPService",
 		file: "clients/lsp/index.ts",
+		// `makeLspServiceDouble` is synchronous and returns the double, so an
+		// overrides object passed to it, or a spread of its result, is seeded
+		// exactly like one passed to the factory itself.
 		factories: ["makeLspServiceDouble"],
+		// `tests/support/lsp-service-seam.ts` (#4709) is the installer: it hands
+		// its argument straight to `makeLspServiceDouble` and installs the
+		// result, so an overrides object passed to it is factory-seeded. It is
+		// ASYNC, so `{ ...installLspServiceDouble(), … }` spreads a Promise and
+		// seeds nothing: that spelling stays a hand-rolled double (#4720 F3).
+		// `installLspService` is NOT registered: it takes a finished double, so
+		// an object literal handed to it is a hand-rolled double and must keep
+		// being counted.
+		argumentOnlyFactories: ["installLspServiceDouble"],
 	},
 ];
 
@@ -980,19 +1166,32 @@ function calledName(call: SgNode | null | undefined): string | undefined {
 	return bareIdentifier(call.field("function") as SgNode);
 }
 
-/** The object is an argument of, or spreads the result of, a factory call. */
+/**
+ * The object is an argument of an admitted seeding call, or it spreads the
+ * result of a factory whose result is itself a double. Every other spelling is
+ * refused: the admitted set is the two `ServiceSurface` lists above, so a name
+ * reached through any other form is counted, never skipped.
+ */
 function factorySeeded(
 	object: SgNode,
 	factories: ReadonlySet<string>,
+	argumentOnlyFactories: ReadonlySet<string>,
 ): boolean {
-	if (factories.size === 0) return false;
+	if (factories.size === 0 && argumentOnlyFactories.size === 0) return false;
 	const parent = object.parent();
 	if (parent?.kind() === "arguments") {
 		const name = calledName(parent.parent());
-		if (name !== undefined && factories.has(name)) return true;
+		if (
+			name !== undefined &&
+			(factories.has(name) || argumentOnlyFactories.has(name))
+		)
+			return true;
 	}
+	if (factories.size === 0) return false;
 	return object.children().some((child) => {
 		if (child.kind() !== "spread_element") return false;
+		// A spread admits `factories` only: an argument-only entry point's result
+		// is not a double (it is a Promise), so spreading it seeds nothing.
 		const name = calledName(unwrapParens(child.namedChildren()[0] as SgNode));
 		return name !== undefined && factories.has(name);
 	});
@@ -1022,6 +1221,9 @@ export function scanServiceDouble(
 	const factories = new Set(
 		SERVICE_SURFACES.flatMap((surface) => surface.factories),
 	);
+	const argumentOnlyFactories = new Set(
+		SERVICE_SURFACES.flatMap((surface) => surface.argumentOnlyFactories ?? []),
+	);
 	// Lexical pre-check over comment-blanked text (quoted keys are real keys,
 	// so strings stay): skip the parse unless some surface could reach the
 	// threshold at all.
@@ -1039,7 +1241,7 @@ export function scanServiceDouble(
 	for (const object of syntaxRoot(scan).findAll({ rule: { kind: "object" } })) {
 		const keys = objectKeys(object);
 		if (keys.size < SERVICE_DOUBLE_MIN_MEMBERS) continue;
-		if (factorySeeded(object, factories)) continue;
+		if (factorySeeded(object, factories, argumentOnlyFactories)) continue;
 		let best: { name: string; shared: number } | undefined;
 		for (const { surface, members } of reachable) {
 			const shared = [...keys].filter(([key]) => members.has(key));

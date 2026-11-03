@@ -41,7 +41,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
 import { copyFixtureGitHelper } from "../support/fixture-git-copy.js";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
@@ -65,6 +65,8 @@ import {
 	parseSupplyArgs,
 	PINNED_ENV_KEYS,
 	pollToTerminal,
+	awaitWarmLog,
+	captureGetCommands,
 	removeScratchRoot,
 	rowReportShows,
 	rowProbeRequest,
@@ -85,6 +87,7 @@ import {
 	CODEMODE_POLL_SCRIPT,
 	buildCodemodeScenario,
 	classifyCodemodeNested,
+	classifyLspWarmLog,
 	locatePiAiIndex,
 	parsePiVersion,
 	planCodemodeRow,
@@ -92,6 +95,7 @@ import {
 	summarizeToolEnds,
 } from "../../scripts/release-qa.mjs";
 import { effectiveConfig } from "../../clients/effective-config.js";
+import { withGlobalConfig } from "../support/global-config.js";
 import { renderToolText } from "../../tools/render-compact.js";
 import {
 	cleanupTestEnvironmentsDrained,
@@ -300,6 +304,271 @@ describe("release-QA matrix and probe map are one list (#2606)", () => {
 		const documented = rows.map((r) => r.id).sort();
 		expect(implementedRowIds()).toEqual(documented);
 	});
+});
+
+describe("release-QA session-start LSP warm witness (#4316)", () => {
+	const resolved = '{"subsystem":"lsp","message":"LSP warm resolved"}\n';
+
+	// Recurrence: 4.4.2 shipped with the LSP warm dead (#4314) because the
+	// failure was a log line no pi-rpc row read.
+	it("requires a resolved warm record and rejects any warm failure", () => {
+		expect(classifyLspWarmLog(resolved)).toEqual({
+			status: "pass",
+			detail: "LSP warm resolved",
+		});
+		expect(
+			classifyLspWarmLog(
+				`${resolved}{"subsystem":"lsp","message":"LSP warm failed: missing module"}\n`,
+			),
+		).toEqual({ status: "fail", detail: "LSP warm failed: missing module" });
+		// The issue's criterion is "any `warm failed` record": the sibling warms
+		// in index.ts log the same way.
+		expect(
+			classifyLspWarmLog(
+				`${resolved}{"subsystem":"format","message":"formatter warm failed: x"}\n`,
+			).status,
+		).toBe("fail");
+		// Fail closed: an old candidate (4.4.3) logs neither record.
+		expect(classifyLspWarmLog("{}\nnot json\n")).toEqual({
+			status: "fail",
+			detail: "no LSP warm resolved record (and no warm failed record)",
+		});
+	});
+
+	// Recurrence: a fixed 500 ms sleep read the log before a slow host's warm
+	// finished, turning a healthy candidate red. The reader has no record for
+	// its first three reads.
+	it("waits for the warm record instead of reading the log once", async () => {
+		let reads = 0;
+		const text = await awaitWarmLog(
+			() => {
+				reads += 1;
+				return reads > 3 ? resolved : "";
+			},
+			{ capMs: 60, intervalMs: 5 },
+		);
+		expect(classifyLspWarmLog(text).status).toBe("pass");
+		expect(reads).toBeGreaterThan(3);
+	});
+
+	// Recurrence (review F1): a sibling warm that failed AFTER the success
+	// record passed the row, because the wait ended 500 ms after the first
+	// record. The failure here lands on the 6th read, well after the success.
+	it("keeps observing after the success record so a late warm failure is seen", async () => {
+		let reads = 0;
+		const text = await awaitWarmLog(
+			() => {
+				reads += 1;
+				return reads < 6
+					? resolved
+					: `${resolved}{"subsystem":"format","message":"formatter warm failed: late"}\n`;
+			},
+			{ capMs: 200, intervalMs: 5 },
+		);
+		expect(classifyLspWarmLog(text).status).toBe("fail");
+	});
+
+	it("gives up at the cap and hands the classifier an empty witness", async () => {
+		const text = await awaitWarmLog(() => "", { capMs: 30, intervalMs: 5 });
+		expect(classifyLspWarmLog(text).status).toBe("fail");
+	});
+
+	// Recurrence (review F4): a reused --scratch-root keeps extension.log, so a
+	// previous run's success record passed a candidate that logged nothing.
+	it("ignores records stamped before this session started", async () => {
+		const old =
+			'{"ts":"2020-01-01T00:00:00.000Z","subsystem":"lsp","message":"LSP warm resolved"}\n';
+		const mine = `{"ts":"2026-10-23T12:00:00.000Z","subsystem":"lsp","message":"LSP warm resolved"}\n`;
+		const since = "2026-10-23T11:00:00.000Z";
+		const stale = await awaitWarmLog(() => old, {
+			capMs: 20,
+			intervalMs: 5,
+			sinceIso: since,
+		});
+		expect(classifyLspWarmLog(stale).status).toBe("fail");
+		// A record with no usable ts cannot prove it is this session's: refused.
+		const undated = await awaitWarmLog(() => resolved, {
+			capMs: 20,
+			intervalMs: 5,
+			sinceIso: since,
+		});
+		expect(classifyLspWarmLog(undated).status).toBe("fail");
+		const fresh = await awaitWarmLog(() => old + mine, {
+			capMs: 20,
+			intervalMs: 5,
+			sinceIso: since,
+		});
+		expect(classifyLspWarmLog(fresh).status).toBe("pass");
+	});
+});
+
+// Review F2/F3: the row's wiring at the startRpcSession process boundary. The
+// fake pi answers get_commands, then logs its warm records 150 ms and 450 ms
+// later, the way a real session's queued writer does.
+describe("release-QA RPC capture carries the extension log (#4316)", () => {
+	const FAKE_PI = [
+		"#!/usr/bin/env node",
+		'import * as fs from "node:fs";',
+		'import * as path from "node:path";',
+		"const home = process.env.PI_LENS_HOME;",
+		"const mode = process.env.FAKE_PI_MODE;",
+		"const log = (message) =>",
+		'\tfs.appendFileSync(path.join(home, "extension.log"), JSON.stringify({ ts: new Date().toISOString(), level: "debug", subsystem: "lsp", message }) + "\\n");',
+		'if (mode === "immediate") log("LSP warm resolved");',
+		'process.stdin.setEncoding("utf8");',
+		'let buf = "";',
+		'process.stdin.on("data", (chunk) => {',
+		"\tbuf += chunk;",
+		'\tif (!buf.includes("get_commands")) return;',
+		'\tbuf = "";',
+		'\tprocess.stdout.write(JSON.stringify({ type: "response", command: "get_commands", data: { commands: [] } }) + "\\n");',
+		'\tif (mode === "unreadable") fs.mkdirSync(path.join(home, "extension.log"));',
+		'\tif (mode === "healthy" || mode === "late-failure") setTimeout(() => log("LSP warm resolved"), 150);',
+		'\tif (mode === "late-failure") setTimeout(() => log("formatter warm failed: late"), 450);',
+		"});",
+		"process.stdin.resume();",
+		"",
+	].join("\n");
+
+	let toIsoSpy: { mockRestore(): void } | undefined;
+
+	async function capture(
+		mode: string,
+		options: {
+			prior?: string;
+			timeoutMs?: number;
+			warmWaitMs?: number;
+			// Hold the parent's first clock read until the child has logged.
+			stampAfterChildLogs?: boolean;
+		} = {},
+	) {
+		const dir = fs.mkdtempSync(
+			path.join(REPO_ROOT, ".probe-home", "release-qa-warm-capture-"),
+		);
+		try {
+			const home = path.join(dir, "home");
+			fs.mkdirSync(home, { recursive: true });
+			if (options.prior)
+				fs.writeFileSync(path.join(home, "extension.log"), options.prior);
+			const piBin = path.join(dir, "fake-pi.mjs");
+			fs.writeFileSync(piBin, FAKE_PI);
+			fs.chmodSync(piBin, 0o755);
+			if (options.stampAfterChildLogs) {
+				// Models a parent that is slow to stamp: its first clock read waits
+				// (up to 1.5 s) for the child's record, then reads a later time. A
+				// stamp taken before the spawn finds no child and reads at once.
+				const realIso = Date.prototype.toISOString;
+				let held = false;
+				toIsoSpy = vi
+					.spyOn(Date.prototype, "toISOString")
+					.mockImplementation(function (this: Date) {
+						if (held) return realIso.call(this);
+						held = true;
+						const log = path.join(home, "extension.log");
+						const deadline = Date.now() + 1500;
+						while (!fs.existsSync(log) && Date.now() < deadline) {
+							// busy-wait: the stamp must stay synchronous
+						}
+						const recordedAt = fs.existsSync(log)
+							? Date.parse(
+									JSON.parse(fs.readFileSync(log, "utf8").split("\n")[0]).ts,
+								)
+							: 0;
+						while (Date.now() <= recordedAt) {
+							// the stamp must be strictly later than the record
+						}
+						return realIso.call(new Date());
+					});
+			}
+			return await captureGetCommands({
+				piBin,
+				cwd: dir,
+				env: { ...process.env, PI_LENS_HOME: home, FAKE_PI_MODE: mode },
+				timeoutMs: options.timeoutMs,
+				warmWaitMs: options.warmWaitMs ?? 900,
+			});
+		} finally {
+			toIsoSpy?.mockRestore();
+			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}
+
+	// Recurrence (review F9): the session start was stamped after the spawn, so
+	// a child that logged its record first had it filtered out as "older than
+	// the session" and a healthy candidate went red.
+	it("counts a record the child logs before the parent would have stamped", async () => {
+		const result = await capture("immediate", { stampAfterChildLogs: true });
+		expect(classifyLspWarmLog(result.extensionLog ?? "").status).toBe("pass");
+	}, 20_000);
+
+	// Recurrence: dropping the wait or the extensionLog field leaves the row
+	// permanently red (review F2 mutation `awaitWarm: true -> false`), with every
+	// unit case above green.
+	it("returns the record the session logs after get_commands", async () => {
+		const result = await capture("healthy");
+		expect(result.ok).toBe(true);
+		expect(classifyLspWarmLog(result.extensionLog ?? "").status).toBe("pass");
+	}, 20_000);
+
+	it("sees a sibling warm failure that lands after the success record", async () => {
+		const result = await capture("late-failure");
+		expect(classifyLspWarmLog(result.extensionLog ?? "")).toEqual({
+			status: "fail",
+			detail: "formatter warm failed: late",
+		});
+	}, 20_000);
+
+	it("does not count a previous run's record in a reused scratch home", async () => {
+		const result = await capture("silent", {
+			prior:
+				'{"ts":"2020-01-01T00:00:00.000Z","subsystem":"lsp","message":"LSP warm resolved"}\n',
+		});
+		expect(classifyLspWarmLog(result.extensionLog ?? "").status).toBe("fail");
+	}, 20_000);
+
+	// Recurrence (review F3): the response deadline kept running through the
+	// warm wait, so a slow registration plus the wait read as "no get_commands
+	// response". get_commands goes out at 3 s and the answer lands just after;
+	// the 3.6 s deadline would expire mid-wait if the response did not clear it.
+	it("does not let the response deadline expire during the warm wait", async () => {
+		const result = await capture("silent", {
+			timeoutMs: 3600,
+			warmWaitMs: 1500,
+		});
+		expect(result.ok).toBe(true);
+	}, 20_000);
+
+	// Recurrence (review F3): a throwing log read was an unhandled rejection
+	// that killed the runner; it now finishes the capture with the error.
+	it("finishes with the read error instead of rejecting", async () => {
+		const result = await capture("unreadable");
+		expect(result.ok).toBe(true);
+		expect(result.extensionLog).toBe("");
+		expect(result.logError).toMatch(/EISDIR|illegal operation/);
+	}, 20_000);
+
+	// The boot probe and the git-install capture judge no warm record.
+	it("skips the wait when the caller has no pi-lens to wait for", async () => {
+		const dir = fs.mkdtempSync(
+			path.join(REPO_ROOT, ".probe-home", "release-qa-warm-skip-"),
+		);
+		try {
+			const piBin = path.join(dir, "fake-pi.mjs");
+			fs.writeFileSync(piBin, FAKE_PI);
+			fs.chmodSync(piBin, 0o755);
+			const home = path.join(dir, "home");
+			fs.mkdirSync(home);
+			const result = await captureGetCommands({
+				piBin,
+				cwd: dir,
+				env: { ...process.env, PI_LENS_HOME: home, FAKE_PI_MODE: "healthy" },
+				awaitWarm: false,
+			});
+			expect(result).toMatchObject({ ok: true, extensionLog: "" });
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 20_000);
 });
 
 describe("release-QA tool-smoke install lane (#2663)", () => {
@@ -1397,11 +1666,7 @@ describe("release-QA global-config-location witnesses application (#3446 F1)", (
 			"extensions",
 			"pi-lens.json",
 		);
-		fs.mkdirSync(path.dirname(agentConfigPath), { recursive: true });
-		fs.writeFileSync(agentConfigPath, `${JSON.stringify(globalConfig)}\n`);
-		const previous = process.env.PI_LENS_CONFIG_PATH;
-		process.env.PI_LENS_CONFIG_PATH = agentConfigPath;
-		try {
+		return withGlobalConfig(agentConfigPath, globalConfig, async () => {
 			const view = await effectiveConfig({
 				cwd: projectDir,
 				file: "a.ts",
@@ -1411,10 +1676,7 @@ describe("release-QA global-config-location witnesses application (#3446 F1)", (
 			});
 			const { content } = renderToolText("Config: …", view);
 			return { text: content[0].text, agentConfigPath, view };
-		} finally {
-			if (previous === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = previous;
-		}
+		});
 	}
 
 	it("passes when the global file's setting decides the server", async () => {
@@ -1590,7 +1852,9 @@ describe("release-QA pack call site (#3887 F1)", () => {
 				"scripts/release-qa.mjs",
 				// release-qa imports the shared RPC driver (#4401), and its phase reader.
 				"scripts/rpc-load-check.mjs",
+				"scripts/lib/is-main-module.mjs",
 				"scripts/lib/latency-log-phases.mjs",
+				"scripts/lib/scratch-home-env.mjs",
 				"scripts/lib/md-matrix.mjs",
 				"scripts/lib/mcp-stdio-client.mjs",
 				"scripts/supply-host-provided-deps.mjs",
@@ -1711,7 +1975,9 @@ describe("release-QA dirty-checkout refusal (#2619 review F1)", () => {
 				"scripts/release-qa.mjs",
 				// release-qa imports the shared RPC driver (#4401), and its phase reader.
 				"scripts/rpc-load-check.mjs",
+				"scripts/lib/is-main-module.mjs",
 				"scripts/lib/latency-log-phases.mjs",
+				"scripts/lib/scratch-home-env.mjs",
 				"scripts/lib/md-matrix.mjs",
 				"scripts/lib/mcp-stdio-client.mjs",
 			]) {

@@ -105,7 +105,8 @@ import {
 } from "./config-core/records.js";
 import {
 	homeRelativePath,
-	isAtOrAboveHomeDir,
+	isUnderDir,
+	realpathOrResolve,
 	walkUpDirs,
 } from "./path-utils.js";
 import {
@@ -436,12 +437,13 @@ export function findNestedProjectMutationValue(
 	projectRoot: string,
 	homeDir = os.homedir(),
 ): NestedProjectMutationValue | undefined {
-	const root = path.resolve(projectRoot);
-	const start = path.dirname(path.resolve(editedFilePath));
-	for (const dir of walkUpDirs(start)) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) break;
-		const rel = path.relative(root, dir);
-		if (rel.startsWith("..") || path.isAbsolute(rel)) break;
+	// #4689 item 6: the walk climbs the edited file's identity, so the root
+	// bound and the home ceiling are identities too. A file linked in from
+	// outside the root is outside at its first step and reads no nested config.
+	const root = realpathOrResolve(projectRoot);
+	const start = path.dirname(realpathOrResolve(editedFilePath));
+	for (const dir of walkUpDirs(start, { homeDir })) {
+		if (!isUnderDir(dir, root)) break;
 		const config = loadPiLensConfigInDir(dir);
 		const enabled = readFlagConfigValue(config, spec.configKey);
 		if (enabled !== undefined) return { value: enabled, dir };
@@ -725,7 +727,10 @@ function parseRulePolicyList(
 	value: unknown,
 ): { list: string[]; invalid: boolean } {
 	if (!Array.isArray(value)) {
-		note(`rules.${ruleId}.${key} must be an array of strings`);
+		note(
+			`rules.${ruleId}.${key} must be an array of strings`,
+			"PILENS_CFG_0005",
+		);
 		return { list: [], invalid: true };
 	}
 	const list: string[] = [];
@@ -740,7 +745,10 @@ function parseRulePolicyList(
 		// but none were usable strings (all blank / non-string), which is a real
 		// authoring mistake that must not fail silently.
 		if (value.length > 0) {
-			note(`rules.${ruleId}.${key} must contain at least one non-empty string`);
+			note(
+				`rules.${ruleId}.${key} must contain at least one non-empty string`,
+				"PILENS_CFG_0005",
+			);
 			return { list: [], invalid: true };
 		}
 		return { list: [], invalid: false };
@@ -754,7 +762,10 @@ function parseRulePathList(
 	value: unknown,
 ): string[] | undefined {
 	if (!Array.isArray(value)) {
-		note(`rules.${ruleId}.ignorePaths must be an array of strings`);
+		note(
+			`rules.${ruleId}.ignorePaths must be an array of strings`,
+			"PILENS_CFG_0005",
+		);
 		return undefined;
 	}
 	const paths = value
@@ -764,7 +775,10 @@ function parseRulePathList(
 		)
 		.map((entry) => entry.trim());
 	if (value.length > 0 && paths.length === 0) {
-		note(`rules.${ruleId}.ignorePaths must contain a non-empty string`);
+		note(
+			`rules.${ruleId}.ignorePaths must contain a non-empty string`,
+			"PILENS_CFG_0005",
+		);
 		return undefined;
 	}
 	return paths;
@@ -792,7 +806,10 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		// reaches one seam, which decides how much of a `JSON.parse`
 		// `SyntaxError#message` (which embeds a snippet of the file being parsed)
 		// survives into the sinks.
-		note({ parseError: outcome.error, sourceText: outcome.sourceText });
+		note(
+			{ parseError: outcome.error, sourceText: outcome.sourceText },
+			"PILENS_CFG_0001",
+		);
 		return {
 			config: EMPTY_PROJECT_CONFIG,
 			records: NO_RECORDS,
@@ -815,7 +832,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		typeof outcome.value !== "object" ||
 		Array.isArray(outcome.value)
 	) {
-		note("top-level value must be an object");
+		note("top-level value must be an object", "PILENS_CFG_0001");
 		return {
 			config: EMPTY_PROJECT_CONFIG,
 			records: NO_RECORDS,
@@ -874,6 +891,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			if (!ruleCfg || typeof ruleCfg !== "object" || Array.isArray(ruleCfg)) {
 				note(
 					`rules.${ruleId} must be an object with threshold, disable, or select; ignored`,
+					"PILENS_CFG_0005",
 				);
 				continue;
 			}
@@ -886,7 +904,10 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			) {
 				entry.threshold = r.threshold;
 			} else if ("threshold" in r) {
-				note(`rules.${ruleId}.threshold must be a positive finite number`);
+				note(
+					`rules.${ruleId}.threshold must be a positive finite number`,
+					"PILENS_CFG_0005",
+				);
 			}
 			if ("disable" in r) {
 				const parsed = parseRulePolicyList(note, ruleId, "disable", r.disable);
@@ -924,6 +945,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			) {
 				note(
 					`rules.${ruleId} has no recognized setting (threshold, disable, select); ignored`,
+					"PILENS_CFG_0004",
 				);
 			}
 		}
@@ -938,7 +960,10 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		) {
 			maxProjectFiles = obj.maxProjectFiles;
 		} else {
-			note("maxProjectFiles must be a positive finite number");
+			note(
+				"maxProjectFiles must be a positive finite number",
+				"PILENS_CFG_0005",
+			);
 		}
 	}
 
@@ -949,7 +974,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			typeof obj.reviewGraph !== "object" ||
 			Array.isArray(obj.reviewGraph)
 		) {
-			note("reviewGraph must be an object");
+			note("reviewGraph must be an object", "PILENS_CFG_0005");
 		} else {
 			const rg = obj.reviewGraph as Record<string, unknown>;
 			if ("maxFiles" in rg) {
@@ -961,7 +986,10 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 					);
 					reviewGraph = { maxFiles: clamped };
 				} else {
-					note("reviewGraph.maxFiles must be a positive finite number");
+					note(
+						"reviewGraph.maxFiles must be a positive finite number",
+						"PILENS_CFG_0005",
+					);
 				}
 			}
 		}
@@ -974,7 +1002,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			typeof obj.startup !== "object" ||
 			Array.isArray(obj.startup)
 		) {
-			note("startup must be an object");
+			note("startup must be an object", "PILENS_CFG_0005");
 		} else {
 			const section = obj.startup as Record<string, unknown>;
 			if (
@@ -984,7 +1012,10 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			) {
 				startup = { mode: section.mode };
 			} else if ("mode" in section) {
-				note('startup.mode must be "quick", "full", or "minimal"');
+				note(
+					'startup.mode must be "quick", "full", or "minimal"',
+					"PILENS_CFG_0005",
+				);
 			}
 			if (section.scans !== undefined) {
 				if (
@@ -992,7 +1023,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 					typeof section.scans !== "object" ||
 					Array.isArray(section.scans)
 				) {
-					note("startup.scans must be an object");
+					note("startup.scans must be an object", "PILENS_CFG_0005");
 				} else if (
 					typeof (section.scans as Record<string, unknown>).enabled ===
 					"boolean"
@@ -1003,7 +1034,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 							.enabled as boolean,
 					};
 				} else if ("enabled" in (section.scans as Record<string, unknown>)) {
-					note("startup.scans.enabled must be a boolean");
+					note("startup.scans.enabled must be a boolean", "PILENS_CFG_0005");
 				}
 			}
 		}
@@ -1060,6 +1091,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		if (!globalOnly) {
 			note(
 				`unknown key "${label}" is not a recognized pi-lens setting (check for a typo); ignored`,
+				"PILENS_CFG_0004",
 			);
 			return;
 		}
@@ -1072,6 +1104,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		const cliClause = hasCliFlag ? " or pass the matching CLI flag" : "";
 		note(
 			`"${label}" is a global-only pi-lens setting and is not honored in a project .pi-lens.json (set it in ${globalConfigLabel}${cliClause}); ignored`,
+			"PILENS_CFG_0004",
 		);
 	};
 	for (const key of Object.keys(obj)) {

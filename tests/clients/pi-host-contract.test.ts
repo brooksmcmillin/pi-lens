@@ -1,3 +1,4 @@
+import { hostPackageDir } from "../support/pi-session.js";
 /**
  * pi host-contract regressions (#1655).
  *
@@ -28,20 +29,11 @@ import {
 } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { matchingCloseIndex } from "../support/sweep-kit.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
 
 const touchFileMock = vi.fn().mockResolvedValue(undefined);
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () =>
-		makeLspServiceDouble({
-			touchFile: touchFileMock,
-			getWarmClientForFile: vi.fn().mockResolvedValue(undefined),
-		}),
-	resetLSPService: () => {},
-}));
-
 vi.mock("../../clients/bootstrap.js", async () => {
 	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
 	return bootstrapSeamMock(async () => ({
@@ -73,13 +65,7 @@ const repoRoot = path.resolve(
 	"..",
 	"..",
 );
-const HOST_DIST = path.join(
-	repoRoot,
-	"node_modules",
-	"@earendil-works",
-	"pi-coding-agent",
-	"dist",
-);
+const HOST_DIST = path.join(hostPackageDir(), "dist");
 
 function readHostSource(relative: string): string {
 	const file = path.join(HOST_DIST, relative);
@@ -110,7 +96,11 @@ function baseDeps(
 	} as Parameters<typeof handleToolCall>[0];
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble({
+		touchFile: touchFileMock,
+		getWarmClientForFile: vi.fn().mockResolvedValue(undefined),
+	});
 	resetDegradationLedger();
 	readGuardLogEntries.length = 0;
 	touchFileMock.mockClear();
@@ -889,19 +879,31 @@ describe("#1655 review F2 — bookkeeping must not discard a block verdict", () 
 });
 
 describe("#1655 review F3 — the bash-side path source, pinned by use", () => {
-	/** Text of every `event.toolName === "bash"` block in a source file. */
+	/**
+	 * The heads of the blocks that hold the bash command string. #4732: the
+	 * recovery block also serves other captured tools, so its head names the
+	 * command variable rather than the tool; its command is still bash's.
+	 */
+	const BASH_BLOCK_HEADS = [
+		'event.toolName === "bash"',
+		"if (bashCommand !== undefined || opaqueNonBash)",
+	];
+
+	/** Text of every bash block (`BASH_BLOCK_HEADS`) in a source file. */
 	function bashBlocks(source: string): string[] {
 		const blocks: string[] = [];
-		let from = 0;
-		for (;;) {
-			const hit = source.indexOf('event.toolName === "bash"', from);
-			if (hit === -1) break;
-			from = hit + 1;
-			const open = source.indexOf("{", source.indexOf(")", hit));
-			if (open === -1) continue;
-			const close = matchingCloseIndex(source, open, "{", "}");
-			const index = close === -1 ? source.length : close;
-			blocks.push(source.slice(open, index + 1));
+		for (const head of BASH_BLOCK_HEADS) {
+			let from = 0;
+			for (;;) {
+				const hit = source.indexOf(head, from);
+				if (hit === -1) break;
+				from = hit + 1;
+				const open = source.indexOf("{", source.indexOf(")", hit));
+				if (open === -1) continue;
+				const close = matchingCloseIndex(source, open, "{", "}");
+				const index = close === -1 ? source.length : close;
+				blocks.push(source.slice(open, index + 1));
+			}
 		}
 		return blocks;
 	}
@@ -1003,7 +1005,13 @@ describe("#1655 review F3 — the bash-side path source, pinned by use", () => {
 		// one that is NOT a path source: it tokenizes the command through
 		// bash-file-access's own `tokenizeShellCommand` and returns a boolean
 		// recovery policy. It proposes no paths, so it needs no workspaceRoot
-		// pin below. Any FUTURE addition here is a path source until proven
+		// pin below.
+		// `resolveOpaqueRecoveryRoots` (#2050) is the sixth, and also not a path
+		// source: it asks `scanShellWriteScopes` for the command's `cd` targets
+		// and recognised writes, then answers WHICH checkouts the recovery runs
+		// in. It proposes no path of its own, and it resolves its operands through
+		// the same bash-file-access walk, so the second-lexer rule holds.
+		// Any FUTURE addition here is a path source until proven
 		// otherwise — pin it, then justify it in one line like this.
 		expect([...callees].sort()).toEqual([
 			"extractDeletedPathsFromCommand",
@@ -1011,6 +1019,7 @@ describe("#1655 review F3 — the bash-side path source, pinned by use", () => {
 			"extractReadPathsFromCommand",
 			"extractWrittenPathsFromCommand",
 			"isFailedGitIntegrationCommand",
+			"resolveOpaqueRecoveryRoots",
 		]);
 
 		// ...and each resolves against the project root, never a ctx.cwd the

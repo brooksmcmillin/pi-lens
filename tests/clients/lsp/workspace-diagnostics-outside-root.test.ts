@@ -29,15 +29,13 @@ import { removeTempDirSync } from "../test-utils.js";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-// Only server selection is stubbed, so no language server is spawned. The
+// Only server selection is injected (the config module's test setter), so no
+// language server is spawned. The
 // session-root registry lives in its own unmocked module, so the REAL
 // predicate decides the decline — that is the behavior under test. That
 // `initLSPConfig` populates that registry is pinned separately in
-// tests/clients/lsp/root-coalescing.test.ts, which mocks nothing.
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: () => undefined,
-}));
+// tests/clients/lsp/root-coalescing.test.ts, whose only mock is a counting
+// pass-through on `stat` (#4788).
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 describe("#2052 sweep over a foreign root does not report or cache a clean", () => {
@@ -47,6 +45,9 @@ describe("#2052 sweep over a foreign root does not report or cache a clean", () 
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 

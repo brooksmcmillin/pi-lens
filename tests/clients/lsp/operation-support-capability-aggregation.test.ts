@@ -30,6 +30,7 @@ const NO_SUPPORT: LSPOperationSupport = {
 	rename: false,
 	willRenameFiles: false,
 	didRenameFiles: false,
+	didCreateFiles: false,
 	implementation: false,
 	callHierarchy: false,
 };

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setupTestEnvironment, useTrackedTempDirs } from "../../test-utils.js";
 
 const { safeSpawnAsync } = vi.hoisted(() => ({ safeSpawnAsync: vi.fn() }));
@@ -70,6 +71,8 @@ describe("spotbugs runner — cache + skip (#133)", () => {
 		);
 	});
 
+	afterEach(() => vi.unstubAllEnvs());
+
 	// The skip case never cleans the env this hook made, so drain every root
 	// here rather than relying on each test's own `finally`.
 	useTrackedTempDirs("pi-lens-spotbugs-");
@@ -123,6 +126,82 @@ describe("spotbugs runner — cache + skip (#133)", () => {
 			await runner.run(ctx(env.tmpDir) as never);
 			expect(safeSpawnAsync).toHaveBeenCalledTimes(2);
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Recurrence (the scanner temp-root fold, refs #4907): the -output file was
+	// joined onto a bare `os.tmpdir()`, so a harness that owns a scanner root
+	// (`PI_LENS_TEST_SCANNER_TMPDIR`) and sweeps it never saw the XML a killed
+	// SpotBugs run stranded; every sibling scanner already asks
+	// `scannerReportParentDir()`.
+	it("writes the -output file under the scanner report root", async () => {
+		const scannerRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-spotbugs-root-"),
+		);
+		vi.stubEnv("PI_LENS_TEST_SCANNER_TMPDIR", scannerRoot);
+		try {
+			const res = await run(env.tmpDir);
+			expect(res.status).toBe("succeeded");
+			const args = safeSpawnAsync.mock.calls[0]?.[1] as string[];
+			const output = args[args.indexOf("-output") + 1];
+			expect(path.dirname(output)).toBe(scannerRoot);
+			expect(path.basename(output)).toMatch(/^pi-lens-spotbugs-.*\.xml$/);
+		} finally {
+			fs.rmSync(scannerRoot, { recursive: true, force: true });
+			env.cleanup();
+		}
+	});
+
+	// Recurrence (#4946 review, F3): the output file was named from the pid and
+	// `Date.now()`, so two cold starts in one millisecond shared it. The run that
+	// read second found the other's cleanup had removed the file and reported
+	// "succeeded" with no findings, and a different interleaving attributed one
+	// run's findings to the other. Registering `lens-spotbugs` made the runner
+	// reachable, so the clock is pinned to force the collision the default clock
+	// only makes unlikely.
+	it("gives two concurrent cold starts distinct output files and each its own findings", async () => {
+		const clock = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+		try {
+			const outputs: string[] = [];
+			let release: () => void = () => {};
+			const bothWritten = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			safeSpawnAsync.mockReset();
+			safeSpawnAsync.mockImplementation(
+				async (_cmd: string, args: string[]) => {
+					const out = args[args.indexOf("-output") + 1] as string;
+					outputs.push(out);
+					const bug = `BUG_${outputs.length}`;
+					fs.writeFileSync(out, ONE_BUG_XML.replace("NP_ALWAYS_NULL", bug));
+					// Both runs have written before either reads: the interleaving
+					// that exposes a shared path.
+					if (outputs.length === 2) release();
+					await bothWritten;
+					return { error: null, status: 0, stdout: "", stderr: "" };
+				},
+			);
+			const mod =
+				await import("../../../../clients/dispatch/runners/spotbugs.js");
+			mod._resetSpotbugsCacheForTests();
+			const runner = mod.default;
+			const [first, second] = await Promise.all([
+				runner.run(ctx(env.tmpDir) as never),
+				runner.run(ctx(env.tmpDir) as never),
+			]);
+
+			expect(safeSpawnAsync).toHaveBeenCalledTimes(2);
+			expect(new Set(outputs).size, JSON.stringify(outputs)).toBe(2);
+			for (const res of [first, second]) {
+				expect(res.status).toBe("succeeded");
+				expect(res.diagnostics).toHaveLength(1);
+			}
+			expect(
+				[first, second].map((res) => res.diagnostics[0]?.rule).sort(),
+			).toEqual(["BUG_1", "BUG_2"]);
+		} finally {
+			clock.mockRestore();
 			env.cleanup();
 		}
 	});

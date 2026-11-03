@@ -43,10 +43,6 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 const SWEEP_SCOPE = buildScopeKey("all", ["opengrep"]);
@@ -67,8 +63,11 @@ describe("a clean re-answer evicts a cache-served entry (#1782 defect C)", () =>
 	let ghost: string;
 	let other: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		clearWidgetState();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
@@ -302,8 +301,11 @@ describe("duplicate and unrelated report entries (#1786 review F2/F3)", () => {
 	let other: string;
 	let stranger: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		clearWidgetState();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();

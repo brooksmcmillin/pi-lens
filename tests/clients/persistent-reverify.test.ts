@@ -118,6 +118,7 @@ interface TouchDouble {
 	inconclusive?: boolean;
 	skipReason?: "outside-project-root";
 	diagnosticsUnsupportedServerIds?: string[];
+	binding?: { boundToCurrentDisk: boolean | "unknown" };
 }
 
 function makeService(
@@ -298,6 +299,26 @@ describe("persistent reverify (#3170)", () => {
 		const replacement = result.replacementFiles[0];
 		expect(replacement?.reVerified).toBe(true);
 		expect(replacement?.reVerifyIncomplete).toBeUndefined();
+	});
+
+	// #5017 (class sweep): a touch that completed its policy against older bytes
+	// (`boundToCurrentDisk: false`) is not an observation of these bytes. Read
+	// as one, its empty answer dropped a carried warning still in the file.
+	it("F3c: a stale-bound confirmed touch is unconfirmed — the carried warning is kept (#5017)", async () => {
+		const carried = makeCarriedReport(filePath);
+		const result = await runPersistentReverify({
+			report: carried,
+			cwd,
+			lspService: makeService({
+				diags: [],
+				confirmation: "confirmed",
+				binding: { boundToCurrentDisk: false },
+			}),
+		});
+		expect(result.outcomes[0]?.outcome).toBe("unconfirmed");
+		const replacement = result.replacementFiles[0];
+		expect(replacement?.warnings).toHaveLength(1);
+		expect(replacement?.reVerifyIncomplete).toBe(true);
 	});
 
 	it("F3b: a skipReason touch is unconfirmed for the same reason", async () => {

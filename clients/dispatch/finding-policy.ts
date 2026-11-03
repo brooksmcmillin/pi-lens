@@ -27,14 +27,16 @@ import {
 } from "../diagnostic-dispositions.js";
 import type { FileRole } from "../file-role.js";
 import type { LSPDiagnostic } from "../lsp/client.js";
+import { isWithinIdentity, pathsEqual } from "../path-utils.js";
 import type { ProjectDiagnostic } from "../project-diagnostics/types.js";
 import { retagAuxiliaryDiagnostics } from "./auxiliary-lsp.js";
 import { applyInlineSuppressions } from "./inline-suppressions.js";
 import { readFileContent } from "./runners/utils.js";
 import {
 	applyRulePolicy,
-	resolvedRulePolicyMap,
-	rulePolicyMapFromConfig,
+	type ProjectRulePolicy,
+	projectRulePolicy,
+	type RulePolicy,
 } from "./rule-policy.js";
 import type { Diagnostic } from "./types.js";
 import { convertLspDiagnostics } from "./utils/lsp-diagnostics.js";
@@ -58,7 +60,7 @@ export interface FindingPolicyOptions<T> {
 	 * hide a finding over an I/O error (AGENTS.md shape 48).
 	 */
 	content: string;
-	policyMap: Record<string, unknown> | undefined;
+	policyMap: RulePolicy | undefined;
 	/**
 	 * Every `(tool, rule)` spelling a mark against THIS surface's rendering of
 	 * the diagnostic can carry. Omit for a surface whose rendered identity IS
@@ -111,13 +113,97 @@ export function applyFindingPolicy<
 	};
 }
 
-/** The project's `.pi-lens.json` `rules.<id>.disable`/`select` policy map.
- * One derivation for every surface that filters by it — `loadPiLensProjectConfig`
- * is mtime-cached, so repeated calls in one sweep cost one stat. */
-export function loadProjectRulePolicyMap(
-	cwd: string,
-): ReturnType<typeof rulePolicyMapFromConfig> {
-	return resolvedRulePolicyMap(cwd);
+/**
+ * {@link applyFindingPolicy} over findings that may name files other than the
+ * one being edited (#5044, the shape #5011 round 8 fixed for rule policy, F24).
+ * A runner reports on several files (helm-lint puts chart-level findings on
+ * `Chart.yaml`), so an inline `pi-lens-ignore` comment or a stored disposition
+ * belongs to the file a finding NAMES (`filePath`, the key `applyRulePolicy`
+ * reads), never to the edited one.
+ *
+ * - A finding with no path, or on `options.filePath`, takes `options.content`.
+ * - A finding on another file is judged by that file's own current content,
+ *   read once per call, and its dispositions are anchored on that file.
+ * - Fail closed: a file that cannot be read, or that lies outside
+ *   `options.cwd` (compared on the identity axis, so a link out is outside),
+ *   is never trusted to suppress anything. Its findings pass the inline and
+ *   disposition steps, weak-anchored marks included; only the rule policy,
+ *   which reads no content, still applies.
+ *
+ * Results keep input order. A call whose findings all name the edited file
+ * is exactly {@link applyFindingPolicy}.
+ */
+export function applyFindingPolicyByOwner<
+	T extends DispositionCandidate & {
+		rule?: string;
+		code?: string;
+		id?: string;
+	},
+>(diagnostics: T[], options: FindingPolicyOptions<T>): FindingPolicyResult<T> {
+	const own: T[] = [];
+	const byOwner = new Map<string, T[]>();
+	for (const d of diagnostics) {
+		const owner = (d as T & { filePath?: string }).filePath;
+		if (!owner || owner === options.filePath) {
+			own.push(d);
+			continue;
+		}
+		const group = byOwner.get(owner);
+		if (group) group.push(d);
+		else byOwner.set(owner, [d]);
+	}
+	// A spelling of the edited file the string compare missed is still it.
+	for (const [owner, group] of byOwner) {
+		if (!pathsEqual(owner, options.filePath)) continue;
+		own.push(...group);
+		byOwner.delete(owner);
+	}
+	if (byOwner.size === 0) return applyFindingPolicy(diagnostics, options);
+
+	const inlineKept = new Set<T>();
+	const disposed = new Set<T>();
+	const kept = new Set<T>();
+	const collect = (result: FindingPolicyResult<T>): void => {
+		for (const d of result.inlineKept) inlineKept.add(d);
+		for (const d of result.disposed) disposed.add(d);
+		for (const d of result.kept) kept.add(d);
+	};
+	collect(applyFindingPolicy(own, options));
+	for (const [owner, group] of byOwner) {
+		const content = isWithinIdentity(owner, options.cwd)
+			? readFileContent(owner)
+			: undefined;
+		if (content === undefined) {
+			collect({
+				kept: applyRulePolicy(group, options.policyMap, {
+					root: options.cwd,
+					filePath: owner,
+				}),
+				inlineKept: group,
+				disposed: group,
+			});
+			continue;
+		}
+		collect(
+			applyFindingPolicy(group, { ...options, filePath: owner, content }),
+		);
+	}
+	const inOrder = (survivors: Set<T>): T[] =>
+		diagnostics.flatMap((d) => (survivors.has(d) ? [d] : []));
+	return {
+		kept: inOrder(kept),
+		inlineKept: inOrder(inlineKept),
+		disposed: inOrder(disposed),
+	};
+}
+
+/** The project's `.pi-lens.json` `rules.<id>.disable`/`select`/`ignorePaths`
+ * policy. One derivation for every surface that filters by it: each file reads
+ * its config owner's policy, so a nested `.pi-lens.json` governs the files
+ * under it. Resolved lazily and memoized per owner for the life of the
+ * returned object. */
+export function loadProjectRulePolicy(cwd: string): ProjectRulePolicy {
+	return projectRulePolicy(cwd);
 }
 
 /**
@@ -291,12 +377,12 @@ export function applyPushedFindingPolicy<
 	findings: T[],
 	options: { cwd: string; filePath: string; content: string | undefined },
 ): { kept: T[]; suppressed: number } {
-	const { kept } = applyFindingPolicy(findings, {
+	const { kept } = applyFindingPolicyByOwner(findings, {
 		cwd: options.cwd,
 		filePath: options.filePath,
 		content: options.content ?? "",
-		// mtime-cached, so several files in one drain cost one stat.
-		policyMap: loadProjectRulePolicyMap(options.cwd),
+		// The file's own config owner decides, so a nested `.pi-lens.json` applies.
+		policyMap: loadProjectRulePolicy(options.cwd),
 		identities: renderedRuleIdentities,
 	});
 	return { kept, suppressed: findings.length - kept.length };
@@ -394,7 +480,7 @@ export function applyLspFindingPolicy(
 		filePath: string;
 		/** `undefined` when the content could not be read — see `content` above. */
 		content: string | undefined;
-		policyMap: Record<string, unknown> | undefined;
+		policyMap: RulePolicy | undefined;
 		fileRole: FileRole;
 	},
 ): LspFindingPolicyResult {

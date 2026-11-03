@@ -32,11 +32,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency,
 }));
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 const ROOT = process.cwd();
 /**
  * The server dies above this many unread documents. Deliberately three times the
@@ -115,8 +110,12 @@ async function runSweep(limit: string | undefined) {
 }
 
 describe("#1714 — real-stream proof against a server with an intake ceiling", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		// KEEP (#4709): unarmed, the real registry spawns ast-grep, opengrep, typos and deno; the arm carries only this file's wedge fake.
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		logLatency.mockReset();
 		// Generous on purpose. This test is about the barrier's PROTOCOL, not about

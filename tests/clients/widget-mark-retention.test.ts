@@ -80,6 +80,7 @@ function diag(
 function makeService(diags: Array<Record<string, unknown>>) {
 	return {
 		announceCreatedFiles: vi.fn(),
+		sweepDocumentDrift: vi.fn(async () => undefined),
 		touchFile: vi.fn(async () => ({ diags })),
 		getDiagnostics: vi.fn(async () => []),
 		getCapabilitySnapshots: vi.fn(async () => []),

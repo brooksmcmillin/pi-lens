@@ -1,0 +1,40 @@
+{
+	"content": "Unresolved from this turn — src/target.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L3: Debugger statement — remove before committing\n    💡 Fix: remove this statement",
+	"blockerContent": "Unresolved from this turn — src/target.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L3: Debugger statement — remove before committing\n    💡 Fix: remove this statement",
+	"blockingFiles": [
+		"<PROJECT>/src/target.ts"
+	],
+	"hasBlockers": true,
+	"affectedFiles": [
+		"<PROJECT>/src/target.ts"
+	],
+	"sessionId": "v4-4-4-session",
+	"projectSeqStart": 1,
+	"projectSeqEnd": 1,
+	"fileSeqByPath": {
+		"<PROJECT>/src/target.ts": 1
+	},
+	"fileContentHashes": {
+		"<PROJECT>/src/target.ts": "b285a2793791554a66d79d7c86b749737bb0b731a6440d8d0e4e03f98b0cf7a9"
+	},
+	"consumed": false,
+	"affectedFilesTruncated": false,
+	"provenance": {
+		"revision": {
+			"sessionId": "v4-4-4-session",
+			"projectSeq": 1,
+			"turnIndex": 2,
+			"generation": 0,
+			"capturedAt": 1792667444803
+		},
+		"files": [
+			{
+				"path": "<PROJECT>/src/target.ts",
+				"role": "affected",
+				"mtimeMs": 1792667444252.3855,
+				"size": 59,
+				"sha256": "b285a2793791554a66d79d7c86b749737bb0b731a6440d8d0e4e03f98b0cf7a9"
+			}
+		]
+	}
+}

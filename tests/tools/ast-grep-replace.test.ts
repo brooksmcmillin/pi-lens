@@ -1,7 +1,8 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createAstGrepReplaceTool } from "../../tools/ast-grep-replace.js";
-import { setupTestEnvironment } from "../clients/test-utils.js";
+import { pinFixtureHome, setupTestEnvironment } from "../clients/test-utils.js";
 
 function makeClient(
 	overrides: Partial<Parameters<typeof createAstGrepReplaceTool>[0]> = {},
@@ -87,26 +88,170 @@ describe("ast_grep_replace tool", () => {
 		});
 	});
 
+	describe("defaulted-cwd home ceiling (#5039)", () => {
+		// RECURRENCE GUARDED: #5039. `ast_grep_search` refused a cwd at or above
+		// $HOME (#747/#250, #4911) while the MUTATING tool had no guard at all: from
+		// `os.homedir()` with no `paths`, a dry run previewed and an apply rewrote
+		// files anywhere under home. The guard is now one seam
+		// (`defaultedCwdHomeRefusal`, tools/shared.ts) both tools call.
+		it("refuses the dry-run preview when no paths are given and cwd is at home", async () => {
+			const pin = pinFixtureHome("sg-replace-5039-dry");
+			const replace = vi.fn().mockResolvedValue({ matches: [] });
+			const replaceWithRule = vi.fn();
+			try {
+				const tool = createAstGrepReplaceTool(
+					makeClient({ replace, replaceWithRule }),
+				);
+				const result = await tool.execute(
+					"home-dry",
+					{ pattern: "var $X", rewrite: "let $X", lang: "typescript" },
+					new AbortController().signal,
+					null,
+					{ cwd: pin.home },
+				);
+				expect(result.isError).toBe(true);
+				expect(String(result.content[0].text)).toContain("Refused");
+				expect(String(result.content[0].text)).toContain("paths");
+				expect(replace).not.toHaveBeenCalled();
+				expect(replaceWithRule).not.toHaveBeenCalled();
+			} finally {
+				pin.restore();
+			}
+		});
+
+		it("refuses the apply path too, so nothing under home is rewritten", async () => {
+			const pin = pinFixtureHome("sg-replace-5039-apply");
+			const replace = vi.fn().mockResolvedValue({ matches: [] });
+			try {
+				const tool = createAstGrepReplaceTool(makeClient({ replace }));
+				const result = await tool.execute(
+					"home-apply",
+					{
+						pattern: "var $X",
+						rewrite: "let $X",
+						lang: "typescript",
+						apply: true,
+					},
+					new AbortController().signal,
+					null,
+					{ cwd: pin.home },
+				);
+				expect(result.isError).toBe(true);
+				expect(replace).not.toHaveBeenCalled();
+			} finally {
+				pin.restore();
+			}
+		});
+
+		it("refuses the structural-rule dispatch as well", async () => {
+			const pin = pinFixtureHome("sg-replace-5039-rule");
+			const replaceWithRule = vi.fn();
+			try {
+				const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule }));
+				const result = await tool.execute(
+					"home-rule",
+					{
+						pattern: "var $X",
+						rewrite: "let $X",
+						lang: "typescript",
+						insideKind: "function_declaration",
+						apply: true,
+					},
+					new AbortController().signal,
+					null,
+					{ cwd: pin.home },
+				);
+				expect(result.isError).toBe(true);
+				expect(replaceWithRule).not.toHaveBeenCalled();
+			} finally {
+				pin.restore();
+			}
+		});
+
+		// #4911: the ceiling compares REAL paths, so a `$HOME` spelled through a
+		// link is refused too. This is the same axis, proven on the write tool.
+		it("refuses when the home is spelled through a link (#4911)", async () => {
+			const env = setupTestEnvironment("pi-lens-sg-replace-home-link-");
+			const pin = pinFixtureHome("sg-replace-4911");
+			try {
+				const link = path.join(env.tmpDir, "link");
+				fs.symlinkSync(pin.home, link, "junction");
+				vi.stubEnv("HOME", link);
+				vi.stubEnv("USERPROFILE", link);
+				const replace = vi.fn().mockResolvedValue({ matches: [] });
+				const tool = createAstGrepReplaceTool(makeClient({ replace }));
+				const result = await tool.execute(
+					"home-link",
+					{ pattern: "var $X", rewrite: "let $X", lang: "typescript" },
+					new AbortController().signal,
+					null,
+					{ cwd: pin.home },
+				);
+				expect(String(result.content[0].text)).toContain("Refused");
+				expect(replace).not.toHaveBeenCalled();
+			} finally {
+				vi.unstubAllEnvs();
+				pin.restore();
+				env.cleanup();
+			}
+		});
+
+		it("does NOT refuse explicit paths at home, so a scoped write still works", async () => {
+			const pin = pinFixtureHome("sg-replace-5039-scoped");
+			const replace = vi.fn().mockResolvedValue({ matches: [] });
+			try {
+				const tool = createAstGrepReplaceTool(makeClient({ replace }));
+				await tool.execute(
+					"home-paths",
+					{
+						pattern: "var $X",
+						rewrite: "let $X",
+						lang: "typescript",
+						paths: [path.join(pin.home, "proj")],
+						apply: true,
+					},
+					new AbortController().signal,
+					null,
+					{ cwd: pin.home },
+				);
+				expect(replace).toHaveBeenCalledOnce();
+			} finally {
+				pin.restore();
+			}
+		});
+
+		it("does NOT refuse a cwd below home", async () => {
+			const pin = pinFixtureHome("sg-replace-5039-below");
+			const replace = vi.fn().mockResolvedValue({ matches: [] });
+			try {
+				const projectDir = path.join(pin.home, "proj");
+				const tool = createAstGrepReplaceTool(makeClient({ replace }));
+				await tool.execute(
+					"home-below",
+					{ pattern: "var $X", rewrite: "let $X", lang: "typescript" },
+					new AbortController().signal,
+					null,
+					{ cwd: projectDir },
+				);
+				expect(replace).toHaveBeenCalledOnce();
+			} finally {
+				pin.restore();
+			}
+		});
+	});
+
 	describe("schema shape", () => {
-		it("lang uses enum not anyOf/const so LLMs do not double-quote it", () => {
+		// #4687: lang is a plain string (the enum cost ~240 bytes per request);
+		// the valid ids are enforced at execute (tests/tools/ast-grep-lang-check.test.ts).
+		it("lang is a plain string, not anyOf/const, so LLMs do not double-quote it", () => {
 			const tool = createAstGrepReplaceTool(makeClient());
 			const langSchema = (
 				tool.parameters as { properties: Record<string, unknown> }
 			).properties.lang as Record<string, unknown>;
 			expect(langSchema.type).toBe("string");
-			expect(Array.isArray(langSchema.enum)).toBe(true);
+			expect(langSchema.enum).toBeUndefined();
 			expect(langSchema.anyOf).toBeUndefined();
 			expect(langSchema.const).toBeUndefined();
-		});
-
-		it("lang enum includes common languages", () => {
-			const tool = createAstGrepReplaceTool(makeClient());
-			const langSchema = (
-				tool.parameters as { properties: Record<string, unknown> }
-			).properties.lang as { enum: string[] };
-			expect(langSchema.enum).toContain("typescript");
-			expect(langSchema.enum).toContain("python");
-			expect(langSchema.enum).toContain("rust");
 		});
 
 		it("hasKind description describes immediate-child semantics, not descendant (#1423)", () => {

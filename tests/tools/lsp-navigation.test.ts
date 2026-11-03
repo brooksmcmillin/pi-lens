@@ -1,3 +1,6 @@
+// flake-shape: in-process-mock — the declaration owner is wrapped, not replaced:
+// every other export stays real, and only the resolver is counted so the
+// snapshot's per-file walks are observable (#4638 review F10).
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -33,12 +36,27 @@ const mocked = vi.hoisted(() => ({
 	service: null as unknown,
 }));
 
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () => mocked.service,
-}));
+// #4638 review (F10): the declaration owner is wrapped, not replaced — every
+// other export stays real — so the snapshot's per-file walks can be counted.
+const walkedDeclarations = vi.hoisted(() => ({ files: [] as string[] }));
+vi.mock("../../clients/python-environment.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<
+			typeof import("../../clients/python-environment.js")
+		>();
+	return {
+		...actual,
+		detectPythonTargetVersion: vi.fn(async (filePath: string) => {
+			walkedDeclarations.files.push(filePath);
+			return actual.detectPythonTargetVersion(filePath);
+		}),
+	};
+});
 
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
+import { LspRequestTimeoutError } from "../../clients/lsp/request-timeout-error.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
 const tmpPath = (name: string): string => path.join(os.tmpdir(), name);
 const tmpFileUrl = (name: string): string => pathToFileURL(tmpPath(name)).href;
@@ -63,69 +81,71 @@ describe("lsp_navigation tool", () => {
 		// present — the real `LSPService` always has it — so the double keeps the
 		// factory's `touchFile`, and the scoped-open case below asserts the touch
 		// (with its options), which is the call production actually makes.
-		mocked.service = makeLspServiceDouble({
-			supportsLSP: vi.fn().mockReturnValue(true),
-			hasLSP: vi.fn().mockResolvedValue(true),
-			getDiagnostics: vi.fn().mockResolvedValue([]),
-			getOperationSupport: vi.fn().mockResolvedValue(null),
-			getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
-			codeAction: vi
-				.fn()
-				.mockResolvedValue([
-					{ title: "Move to new file", kind: "refactor.move.newFile" },
+		mocked.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: vi.fn().mockReturnValue(true),
+				hasLSP: vi.fn().mockResolvedValue(true),
+				getDiagnostics: vi.fn().mockResolvedValue([]),
+				getOperationSupport: vi.fn().mockResolvedValue(null),
+				getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
+				codeAction: vi
+					.fn()
+					.mockResolvedValue([
+						{ title: "Move to new file", kind: "refactor.move.newFile" },
+					]),
+				rename: vi.fn().mockResolvedValue(null),
+				// #3601: a rename edit that writes a file besides its target is applied
+				// only to a file the client tracks. These cases are about provenance,
+				// not staleness, so every file reads as tracked in sync with the disk,
+				// sent long before the rename.
+				getTrackedContent: vi.fn((filePath: string) => ({
+					hash: hashDiagnosticContent(fs.readFileSync(filePath, "utf-8")),
+					changedAtMs: 0,
+				})),
+				renameFile: vi.fn().mockResolvedValue({
+					applied: false,
+					serverIds: [],
+					willRenameFailures: [],
+					didRenameFailures: [],
+					droppedConflicts: 0,
+					inputEditCount: 0,
+					summary: [],
+				}),
+				references: vi.fn().mockResolvedValue([
+					{
+						uri: tmpFileUrl("sample.ts"),
+						range: {
+							start: { line: 1, character: 1 },
+							end: { line: 1, character: 5 },
+						},
+					},
 				]),
-			rename: vi.fn().mockResolvedValue(null),
-			// #3601: a rename edit that writes a file besides its target is applied
-			// only to a file the client tracks. These cases are about provenance,
-			// not staleness, so every file reads as tracked in sync with the disk,
-			// sent long before the rename.
-			getTrackedContent: vi.fn((filePath: string) => ({
-				hash: hashDiagnosticContent(fs.readFileSync(filePath, "utf-8")),
-				changedAtMs: 0,
-			})),
-			renameFile: vi.fn().mockResolvedValue({
-				applied: false,
-				serverIds: [],
-				willRenameFailures: [],
-				didRenameFailures: [],
-				droppedConflicts: 0,
-				inputEditCount: 0,
-				summary: [],
+				typeDefinition: vi.fn().mockResolvedValue([
+					{
+						uri: tmpFileUrl("types.ts"),
+						range: {
+							start: { line: 9, character: 0 },
+							end: { line: 9, character: 4 },
+						},
+					},
+				]),
+				declaration: vi.fn().mockResolvedValue([]),
+				workspaceSymbol: vi.fn().mockResolvedValue([]),
+				getAdvertisedCommands: vi
+					.fn()
+					.mockResolvedValue(["_typescript.organizeImports"]),
+				executeCommand: vi
+					.fn()
+					.mockResolvedValue({ executed: true, result: null }),
+				documentSymbol: vi.fn().mockResolvedValue([]),
+				incomingCalls: vi.fn().mockResolvedValue([]),
+				outgoingCalls: vi.fn().mockResolvedValue([]),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getWorkspaceDiagnosticsSupport: vi
+					.fn()
+					.mockResolvedValue({ mode: "push-only" }),
 			}),
-			references: vi.fn().mockResolvedValue([
-				{
-					uri: tmpFileUrl("sample.ts"),
-					range: {
-						start: { line: 1, character: 1 },
-						end: { line: 1, character: 5 },
-					},
-				},
-			]),
-			typeDefinition: vi.fn().mockResolvedValue([
-				{
-					uri: tmpFileUrl("types.ts"),
-					range: {
-						start: { line: 9, character: 0 },
-						end: { line: 9, character: 4 },
-					},
-				},
-			]),
-			declaration: vi.fn().mockResolvedValue([]),
-			workspaceSymbol: vi.fn().mockResolvedValue([]),
-			getAdvertisedCommands: vi
-				.fn()
-				.mockResolvedValue(["_typescript.organizeImports"]),
-			executeCommand: vi
-				.fn()
-				.mockResolvedValue({ executed: true, result: null }),
-			documentSymbol: vi.fn().mockResolvedValue([]),
-			incomingCalls: vi.fn().mockResolvedValue([]),
-			outgoingCalls: vi.fn().mockResolvedValue([]),
-			getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
-			getWorkspaceDiagnosticsSupport: vi
-				.fn()
-				.mockResolvedValue({ mode: "push-only" }),
-		});
+		);
 	});
 
 	it("reports cached LSP capabilities without requiring path", async () => {
@@ -216,6 +236,7 @@ describe("lsp_navigation tool", () => {
 		);
 
 		expect(result.isError).toBe(true);
+		expect(result.details?.failureKind).toBe("lsp_disabled");
 		expect(parseToolJson(result)).toMatchObject({
 			tool: "lsp_navigation",
 			operation: "precheck",
@@ -273,6 +294,122 @@ describe("lsp_navigation tool", () => {
 				.incomingCalls,
 		).toHaveBeenCalledOnce();
 		expect(result.details?.operation).toBe("incomingCalls");
+	});
+
+	// #4687: the schema carries callHierarchyItem as an opaque object, so the
+	// LSP CallHierarchyItem shape is checked at execute, before any server call
+	// (MCP never validates the schema at all). Recurrence: a malformed item
+	// reaching `uriToPath` or the server, where it fails as an opaque error or
+	// an empty "no callers" answer instead of a refusal naming the field.
+	const wellFormedItem = () => ({
+		name: "foo",
+		kind: 12,
+		uri: tmpFileUrl("item.py"),
+		range: {
+			start: { line: 1, character: 0 },
+			end: { line: 1, character: 3 },
+		},
+		selectionRange: {
+			start: { line: 1, character: 0 },
+			end: { line: 1, character: 3 },
+		},
+	});
+	it.each([
+		[
+			"absent",
+			(): unknown => undefined,
+			"callHierarchyItem parameter required",
+		],
+		[
+			"a string",
+			(): unknown => "foo",
+			"callHierarchyItem must be the object prepareCallHierarchy returned",
+		],
+		// #4723 F7: an array is an object to `typeof`; without the array branch
+		// it would be reported as a missing `name` instead of the wrong shape.
+		[
+			"an array",
+			(): unknown => [],
+			"callHierarchyItem must be the object prepareCallHierarchy returned",
+		],
+		[
+			"no uri",
+			(): unknown => ({ ...wellFormedItem(), uri: undefined }),
+			"callHierarchyItem.uri must be a string",
+		],
+		[
+			"a string kind",
+			(): unknown => ({ ...wellFormedItem(), kind: "Function" }),
+			"callHierarchyItem.kind must be a number",
+		],
+		[
+			"no range",
+			(): unknown => ({ ...wellFormedItem(), range: undefined }),
+			"callHierarchyItem.range must be a range object",
+		],
+		[
+			"a string selectionRange.end.character",
+			(): unknown => {
+				const item = wellFormedItem();
+				return {
+					...item,
+					selectionRange: {
+						...item.selectionRange,
+						end: { line: 1, character: "3" },
+					},
+				};
+			},
+			"callHierarchyItem.selectionRange.end.character must be a number",
+		],
+	] satisfies ReadonlyArray<readonly [string, () => unknown, string]>)(
+		"refuses a callHierarchyItem that is %s before any server call",
+		async (_label, makeItem, message) => {
+			for (const operation of ["incomingCalls", "outgoingCalls"] as const) {
+				const service = mocked.service as Record<
+					string,
+					ReturnType<typeof vi.fn>
+				>;
+				service.getOperationSupport?.mockClear();
+				service[operation]?.mockClear();
+				const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+				const result = await tool.execute(
+					`bad-item-${operation}`,
+					{ operation, callHierarchyItem: makeItem() },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				);
+
+				expect(result.isError).toBe(true);
+				expect(result.details?.failureKind).toBe("bad_input");
+				expect(parseToolJson(result).errors).toEqual([
+					`${message} for ${operation}`,
+				]);
+				expect(service[operation]).not.toHaveBeenCalled();
+				expect(service.getOperationSupport).not.toHaveBeenCalled();
+			}
+		},
+	);
+
+	it("passes a call hierarchy item's extra fields (detail, data) to the server unchanged", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		const callHierarchyItem = {
+			...wellFormedItem(),
+			detail: "module a",
+			data: { serverToken: 7 },
+		};
+		await tool.execute(
+			"item-extra",
+			{ operation: "outgoingCalls", callHierarchyItem },
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(
+			(mocked.service as { outgoingCalls: ReturnType<typeof vi.fn> })
+				.outgoingCalls,
+		).toHaveBeenCalledWith(callHierarchyItem);
 	});
 
 	it("adds workspaceSymbol hint when path is omitted and empty", async () => {
@@ -502,6 +639,36 @@ describe("lsp_navigation tool", () => {
 		expect(
 			(mocked.service as { declaration: ReturnType<typeof vi.fn> }).declaration,
 		).toHaveBeenCalled();
+	});
+
+	it("reports a navigation timeout as an error, not an empty result", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		(
+			mocked.service as { documentSymbol: ReturnType<typeof vi.fn> }
+		).documentSymbol = vi
+			.fn()
+			.mockRejectedValue(
+				new LspRequestTimeoutError("textDocument/documentSymbol", 100, 101),
+			);
+
+		const result = await tool.execute(
+			"document-symbol-timeout",
+			{
+				operation: "documentSymbol",
+				path: path.resolve("tests/tools/lsp-navigation.test.ts"),
+			},
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(result.isError).toBe(true);
+		expect(parseToolJson(result)).toMatchObject({
+			ok: false,
+			status: "timeout",
+			resultCount: 0,
+		});
+		expect(String(result.content[0]?.text)).toContain("timed out");
 	});
 
 	it("attaches searchReads for reference locations", async () => {
@@ -1753,7 +1920,7 @@ describe("lsp_navigation tool", () => {
 			sourcePath: string,
 			newFilePath: string,
 		) => {
-			mocked.service = harness.service;
+			mocked.service = installLspService(harness.service);
 			const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 			return tool.execute(
 				callId,
@@ -2041,14 +2208,16 @@ describe("lsp_navigation workspaceDiagnostics delivery gate (#1634)", () => {
 		);
 		previousDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
-		mocked.service = makeLspServiceDouble({
-			supportsLSP: vi.fn().mockReturnValue(true),
-			getDiagnostics: vi.fn().mockResolvedValue([]),
-			getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
-			getWorkspaceDiagnosticsSupport: vi
-				.fn()
-				.mockResolvedValue({ mode: "push-only" }),
-		});
+		mocked.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: vi.fn().mockReturnValue(true),
+				getDiagnostics: vi.fn().mockResolvedValue([]),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getWorkspaceDiagnosticsSupport: vi
+					.fn()
+					.mockResolvedValue({ mode: "push-only" }),
+			}),
+		);
 		_resetDeferredForTests();
 		_resetStateCacheForTests();
 		// The phase ring is process state: an earlier case's record must not
@@ -2158,6 +2327,189 @@ describe("lsp_navigation workspaceDiagnostics delivery gate (#1634)", () => {
 			}),
 		);
 	});
+
+	const COMPILE = "SyntaxError: multiple exception types must be parenthesized";
+	const PYRIGHT = 'Cannot access attribute "value" for class "object"';
+
+	const jediCompileRow = () => ({
+		severity: 1,
+		message: COMPILE,
+		source: "compile",
+		rule: "compile:unknown",
+		semantic: "blocking" as const,
+		serverId: "python-jedi",
+		range: {
+			start: { line: 2, character: 8 },
+			end: { line: 2, character: 20 },
+		},
+	});
+	const pyrightRow = () => ({
+		severity: 1,
+		message: PYRIGHT,
+		source: "pyright",
+		serverId: "pyright",
+		range: { start: { line: 4, character: 4 }, end: { line: 4, character: 9 } },
+	});
+
+	async function snapshotWith(
+		files: Array<[string, Array<Record<string, unknown>>]>,
+	) {
+		walkedDeclarations.files.length = 0;
+		(mocked.service as { getAllDiagnostics: unknown }).getAllDiagnostics = vi
+			.fn()
+			.mockResolvedValue(
+				new Map(
+					files.map(([file, diags]) => [file, { diags, ts: Date.now() }]),
+				),
+			);
+		return parseToolJson(
+			await createLspNavigationTool((flag) => flag === "lens-lsp").execute(
+				"nav-4638",
+				{ operation: "workspaceDiagnostics" },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			),
+		);
+	}
+
+	function snapshotRows(envelope: Record<string, unknown>) {
+		return (
+			envelope.result as Array<{
+				diagnostics: Array<Record<string, unknown>>;
+			}>
+		).flatMap((entry) => entry.diagnostics);
+	}
+
+	it("drops jedi's compile row from the tracked snapshot and names what it withheld (#4638 F10)", async () => {
+		const jediFile = path.join(cwd, "jedi_only.py");
+		const typedFile = path.join(cwd, "typed.py");
+		fs.writeFileSync(jediFile, "def run() -> None:\n\tpass\n");
+		fs.writeFileSync(typedFile, "value: int = 1\n");
+		fs.writeFileSync(
+			path.join(cwd, "pyproject.toml"),
+			'[project]\nname = "d"\nrequires-python = ">=3.14"\n',
+		);
+
+		const envelope = await snapshotWith([
+			[jediFile, [jediCompileRow(), pyrightRow()]],
+			[typedFile, [pyrightRow()]],
+		]);
+
+		expect(resultMessages(envelope)).not.toContain(COMPILE);
+		expect(resultMessages(envelope)).toContain(PYRIGHT);
+		expect(envelope.notes).toContainEqual(
+			expect.stringContaining("1 python-jedi compile finding withheld"),
+		);
+		// The filter is what keeps the pyright-only file from paying for a walk.
+		expect(walkedDeclarations.files).not.toContain(typedFile);
+		expect(walkedDeclarations.files).toContain(jediFile);
+	});
+
+	it("cites each project's own declaration when the snapshot spans two (#4638 r4 F3)", async () => {
+		// Recurrence: the snapshot printed the FIRST file's count under the first
+		// declaration while the details carried the total, so two projects read as
+		// one level and the text and the details disagreed.
+		const a = path.join(cwd, "a");
+		const b = path.join(cwd, "b");
+		for (const [dir, level] of [
+			[a, "3.14"],
+			[b, "3.15"],
+		] as const) {
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(
+				path.join(dir, "pyproject.toml"),
+				`[project]\nname = "d"\nrequires-python = ">=${level}"\n`,
+			);
+			fs.writeFileSync(
+				path.join(dir, "app.py"),
+				"def run() -> None:\n\tpass\n",
+			);
+		}
+
+		const envelope = await snapshotWith([
+			[path.join(a, "app.py"), [jediCompileRow()]],
+			[path.join(b, "app.py"), [jediCompileRow()]],
+		]);
+
+		const note = (envelope.notes as string[]).find((entry) =>
+			entry.includes("withheld"),
+		);
+		expect(note).toContain(
+			"2 python-jedi compile findings withheld across 2 declarations",
+		);
+		expect(note).toContain(
+			`1 under Python 3.14 (requires-python) in ${path.join(a, "pyproject.toml")}`,
+		);
+		expect(note).toContain(
+			`1 under Python 3.15 (requires-python) in ${path.join(b, "pyproject.toml")}`,
+		);
+	});
+
+	it("names the withheld row on the single-file path read (#4638 r3 N2)", async () => {
+		// Recurrence: the path route filtered the row and returned a bare empty
+		// answer (`empty_result`), indistinguishable from "no findings published".
+		const jediFile = path.join(cwd, "jedi_only.py");
+		fs.writeFileSync(jediFile, "def run() -> None:\n\tpass\n");
+		fs.writeFileSync(
+			path.join(cwd, "pyproject.toml"),
+			'[project]\nname = "d"\nrequires-python = ">=3.14"\n',
+		);
+		const service = mocked.service as {
+			getWorkspaceDiagnosticsSupport: unknown;
+			getDiagnostics: unknown;
+		};
+		service.getWorkspaceDiagnosticsSupport = vi
+			.fn()
+			.mockResolvedValue({ mode: "pull" });
+		service.getDiagnostics = vi.fn().mockResolvedValue([jediCompileRow()]);
+
+		const result = await createLspNavigationTool(
+			(flag) => flag === "lens-lsp",
+		).execute(
+			"nav-4638-path",
+			{ operation: "workspaceDiagnostics", path: jediFile },
+			new AbortController().signal,
+			null,
+			{ cwd },
+		);
+
+		const envelope = parseToolJson(result);
+		expect(resultMessages(envelope)).not.toContain(COMPILE);
+		expect(envelope.notes).toContainEqual(
+			expect.stringContaining(
+				"1 python-jedi compile finding withheld: the project declares Python 3.14 (requires-python)",
+			),
+		);
+		// One shape on every tool (#4638 r4 F2): the object the other two tools
+		// carry, never a bare count.
+		expect(result.details?.withheldCompile).toEqual({
+			count: 1,
+			declared: expect.objectContaining({
+				major: 3,
+				minor: 14,
+				source: "requires-python",
+				file: path.join(cwd, "pyproject.toml"),
+			}),
+		});
+	});
+
+	it("still delivers jedi's compile row blocking while the project declares 3.13 (#4638 F10)", async () => {
+		const jediFile = path.join(cwd, "jedi_only.py");
+		fs.writeFileSync(jediFile, "def run() -> None:\n\tpass\n");
+		fs.writeFileSync(
+			path.join(cwd, "pyproject.toml"),
+			'[project]\nname = "d"\nrequires-python = ">=3.13"\n',
+		);
+
+		const envelope = await snapshotWith([
+			[jediFile, [jediCompileRow(), pyrightRow()]],
+		]);
+
+		expect(snapshotRows(envelope)).toContainEqual(
+			expect.objectContaining({ message: COMPILE, semantic: "blocking" }),
+		);
+	});
 });
 
 /**
@@ -2168,6 +2520,19 @@ describe("lsp_navigation workspaceDiagnostics delivery gate (#1634)", () => {
  * mutation target, filed as #4578.
  */
 describe("lsp_navigation path resolution (#4577 M2)", () => {
+	// #4723 F2: this block installs its own service. It used to inherit the
+	// last block's double; under --sequence.shuffle (seed 424) that was the
+	// delivery-gate double, whose hasLSP is false, so `references` never ran.
+	beforeEach(() => {
+		mocked.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: vi.fn().mockReturnValue(true),
+				hasLSP: vi.fn().mockResolvedValue(true),
+				getOperationSupport: vi.fn().mockResolvedValue(null),
+			}),
+		);
+	});
+
 	it("resolves a ~ path to $HOME, not under the cwd", async () => {
 		const { home, restore } = pinFixtureHome("nav-tilde");
 		const filePath = path.join(home, "proj", "refs.ts");

@@ -1,5 +1,115 @@
 # HISTORY
 
+## 2026-11-02 — serial await of independent work on a hot path (shape 89)
+
+#2540: a cold first edit blocked ~7 s because the edit hook spawned the file's
+LSP servers one after another; #1409: the word-index rebuild walked its files
+with one `stat` at a time, 8 s on a slow filesystem. Both were fixed by
+overlapping the calls. A hot-path audit (2026-11-02) found one more candidate,
+the neighbour cascade's serial `references()` calls (#5174), and refuted its
+own top finding: dispatch groups already run in parallel and every
+`mode:"all"` group holds one runner. #5174 is measure-first because
+typescript-language-server answers one request at a time.
+
+## 2026-11-01 — learned attribution keyed on a name alone (shape 88)
+
+#4139: `lsp_navigation` mixes a write (`rename`) with read-only operations, and
+tier-4 learning classified the whole tool as an edit after two observed
+renames, so a plain hover on an unread file was refused. The fix exempted the
+registry names. #5160: pi-cursor-sdk replays Cursor's native edits as
+display-only `cursor` calls (`cursor-replay-` ids) after the file is written;
+Cursor's write landing in a replay's window taught the net `cursor`, and every
+later replay was refused "Edit without read". The fix keys on the id prefix
+(`isProviderReplayCall`), which also skips the read guard for built-in `edit`
+replays. Two carve-outs now: a third triggers the fail-closed redesign.
+The replays' write credits were shape 65 instances too (#5162 r3): a replayed
+`edit` or `write` re-baselined an existing authorship over another writer's
+bytes, and a replayed `bash` credited a first one from its window's git diff.
+
+## 2026-10-27 — factory-time read of a host value set later (shape 87)
+
+#4913: `pi --no-lens` still started language servers and ran the write-time
+runners. pi applies an extension flag's command-line value after every factory
+has run (`agent-session-services.js` `applyExtensionFlagValues`), and
+`index.ts` read `no-lens`, `no-lens-context`, `lens-compact-tool-line` and
+`--no-tool` inside the factory, where `pi.getFlag` answers the registered
+default. The pi double (`tests/support/pi-mock.ts`) applied flag values before
+the factory, so no test saw it (#4632). The four reads now happen in
+`session_start`; `tests/config/factory-flag-read-sweep.test.ts` refuses a new
+one, and `tests/index-4913-cli-flag-timing.test.ts` drives the real host order.
+
+## 2026-10-25 — turn-count wait for real I/O (shape 86)
+
+Two tests waited for real I/O by counting event-loop turns. #4850 waited for the loss-notice bound in `tests/clients/fix-run-restore.test.ts`. #4830 did the same in `tests/index-3521-fork-tree-witness.test.ts`. Both went red on loaded CI runners, and #4852 moved both onto `waitFor`'s real-clock deadline. Master run 40191426869 went red on the #4850 cell before #4852 landed. The detector is tracked in #4865.
+
+## 2026-10-25 — `path.resolve` in front of an identity key (shape 1)
+
+Three members surfaced in one day during the #4689 census. #4853's review
+found F1, a key built through `path.resolve` before `normalizeMapKey`.
+#4860's review found `test-runner-client.ts:739`. The census then listed
+`clients/dispatch/runner-context.ts:12`. Each folds `/repo/link/../f.ts`
+lexically to `/repo/f.ts`, while the kernel resolves `link` first and opens a
+different file. The rule now sits in AGENTS.md shape 1 with its screen.
+
+## 2026-10-25 — default-budget tree census (shape 85)
+
+Four `tests/config` censuses (`lsp-spawn-heavy-coverage`,
+`pi-mock-importer-sweep`, `real-home-reader-registry`, `runner-group-id-census`)
+timed out on the Windows unit leg at vitest's 5 s default while taking 0.7 to
+1.2 s on Linux; the 2026-10-24 #4823 run timed out `pi-mock-importer-sweep`
+at 5000 ms. Issue #4828; the fix is PR #4832, which gave 121 census tests the
+shared `TREE_WALK_TIMEOUT_MS`. Review round 1 showed the first detector
+listed spellings (`it.each`, an array-element `ls-files`), so an `it.skipIf`
+census, an aliased walker and an `it.each` over a walked table were not seen
+(shape 69). Round 2 derives the declaration callee from the vitest imports and
+fails closed on a test-shaped call it cannot trace.
+
+## 2026-10-24 — tool-state prose blind to a posture (shape 84)
+
+The session-start orientation named three of the five lazy tools (the hand list
+in `situationalGuidance` dropped `ast_grep_outline` and `lens_diagnostic_mark`),
+and its clause was wrong under `tools.lazy: false` (#4293, #4294 for the enabled
+axis; #4682 for the lazy axis). The clause is fixed in #4730; the tool list is
+derived from the registry. The MCP translation drops the pi-only rows (no
+mcpName) from the bullet (#2535 F3). Shape 84 is the catalog entry for the class.
+
+## 2026-10-24 — a rule re-derived beside its owner (shape 83)
+
+#4803 fixed csharp-ls aborting in a folder with no .NET project (#4806) and, in
+its review rounds, kept finding the project-file rule copied beside its owner:
+the contributor's first draft tested the directory with its own regex
+(`dirHasDotnetProjectFile`; a directory named `App.csproj` counted), and two
+siblings still carried their own copy of the rule. `dispatch/runners/dotnet-build.ts` picked its target with a regex pair, and
+`test-runner-client.ts` listed `*.csproj` / `*.sln` and matched them with an
+unanchored `RegExp` built from the glob, so `Foo.csproj.bak` and a `Decoy.csproj`
+directory claimed a runner. Both now read `DOTNET_CSHARP_ROOT_MARKERS` and
+`direntsHaveMarkerGlobMatch`. Earlier members of the same shape: the marker
+list hand-copied before #895 and the glob options hand-copied before #201.
+
+## 2026-10-23 — one home variable pinned, the rest left at the real home (shape 82)
+
+`tests/support/vitest-setup.ts` pinned `PI_LENS_HOME` per worker (#525, #3721)
+but left `HOME` and the XDG directories at the maintainer's real home. The
+#4780 verify's live opengrep test wrote `$HOME/.config/.opengrep` and
+`$HOME/.config/.semgrep`, and a #4780 lane probe overwrote the real
+`~/.pi-lens/bin/opengrep` through a probe home whose `bin` was a link to a
+directory outside it. The full suite (1,618 files) ran green under the pin; one
+file read the real home on purpose (the managed-prettier probe in
+`formatter-template-preserve.test.ts`) and is now a named opt-out. Reproduced
+through `installTool("opengrep")`: a linked `bin` directory is written through, a
+linked `bin/opengrep` file is not (the atomic writer renames over the link) (#4789).
+
+## 2026-10-22 — a synchronous native-tree walk holds every tree (shape 81)
+
+`silent-catch-sweep` parsed about 530 files in one synchronous loop. The
+`@ast-grep/napi` finalizer that frees a tree runs only when the event loop
+turns, so the file peaked at 1,902 MB of a 2,048 MB budget with 44 MB of V8
+heap, and #4713's +0.34% of source redded Unit shard 2/5 (#4736). One
+`setImmediate` per file brings it to about 250 MB with an identical finding
+list. `env-path-key-composition-sweep` and `lsp-service-double-sweep` had the
+same loop at 1,703 and 1,715 MB and got the same turn. Earlier members:
+#3565 and #4292.
+
 ## 2026-10-20 — a fold rule that ran only after the lane was written
 
 Three documents decided folding before this date, and none of them read the
@@ -17,6 +127,15 @@ each one that stays out. #4672 is the first lane to run it: it planned to fold
 #3920's three members into one change, refused #3753 with a reason, and sent two
 findings that no lane could carry (#4673, and the `index-3248` shuffle member on
 #4561) to the record instead of the folder.
+
+## 2026-10-21 — a detector reads one root while its subject writes in several (shape 80)
+
+Bash write recovery ran `git status` in the session's own checkout only. A
+write inside a sibling linked worktree therefore read as "nothing changed",
+and got no dispatch, no LSP resync and no record (#2050). The same shape made
+a HEAD-less `.git` resolve to the wrong checkout (#4508). The #2050 fix takes
+the verdict per root: the session root plus each checkout the command itself
+names, capped and with one bounded refusal record per session.
 
 ## 2026-10-20 — instrument attributes by id and order (shape 76)
 
@@ -48,6 +167,21 @@ interposer recorded the directory as a fixture sibling of
 `tests/clients/skills-package-filter.test.ts` — accurate per process, wrong per
 cause. Pinning `JITI_FS_CACHE=0`/`JITI_CACHE=0` drops the write from 1/1 to 0/0
 and a planted sibling still reds (#4673).
+
+## 2026-10-20 — prefix churn from a non-append write (shape 79)
+
+Shape 79 ("Prefix churn from a non-append write") entered the catalog here.
+
+#4644 moved context injection onto `context_with_system` so a turn-end finding
+no longer makes pi rebuild the system head: before it, an injecting turn cost
+about 175k written tokens (#4631). A sweep of every pi-lens writer of the cached
+prefix then found one more live member, lazy tool activation through
+`pi_lens_activate_tools`. On a model without mid-conversation system messages,
+pi-ai folds the system messages into one rebuilt head per request, so one
+activation rewrote that head once (a real 1.3.0 session: `329be587b646` ->
+`ffbf6d1b3f38`) and the miss read `unknown / sequence-hash-truncated` right
+after pi-lens's own `tool_set_mutation` row. The guard is the per-writer tier-2
+prefix-stability case in #4687.
 
 ## 2026-10-20 — the lesson shapes 76, 77 and 78 share
 
@@ -1145,7 +1279,7 @@ Diagnostics have one model-facing surface, `lens_diagnostics`; `source` selects 
 - **Map blast radius for every code PR.** Before and after editing, use `module_report` on each touched production module with `blastRadius: true`; inspect `callbacks[]`, closures, `usedBy`, entry points, and risk flags, then use `read_symbol`/`read_enclosing` for relevant bodies. The PR must state affected dependents, callbacks/entry points, and the verification plan—or explicitly record that the blast radius is empty/unavailable and why. Re-run this map after conflict resolution or architectural changes. If the change touches a hot path (per-spawn, per-file, per-render), MEASURE the cost delta and state the number. Silent per-call taxes ship otherwise: #1673 added 100 ms to every spawn across 118 call sites, #1687 multiplied a per-file budget, and #1701 cost 14x on the background scan. Every one was caught by a reviewer's measurement. None was stated by its author. `module_report` is a navigable structural/dependent view, not a complete function-level call graph; for call-graph work reuse `clients/call-graph.ts` or LSP incoming/outgoing-call navigation instead of inferring completeness from `usedBy` or `blastRadius`.
 - **Describe every test in the PR body.** The PR body (or a review-prompt appendix) carries a section naming each NEW test file/case and each EDIT of an existing test, with one line on what it pins and why it exists — a regression proof, a contract seam, an occupancy budget. A reviewer who cannot see what changed about the tests cannot review the change: silently swapping a real coordinator for a fake runtime inside an existing test is exactly the edit this section exists to expose.
 
-**PR body structure is advisory-linted.** Keep `Summary`, `Tests`, `Blast radius`, `Class sweep`, and `Observability` populated — plus `Test assessment` whenever the PR touches `tests/` (see "Test assessment and removal" under Test requirements); `scripts/check-pr-body.mjs` also checks runtime diff observability when its local range is available, so reviewers still judge the answers.
+**PR body structure is advisory-linted.** Keep `Summary`, `Tests`, `Blast radius`, `Class sweep`, and `Observability` populated — plus `Test assessment` whenever the PR touches `tests/` (see "Test assessment and removal" under Test requirements); `scripts/check-pr-body.mjs` also checks runtime diff observability when its local range is available, so reviewers still judge the answers. *(2026-10-31, #5003: the gate now reads the template's `Summary`, `Notes for the reviewer`, `Change outline` and `Proof and checks`, with `Tests`, `Class sweep`, `Observability` and `Fold check` inside the last; `Blast radius` is conditional and `Test assessment` is retired. The paragraph above stays as the 2026-09 record.)*
 
 **Draw the blast radius as a call-tree diff (optional, text only; 2026-09-06).** Prose blast radius keeps missing callers. When a change touches a shared seam, the `Blast radius` section may carry a call-tree diff: the changed symbol, its callers above, its callees below, with `+`/`-` on the lines that moved (`resyncLspFile` / `  touchFile` / `+ getAuxiliaryClientsForFile`). A fix round that changes ordering or control flow shows the before/after as a flow diff of the same shape. The reviewer verifies the tree against grep, which is what the reviewer playbook's neighbourhood rule asks for. Never HTML, Mermaid, or diagrams for their own sake — the smallest text view that makes the reviewer's check mechanical.
 
@@ -4899,16 +5033,22 @@ Eleven screens. The first six were distilled from nine adversarially reviewed PR
 
 ### Test assessment and removal (value discipline)
 
+> 2026-10-31, #5003: the PR template no longer has a `### Test assessment`
+> clause and the lint no longer gates it. The per-file proof lives in
+> `### Tests` (a red-first transcript or a `Control:` line). The removal rules
+> below still bind.
+
 The screens above catch tests that are broken; this section addresses tests
 that are merely worthless — redundant sibling pins, characterization tests
 that outlived their purpose, load-heavy files pinning one behavior three
 ways. That weight is what the suite pays for in runtime, OOM pressure, and
 contention flakes.
 
-- **Every PR that touches a test file carries a Test assessment** (the PR
-  template's `### Test assessment` clause): per touched test FILE, one line
-  on what behavior it uniquely pins, plus any test the PR makes redundant.
-  Scope is the touched files only — never the whole suite.
+- **Retired 2026-10-31 (#5003): the PR template's `### Test assessment`
+  clause.** Until then every PR that touched a test file carried one line per
+  touched test FILE on what behavior it uniquely pins, plus any test the PR
+  made redundant. The proof now lives in `### Tests`. Scope stays the touched
+  files only — never the whole suite.
 - **Removal requires proof, not judgment.** A test may be removed only when
   a NAMED surviving test reds on the same mutations the removed test would
   have redded on. Run the mutations and quote the surviving red. "Low value"
@@ -4921,7 +5061,7 @@ contention flakes.
   re-asserts a sibling's exact assertions on the same fixture is weight with
   no guard behind it. Fixers are EXPECTED to delete these while working in a
   file — quote the mutation sweep that shows nothing reds, list each deleted
-  case in `Test assessment`, and move on. Deferring an obvious deletion to
+  case in `### Tests`, and move on. Deferring an obvious deletion to
   the ledger is the failure mode, not the safe choice (maintainer, 2026-09-03).
 - **Removal candidates you identify but do not delete go to the corpus
   value ledger issue** (deferral hygiene: the candidate is recorded with the
@@ -5272,17 +5412,20 @@ A fix on `clients/lsp/`, the read guard, tool registration, or session lifecycle
   row↔probe tie test cannot see a row that never passes (#2893).
 - Before handoff, run `npm run preflight` last and paste its table in
   `PR_BODY.md` — a handoff without it is incomplete.
-- One set of template headings per PR. A fix round APPENDS `## Round N` and
-  edits the existing `## Observability` / `## Tests` sections in place; it
+- One set of template headings per PR. A fix round edits the existing
+  sections in place and never appends a `## Round N` section (#5026); it
   never adds a second `## Observability` (the lint reads the first one, and a
   stale first section was the most common `PR body` red on 2026-09-10). Lint
   the FULL body you will publish (`gh pr view <n> --json body -q .body` plus
   your round), against the real `origin/master...HEAD` diff (fetch first),
   not a hand-shaped diff.
 - `PR_BODY.md` passes `node scripts/check-pr-body.mjs --lint-local PR_BODY.md`
-  before handoff. The gate requires the headings `## Summary`, `## Tests`,
-  `## Blast radius`, `## Class sweep`, `## Observability`, and
-  `## Test assessment` whenever the diff touches `tests/`; Observability
+  before handoff. The gate requires the headings `## Summary`,
+  `## Notes for the reviewer`, `## Change outline` and `## Proof and checks`,
+  and inside the last `### Tests`, `### Class sweep`, `### Observability` and
+  `### Fold check` (2026-10-31, #5003; before that the gate required
+  `## Blast radius` and, for a diff touching `tests/`, `## Test assessment`);
+  Observability
   names a record literal that appears in the runtime diff, and may say
   exactly "No new failure path; no record added." only when the diff adds no
   failure path (no new catch, fallback or degradation branch). Record: on

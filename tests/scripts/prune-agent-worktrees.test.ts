@@ -1207,22 +1207,30 @@ function createSubagentStopFixture(agentId: string) {
 	);
 
 	/**
-	 * Review round 3, F1's technique: wrap the fixture's OWN copy of
-	 * `process-scan.mjs` so `snapshotProcesses` — the one async step between
+	 * Review round 3, F1's technique, made order-deterministic (the same shape
+	 * as `patchRecheck` below): wrap the fixture's OWN copy of
+	 * `process-scan.mjs` so `snapshotProcesses` -- the one async step between
 	 * enrichment's `isDirty()` call and the removal loop's own pre-remove
-	 * recheck — resolves only after `delayMs`. Widens the enrichment-to-
-	 * removal gap to a controlled, machine-speed-independent window instead
-	 * of trusting absolute wall-clock timing.
+	 * recheck -- writes `lateFilePath` synchronously at its entry. That entry is
+	 * only reached after enrichment's `isDirty()` has returned for every
+	 * candidate, and the recheck only runs after the awaited result, so the
+	 * write lands strictly inside the gap on any machine. The earlier version
+	 * started a 20ms writer 500ms after spawning the CLI and assumed
+	 * enrichment (a handful of `git` spawns) had finished by then; where a
+	 * spawn is slow (Windows CI) the writer won the race against enrichment,
+	 * the tree took the enrichment-time dirty rail to `plan.keep`, and the
+	 * removal loop never wrote `hygiene.worktree-removed`.
 	 */
-	function patchProcessScan(delayMs: number) {
+	function patchProcessScanLateWrite(lateFilePath: string) {
 		fs.renameSync(processScanPath, realProcessScanPath);
 		fs.writeFileSync(
 			processScanPath,
 			[
+				'import fs from "node:fs";',
 				'import * as real from "./process-scan-real.mjs";',
 				'export * from "./process-scan-real.mjs";',
 				"export async function snapshotProcesses(...args) {",
-				`\tawait new Promise((resolve) => setTimeout(resolve, ${delayMs}));`,
+				`\tfs.writeFileSync(${JSON.stringify(lateFilePath)}, "written after enrichment\\n");`,
 				"\treturn real.snapshotProcesses(...args);",
 				"}",
 				"",
@@ -1431,7 +1439,7 @@ function createSubagentStopFixture(agentId: string) {
 		worktree,
 		cli,
 		git,
-		patchProcessScan,
+		patchProcessScanLateWrite,
 		patchProcessScanFailure,
 		patchRecheck,
 		patchProcessScanAppendRows,
@@ -1540,56 +1548,60 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 	const eventsOf = (records: Record<string, unknown>[]) =>
 		records.map((record) => record.event);
 
-	it("leaves both candidate kinds untouched in dry-run and at --max 0", () => {
-		// `--min-age 0` throughout: these fresh trees are the subject of the cap,
-		// not of the merged sweep's recent-activity rail (#3694 round 3).
-		const candidates = fixture.addCapCandidates(5);
-		const before = [candidates.registered[0], candidates.unregistered[0]].map(
-			(entry) => ({ entry, stat: fs.statSync(entry) }),
-		);
-		const dryRun = JSON.parse(
-			runCli(
-				[
-					"--max",
-					"2",
-					"--dry-run",
-					"--no-orphan-sweep",
-					"--json",
-					"--min-age",
-					"0",
-				],
-				"",
-			),
-		) as { remove: unknown[]; unregistered: { remove: unknown[] } };
-		expect(dryRun.remove).toHaveLength(2);
-		expect(dryRun.unregistered.remove).toHaveLength(0);
-		for (const { entry, stat } of before) {
-			const after = fs.statSync(entry);
-			expect(after.ino).toBe(stat.ino);
-			expect(after.mtimeMs).toBe(stat.mtimeMs);
-		}
+	it(
+		"leaves both candidate kinds untouched in dry-run and at --max 0",
+		{ timeout: 90_000 },
+		() => {
+			// `--min-age 0` throughout: these fresh trees are the subject of the cap,
+			// not of the merged sweep's recent-activity rail (#3694 round 3).
+			const candidates = fixture.addCapCandidates(5);
+			const before = [candidates.registered[0], candidates.unregistered[0]].map(
+				(entry) => ({ entry, stat: fs.statSync(entry) }),
+			);
+			const dryRun = JSON.parse(
+				runCli(
+					[
+						"--max",
+						"2",
+						"--dry-run",
+						"--no-orphan-sweep",
+						"--json",
+						"--min-age",
+						"0",
+					],
+					"",
+				),
+			) as { remove: unknown[]; unregistered: { remove: unknown[] } };
+			expect(dryRun.remove).toHaveLength(2);
+			expect(dryRun.unregistered.remove).toHaveLength(0);
+			for (const { entry, stat } of before) {
+				const after = fs.statSync(entry);
+				expect(after.ino).toBe(stat.ino);
+				expect(after.mtimeMs).toBe(stat.mtimeMs);
+			}
 
-		const zero = JSON.parse(
-			runCli(
-				["--max", "0", "--no-orphan-sweep", "--json", "--min-age", "0"],
-				"",
-			),
-		) as {
-			remove: unknown[];
-			deferred: string[];
-			unregistered: { remove: unknown[]; deferred: string[] };
-		};
-		expect(zero.remove).toHaveLength(0);
-		expect(zero.deferred).toHaveLength(5);
-		expect(zero.unregistered.remove).toHaveLength(0);
-		expect(zero.unregistered.deferred).toHaveLength(5);
-		expect(candidates.registered.every((entry) => fs.existsSync(entry))).toBe(
-			true,
-		);
-		expect(candidates.unregistered.every((entry) => fs.existsSync(entry))).toBe(
-			true,
-		);
-	});
+			const zero = JSON.parse(
+				runCli(
+					["--max", "0", "--no-orphan-sweep", "--json", "--min-age", "0"],
+					"",
+				),
+			) as {
+				remove: unknown[];
+				deferred: string[];
+				unregistered: { remove: unknown[]; deferred: string[] };
+			};
+			expect(zero.remove).toHaveLength(0);
+			expect(zero.deferred).toHaveLength(5);
+			expect(zero.unregistered.remove).toHaveLength(0);
+			expect(zero.unregistered.deferred).toHaveLength(5);
+			expect(candidates.registered.every((entry) => fs.existsSync(entry))).toBe(
+				true,
+			);
+			expect(
+				candidates.unregistered.every((entry) => fs.existsSync(entry)),
+			).toBe(true);
+		},
+	);
 
 	it(
 		"applies --max once across registered and unregistered removals",
@@ -2080,9 +2092,11 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// one fixed delay to land in reliably. Instead this hooks the
 			// process-table step itself (the finding's own suggested
 			// alternative): the fixture's copy of `process-scan.mjs` wraps
-			// `snapshotProcesses` with a fixed, generous artificial delay, so
-			// the enrichment-to-removal gap is a controlled window regardless
-			// of machine speed.
+			// `snapshotProcesses` so it writes the late file at its own entry,
+			// which is strictly after enrichment and strictly before the
+			// recheck whatever the machine speed. (A later version still
+			// started a timer-driven writer and a fixed process-table delay;
+			// a slow `git` spawn let the writer beat enrichment.)
 			//
 			// keepalive.mjs is committed and pushed on the worktree's OWN
 			// branch before the race starts, not written straight into the
@@ -2103,10 +2117,13 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// status` dirty on its own; only the late write below does that.
 			const junctionPath = fixture.addNodeModulesJunction();
 
-			// Deliberately delayed for review round 3, F1: widens the gap
-			// between enrichment's isDirty() and the final removal call to a
-			// fixed, machine-speed-independent window.
-			fixture.patchProcessScan(800);
+			// Review round 3, F1: the late write is made by the CLI's own
+			// process-table step, which runs strictly after enrichment's
+			// isDirty() and strictly before the pre-remove recheck. No timer
+			// races enrichment, so a slow `git` spawn cannot move the write
+			// ahead of it (the CI flake on Windows).
+			const lateFile = path.join(worktree, "late-write.txt");
+			fixture.patchProcessScanLateWrite(lateFile);
 
 			const helperScript = path.join(worktree, "keepalive.mjs");
 			const helper = spawn(process.execPath, [helperScript], {
@@ -2114,8 +2131,6 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 				stdio: "ignore",
 			});
 			try {
-				const lateFile = path.join(worktree, "late-write.txt");
-				let wrote = false;
 				// Deliberately `--only`, not the registered `--hook subagent-stop
 				// --quiet` form the sibling tests in this block drive (PR #2493
 				// round 4, S1 vs S2 in tension): the hook-derived path is built by
@@ -2156,37 +2171,8 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 					child.stdin.write(subagentStopPayload(AGENT_ID));
 					child.stdin.end();
 				});
-				// Starts well after enrichment (a handful of git spawns against
-				// ONE candidate, observed under 100ms even on a loaded box) and
-				// keeps hammering every 20ms until the CLI exits -- comfortably
-				// inside the artificial 800ms process-table delay above, so some
-				// attempt is certain to land in the gap regardless of exactly
-				// when enrichment finishes.
-				const hammer = new Promise<void>((resolve) => {
-					setTimeout(() => {
-						const timer = setInterval(() => {
-							try {
-								fs.writeFileSync(lateFile, "written after enrichment\n");
-								wrote = true;
-							} catch {
-								/* the tree may already be gone */
-							}
-						}, 20);
-						void cliRun.finally(() => {
-							clearInterval(timer);
-							resolve();
-						});
-					}, 500);
-				});
-				await Promise.all([cliRun, hammer]);
+				await cliRun;
 
-				// If the write never landed at all, the race window closed
-				// before it could be exercised -- that is a broken TEST, not a
-				// passing one, so it fails loudly rather than passing vacuously.
-				expect(
-					wrote,
-					"the late write never landed; the race window closed before the test could exercise it",
-				).toBe(true);
 				// The late write must never be silently destroyed: the removal
 				// is refused and BOTH the tree and the file survive.
 				expect(fs.existsSync(worktree)).toBe(true);

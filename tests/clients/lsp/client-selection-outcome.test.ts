@@ -25,11 +25,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 function fakeClient(alive: { value: boolean }) {
@@ -83,6 +78,9 @@ describe("lsp_client_selected outcome discriminator (#1934)", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-08-21T06:00:00Z"));
 		logLatency.mockClear();
@@ -310,6 +308,9 @@ describe("getWarmClientForFile warm-miss record (#1934)", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-08-21T06:00:00Z"));
 		logLatency.mockClear();

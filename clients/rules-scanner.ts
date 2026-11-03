@@ -13,6 +13,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { toPosix } from "./path-utils.js";
 
 interface ProjectRule {
 	source: string; // ".claude/rules", ".agents/rules", "root"
@@ -71,7 +72,7 @@ function findMarkdownFiles(
 				source: path.relative(baseDir, dir) || path.basename(baseDir),
 				name: entry.name,
 				filePath: fullPath,
-				relativePath: path.relative(baseDir, fullPath).replace(/\\/g, "/"),
+				relativePath: toPosix(path.relative(baseDir, fullPath)),
 			});
 		}
 	}

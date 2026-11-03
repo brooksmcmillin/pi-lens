@@ -37,19 +37,10 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { surfaceHandlerCrash } from "../../clients/session-event-guard.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
 import { createPiMock, makeCtx } from "../support/pi-mock.js";
 import { setupTestEnvironment } from "./test-utils.js";
-
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: () => makeLspServiceDouble(),
-	resetLSPService: () => {},
-	notifyExternalFileChange: vi.fn(async () => undefined),
-}));
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 // The #4182 defect: `handleToolCall` demands `requestBootstrapClients` for its
 // complexity baseline and the mock did not supply it, so the demand threw.
@@ -112,8 +103,9 @@ async function expectHelperFailure(
 	return (failure as Error).message;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	resetDegradationLedger();
+	await installLspServiceDouble();
 });
 
 describe("#3518 — a swallowed handler throw fails the handler-verdict test", () => {
@@ -245,6 +237,9 @@ describe("#3518 — a swallowed handler throw fails the handler-verdict test", (
 			const filePath = path.join(env.tmpDir, "target.ts");
 			fs.writeFileSync(filePath, SOURCE);
 			vi.resetModules();
+			// The fresh graph's handler throws at the `requestBootstrapClients` mock
+			// at the top of this file, before any service read, so no second
+			// install is needed here.
 			const fresh = await import("../../clients/runtime-tool-call.js");
 			const freshLedger = await import("../../clients/degradation-ledger.js");
 			expect(freshLedger.getDegradationSummary).not.toBe(getDegradationSummary);

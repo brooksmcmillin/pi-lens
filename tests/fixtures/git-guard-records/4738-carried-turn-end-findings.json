@@ -1,0 +1,59 @@
+{
+	"content": "<PROJECT>/src/other.ts: 🔴 STOP — 1 issue(s) must be fixed:\n  L3: Debugger statement — remove before committing\n    💡 Fix: remove this statement",
+	"blockerContent": "<PROJECT>/src/other.ts: 🔴 STOP — 1 issue(s) must be fixed:\n  L3: Debugger statement — remove before committing\n    💡 Fix: remove this statement",
+	"blockingFiles": [
+		"<PROJECT>/src/other.ts"
+	],
+	"carriedBlockers": [
+		{
+			"sessionId": "v4738-first-session",
+			"blockerContent": "Unresolved from this turn — src/target.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L3: Debugger statement — remove before committing\n    💡 Fix: remove this statement",
+			"blockingFiles": [
+				"<PROJECT>/src/target.ts"
+			]
+		}
+	],
+	"hasBlockers": true,
+	"affectedFiles": [
+		"<PROJECT>/src/target.ts",
+		"<PROJECT>/src/other.ts"
+	],
+	"sessionId": "v4738-second-session",
+	"projectSeqStart": 1,
+	"projectSeqEnd": 2,
+	"fileSeqByPath": {
+		"<PROJECT>/src/target.ts": 1,
+		"<PROJECT>/src/other.ts": 1
+	},
+	"fileContentHashes": {
+		"<PROJECT>/src/target.ts": "b285a2793791554a66d79d7c86b749737bb0b731a6440d8d0e4e03f98b0cf7a9",
+		"<PROJECT>/src/other.ts": "b285a2793791554a66d79d7c86b749737bb0b731a6440d8d0e4e03f98b0cf7a9"
+	},
+	"consumed": true,
+	"affectedFilesTruncated": false,
+	"provenance": {
+		"revision": {
+			"sessionId": "v4738-second-session",
+			"projectSeq": 2,
+			"turnIndex": 1,
+			"generation": 0,
+			"capturedAt": 1792668251094
+		},
+		"files": [
+			{
+				"path": "<PROJECT>/src/target.ts",
+				"role": "affected",
+				"mtimeMs": 1792668249746.9817,
+				"size": 59,
+				"sha256": "b285a2793791554a66d79d7c86b749737bb0b731a6440d8d0e4e03f98b0cf7a9"
+			},
+			{
+				"path": "<PROJECT>/src/other.ts",
+				"role": "affected",
+				"mtimeMs": 1792668250693.9565,
+				"size": 59,
+				"sha256": "b285a2793791554a66d79d7c86b749737bb0b731a6440d8d0e4e03f98b0cf7a9"
+			}
+		]
+	}
+}

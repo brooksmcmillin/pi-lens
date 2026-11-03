@@ -43,21 +43,13 @@ vi.mock("../../clients/dispatch/integration.js", async (importOriginal) => ({
 	dispatchLintWithResult: vi.fn(),
 	computeCascadeForFile: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(),
-	resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
-}));
 vi.mock("../../clients/recent-touches.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/recent-touches.js")>()),
 	appendRecentTouches: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 // The model's timeline, in ms. T_READ is the pipeline's analysis read; the
 // dispatch awaits for 1.5 s, and a parallel write lands 400 ms into it.
@@ -203,17 +195,16 @@ function widgetRows(filePath: string) {
 }
 
 describe("formal/store-freshness replays", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		clearWidgetState();
-		vi.mocked(getLSPService).mockReturnValue(
-			makeLspServiceDouble({
-				supportsLSP: () => false,
-				hasLSP: async () => false,
-				openFile: async () => {},
-				touchFile: async () => {},
-				getAllDiagnostics: async () => new Map(),
-			}) as never,
-		);
+		await installLspServiceDouble({
+			resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
+			supportsLSP: () => false,
+			hasLSP: async () => false,
+			openFile: async () => {},
+			touchFile: async () => {},
+			getAllDiagnostics: async () => new Map(),
+		});
 		vi.mocked(dispatchLintWithResult).mockReset();
 		vi.useFakeTimers({ toFake: ["Date"] });
 		vi.setSystemTime(T_READ);

@@ -1,0 +1,57 @@
+{
+	"_comment": "Raw Expert gate rows behind the readiness deadline in scripts/smoke-tools.mjs (lspGateReadiness, #3405). Measuring command: `gh run view <run> --log`, filtered to the `expert` row of the LSP clean-gate table (timestamp prefix removed); every run is a workflow_dispatch of tool-smoke.yml on fix/3405-expert-save-gate at `head` with Expert from the managed install on ubuntu-latest. Arm A: the client sends didSave, the seed is lib/bad.ex. Arm B: dist/clients/lsp/client.js patched in the workflow so the save capability is never recorded and no didSave leaves (checked locally with clangd: one didSave on the wire unpatched, none patched). Arm C: didSave is sent, the seed sits at the Mix root, outside elixirc_paths. tests/config/lsp-gate-population.test.ts pins the deadline above twice the slowest answer and the arm-C zero.",
+	"command": "gh run view <run> --log",
+	"arms": {
+		"A-didSave-lib-seed": [
+			{
+				"run": 39841005513,
+				"head": "4be07587e",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 22, 50864 ms after the cold call)"
+			},
+			{
+				"run": 39843898054,
+				"head": "4be07587e",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 7, 13301 ms after the cold call)"
+			},
+			{
+				"run": 39843914965,
+				"head": "4be07587e",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 18, 40516 ms after the cold call)"
+			},
+			{
+				"run": 39845687189,
+				"head": "62128927a",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 7, 12693 ms after the cold call)"
+			},
+			{
+				"run": 39848391781,
+				"head": "4d23f506f",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 6, 11355 ms after the cold call)"
+			},
+			{
+				"run": 39848406051,
+				"head": "4d23f506f",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 9, 19465 ms after the cold call)"
+			}
+		],
+		"B-no-didSave-lib-seed": [
+			{
+				"run": 39844770516,
+				"head": "766e73bd4",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 6, 11092 ms after the cold call)"
+			},
+			{
+				"run": 39848687728,
+				"head": "3fb207033",
+				"line": "✓  expert       Expert (alternate of ElixirLS) 1     lsp_diagnostics returned 1 primary finding (answered on call 22, 52027 ms after the cold call)"
+			}
+		],
+		"C-didSave-root-seed": [
+			{
+				"run": 39845124068,
+				"head": "824a7bc93",
+				"line": "✗  expert       Expert (alternate of ElixirLS) 0     lsp_diagnostics returned 0 diagnostic(s) but 0 primary findings (auxiliary=0) (still unanswered on call 61, 151521 ms after the cold call)"
+			}
+		]
+	}
+}

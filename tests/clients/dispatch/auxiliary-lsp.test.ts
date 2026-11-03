@@ -7,12 +7,15 @@ import {
 	AUXILIARY_LSP_PROFILES,
 	applyAuxiliarySuppressions,
 	configDisabledAuxiliaryLspServerIds,
+	dropExcludedServers,
 	enabledAuxiliaryLspServerIds,
 	findAuxiliaryProfileForSource,
 	isAuxiliaryDiagnosticSuppressed,
 	retagAuxiliaryDiagnostics,
 } from "../../../clients/dispatch/auxiliary-lsp.js";
 import { convertLspDiagnostics } from "../../../clients/dispatch/utils/lsp-diagnostics.js";
+import { resolvePiLensFlag } from "../../../clients/lens-config.js";
+import { getLensFlagSpec } from "../../../clients/lens-flag-registry.js";
 import { removeTempDirSync } from "../test-utils.js";
 import { _resetSubagentModeForTests } from "../../../clients/subagent-mode.js";
 
@@ -154,15 +157,24 @@ describe("configDisabledAuxiliaryLspServerIds (#4323)", () => {
 		}
 	});
 
-	it("is the complement of the enabled set for every profile outside the degrade", () => {
+	it("is the complement of the enabled set for every default-on profile outside the degrade", () => {
 		const switches = new Set(["no-opengrep", "no-ast-grep"]);
 		const getFlag = (f: string) => switches.has(f);
 		const enabled = new Set(enabledAuxiliaryLspServerIds(getFlag));
 		const disabled = configDisabledAuxiliaryLspServerIds(getFlag);
-		for (const profile of AUXILIARY_LSP_PROFILES) {
+		for (const profile of AUXILIARY_LSP_PROFILES.filter(
+			(p) => p.enabledByDefault,
+		)) {
 			expect(enabled.has(profile.serverId)).toBe(
 				!disabled.has(profile.serverId),
 			);
+		}
+		// #4929: an opt-in profile that is not enabled was not "switched off", so
+		// it is never reported (auxiliary-lsp-opt-in-4929.test.ts names why).
+		for (const profile of AUXILIARY_LSP_PROFILES.filter(
+			(p) => !p.enabledByDefault,
+		)) {
+			expect(disabled.has(profile.serverId)).toBe(false);
 		}
 	});
 });
@@ -1087,4 +1099,96 @@ describe("auxiliary retag policy (#4365)", () => {
 			opengrep.defectClass = declared;
 		}
 	});
+});
+
+// #4946: `killSwitchFlag: "no-typos"` and `"no-zizmor"` were read for months
+// while the registry registered neither, so the host answered `undefined` and
+// neither server could be switched off. Every case resolves the profile's
+// switch through the production resolver (`resolvePiLensFlag`: host value,
+// global config, registry default), the way `index.ts` and the MCP host do.
+describe("every auxiliary kill switch is a registered switch (#4946)", () => {
+	beforeEach(() => {
+		_resetSubagentModeForTests();
+	});
+	afterEach(() => {
+		_resetSubagentModeForTests();
+	});
+
+	const switchable = AUXILIARY_LSP_PROFILES.filter((p) => p.killSwitchFlag);
+
+	// #4929: an opt-in profile (`fallow`) is switched by its `optInFlag`, not a
+	// kill switch, so the kill switches cover exactly the default-on profiles.
+	it("covers every default-on profile", () => {
+		expect(switchable.map((p) => p.serverId).sort()).toEqual(
+			AUXILIARY_LSP_PROFILES.filter((p) => p.enabledByDefault)
+				.map((p) => p.serverId)
+				.sort(),
+		);
+	});
+
+	it.each(switchable.map((p) => [p.serverId, p.killSwitchFlag as string]))(
+		"%s: %s is registered, negated and off by default",
+		(_serverId, flag) => {
+			const spec = getLensFlagSpec(flag);
+			expect(spec, `${flag} is not in LENS_FLAGS`).toBeDefined();
+			expect(spec?.negated).toBe(true);
+			expect(spec?.default).toBe(false);
+		},
+	);
+
+	it.each(switchable.map((p) => [p.serverId, p.killSwitchFlag as string]))(
+		"%s is switched off by its CLI flag and by its global config key, and on otherwise",
+		(serverId, flag) => {
+			const spec = getLensFlagSpec(flag);
+			const [section, key] = (spec?.configKey ?? "").split(".");
+			const reader =
+				(host: boolean, config: Record<string, unknown>) => (name: string) =>
+					resolvePiLensFlag(name, host && name === flag, config);
+			expect(enabledAuxiliaryLspServerIds(reader(false, {}))).toContain(
+				serverId,
+			);
+			expect(enabledAuxiliaryLspServerIds(reader(true, {}))).not.toContain(
+				serverId,
+			);
+			expect(
+				enabledAuxiliaryLspServerIds(
+					reader(false, { [section as string]: { [key as string]: false } }),
+				),
+			).not.toContain(serverId);
+			expect([
+				...configDisabledAuxiliaryLspServerIds(reader(true, {})),
+			]).toEqual([serverId]);
+		},
+	);
+
+	// A warm-attached peer answers every auxiliary whatever this process's
+	// switches say; the receipt drops a switched-off server's rows and its name
+	// in the coverage gap (#4944), for typos and zizmor as for the others.
+	it.each(switchable.map((p) => [p.serverId, p.killSwitchFlag as string]))(
+		"%s: a peer answer drops its rows (by serverId or by source) and its gap name when switched off",
+		(serverId, flag) => {
+			const profile = AUXILIARY_LSP_PROFILES.find(
+				(p) => p.serverId === serverId,
+			);
+			const source = profile?.tool ?? serverId;
+			const answer = {
+				diagnostics: [
+					diag({ serverId, message: "by id" }),
+					diag({ source, message: "by source" }),
+					diag({ serverId: "typescript", source: "ts", message: "primary" }),
+				],
+				unconfirmedServerIds: [serverId, "typescript"],
+			};
+			const excluded = configDisabledAuxiliaryLspServerIds((name) =>
+				resolvePiLensFlag(name, name === flag, {}),
+			);
+			const kept = dropExcludedServers(answer, excluded);
+			expect(kept.diagnostics.map((d) => d.message)).toEqual(["primary"]);
+			expect(kept.unconfirmedServerIds).toEqual(["typescript"]);
+			// Nothing switched off: the answer is unchanged.
+			expect(dropExcludedServers(answer, new Set()).diagnostics).toHaveLength(
+				3,
+			);
+		},
+	);
 });

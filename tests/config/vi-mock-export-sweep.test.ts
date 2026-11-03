@@ -16,6 +16,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
@@ -28,9 +29,11 @@ import {
 	findLatencyLoggerGapsForFile,
 	findViMockExportGaps,
 	isLatencyLoggerSpecifier,
+	isProductionModulePath,
 	latencyAdmissionHeader,
 	type ViMockExportFinding,
 } from "../support/vi-mock-export-gate.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const TESTS_ROOT = path.join(REPO_ROOT, "tests");
@@ -227,11 +230,15 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	// so test order (including the shuffle census) cannot move the cost.
 	beforeAll(() => sweepOnce(), 120_000);
 
-	it("keeps every latency-logger mock on the real export surface", async () => {
-		// Recurrence guard for #2272 and #2281: a whole-module factory mock can
-		// stay green until an untested production call reaches a newly added export.
-		expect(await scanLatencyLoggerSurface()).toEqual([]);
-	}, 60_000);
+	it(
+		"keeps every latency-logger mock on the real export surface",
+		async () => {
+			// Recurrence guard for #2272 and #2281: a whole-module factory mock can
+			// stay green until an untested production call reaches a newly added export.
+			expect(await scanLatencyLoggerSurface()).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("every latency pin carries a reason and the file carries its header", () => {
 		// Shape 38: a latency baseline pin without two-part admission reds.
@@ -257,7 +264,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// generic detector) must red on a bad latency mock, so deleting the
 		// discriminator in `vi-mock-export-gate.ts` reds here. Specifier is
 		// exactly `latency-logger.js`.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(
 				path.join(root, "latency-logger.ts"),
@@ -283,7 +290,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// Accept twin of the latency reject above: a complete pass-through
 		// must not flag, or the positive control would prove only that the
 		// pipeline flags everything.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(
 				path.join(root, "latency-logger.ts"),
@@ -306,7 +313,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags an out-of-line const factory with an omitted export", () => {
 		// #2959 MEDIUM spelling 1 (the review's): the factory binding lives
 		// outside the `vi.mock` call and must resolve to its body, not pass.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
 			fs.writeFileSync(
@@ -329,7 +336,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// #4429 review F7: the gap loop read the specifier through
 		// `unquote(text)`, so a typed `vi.mock(import("./module.js"), …)` had no
 		// specifier and its omitted export passed silently.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
 			fs.writeFileSync(
@@ -352,7 +359,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// #4429 review F7: the mocked-specifier set read `unquote(text)`, so an
 		// importer mocked as `vi.mock(import("./importer.js"), …)` was still
 		// walked and its real imports were demanded from the module's mock.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
 			fs.writeFileSync(
@@ -374,7 +381,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// imported factory has no local body to prove complete, so the guard
 		// fails closed. Same semantic rule as the const binding above — "prove
 		// complete or flag" — not a second enumerated spelling.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
 			fs.writeFileSync(
@@ -401,7 +408,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// Accept twin for the out-of-line rejects: a resolvable complete
 		// pass-through must not flag, proving resolution checks the body
 		// rather than flagging every identifier factory.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
 			fs.writeFileSync(
@@ -422,7 +429,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// Own evasion attempt, third spelling: `vi["mock"]` is the same seam
 		// as `vi.mock` with different surface spelling. The detector reads the
 		// member-expression fields, never the callee text, so both red.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
 			fs.writeFileSync(
@@ -443,7 +450,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it("flags an export used by a production importer", () => {
 		// Regression #2782: importer-use mode must not miss an indirect named import.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -466,7 +473,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it("follows more than one production-importer hop", () => {
 		// Regression #2782: the recurrence is test -> A -> B -> mocked module.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			fs.writeFileSync(path.join(root, "module.ts"), "export const x = 1;\n");
 			fs.writeFileSync(
@@ -496,7 +503,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it("accepts a no-argument importOriginal pass-through spread", () => {
 		// Regression #2784: the correct Vitest pass-through idiom has no import argument.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -520,7 +527,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// complete pass-through identical to the no-argument form, but the
 		// tree-sitter grammar misparses it as a `<` binary comparison, so the
 		// sweep read it as dropping every export.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -542,7 +549,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts a simple-type-argument importOriginal pass-through spread", () => {
 		// Class sweep #2881: `await importOriginal<T>()` nests the await
 		// inside the call callee, so the old identifier-callee check missed it.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -564,7 +571,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts an as-cast importOriginal pass-through spread", () => {
 		// Class sweep #2881: `...(await importOriginal<T>() as any)` wraps
 		// the awaited call in an as_expression the old check never unwrapped.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -585,7 +592,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it("accepts a satisfies importOriginal pass-through spread", () => {
 		// Class sweep #2881: the satisfies_expression twin of the as-cast.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -607,7 +614,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts a parenthesised importOriginal pass-through spread", () => {
 		// Class sweep #2881: `...((await importOriginal<T>()))` nests the
 		// awaited call two parenthesised layers deep inside the spread.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -630,7 +637,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// Class sweep #2881: the dominant live idiom binds the awaited
 		// module first (`const actual = await importOriginal<T>()`) and
 		// spreads the alias in the returned object.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -694,7 +701,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it.each(importActualFactories)(
 		"vi.importActual pass-through: %s",
 		(_name, factory, complete) => {
-			const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 			try {
 				fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
 				fs.writeFileSync(
@@ -716,7 +723,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts a two-statement no-argument importOriginal binding spread", () => {
 		// The PREMISE transcript's seventh shape: the alias idiom without a
 		// type argument is the same complete pass-through.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -738,7 +745,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts a two-statement binding beside a nested helper", () => {
 		// Scope positive control for the F3 fix: a nested function inside the
 		// factory must not hide the body's own top-level awaited alias.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -761,7 +768,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// Pins the as_expression arm of the shared unwrap: the generic-form
 		// as-cast test never reaches it (the misparse branch swallows the
 		// generic first), so only this no-argument form reds when the arm dies.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -783,7 +790,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts a no-argument satisfies importOriginal pass-through spread", () => {
 		// Pins the satisfies_expression arm specifically: deleting only that
 		// kind from the unwrap reds this test and leaves the as-cast green.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -805,7 +812,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts a non-null-asserted importOriginal pass-through spread", () => {
 		// Review F2/X1 accept side: `...(await importOriginal())!` was clean
 		// on master; the shared unwrap covers non_null_expression.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -827,7 +834,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("accepts a comment between await and the importOriginal call", () => {
 		// Review F2 accept side: a comment is a named child in this grammar,
 		// so operand picks must filter it through the shared seam.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -849,7 +856,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a generic pass-through that spreads a different module", () => {
 		// Review F1a reject side: the generic form must be identical to the
 		// no-argument form, which flags `...(await importOriginal("./other.js"))`.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -876,7 +883,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a two-statement binding that awaits a different module", () => {
 		// Review F1b reject side: the alias value carries the same
 		// wrong-module argument through the two-statement entry point.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -903,7 +910,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a generic spread with no call parentheses", () => {
 		// Criterion-1 reverse direction: `...(await importOriginal)` (no
 		// call) is not a pass-through, and neither is its generic twin.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -927,7 +934,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a simple-type-argument spread that passes a value", () => {
 		// Pins the await-in-callee branch's zero-argument check: deleting it
 		// lets `...(await importOriginal<T>("./other.js"))` read as complete.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -951,7 +958,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a no-argument-form spread that passes a value", () => {
 		// Pins the await branch's zero-argument check, the twin the generic
 		// form must match.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -975,7 +982,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a parenthesised spread that passes a value", () => {
 		// Reject twin of the parenthesised accept: parens must not launder
 		// an argument either.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -999,7 +1006,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags an as-cast spread that passes a value", () => {
 		// Reject twin of the as-cast accepts: the cast unwrap must not skip
 		// the argument check underneath.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1022,7 +1029,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it("flags a satisfies spread that passes a value", () => {
 		// Reject twin of the satisfies accept.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1045,7 +1052,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it("flags a non-null-asserted spread that passes a value", () => {
 		// Reject twin of the non-null accept.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1069,7 +1076,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a commented spread that passes a value", () => {
 		// Reject twin of the comment accept: filtering the comment must not
 		// filter the argument check with it.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1094,7 +1101,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// The shared leaf helper only names the binding; the awaited-call
 		// shape around it still has to hold, or `...importOriginal()` would
 		// read as a pass-through of the factory function itself.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1118,7 +1125,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a spread alias bound to a non-awaited value", () => {
 		// Pins that aliases enter the set only through an awaited binding:
 		// collecting every same-named declarator would launder this object.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1143,7 +1150,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// Alias-path twin of the no-call spread: the declaration proves its
 		// trailing `()` through error recovery, so a bare instantiation
 		// keeps flagging even though its value node matches the valid shape.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1167,7 +1174,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	it("flags a spread laundered by a nested-helper binding", () => {
 		// Review F3 reject side: the only awaited `actual` binding lives
 		// inside a nested helper, so the top-level spread keeps flagging.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const importerFile = path.join(root, "importer.ts");
@@ -1190,7 +1197,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it("ignores export names mentioned only in comments and strings", () => {
 		// Guard against prose laundering a source scan into a false importer use.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const testFile = path.join(root, "case.test.ts");
@@ -1204,9 +1211,53 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		}
 	});
 
+	it("reads a fixture on another Windows drive as outside the checkout (#4878 F1)", () => {
+		// Every fixture above lives under `os.tmpdir()`, which on the Windows
+		// runner is another drive: `path.win32.relative` then returns an
+		// ABSOLUTE path, so the `../` arm never matched, `isProductionModule`
+		// answered false, and each positive control in this file asserted `[]`
+		// (26 red on `Unit tests Windows`, head a99db371e).
+		const cwd = "D:\\a\\pi-lens\\pi-lens";
+		const fixture =
+			"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\pi-lens-vi-mock-x\\module.ts";
+		const relative = path.win32.relative(cwd, fixture);
+		expect(relative).toBe(fixture);
+		expect(isProductionModulePath(relative, path.win32)).toBe(true);
+		// The verdict widens only "outside": a checkout path on the same drive
+		// still answers by its source root.
+		expect(
+			isProductionModulePath(
+				path.win32.relative(
+					cwd,
+					"D:\\a\\pi-lens\\pi-lens\\tests\\support\\x.ts",
+				),
+				path.win32,
+			),
+		).toBe(false);
+		expect(
+			isProductionModulePath(
+				path.win32.relative(
+					cwd,
+					"D:\\a\\pi-lens\\pi-lens\\clients\\lsp\\index.ts",
+				),
+				path.win32,
+			),
+		).toBe(true);
+		// The POSIX shapes the gate has always read keep their verdicts.
+		expect(
+			isProductionModulePath("../tmp/pi-lens-vi-mock-x/module.ts", path.posix),
+		).toBe(true);
+		expect(isProductionModulePath("clients/lsp/index.ts", path.posix)).toBe(
+			true,
+		);
+		expect(isProductionModulePath("tests/support/x.ts", path.posix)).toBe(
+			false,
+		);
+	});
+
 	it("skips node and non-TypeScript mock specifiers", () => {
 		// Guard against scanning .mjs and node: mocks as TypeScript production modules.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleDir = path.join(root, ".probe-vi-m.mjs");
 			const testFile = path.join(root, "case.test.ts");
@@ -1225,7 +1276,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	});
 
 	it("reds when production gains an omitted export", () => {
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const testFile = path.join(root, "case.test.ts");
@@ -1252,7 +1303,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		// The ratchet-down side of #4411 round 2 F6 (mocks): making a rise red
 		// must not turn a mock that gained an export into a red; the fall stays
 		// a warning until the baseline row is regenerated.
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const testFile = path.join(root, "case.test.ts");
@@ -1275,7 +1326,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	});
 
 	it("reds when a factory drops a previously provided export", () => {
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const testFile = path.join(root, "case.test.ts");
@@ -1296,7 +1347,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	});
 
 	it("keeps the admission key stable when lines move", () => {
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const testFile = path.join(root, "case.test.ts");
@@ -1315,7 +1366,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	});
 
 	it("makes line-key mutation red", () => {
-		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
 			const testFile = path.join(root, "case.test.ts");
@@ -1365,7 +1416,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 			);
 			expect(result.problems, result.problems.join("\n")).toEqual([]);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 
 	it.skipIf(!!process.env.VI_MOCK_EXPORT_REGEN)(
@@ -1376,7 +1427,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 			const dead = Object.keys(BASELINE).filter((entry) => !live.has(entry));
 			expect(dead).toEqual([]);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 
 	it.skipIf(!process.env.VI_MOCK_EXPORT_REGEN)(
@@ -1387,7 +1438,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 				`${JSON.stringify(baselineFrom(await scan()), null, "\t")}\n`,
 			);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 });
 

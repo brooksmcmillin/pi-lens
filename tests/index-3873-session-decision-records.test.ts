@@ -88,6 +88,8 @@ import {
 	drainBackgroundWritesForTests,
 	setupTestEnvironment,
 } from "./clients/test-utils.js";
+import { waitFor } from "./clients/interleaving-kit.js";
+import { scaledTestTimeout } from "./support/test-timeout-scale.js";
 
 const FLAGS = new Map<string, boolean>([
 	["no-lsp", true],
@@ -305,16 +307,21 @@ async function reload(runtime: AgentSessionRuntime): Promise<void> {
 	await runtime.session.reload();
 }
 
-/** Let a fire-and-forget sidecar write land (no timer: yield the loop). */
+/**
+ * Let a fire-and-forget sidecar write land, bounded by a real-clock deadline.
+ *
+ * Callers pass `scaledTestTimeout(20_000)`: the wait's own 4,000 ms budget grows
+ * with `PI_LENS_TEST_TIMEOUT_SCALE` (12,000 ms on the Windows leg), so the
+ * enclosing test must outlast it or a sidecar that never lands reports `Test
+ * timed out` instead of the wait's diagnostic (#4983).
+ */
 async function sidecarSettled(sessionId: string): Promise<void> {
 	const file = path.join(
 		getProjectDataDir(cwd),
 		"sessions",
 		`${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`,
 	);
-	for (let i = 0; i < 5000 && !fs.existsSync(file); i++)
-		await new Promise<void>((resolve) => setImmediate(resolve));
-	expect(fs.existsSync(file), `sidecar ${file}`).toBe(true);
+	await waitFor(() => fs.existsSync(file), Boolean, { timeoutMs: 4_000 });
 }
 
 async function turnEnd(runtime: AgentSessionRuntime): Promise<void> {
@@ -627,52 +634,58 @@ describe("#3873 O2, O3: the adopt walk and each store's action", () => {
 		);
 	});
 
-	it("a resume from the sidecar names the sidecar it read, and a branch move shows in payloadReads", async () => {
-		const runtime = await startRuntime(SessionManager.create(cwd, sessionsDir));
-		const c = conversation(runtime);
-		const a = fixture("a.conf", 6);
-		const b = fixture("b.conf", 6);
-		c.user("prompt 1");
-		await c.read("call_read_a", a);
-		const p1Done = c.done();
-		c.user("prompt 2");
-		await c.read("call_read_b", b);
-		c.done();
-		await turnEnd(runtime);
-		await c.S().navigateTree(p1Done);
-		c.user("prompt 2 on branch Y");
-		c.done();
+	it(
+		"a resume from the sidecar names the sidecar it read, and a branch move shows in payloadReads",
+		async () => {
+			const runtime = await startRuntime(
+				SessionManager.create(cwd, sessionsDir),
+			);
+			const c = conversation(runtime);
+			const a = fixture("a.conf", 6);
+			const b = fixture("b.conf", 6);
+			c.user("prompt 1");
+			await c.read("call_read_a", a);
+			const p1Done = c.done();
+			c.user("prompt 2");
+			await c.read("call_read_b", b);
+			c.done();
+			await turnEnd(runtime);
+			await c.S().navigateTree(p1Done);
+			c.user("prompt 2 on branch Y");
+			c.done();
 
-		await runtime.switchSession(c.S().sessionManager.getSessionFile()!);
+			await runtime.switchSession(c.S().sessionManager.getSessionFile()!);
 
-		const adopt = (await rows("session_handoff_adopt")).at(-1);
-		expect(adopt).toMatchObject({ reason: "resume", chosen: "own-sidecar" });
-		expect(adopt?.tried).toEqual([
-			expect.objectContaining({
+			const adopt = (await rows("session_handoff_adopt")).at(-1);
+			expect(adopt).toMatchObject({ reason: "resume", chosen: "own-sidecar" });
+			expect(adopt?.tried).toEqual([
+				expect.objectContaining({
+					source: "own-sidecar",
+					found: true,
+					version: 2,
+					ageMs: expect.any(Number),
+				}),
+			]);
+			expect(adopt?.tried?.[0]?.storeNames).toEqual(
+				expect.arrayContaining(["widget", "read-guard"]),
+			);
+			expect((await rows("read_guard_branch_retained")).at(-1)).toMatchObject({
+				trigger: "resume",
 				source: "own-sidecar",
-				found: true,
-				version: 2,
-				ageMs: expect.any(Number),
-			}),
-		]);
-		expect(adopt?.tried?.[0]?.storeNames).toEqual(
-			expect.arrayContaining(["widget", "read-guard"]),
-		);
-		expect((await rows("read_guard_branch_retained")).at(-1)).toMatchObject({
-			trigger: "resume",
-			source: "own-sidecar",
-			kept: 1,
-			dropped: 1,
-			payloadReads: 2,
-		});
-		expect(
-			(await rows("session_store_action")).filter(
-				(row) => row.reason === "resume" && row.store === "read-guard",
-			),
-		).toEqual([
-			expect.objectContaining({ itemsIn: 2, itemsKept: 1, itemsDropped: 1 }),
-		]);
-	});
+				kept: 1,
+				dropped: 1,
+				payloadReads: 2,
+			});
+			expect(
+				(await rows("session_store_action")).filter(
+					(row) => row.reason === "resume" && row.store === "read-guard",
+				),
+			).toEqual([
+				expect.objectContaining({ itemsIn: 2, itemsKept: 1, itemsDropped: 1 }),
+			]);
+		},
+		scaledTestTimeout(20_000),
+	);
 
 	it("a launch with no sidecar says both candidates were absent, and kept 0 reads payloadReads null", async () => {
 		await startRuntime(SessionManager.create(cwd, sessionsDir));
@@ -857,8 +870,18 @@ describe("#3873 O4: a scope's end and a gap demotion", () => {
 		await startRuntime(SessionManager.inMemory(cwd));
 		await startRuntime(SessionManager.inMemory(cwd));
 
+		// Only this case's own starts and the absence of a demote row. An `end`
+		// row for the process's module-load primary (index.ts `runtime`) is
+		// written by whichever case starts a runtime first, not by this one.
 		const transitions = await rows("session_scope_transition");
-		expect(transitions.map((row) => [row.transition, row.role])).toEqual([
+		expect(transitions.filter((row) => row.transition === "demote")).toEqual(
+			[],
+		);
+		expect(
+			transitions
+				.filter((row) => row.transition === "start")
+				.map((row) => [row.transition, row.role]),
+		).toEqual([
 			["start", "primary"],
 			["start", "secondary"],
 		]);
@@ -915,8 +938,14 @@ describe("#3873 O5: the fence rollup", () => {
 
 	it("folds sources past the declaration cap into one (other) entry instead of growing the tally", async () => {
 		// `declare` keeps 128 names; 130 more guarantee the last are undeclared.
+		// Fill a second module copy's table: the declared-source Set is process
+		// lifetime, and filling the static copy's would make later cases tally
+		// their own source as `(other)`.
+		vi.resetModules();
+		const fresh = await import("../clients/generation-guard.js");
 		for (let i = 0; i < 130; i += 1)
-			createGenerationSource(`fence-cap-probe-${i}`)
+			fresh
+				.createGenerationSource(`fence-cap-probe-${i}`)
 				.capture()
 				.guardedWrite("w", () => i);
 
@@ -1058,42 +1087,60 @@ describe("#3873 round 2: the agent_nudge row's bounds and producers", () => {
 		return file;
 	}
 
+	// Each turn emits a context event and reads the nudge rows; the wait is
+	// bounded by waitFor's real-clock deadline, not a turn count (#4865).
+	//
+	// Both callers pass `scaledTestTimeout(30_000)` as their per-test timeout,
+	// above the helper's own `10_000 * PI_LENS_TEST_TIMEOUT_SCALE` budget: a
+	// drain that never completes must fail with waitFor's diagnostic (budget,
+	// caller frame, last value) instead of Vitest's bare 5 s default, which
+	// fires first at every supported scale.
 	async function drainedNudge(runtime: AgentSessionRuntime): Promise<Row> {
-		for (let i = 0; i < 5000; i += 1) {
-			await runtime.session.extensionRunner.emitContext([
-				{ role: "user", content: "keep working", timestamp: Date.now() },
-			] as never);
-			const [row] = await rows("agent_nudge");
-			if (row) return row;
-			await new Promise<void>((resolve) => setImmediate(resolve));
-		}
-		throw new Error("no agent_nudge row");
+		let nudge: Row | undefined;
+		const row = await waitFor(() => nudge, Boolean, {
+			yieldControl: async () => {
+				await runtime.session.extensionRunner.emitContext([
+					{ role: "user", content: "keep working", timestamp: Date.now() },
+				] as never);
+				[nudge] = await rows("agent_nudge");
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			},
+		});
+		return row as Row;
 	}
 
-	it("session_start passes a writer's session id from the shared touch record", async () => {
-		otherProcessTouched("writer-at-start");
+	it(
+		"session_start passes a writer's session id from the shared touch record",
+		async () => {
+			otherProcessTouched("writer-at-start");
 
-		const runtime = await startRuntime(SessionManager.inMemory(cwd));
+			const runtime = await startRuntime(SessionManager.inMemory(cwd));
 
-		expect((await drainedNudge(runtime)).originSessionIds).toEqual([
-			"writer-at-start",
-		]);
-	});
+			expect((await drainedNudge(runtime)).originSessionIds).toEqual([
+				"writer-at-start",
+			]);
+		},
+		scaledTestTimeout(30_000),
+	);
 
-	it("turn_start passes a writer's session id from the shared touch record", async () => {
-		const runtime = await startRuntime(SessionManager.inMemory(cwd));
-		otherProcessTouched("writer-at-turn");
+	it(
+		"turn_start passes a writer's session id from the shared touch record",
+		async () => {
+			const runtime = await startRuntime(SessionManager.inMemory(cwd));
+			otherProcessTouched("writer-at-turn");
 
-		await runtime.session.extensionRunner.emit({
-			type: "turn_start",
-			turnIndex: 1,
-			timestamp: Date.now(),
-		} as never);
+			await runtime.session.extensionRunner.emit({
+				type: "turn_start",
+				turnIndex: 1,
+				timestamp: Date.now(),
+			} as never);
 
-		expect((await drainedNudge(runtime)).originSessionIds).toEqual([
-			"writer-at-turn",
-		]);
-	});
+			expect((await drainedNudge(runtime)).originSessionIds).toEqual([
+				"writer-at-turn",
+			]);
+		},
+		scaledTestTimeout(30_000),
+	);
 });
 
 describe("#3873 round 2: decision rows do not take over stall attribution", () => {

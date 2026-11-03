@@ -1,25 +1,22 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	appendActionableWarningsHistory,
 	getActionableWarningsHistoryPath,
 	type ActionableWarningsReport,
 } from "../../clients/actionable-warnings.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { removeTempDirSync } from "./test-utils.js";
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	// `supportsLSP: false` is the only method this suite's path reads; the rest
-	// of the surface comes from the factory (#2592).
-	getLSPService: () => makeLspServiceDouble({ supportsLSP: () => false }),
-}));
 
 let env: { tmpDir: string; cleanup: () => void } | undefined;
 let previousDataDir: string | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
+	// `supportsLSP: false` is the only method this suite's path reads; the rest
+	// of the surface comes from the factory (#2592).
+	await installLspServiceDouble({ supportsLSP: () => false });
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-aw-hist-"));
 	env = {
 		tmpDir,

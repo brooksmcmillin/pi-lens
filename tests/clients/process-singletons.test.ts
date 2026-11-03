@@ -27,18 +27,24 @@ import {
 } from "vitest";
 import { removeTempDirSync } from "./test-utils.js";
 
-// Seeded before any module import so the mocked `getGlobalPiLensDir` never
-// returns `undefined` to a log-file module that resolves its path at module
-// scope. The registry suite re-points it at a per-test dir.
+// Seeded before any module import so `PI_LENS_HOME` never resolves to an
+// unset dir for a log-file module that resolves its path at module scope.
+// The registry suite re-points it at a per-test dir.
 const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2146-base-"));
 let dir: string = baseDir;
+let previousHome: string | undefined;
 
 afterAll(() => removeTempDirSync(baseDir));
 
-vi.mock("../../clients/file-utils.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/file-utils.js")>();
-	return { ...actual, getGlobalPiLensDir: () => dir };
+// `PI_LENS_HOME` is the knob `getGlobalPiLensDir` reads; every case, in every
+// describe, runs with it pointing at the current `dir`.
+beforeEach(() => {
+	previousHome = process.env.PI_LENS_HOME;
+	process.env.PI_LENS_HOME = dir;
+});
+afterEach(() => {
+	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+	else process.env.PI_LENS_HOME = previousHome;
 });
 
 type SessionLifecycleModule =
@@ -138,6 +144,7 @@ describe("#2146 — session-lifecycle registration is one per process", () => {
 describe("#2146 — the registry mutation tail is one per process", () => {
 	beforeEach(async () => {
 		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2146-reg-"));
+		process.env.PI_LENS_HOME = dir;
 		const singletons = await import("../../clients/process-singletons.js");
 		singletons._resetProcessSingletonsForTests();
 	});

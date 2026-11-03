@@ -1869,7 +1869,8 @@
       "avatar_url": "https://avatars.githubusercontent.com/u/81386636?v=4",
       "profile": "https://github.com/pandas9",
       "contributions": [
-        "bug"
+        "bug",
+        "code"
       ]
     },
     {
@@ -1925,7 +1926,8 @@
       "avatar_url": "https://avatars.githubusercontent.com/u/108321891?v=4",
       "profile": "https://github.com/op15066212",
       "contributions": [
-        "bug"
+        "bug",
+        "ideas"
       ]
     },
     {
@@ -1978,6 +1980,153 @@
       "name": "beardrux",
       "avatar_url": "https://avatars.githubusercontent.com/u/310295749?v=4",
       "profile": "https://github.com/beardrux",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "Nyarlathoteppppp",
+      "name": "bowen xu",
+      "avatar_url": "https://avatars.githubusercontent.com/u/126082256?v=4",
+      "profile": "https://github.com/Nyarlathoteppppp",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "dmae97",
+      "name": "dmae97",
+      "avatar_url": "https://avatars.githubusercontent.com/u/146327957?v=4",
+      "profile": "https://github.com/dmae97",
+      "contributions": [
+        "code",
+        "bug"
+      ]
+    },
+    {
+      "login": "Battlelamb",
+      "name": "Battlelamb",
+      "avatar_url": "https://avatars.githubusercontent.com/u/12995996?v=4",
+      "profile": "https://github.com/Battlelamb",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "wayne930242",
+      "name": "WeiHung",
+      "avatar_url": "https://avatars.githubusercontent.com/u/5166321?v=4",
+      "profile": "http://wayneh.tw/",
+      "contributions": [
+        "code",
+        "ideas"
+      ]
+    },
+    {
+      "login": "wertyMSD",
+      "name": "wertyMSD",
+      "avatar_url": "https://avatars.githubusercontent.com/u/130595241?v=4",
+      "profile": "https://github.com/wertyMSD",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "rcdailey",
+      "name": "Robert Dailey",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1768054?v=4",
+      "profile": "https://github.com/rcdailey",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "letwir",
+      "name": "letwir",
+      "avatar_url": "https://avatars.githubusercontent.com/u/16576177?v=4",
+      "profile": "https://twitter.com/letwir",
+      "contributions": [
+        "doc"
+      ]
+    },
+    {
+      "login": "erikdarlingdata",
+      "name": "Erik Darling",
+      "avatar_url": "https://avatars.githubusercontent.com/u/2136037?v=4",
+      "profile": "http://www.erikdarling.com/",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "Silvio-Re",
+      "name": "Silvio",
+      "avatar_url": "https://avatars.githubusercontent.com/u/5860449?v=4",
+      "profile": "https://github.com/Silvio-Re",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "forge18",
+      "name": "forge18",
+      "avatar_url": "https://avatars.githubusercontent.com/u/31629847?v=4",
+      "profile": "https://github.com/forge18",
+      "contributions": [
+        "ideas"
+      ]
+    },
+    {
+      "login": "paymog",
+      "name": "Paymahn Moghadasian",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1986950?v=4",
+      "profile": "https://github.com/paymog",
+      "contributions": [
+        "doc"
+      ]
+    },
+    {
+      "login": "vjda",
+      "name": "Victor J. Diaz Ayuste",
+      "avatar_url": "https://avatars.githubusercontent.com/u/20127271?v=4",
+      "profile": "https://github.com/vjda",
+      "contributions": [
+        "ideas"
+      ]
+    },
+    {
+      "login": "GlitchOverride",
+      "name": "GlitchOverride",
+      "avatar_url": "https://avatars.githubusercontent.com/u/112761176?v=4",
+      "profile": "https://github.com/GlitchOverride",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "sbscan",
+      "name": "Can Gürcan",
+      "avatar_url": "https://avatars.githubusercontent.com/u/18386839?v=4",
+      "profile": "https://github.com/sbscan",
+      "contributions": [
+        "ideas"
+      ]
+    },
+    {
+      "login": "zackchiutw",
+      "name": "Zachary Chiu",
+      "avatar_url": "https://avatars.githubusercontent.com/u/107488700?v=4",
+      "profile": "https://github.com/zackchiutw",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "yxlimo",
+      "name": "ShayLu",
+      "avatar_url": "https://avatars.githubusercontent.com/u/13878887?v=4",
+      "profile": "https://github.com/yxlimo",
       "contributions": [
         "bug"
       ]

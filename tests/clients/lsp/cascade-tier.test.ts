@@ -18,23 +18,12 @@ const registerQuietWindowTask = vi.fn();
 // different spy than the code under test called.
 const logCascade = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-}));
-
 vi.mock("../../../clients/quiet-window.js", () => ({
 	registerQuietWindowTask,
 }));
 
 vi.mock("../../../clients/cascade-logger.js", () => ({
 	logCascade,
-}));
-
-vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
-	...(await importActual<
-		typeof import("../../../clients/latency-logger.js")
-	>()),
-	logLatency: vi.fn(),
 }));
 
 const FILE = "C:/repo/neighbor.ts";
@@ -67,6 +56,9 @@ describe("classifyCascadeWaitTier", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		registerQuietWindowTask.mockReset();
 		mod = await import("../../../clients/lsp/cascade-tier.js");
@@ -187,6 +179,29 @@ describe("classifyCascadeWaitTier", () => {
 		];
 		expect(mod.classifyCascadeWaitTier({} as any, FILE, snapshots as any)).toBe(
 			"collect-later",
+		);
+	});
+
+	// #4914: `effect-tsgo` runs the same typescript-go server as native-ts7.
+	// Recurrence it prevents: the variant read as "not native", so its snapshot
+	// took classic's tier3-silent path and the cascade skipped a wait the server
+	// needs.
+	it("classifies an effect-tsgo typescript snapshot like native-ts7 (#4914)", () => {
+		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
+		const snapshot = {
+			serverId: "typescript",
+			root: "C:/repo",
+			operationSupport: {} as any,
+			workspaceDiagnosticsSupport: { mode: "push-only" as const },
+			advertisedCommands: [],
+			rawCapabilityKeys: [],
+			launchVariant: "effect-tsgo" as const,
+		};
+		expect(
+			mod.classifyCascadeWaitTier({} as any, FILE, [snapshot] as any),
+		).toBe("collect-later");
+		expect(mod.classifyServerWaitTier("typescript", snapshot as any)).toBe(
+			"waits",
 		);
 	});
 
@@ -345,6 +360,9 @@ describe("outstanding touch registry + reconcile", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		registerQuietWindowTask.mockReset();
 		mod = await import("../../../clients/lsp/cascade-tier.js");
@@ -628,6 +646,9 @@ describe("registerCascadeTierReconcileTask", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		registerQuietWindowTask.mockReset();
 		mod = await import("../../../clients/lsp/cascade-tier.js");
@@ -842,6 +863,9 @@ describe("isTierAwareCascadeEnabled kill switch", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		delete process.env.PI_LENS_TIER_AWARE_CASCADE;
 		mod = await import("../../../clients/lsp/cascade-tier.js");
 		mod._resetTierAwareCascadeEnabledForTests();

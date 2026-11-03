@@ -107,13 +107,19 @@ afterAll(() => removeTempDirSync(tempRoot));
 
 describe("pi-lens build-graph CLI", () => {
 	it("builds and persists a small project with a stats line", async () => {
-		const result = await runCli(["build-graph", "--cwd", projectDir], dataDir);
+		// Its own data dir: the re-run case below shares `dataDir`, and a snapshot
+		// it left there turns this cold build into "snapshot already current".
+		const coldDataDir = path.join(tempRoot, "data-cold");
+		const result = await runCli(
+			["build-graph", "--cwd", projectDir],
+			coldDataDir,
+		);
 		expect(result.code).toBe(0);
 		expect(result.stdout.trim()).toMatch(
 			/^pi-lens build-graph: files=\d+ nodes=\d+ edges=\d+ elements=\d+ jsonBytes=\d+ durationMs=\d+$/,
 		);
 		const snapshots = fs
-			.readdirSync(dataDir, { recursive: true })
+			.readdirSync(coldDataDir, { recursive: true })
 			.filter((entry) => String(entry).endsWith("review-graph.json.gz"));
 		expect(snapshots).toHaveLength(1);
 	});

@@ -8,7 +8,15 @@ import {
 	loadCodebaseModel,
 	saveCodebaseModel,
 } from "../../clients/codebase-model.js";
-import type { FunctionCallGraph } from "../../clients/call-graph.js";
+import {
+	buildCallGraph,
+	type FunctionCallGraph,
+} from "../../clients/call-graph.js";
+import { FactStore } from "../../clients/dispatch/fact-store.js";
+import {
+	buildOrUpdateGraph,
+	extractSymbolsAndRefsFromGraph,
+} from "../../clients/review-graph/builder.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
 import { removeTempDirSync } from "./test-utils.js";
 
@@ -83,6 +91,47 @@ describe("buildCodebaseModel", () => {
 		expect(names).not.toContain("testHelper");
 		expect(names).not.toContain("bundled");
 		expect(names).toContain("realFn");
+	});
+
+	it("keeps the project's functions when the session root is spelled through a link (#4689)", async (ctx) => {
+		// RECURRENCE GUARDED: review r1 F5 (Sourcery S4). session_start builds
+		// the review graph, the call graph and this model from the session
+		// root as spelled, and the graph keys every file by its path identity,
+		// so under a root reached through a link every callee read as outside
+		// the project and the model came out empty. Production chain:
+		// clients/runtime-session.ts "call-graph" and "codebase-model" tasks.
+		const real = path.join(tmpDir, "repo");
+		const alias = path.join(tmpDir, "repo-alias");
+		fs.mkdirSync(real);
+		fs.writeFileSync(
+			path.join(real, "callee.ts"),
+			"export function helper(): number {\n  return 1;\n}\n",
+		);
+		for (const caller of ["a", "b"])
+			fs.writeFileSync(
+				path.join(real, `${caller}.ts`),
+				`import { helper } from "./callee";\n\nexport function ${caller}(): number {\n  return helper();\n}\n`,
+			);
+		try {
+			fs.symlinkSync("repo", alias, "dir");
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+		const reviewGraph = await buildOrUpdateGraph(alias, [], new FactStore());
+		const extracted = extractSymbolsAndRefsFromGraph(reviewGraph);
+		const callGraph = buildCallGraph(
+			extracted.allSymbols,
+			extracted.allRefs,
+			extracted.coverage,
+		);
+		expect(callGraph.edges.length).toBeGreaterThan(0);
+		const entries = buildCodebaseModel(callGraph, alias).entries;
+		expect(entries.map((entry) => entry.name)).toContain("helper");
+		// The model names each file relative to the session root, never as a
+		// `../` walk out of the link spelling into the target.
+		expect(entries.find((entry) => entry.name === "helper")?.file).toBe(
+			"callee.ts",
+		);
 	});
 
 	it("uses shared file-role classification for missed path-shape cases", () => {

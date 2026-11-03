@@ -14,17 +14,36 @@ Before mocking a `clients/` module, look for its test seam (`set*`, `adopt*`, or
 `reset*`). The pre-flight must list the mock dependents of any module whose
 exports change.
 
+A new test starts from `tests/support/`: a registration question (flags,
+tools, commands, declarations) goes through tier 1
+(`tests/support/pi-runner.ts`, a real `ExtensionRunner`), a session-flow case
+through tier 2 (`tests/support/pi-session.ts`), and a JSON-lines sink through
+`readNdjsonRows` (`tests/support/ndjson-rows.ts`), asserting `skipped === 0`
+when the claim needs the complete output. No fake of an in-process store or
+registry; other doubles only as `AGENTS.md` admits them.
+
 - Trace the production entry point and reproduce the defect through it
   (principles §1, "Premise first"). Name no seam before the reproduction; the
   red reproduction is your feedback loop, built before any theory of the fix.
+  Reproduce on the reporter's pi host and pi-lens version, taken from the
+  report or its session log. When that version cannot be installed, name the
+  one you used instead; never substitute the latest silently. Report
+  `confirmed`, `partially confirmed` (name what differed), `not reproduced`
+  (name what you tried), or `blocked` (name the missing access or state).
 - Climb the minimalism ladder before screening against the `AGENTS.md`
   catalog: the catalog says what must not break, never what to add.
+- Mechanism for a race, security edge case or failure nobody has reproduced is
+  not built in the round (principles §1, speculative robustness). Name its
+  trigger path, evidence and cost under scope at the top of the hand-back, and
+  leave the decision to the maintainer. Validation, error handling and security
+  at a real trust boundary are still required.
 - Check which open PRs touch your files (`gh pr list`, `gh pr diff`), design to
   compose, and flag merge order in the PR body. Branch `fix/<N>-<slug>` from
   `origin/master` unless the brief names a branch. Preserve contributor
   authorship on a contributor's branch.
-- Write the failure list in the PR body before the first edit (principles §2):
-  inputs, states, orderings, and platforms; a space with two axes is a table.
+- Write the failure list under `### Tests` in the PR body before the first edit
+  (principles §2): inputs, states, orderings, and platforms; a space with two
+  axes is a table.
   The tests cover that list, not only the happy path. For a change to N of M
   members, the list also names M, the excluded default, and the planned
   generalization verdict: *widen in this PR*, *follow-up issue* with its seam
@@ -67,7 +86,7 @@ exports change.
   tests stay green; put any behaviour change in a separate commit (#3817).
 - Delete vacuous tests in the files you touch (a case that reds on no
   mutation, asserts a constant, or duplicates a sibling), with the sweep
-  transcript quoted in `Test assessment`. A redundant test that still guards
+  transcript quoted in `### Tests`. A redundant test that still guards
   goes only with the named survivor that covers it.
 - Apply folded review follow-ups per `docs/pi-lens-subagent.md`
   "Follow-ups", and list every gap left open in one **Accepted residuals** section of
@@ -212,7 +231,8 @@ exports change.
   (#2654).
 - Spot-check one prior round's mutation on the new head (#2583).
 - Re-read the changelog fragment for any claim the round retracts (#3155), then
-  add an honest review-round section to the PR body.
+  update the PR body in place so it describes the current head. Do not append a
+  round section; commits and review threads hold the history.
 - Lint the PR body (`--lint-local`) before the first push of a round, not only
   at hand-back: `PR body (advisory)` re-reads the same body on every push, so
   an unfixed finding reds each one.
@@ -227,22 +247,39 @@ rigor (#2599).
 
 ## Handoff
 
-- The PR body is the whole `.github/PULL_REQUEST_TEMPLATE.md`, every
-  heading present in order: `## Why` (one sentence), `## Notes for the
-  reviewer`, `## Change outline`, `## Summary`, `## Type of change`,
-  `## Area`, `## Checklist`, `## Tests`, `## Blast radius`,
-  `## Observability` (a record literal from the runtime diff, `none: <reason>`,
+- The PR body follows `.github/PULL_REQUEST_TEMPLATE.md`, which a reader must
+  be able to scan (#5003): `## Summary` (at most three sentences, with the
+  closing keyword, which GitHub ignores in a title, and with counted sentences
+  in its `Refs #NNN`, `Remaining #NNN:` and `Closes #NNN` lines counted too),
+  `## Notes for the reviewer`
+  (at most five bullets, no tables or fences), `## Change outline`, and
+  `## Proof and checks` with `### Tests`, `### Class sweep` (ending in one
+  `Alignment:` line that names the families of `docs/alignment-families.md` the
+  change touches, or `none: <reason>` of 12+ characters),
+  `### Observability` (a record literal from the runtime diff, `none: <reason>`,
   or exactly `No new failure path; no record added.`, which a new decision
-  branch on a session, lifecycle or delivery seam refuses, #3875),
-  `## Class sweep`, and `## Test assessment`. A brief that names only some
-  headings does not shorten this list. The closing keyword lives in the body;
-  GitHub ignores it in a title.
+  branch on a session, lifecycle or delivery seam refuses, #3875), and
+  `### Fold check` (one line per candidate, `#N folded`, `#N not folded` or
+  `#N sequenced`, then its reason, or `none: <reason>`; the body lint owns the
+  form and the local script owns the candidate list, #4711). Add `### Blast
+  radius` only when the change reaches outside the touched module or hits a hot
+  path. The lint caps visible text at 5000 characters and each code fence at 20
+  lines: quote failing lines, not whole runs, and give each mutation one table
+  row, not a paragraph. A brief that names only some headings does not shorten
+  this list.
 - Run `node scripts/check-pr-body.mjs --lint-local PR_BODY.md` and
   `node scripts/check-changelog-fragments.mjs` before the hand-back; both
   must pass, and the hand-back quotes them. The body lint reads the closed
   issue's labels through `gh api`; a `::warning::` that the Detection check
   was skipped means gh failed, so the section was not required, not that it
-  passed (#4288). A non-bug PR either deletes the `## Detection` section or
+  passed (#4288). A body that only references an issue (`Refs #N`, or any
+  close keyword the closing read does not own), or whose title names one
+  (`(refs #N)`), owes the same section when that issue is labelled `bug` or
+  `nightly-drift`; so does a body that closes a `nightly-drift` issue. A
+  reference written as `owner/repo#N` or a URL is refused unless the body
+  already closes a bug, which owes the section whatever else it cites. CI refuses a label
+  it cannot read; the local preflight, with no working gh, warns and skips it
+  as for a closed issue (#4968). A non-bug PR either deletes the `### Detection` section or
   fills the three lines, and a `Shape:` or `Enforcer:` line it does write is
   validated too; free text in between reds the local preflight. A bug-closing
   PR that answers a layer, the `Gap: none:` reason, the `Shape: new:` name or
@@ -270,7 +307,8 @@ rigor (#2599).
   (#4439).
 - A `Shape: new: <name>` is a proposal, not a catalog entry: write the
   proposed shape text in the PR body under "Proposed contract change
-  (maintainer decision)" and never edit `AGENTS.md`. Catalog shapes and rule
+  (maintainer decision)" and never edit `docs/defect-shapes.md`. Catalog shapes
+  and rule
   changes are the maintainer's decision; the orchestrator lands an approved
   one in its own change (#4577's fixer added shape 74 unasked, and the
   governance suites redded).

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import {
@@ -109,6 +110,19 @@ interface AgentEndDeps {
 	 * fall back to today's "claim everything" behavior.
 	 */
 	currentSessionId?: string;
+	/**
+	 * #4943: a concurrent in-process secondary drains only the records its own
+	 * session owns, and leaves the per-cwd actionable-warning quickfix to the
+	 * primary. Omitted: the primary's drain.
+	 */
+	sessionRole?: "primary" | "concurrent-secondary";
+	/**
+	 * #5108 F5: the session an agent advisory from this drain is for, as the
+	 * caller's `context` drain resolves it. The coordinator's scope (`session`
+	 * below) is the primary's, and a concurrent secondary drains its own.
+	 * Guarded writes keep `session`. Absent: `session`.
+	 */
+	advisoryScope?: LineageHandle;
 	/** Test/override hook for {@link DEFERRED_FORMAT_STALE_AFTER_MS}. */
 	staleAfterMs?: number;
 }
@@ -135,6 +149,8 @@ function recordProjectChange(args: {
 	filePath: string;
 	source: ProjectChangeSource;
 	dbg: (msg: string) => void;
+	/** #4943: the draining session, which owns every record it claimed. */
+	sessionId: string | undefined;
 }): void {
 	// One mutation seam (#2000 phase 1): bump + receipt + change-log live in
 	// RuntimeCoordinator.recordProjectMutation; this wrapper only carries the
@@ -143,6 +159,7 @@ function recordProjectChange(args: {
 		filePath: args.filePath,
 		source: args.source,
 		cwd: args.cwd,
+		sessionId: args.sessionId,
 		onAppendError: (err) =>
 			args.dbg(`project change log append failed for ${args.filePath}: ${err}`),
 	});
@@ -160,11 +177,12 @@ function retireChangedAuthorshipBeforeDrain(
 	session: LineageHandle,
 	filePath: string,
 	getFlag: (name: string, filePath?: string) => boolean | string | undefined,
+	sessionId: string | undefined,
 ): void {
 	if (getFlag("no-read-guard")) return;
 	// Optional, as the guard's other per-write members are to a host double.
 	session.guardedWrite(filePath, () =>
-		runtime.readGuard.retireChangedAuthorship?.(filePath),
+		runtime.readGuardFor(sessionId).retireChangedAuthorship?.(filePath),
 	);
 }
 
@@ -182,6 +200,8 @@ export async function handleAgentEnd({
 	ruffClient,
 	getAutofixClients,
 	currentSessionId,
+	sessionRole = "primary",
+	advisoryScope,
 	staleAfterMs = DEFERRED_FORMAT_STALE_AFTER_MS,
 }: AgentEndDeps): Promise<AgentEndFormatSummary | undefined> {
 	// Backstop for read captures (#4185 R2-3, round 4). A call's capture is
@@ -190,7 +210,7 @@ export async function handleAgentEnd({
 	// pi's agent loop takes `handleRunFailure`, which emits agent_end and no
 	// tool_execution_end) leaves one, and it must not license an edit in the
 	// next run.
-	runtime.readGuard.dropProvisionalReads();
+	runtime.readGuardFor(currentSessionId).dropProvisionalReads();
 	// #791: ownership-filtered drain — records queued by a DIFFERENT known
 	// session (e.g. a concurrent in-process secondary/subagent) stay queued
 	// for their owner's own agent_end, unless they've been stale long enough
@@ -238,6 +258,8 @@ export async function handleAgentEnd({
 			Date.now(),
 			staleAfterMs,
 			ctxCwd ?? runtime.projectRoot,
+			// #4943: a secondary takes its own records and nothing else.
+			sessionRole === "concurrent-secondary",
 		);
 	const records = [...claimed, ...staleClaimed];
 	const scheduledTurnId = records[0]?.queuedTurnId;
@@ -305,7 +327,10 @@ export async function handleAgentEnd({
 	// A path-aware source resolver signals that nested configs may re-enable
 	// actionable autofix even when the root default is off. Legacy/test hosts
 	// without that resolver keep the old fast exit and avoid a cache read.
+	// #4943: the report is per cwd, not any session's own record, so only the
+	// primary's drain applies its quick fixes.
 	const inspectActionableReport =
+		sessionRole === "primary" &&
 		actionableWarningsWriterEnabled &&
 		typeof cacheManager.readCache === "function" &&
 		(rootActionableAutofixEnabled || getFlagSource !== undefined);
@@ -535,11 +560,32 @@ export async function handleAgentEnd({
 			policy?.scope && policy.scope !== "file"
 				? `${policy.defaultTool ?? "unknown"}:${path.resolve(record.cwd)}`
 				: `${policy?.defaultTool ?? "unknown"}:${filePath}`;
-		if (executedAutofixScopes.has(scopeKey)) continue;
+		if (executedAutofixScopes.has(scopeKey)) {
+			// Once per tool/scope per session, not per skipped file or drain.
+			recordDegradationOnce({
+				kind: "deferred-autofix-duplicate-scope",
+				subject: createHash("sha256").update(scopeKey).digest("hex"),
+				reason: "deferred autofix scope already attempted in this drain",
+				metadata: {
+					scopeKey,
+					reason: "duplicate-scope",
+					tool: policy?.defaultTool ?? "unknown",
+					scope: policy?.scope ?? "file",
+					filePath,
+				},
+			});
+			continue;
+		}
 		executedAutofixScopes.add(scopeKey);
 		// #4131: the fixer's recordWritten below credits authorship without
 		// bytes the agent saw, so it may only advance one whose bytes still hold.
-		retireChangedAuthorshipBeforeDrain(runtime, session, filePath, getFlag);
+		retireChangedAuthorshipBeforeDrain(
+			runtime,
+			session,
+			filePath,
+			getFlag,
+			currentSessionId,
+		);
 		// #3506: the fixer rewrites the file in place, inside pi's queue, which
 		// runAutofix enters only once the fixer is resolved.
 		const fixHold = holdFileMutationQueue(filePath);
@@ -578,10 +624,11 @@ export async function handleAgentEnd({
 						filePath: changedPath,
 						source: "autofix",
 						dbg,
+						sessionId: currentSessionId,
 					});
 					// #3525: bytes the agent never saw; authorship, not FileTime.
 					if (!getFlag("no-read-guard"))
-						runtime.readGuard.recordWritten(changedPath, {
+						runtime.readGuardFor(currentSessionId).recordWritten(changedPath, {
 							authorship: "whole-file",
 							branchEpoch: queuedBranchEpoch,
 							stampFileTime: false,
@@ -617,17 +664,39 @@ export async function handleAgentEnd({
 		} finally {
 			fixHold?.release();
 		}
-		// The restore of agent edits the fixer overwrote waits for pi's queue
-		// entries (#3830), so it is awaited here, after the hold is released,
-		// never inside it.
-		const loss = await restoring;
-		if (loss && (loss.lost.length > 0 || loss.possiblyLost.length > 0)) {
-			// The agent's turn is over, so a UI notify alone reaches nobody it
-			// could act through (and print/json modes drop it): queue the same
-			// text for the model's next `context` call as well.
-			const text = renderFixRunLoss(loss);
-			queueAgentAdvisory(text, session);
-			notify(`pi-lens: ${text}`, "warning");
+		// #3915: bound only the wait, after releasing the target's hold.
+		// The original restore still owns its queued writes and reports loss
+		// once when it settles, even after the deadline or caller abort.
+		if (restoring) {
+			// #3915: the restore needs no `lateFormatCompletions`-style registration — every file it writes is an agent-edited one, which `wholePackageChangedFiles` excludes from `changedFiles`, so no `pilens:files:touched` event and no drain write names a restored file.
+			await bounded(
+				restoring.then((loss) => {
+					if (loss.lost.length > 0 || loss.possiblyLost.length > 0) {
+						try {
+							// Keep the captured session: a late advisory must not reach
+							// the session that replaced this drain.
+							const text = renderFixRunLoss(loss);
+							queueAgentAdvisory(text, advisoryScope ?? session);
+							notify(`pi-lens: ${text}`, "warning");
+						} catch (err) {
+							// #3915: `bounded()` boxes this rejection and swallows it once
+							// its deadline fired, so the loss notice failure is recorded.
+							const message = err instanceof Error ? err.message : String(err);
+							recordDegradationOnce({
+								kind: "fix-run-loss-notice-failed",
+								subject: filePath,
+								reason: `the deferred autofix loss notice failed: ${message}`,
+							});
+						}
+					}
+				}),
+				{
+					ms: HOOK_WALL_BUDGET_MS.agent_settled,
+					signal,
+					hook: "agent_settled",
+					label: "deferred-autofix-restore",
+				},
+			);
 		}
 	}
 	if (deferredAutofixFixes.length > 0) {
@@ -764,7 +833,13 @@ export async function handleAgentEnd({
 					continue;
 				}
 				// #4131: as in the autofix loop, before the formatter rewrites it.
-				retireChangedAuthorshipBeforeDrain(runtime, session, filePath, getFlag);
+				retireChangedAuthorshipBeforeDrain(
+					runtime,
+					session,
+					filePath,
+					getFlag,
+					currentSessionId,
+				);
 				// #3506: the formatter rewrites the file in place, and its read-back
 				// belongs to the same hold. The release follows the phase itself,
 				// not this bound, and an abandoned formatter keeps it until its
@@ -1006,10 +1081,11 @@ export async function handleAgentEnd({
 						filePath,
 						source: "format",
 						dbg,
+						sessionId: currentSessionId,
 					});
 					// #3525: bytes the agent never saw; authorship, not FileTime.
 					if (!getFlag("no-read-guard")) {
-						runtime.readGuard.recordWritten(filePath, {
+						runtime.readGuardFor(currentSessionId).recordWritten(filePath, {
 							authorship: "whole-file",
 							branchEpoch: queuedBranchEpoch,
 							stampFileTime: false,
@@ -1280,6 +1356,7 @@ export async function handleAgentEnd({
 						session,
 						file.filePath,
 						getFlag,
+						currentSessionId,
 					);
 				const mutationContext: LspMutationContext = {
 					cwd: fixCwd,
@@ -1304,11 +1381,13 @@ export async function handleAgentEnd({
 									// (retire before, advance over its rewrite) and not an
 									// unlicensed advance over a byte nothing checked.
 									recordWritten: (filePath: string) =>
-										runtime.readGuard.recordWritten(filePath, {
-											authorship: "whole-file",
-											branchEpoch: credit,
-											stampFileTime: false,
-										}),
+										runtime
+											.readGuardFor(currentSessionId)
+											.recordWritten(filePath, {
+												authorship: "whole-file",
+												branchEpoch: credit,
+												stampFileTime: false,
+											}),
 								},
 					// #3576: a /new during the pass stops it and its bookkeeping.
 					session,

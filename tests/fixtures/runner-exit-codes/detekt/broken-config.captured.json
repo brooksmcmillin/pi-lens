@@ -1,0 +1,37 @@
+{
+	"provenance": {
+		"runner": "detekt",
+		"tool": "detekt",
+		"version": "1.23.8",
+		"command": "detekt --input __WORKSPACE__/Bad.kt --config __WORKSPACE__/detekt.yml",
+		"argv": [
+			"--input",
+			"__WORKSPACE__/Bad.kt",
+			"--config",
+			"__WORKSPACE__/detekt.yml"
+		],
+		"versionArgv": [
+			"--version"
+		],
+		"workspace": "tests/fixtures/runner-exit-codes/detekt/workspace",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-24",
+		"note": "Exit 1: detekt rejects a malformed detekt.yml (InvalidConfigurationError on stderr, no findings)"
+	},
+	"availability": [
+		{
+			"command": "detekt",
+			"argv": [
+				"--version"
+			],
+			"version": "1.23.8",
+			"exitCode": 0,
+			"stdout": "1.23.8\n",
+			"stderr": ""
+		}
+	],
+	"file": "Bad.kt",
+	"exitCode": 1,
+	"stdout": "",
+	"stderr": "Exception in thread \"main\" io.gitlab.arturbosch.detekt.api.Config$InvalidConfigurationError: Provided configuration file is invalid: Structure must be from type Map<String,Any>!\nwhile parsing a block mapping\n in reader, line 2, column 3:\n      ForbiddenComment:\n      ^\nexpected <block end>, but found ':'\n in reader, line 4, column 3:\n      : : [\n      ^\n\n\tat io.gitlab.arturbosch.detekt.core.config.YamlConfig$Companion.load(YamlConfig.kt:77)\n\tat io.gitlab.arturbosch.detekt.core.config.YamlConfig$Companion.load(YamlConfig.kt:66)\n\tat io.gitlab.arturbosch.detekt.core.config.ConfigurationsKt.parsePathConfig(Configurations.kt:43)\n\tat io.gitlab.arturbosch.detekt.core.config.ConfigurationsKt.loadConfiguration(Configurations.kt:16)\n\tat io.gitlab.arturbosch.detekt.core.tooling.ProcessingSpecSettingsBridgeKt.withSettings$lambda$0(ProcessingSpecSettingsBridge.kt:16)\n\tat io.gitlab.arturbosch.detekt.core.util.PerformanceMonitor.measure(PerformanceMonitor.kt:43)\n\tat io.gitlab.arturbosch.detekt.core.tooling.ProcessingSpecSettingsBridgeKt.withSettings(ProcessingSpecSettingsBridge.kt:16)\n\tat io.gitlab.arturbosch.detekt.core.tooling.AnalysisFacade.runAnalysis$detekt_core(AnalysisFacade.kt:47)\n\tat io.gitlab.arturbosch.detekt.core.tooling.AnalysisFacade.run(AnalysisFacade.kt:25)\n\tat io.gitlab.arturbosch.detekt.cli.runners.Runner.call(Runner.kt:33)\n\tat io.gitlab.arturbosch.detekt.cli.CliRunner.run(CliRunner.kt:31)\n\tat io.gitlab.arturbosch.detekt.cli.CliRunner.run(CliRunner.kt:14)\n\tat io.gitlab.arturbosch.detekt.cli.Main.main(Main.kt:20)\nCaused by: while parsing a block mapping\n in reader, line 2, column 3:\n      ForbiddenComment:\n      ^\nexpected <block end>, but found ':'\n in reader, line 4, column 3:\n      : : [\n      ^\n\n\tat org.snakeyaml.engine.v2.parser.ParserImpl$ParseBlockMappingKey.produce(ParserImpl.java:728)\n\tat org.snakeyaml.engine.v2.parser.ParserImpl.lambda$produce$1(ParserImpl.java:232)\n\tat java.base/java.util.Optional.ifPresent(Unknown Source)\n\tat org.snakeyaml.engine.v2.parser.ParserImpl.produce(ParserImpl.java:232)\n\tat org.snakeyaml.engine.v2.parser.ParserImpl.peekEvent(ParserImpl.java:206)\n\tat org.snakeyaml.engine.v2.comments.CommentEventsCollector$1.peek(CommentEventsCollector.java:57)\n\tat org.snakeyaml.engine.v2.comments.CommentEventsCollector$1.peek(CommentEventsCollector.java:43)\n\tat org.snakeyaml.engine.v2.comments.CommentEventsCollector.collectEvents(CommentEventsCollector.java:135)\n\tat org.snakeyaml.engine.v2.comments.CommentEventsCollector.collectEvents(CommentEventsCollector.java:115)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeMappingNode(Composer.java:328)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeNode(Composer.java:210)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeValueNode(Composer.java:364)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeMappingChildren(Composer.java:343)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeMappingNode(Composer.java:321)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeNode(Composer.java:210)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeValueNode(Composer.java:364)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeMappingChildren(Composer.java:343)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeMappingNode(Composer.java:321)\n\tat org.snakeyaml.engine.v2.composer.Composer.composeNode(Composer.java:210)\n\tat org.snakeyaml.engine.v2.composer.Composer.next(Composer.java:162)\n\tat org.snakeyaml.engine.v2.composer.Composer.getSingleNode(Composer.java:128)\n\tat org.snakeyaml.engine.v2.api.Load.loadOne(Load.java:110)\n\tat org.snakeyaml.engine.v2.api.Load.loadFromReader(Load.java:134)\n\tat io.gitlab.arturbosch.detekt.core.config.YamlConfig$Companion.load(YamlConfig.kt:76)\n\t... 12 more\n"
+}

@@ -23,6 +23,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { faultResult, faultSkip } from "../types.js";
 
 import {
 	resolveRunnerCwd,
@@ -315,7 +316,7 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 
 		// Handle spawn errors (e.g., binary not found)
 		if (checkResult.error) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			return faultSkip("did-not-run");
 		}
 
 		let fixKindByRule: Map<string, BiomeFixKind> | undefined;
@@ -355,24 +356,17 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 				"Biome JSON parse failed: " +
 				parsed.parseError +
 				(preview ? " (output preview: " + preview + ")" : "");
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: "biome:parse-error:1",
-						message,
-						filePath: ctx.filePath,
-						line: 1,
-						column: 1,
-						severity: "warning",
-						semantic: "warning",
-						tool: "biome",
-					},
-				],
-				semantic: "warning",
-				failureKind: "parser_error",
-				failureMessage: message.slice(0, 200),
-			};
+			return faultResult(
+				{ kind: "parser_error", failureMessage: message },
+				{
+					id: "biome:parse-error:1",
+					message,
+					filePath: ctx.filePath,
+					line: 1,
+					column: 1,
+					tool: "biome",
+				},
+			);
 		}
 
 		return finishParsedRun({

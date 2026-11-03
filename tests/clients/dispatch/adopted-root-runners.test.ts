@@ -30,7 +30,20 @@ import { FormatService } from "../../../clients/format-service.js";
 import { clearFormatterRuntimeState } from "../../../clients/formatters.js";
 import { MetricsClient } from "../../../clients/metrics-client.js";
 import { RuffClient } from "../../../clients/ruff-client.js";
-import { analyzeFile } from "../../../clients/mcp/analyze.js";
+import {
+	acquireWarmWordIndex,
+	analyzeFile,
+} from "../../../clients/mcp/analyze.js";
+import {
+	buildWordIndex,
+	serializeWordIndex,
+	wordIndexPostingHits,
+} from "../../../clients/word-index.js";
+import {
+	flushProjectSnapshotPersistsForTests,
+	PROJECT_SNAPSHOT_VERSION,
+	saveProjectSnapshot,
+} from "../../../clients/project-snapshot.js";
 import {
 	runAutofix,
 	runFormatPhase,
@@ -943,6 +956,172 @@ describe("#4242 adopted-root runner allowlist", () => {
 			);
 			expect(run).not.toHaveBeenCalled();
 			expect(result.diagnostics).toEqual([]);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	// #4242 remainder, MCP half: `pilens_analyze` (and the warm hook route) keeps a
+	// per-cwd warm word index, so the same refusal applies when the analyzed file
+	// lives in an adopted root — the index belongs to `cwd`, not to the file.
+	it("leaves the warm word index of the workspace unchanged for an adopted-root analyze", async () => {
+		const fixture = adoptedFixture();
+		try {
+			vi.stubEnv("PI_LENS_TEST_MODE", "0");
+			const sessionFile = path.join(fixture.sessionRoot, "session-widget.sh");
+			const sessionContent = "session_widget() { echo widget; }\n";
+			fs.writeFileSync(sessionFile, sessionContent);
+			saveProjectSnapshot(fixture.sessionRoot, {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: fixture.sessionRoot,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [],
+				wordIndex: serializeWordIndex(
+					buildWordIndex([{ path: sessionFile, content: sessionContent }]),
+				),
+			});
+			flushProjectSnapshotPersistsForTests();
+
+			const adoptedFile = path.join(fixture.adoptedRoot, "adopted-widget.sh");
+			fs.writeFileSync(adoptedFile, "adopted_widget() { echo widget; }\n");
+			const result = await analyzeFile(adoptedFile, fixture.sessionRoot, {
+				warmLsp: false,
+				record: false,
+				updateGraph: true,
+				flags: { "no-lsp": true, "no-autofix": true },
+			});
+			expect(result.hasBlockers).toBe(false);
+
+			const lease = acquireWarmWordIndex(fixture.sessionRoot);
+			try {
+				expect(lease.index?.docCount).toBe(1);
+				expect(
+					wordIndexPostingHits(lease.index!, "widget").map((hit) => hit.file),
+				).toEqual([sessionFile]);
+			} finally {
+				lease.release();
+			}
+			expect(
+				(await decisionRows(adoptedFile, "adopted_root_writer_skipped")).map(
+					(row) => row.metadata.writer,
+				),
+			).toContain("word-index");
+
+			// The allow direction: a file of the workspace itself still enters the
+			// warm index. Recurrence: an over-refusing gate (inverted or always
+			// refusing) stops the warm index receiving every in-workspace file and
+			// stays green when only the refusal is asserted (#4775 F2).
+			const gadgetFile = path.join(fixture.sessionRoot, "session-gadget.md");
+			fs.writeFileSync(gadgetFile, "# Gadget notes\n");
+			await analyzeFile(gadgetFile, fixture.sessionRoot, {
+				warmLsp: false,
+				record: false,
+				updateGraph: true,
+				flags: { "no-lsp": true, "no-autofix": true },
+			});
+			const afterSession = acquireWarmWordIndex(fixture.sessionRoot);
+			try {
+				expect(afterSession.index?.docCount).toBe(2);
+				expect(
+					wordIndexPostingHits(afterSession.index!, "gadget").map(
+						(hit) => hit.file,
+					),
+				).toEqual([gadgetFile]);
+			} finally {
+				afterSession.release();
+			}
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	// Recurrence (#4775 F1): the refusal record was written before asking whether
+	// a warm index exists, so a cold process logged a skipped write that had no
+	// target and spent the file's first rising-edge record on it.
+	it("records no word-index refusal for an adopted-root analyze when no warm index exists", async () => {
+		const fixture = adoptedFixture();
+		try {
+			vi.stubEnv("PI_LENS_TEST_MODE", "0");
+			const adoptedFile = path.join(fixture.adoptedRoot, "adopted-cold.sh");
+			fs.writeFileSync(adoptedFile, "adopted_cold() { echo cold; }\n");
+			await analyzeFile(adoptedFile, fixture.sessionRoot, {
+				warmLsp: false,
+				record: false,
+				updateGraph: true,
+				flags: { "no-lsp": true, "no-autofix": true },
+			});
+			const lease = acquireWarmWordIndex(fixture.sessionRoot);
+			try {
+				expect(lease.index).toBeUndefined();
+			} finally {
+				lease.release();
+			}
+			expect(
+				(await decisionRows(adoptedFile, "adopted_root_writer_skipped")).map(
+					(row) => row.metadata.writer,
+				),
+			).not.toContain("word-index");
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	// #4242 remainder, pi half: the per-edit cascade's word-index update is
+	// SESSION state, so a file in an adopted (read-only) root must not enter it.
+	// Driven through the real write pipeline, whose deferred cascade the host
+	// runs unawaited.
+	it("leaves the session word index unchanged for an adopted-root edit", async () => {
+		const fixture = adoptedFixture();
+		try {
+			vi.stubEnv("PI_LENS_TEST_MODE", "0");
+			const sessionFile = path.join(fixture.sessionRoot, "session-widget.ts");
+			const sessionContent = "export function sessionWidget() { return 1; }\n";
+			fs.writeFileSync(sessionFile, sessionContent);
+			const wordIndex = buildWordIndex([
+				{ path: sessionFile, content: sessionContent },
+			]);
+			expect(wordIndex.docCount).toBe(1);
+
+			const adoptedFile = path.join(fixture.adoptedRoot, "adopted-widget.sh");
+			fs.writeFileSync(adoptedFile, "adopted_widget() { echo widget; }\n");
+			const onWordIndexUpdated = vi.fn();
+
+			const result = await runPipeline(
+				{
+					filePath: adoptedFile,
+					cwd: fixture.adoptedRoot,
+					projectRoot: fixture.sessionRoot,
+					analysisRootMode: "adopted",
+					toolName: "write",
+					dbg: () => {},
+					getFlag: () => false,
+					wordIndex,
+					onWordIndexUpdated,
+				},
+				{
+					biomeClient: new BiomeClient(),
+					ruffClient: new RuffClient(),
+					metricsClient: new MetricsClient(),
+					fixedThisTurn: new Set(),
+					getFormatService: () => new FormatService("adopted-word-index"),
+				},
+			);
+			await result.cascadePromise;
+
+			expect(wordIndex.docCount).toBe(1);
+			expect(
+				wordIndexPostingHits(wordIndex, "widget").map((hit) => hit.file),
+			).toEqual([sessionFile]);
+			expect(onWordIndexUpdated).not.toHaveBeenCalled();
+			expect(
+				(await decisionRows(adoptedFile, "adopted_root_writer_skipped")).map(
+					(row) => row.metadata.writer,
+				),
+			).toContain("word-index");
 		} finally {
 			fixture.cleanup();
 		}

@@ -14,23 +14,13 @@
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LatencyEntry } from "../../clients/latency-logger.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const latencyEntries = vi.hoisted(() => [] as LatencyEntry[]);
 
 vi.mock("../../clients/latency-logger.js", async (importActual) => ({
 	...(await importActual<typeof import("../../clients/latency-logger.js")>()),
 	logLatency: (entry: LatencyEntry) => latencyEntries.push(entry),
-}));
-
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
 vi.mock("../../clients/safe-spawn.js", () => ({
@@ -48,6 +38,8 @@ vi.mock("../../clients/installer/index.js", () => ({
 
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 // The full path runs a REAL (unmocked) handleSessionStart body, same as
 // tests/index-integration.test.ts's integration cases — vitest's default
@@ -139,13 +131,18 @@ describe("quick-mode session_start skip observability (#1911)", () => {
 	let tmpDir: string;
 	let restoreStartupMode: () => void;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// The real config loader walks up from the session cwd to HOME (#4709);
+		// a pinned fixture HOME keeps that read off the maintainer's home.
+		pinFixtureHome("runtime-session-quick-mode-observability");
+		await installLspServiceDouble();
 		vi.clearAllMocks();
 		latencyEntries.length = 0;
 		tmpDir = setupTestEnvironment("pi-lens-quick-mode-obs-").tmpDir;
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		restoreStartupMode?.();
 		removeTempDirSync(tmpDir);
 	});

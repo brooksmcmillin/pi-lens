@@ -157,6 +157,19 @@ export function getGlobalPiLensLogDir(): string {
 }
 
 /**
+ * The machine-state root: `PI_LENS_HOME`, else `~/.pi-lens`, with no probe
+ * redirect. `getGlobalPiLensDir()` (`file-utils.ts`) answers through this.
+ * It lives here, off every cycle, because the spawn seam's trust judgment
+ * (`session-repository.ts`) excludes pi-lens's own store and cannot import
+ * `file-utils.ts`, which imports `safe-spawn.ts` (#4530).
+ */
+export function machineStateDir(): string {
+	const override = process.env.PI_LENS_HOME?.trim();
+	if (override) return path.resolve(override);
+	return path.join(os.homedir(), ".pi-lens");
+}
+
+/**
  * True when a vitest process is about to DESTROY a log under the REAL
  * machine-global home, `<os.homedir()>/.pi-lens` (#3721). The one rule every
  * truncating helper asks: `createNdjsonLogger`'s `truncate()` (behind

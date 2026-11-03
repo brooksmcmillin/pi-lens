@@ -1,15 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { checkProse } from "../../scripts/check-prose.mjs";
 import { lintPrBody } from "../../scripts/check-pr-body.mjs";
-import { htmlCommentEnd } from "../../scripts/lib/defect-shapes.mjs";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
+
+describe("heading rules read the lexer's headings (#4717 N2)", () => {
+	it("judges a setext heading's case", () => {
+		// Recurrence it prevents: the heading rule kept its own `#` regex, so a
+		// setext heading in Title Case was read as a prose line.
+		expect(checkProse("Some Title Case\n---------------\n").errors).toEqual([
+			expect.stringContaining("heading-case"),
+		]);
+	});
+});
 
 describe("checkProse", () => {
-	it("blocks the long sentence from the #4274 comment", () => {
+	it("warns on the long sentence from the #4274 comment, without failing (#5110)", () => {
 		const result = checkProse(
 			"The harness derives repoRoot from import.meta.url, and its sibling worktree case uses two scratch projects, not git worktree add, while the surrounding selection runs many files concurrently and makes the timing-sensitive case fail only under contention.",
 		);
-		expect(result.valid).toBe(false);
-		expect(result.errors.join(" ")).toContain("sentence-length");
+		expect(result.valid).toBe(true);
+		expect(result.errors).toEqual([]);
+		expect(result.warnings.join(" ")).toContain("sentence-length");
 	});
 
 	it("accepts clean prose and reports passive voice as a warning", () => {
@@ -33,15 +47,14 @@ describe("checkProse", () => {
 		expect(checkProse(text)).toEqual({ valid: true, errors: [], warnings: [] });
 	});
 
-	it("blocks please and downgrades it in warn mode", () => {
-		const result = checkProse("Please do the requested check.");
-		expect(result.valid).toBe(false);
-		expect(result.errors.join(" ")).toContain('remove "please"');
-		const warning = checkProse("Please do the requested check.", {
-			mode: "warn",
-		});
-		expect(warning).toMatchObject({ valid: true, errors: [] });
-		expect(warning.warnings.join(" ")).toContain('remove "please"');
+	it("warns on please and simply, and never fails on them (#5110)", () => {
+		const result = checkProse("Please simply do this.");
+		expect(result).toMatchObject({ valid: true, errors: [] });
+		expect(result.warnings.join(" ")).toContain('remove "please"');
+		expect(result.warnings.join(" ")).toContain('remove "simply"');
+		expect(checkProse("Please simply do this.", { mode: "warn" })).toEqual(
+			result,
+		);
 	});
 
 	it("ignores comments, generated footers, and trailing metadata", () => {
@@ -75,39 +88,76 @@ describe("checkProse", () => {
 		expect(
 			checkProse(
 				"- This deliberately has enough ordinary words to exceed the prose limit because it never reaches a terminal sentence boundary and must remain one sentence while the checker preserves this unbroken paragraph for its length guard.",
-			).errors.join(" "),
+			).warnings.join(" "),
 		).toContain("sentence-length");
-	});
-
-	it("can downgrade blocking findings in warn mode", () => {
-		const result = checkProse("Please simply do this.", { mode: "warn" });
-		expect(result).toMatchObject({ valid: true, errors: [] });
-		expect(result.warnings.join(" ")).toContain("filler");
 	});
 
 	const longAfterEnd =
 		"This deliberately long sentence sits after a comment close and contains enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because the guard must never miss visible text.";
 	// Recurrence (#4565): this masker ended an HTML comment at `-->` alone,
 	// so text GitHub renders after `--!>`, `<!-->` or `<!--->` was masked,
-	// and a gating rule read visible prose as absent. Each row names one of
-	// the four ends the HTML spec gives a comment (13.2.5.43-46).
+	// and a gating rule read visible prose as absent. Each row is an inline
+	// comment the lexer reads (#4717): `--!>` ends none, so its text is prose
+	// too. A line that opens with `<!--` is a raw-HTML block instead, dropped
+	// whole (fail closed), so the rows sit mid-line.
 	const commentEnds: Array<[string, string]> = [
-		["`-->`", `<!-- note --> ${longAfterEnd}`],
-		["`--!>`", `<!-- note --!> ${longAfterEnd}`],
-		["`<!-->`", `<!--> ${longAfterEnd}`],
-		["`<!--->`", `<!---> ${longAfterEnd}`],
+		["`-->`", `Intro <!-- note --> ${longAfterEnd}`],
+		["`--!>`", `Intro <!-- note --!> ${longAfterEnd}`],
+		["`<!-->`", `Intro <!--> ${longAfterEnd}`],
+		["`<!--->`", `Intro <!---> ${longAfterEnd}`],
 	];
 	for (const [end, text] of commentEnds)
 		it(`counts a long sentence after the ${end} end`, () => {
-			expect(checkProse(text).errors.join(" ")).toContain("sentence-length");
+			expect(checkProse(text).warnings.join(" ")).toContain("sentence-length");
 		});
 
 	it("still hides a long sentence inside a comment", () => {
 		const hidden =
 			"This comment body sits inside the comment and carries enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because the guard must never count hidden text as prose.";
 		expect(
-			checkProse(`<!-- ${hidden} --> Run the test.`).errors.join(" "),
+			checkProse(`<!-- ${hidden} --> Run the test.`).warnings.join(" "),
 		).not.toContain("sentence-length");
+	});
+
+	// #4717 V1: the masker treated any `<!--` as an opener, so prose after a
+	// mid-line opener that never closes was skipped instead of judged, and a
+	// body writing about the comment syntax escaped the length rule. The opener
+	// rule is `blankHtmlComments`'s now.
+	it("counts prose after a mid-line opener that never closes", () => {
+		const long =
+			"This sentence follows a mid-line opener and carries enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because visible prose is prose.";
+		expect(
+			checkProse(`The scan reads <!-- as an opener. ${long}`).warnings.join(
+				" ",
+			),
+		).toContain("sentence-length");
+	});
+
+	it("counts prose after an opener quoted in a backtick span", () => {
+		const long =
+			"This sentence follows a quoted opener and carries enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because visible prose is prose.";
+		expect(
+			checkProse(`The scan reads \`<!--\` as an opener. ${long}`).warnings.join(
+				" ",
+			),
+		).toContain("sentence-length");
+	});
+
+	// #4717 parity: code spans are blanked before the prose rules read a line,
+	// but the line filters (a stack frame `at …`, a command) must read the line
+	// as written. Filtering the blanked line dropped `\`rows\` at 0 …` from
+	// docs/release-qa-baseline.md as a stack frame and lost its findings.
+	it("judges a line that opens with a code span followed by `at`", () => {
+		const result = checkProse(
+			"`rows` at 0 is then dropped, so nothing was witnessed and the row is ignored.",
+		);
+		expect(result.warnings.join(" ")).toContain("passive-voice");
+	});
+
+	it("quotes a passive excerpt with one space where a code span sat", () => {
+		expect(
+			checkProse("The value is `cap` clamped.").warnings.join(" "),
+		).toContain('near "is clamped"');
 	});
 
 	it("hides a continuation line that starts with the abrupt-end dash", () => {
@@ -119,31 +169,106 @@ describe("checkProse", () => {
 		const hidden =
 			"This comment continuation carries enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because the guard must never count hidden text as prose.";
 		const result = checkProse(`<!--\n-> ${hidden}\n--> Run the test.`);
-		expect(result.errors.join(" ")).not.toContain("sentence-length");
+		expect(result.warnings.join(" ")).not.toContain("sentence-length");
 		expect(result).toEqual({ valid: true, errors: [], warnings: [] });
-	});
-
-	it("applies the abrupt ends at the opener only, never mid-comment", () => {
-		// The owner's precondition, which F1 in the round-7 verify walked into:
-		// `>` and `->` close inside `<!--` itself, so they answer only when `from`
-		// is the opener's end. check-prose skips a blockquote line before it
-		// masks, so no masker row reaches the `>` arm; this pins the contract the
-		// next per-line consumer inherits.
-		expect(htmlCommentEnd("<!--> tail", 4)).toBe(5);
-		expect(htmlCommentEnd("<!---> tail", 4)).toBe(6);
-		expect(htmlCommentEnd("> tail", 0)).toBe(-1);
-		expect(htmlCommentEnd("-> tail", 0)).toBe(-1);
 	});
 
 	it("applies the checker to PR prose sections only", () => {
 		const long =
-			"This sentence has enough ordinary words to exceed the prose limit and should fail when it appears in a Summary section because the PR body gate checks that section during every local and CI validation run.";
+			"This sentence has enough ordinary words to exceed the prose limit and should warn when it appears in a Summary section because the PR body gate checks that section during every local and CI validation run.";
 		const body = `## Why\nShort reason.\n\n## Notes for the reviewer\nShort note.\n\n## Summary\n${long}\n\n## Tests\n\`\`\`text\n${long}\n\`\`\`\n\n## Blast radius\nNone.\n\n## Class sweep\nDone.\n\n## Observability\nRecorded.`;
-		expect(lintPrBody(body, { workingTree: true }).errors.join(" ")).toContain(
-			"sentence-length",
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const result = lintPrBody(body, { workingTree: true });
+		expect(result.errors.join(" ")).not.toContain("sentence-length");
+		// Only the Summary sentence is judged: the fenced Tests line is not prose.
+		const printed = warn.mock.calls.map(([line]) => String(line));
+		expect(
+			printed.filter((line) => line.includes("sentence-length")),
+		).toHaveLength(1);
+	});
+});
+
+// #5110: the prose rules print warnings and never fail the lint on their own;
+// every structural rule still fails. Each body below carries one prose fault
+// or one missing section, so a red names the rule that changed.
+describe("prose rules warn, structural rules still fail (#5110)", () => {
+	const forty =
+		"The lint reads every Summary and Notes sentence, and a sentence that runs past thirty words currently blocks the whole body even when every required section is present, complete, accurate, and correct in the final text that reviewers read today.";
+	const body = (summary: string, observability = true) =>
+		`## Summary\n\nCloses #5110. ${summary} Structural rules still fail.\n\n## Notes for the reviewer\n\n- The fixture changes nothing else.\n\n## Change outline\n\n- caller\n  + changed symbol\n    + callee\n\n## Proof and checks\n\n### Tests\n\nTargeted tests pass.\n\n### Class sweep\n\nDefect shape: a prose rule that fails the lint. Search: \`rg -n "sentence-length" scripts\`. Verdict: stays distributed because the fixture changes no code.\n\nAlignment: none: this fixture touches no family.\n\n${observability ? "### Observability\n\nNo new failure path; no record added.\n\n" : ""}### Fold check\n\nnone: fixture only, no candidate.\n`;
+
+	it("control: a clean body passes with no prose warning", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		expect(
+			lintPrBody(body("The lint reads each sentence once."), {
+				workingTree: true,
+			}),
+		).toEqual({ valid: true, errors: [] });
+		expect(warn).not.toHaveBeenCalledWith(
+			expect.stringContaining("PR body prose"),
+		);
+	});
+
+	// Recurrence it prevents: a prose rule that fails the lint again, which
+	// the author would only see on the next push.
+	const passesWithWarning = (summary: string, rule: string, detail: string) => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		expect(lintPrBody(body(summary), { workingTree: true })).toEqual({
+			valid: true,
+			errors: [],
+		});
+		const printed = warn.mock.calls.map(([line]) => String(line)).join("\n");
+		expect(printed).toContain(`PR body prose warning: ${rule} (line 3)`);
+		expect(printed).toContain(detail);
+	};
+	it("passes a body whose only fault is a 40-word sentence, with a warning line", () =>
+		passesWithWarning(forty, "sentence-length", "found 40"));
+	it("passes a body whose only fault is a filler word, with a warning line", () =>
+		passesWithWarning(
+			"Please read the summary before the round starts.",
+			"filler",
+			'remove "please"',
+		));
+
+	it("still fails a body that is missing a required section", () => {
+		// Recurrence it prevents: demoting the prose channel to warnings also
+		// demotes the structural errors, so a body without its Observability
+		// section passes the lint with its prose clean.
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const result = lintPrBody(body(forty, false), { workingTree: true });
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('is missing "## Observability"');
+	});
+	it("still fails a title-case heading through the lint (#5110)", () => {
+		// Recurrence it prevents: the lint stops pushing prose errors, so the one
+		// prose rule that still blocks (title-case headings) passes silently.
+		// Only checkProse read it before this pin.
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const text = body("The fixture is short.").replace(
+			"## Notes for the reviewer",
+			"## Notes For The Reviewer",
+		);
+		const result = lintPrBody(text, { workingTree: true });
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("PR body prose heading-case");
+	});
+
+	it("demotes a title-case heading in grace mode, and only headings (#5110)", () => {
+		// Recurrence it prevents: grace mode (PI_LENS_PROSE_GRACE, --prose-grace)
+		// stops reaching the heading rule, or it demotes a structural error too.
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const titleCase = body("The fixture is short.").replace(
+			"## Notes for the reviewer",
+			"## Notes For The Reviewer",
 		);
 		expect(
-			lintPrBody(body, { proseMode: "warn" }).errors.join(" "),
-		).not.toContain("sentence-length");
+			lintPrBody(titleCase, { workingTree: true, proseMode: "warn" }),
+		).toEqual({ valid: true, errors: [] });
+		const printed = warn.mock.calls.map(([line]) => String(line)).join("\n");
+		expect(printed).toContain("PR body prose warning: heading-case");
+		expect(
+			lintPrBody(body(forty, false), { workingTree: true, proseMode: "warn" })
+				.valid,
+		).toBe(false);
 	});
 });

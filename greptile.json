@@ -8,13 +8,53 @@
 
 	"ignorePatterns": "package-lock.json",
 
-	"instructions": "This repo has a contract in AGENTS.md ('Recurring defect shapes'). Review against it. Do not comment on lint-enforced style. A finding needs a code path or a test that demonstrates it. Reviews run on PR open only: request a review with @greptileai when wanted.",
+	"instructions": "This repo has a contract in AGENTS.md, with the numbered defect shapes in docs/defect-shapes.md and the per-seam invariants in docs/invariants/. Review against them. Do not comment on lint-enforced style. A finding needs a code path or a test that demonstrates it. Reviews run on PR open only: request a review with @greptileai when wanted.",
 
 	"customContext": {
 		"files": [
 			{
 				"path": "AGENTS.md",
-				"description": "Repo contract: recurring defect shapes and contributing rules. Review changes against these shapes.",
+				"description": "Repo contract: the trigger-grouped index of recurring defect shapes, task routing and contributing rules. Review changes against these shapes.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/defect-shapes.md",
+				"description": "Numbered defect-shape catalog: each entry's screen, enforcer, census and gathered evidence. Review changes against these entries.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/invariants/language-config.md",
+				"description": "Standing invariants: languages and configuration.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/invariants/paths-os.md",
+				"description": "Standing invariants: path keys, path spelling and platform behavior.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/invariants/lsp-trust-exec.md",
+				"description": "Standing invariants: LSP, trust and process execution.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/invariants/dispatch-runners.md",
+				"description": "Standing invariants: dispatch, runners, formatters and installers.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/invariants/caches-stores.md",
+				"description": "Standing invariants: caches, stores and project intelligence.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/invariants/session-telemetry.md",
+				"description": "Standing invariants: session, telemetry and delivery.",
+				"scope": ["**/*"]
+			},
+			{
+				"path": "docs/invariants/git-guard-host.md",
+				"description": "Standing invariants: the Git guard and the host adapters.",
 				"scope": ["**/*"]
 			}
 		]

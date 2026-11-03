@@ -29,6 +29,7 @@ import {
 	napiFallbackCoveredSince,
 	resetNapiFallbackCoverageForTests,
 } from "../../../../clients/lsp/pending-aux-coverage.js";
+import { installLspServiceDouble } from "../../../support/lsp-service-seam.js";
 import {
 	makeRealRunnerEnv,
 	type RealRunnerEnv,
@@ -48,13 +49,6 @@ const { mockAuxiliaryLspPublished, recordEntitySnapshotDiffMock } = vi.hoisted(
 // Environment only: whether the ast-grep LSP has published for this root is LSP
 // state, not the behavior under test. Everything else in `clients/lsp/index.js`
 // stays real so the dispatch module graph still resolves.
-vi.mock("../../../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../../../clients/lsp/capabilities.js")
-	>()),
-	hasAuxiliaryLspPublishedForRoot: mockAuxiliaryLspPublished,
-}));
-
 vi.mock(
 	"../../../../clients/review-graph/service.js",
 	async (importOriginal) => ({
@@ -100,8 +94,11 @@ beforeAll(() => {
 });
 afterAll(() => env?.cleanup());
 
-beforeEach(() => {
+beforeEach(async () => {
 	mockAuxiliaryLspPublished.mockResolvedValue(false);
+	await installLspServiceDouble({
+		hasServerPublishedForFileRoot: mockAuxiliaryLspPublished,
+	});
 	resetNapiFallbackCoverageForTests();
 });
 

@@ -37,7 +37,9 @@ describe("FormatService", () => {
 
 	it("returns empty result when disabled", async () => {
 		const service = new FormatService("test", false);
-		const result = await service.formatFile("/any/path.ts");
+		const result = await service.formatFile("/any/path.ts", {
+			sessionRoot: "/any",
+		});
 
 		expect(result.formatters).toEqual([]);
 		expect(result.anyChanged).toBe(false);
@@ -46,7 +48,10 @@ describe("FormatService", () => {
 
 	it("returns empty result when skip option is set", async () => {
 		const service = new FormatService("test", true);
-		const result = await service.formatFile("/any/path.ts", { skip: true });
+		const result = await service.formatFile("/any/path.ts", {
+			skip: true,
+			sessionRoot: "/any",
+		});
 
 		expect(result.formatters).toEqual([]);
 		expect(result.anyChanged).toBe(false);
@@ -60,7 +65,9 @@ describe("FormatService", () => {
 
 		const service = new FormatService("test", true);
 		service.recordRead(filePath);
-		const result = await service.formatFile(filePath);
+		const result = await service.formatFile(filePath, {
+			sessionRoot: fs.realpathSync(tmpDir),
+		});
 
 		expect(result.formatters).toEqual([]);
 		expect(result.anyChanged).toBe(false);
@@ -87,7 +94,9 @@ describe("FormatService", () => {
 
 		const service = new FormatService("test", true);
 		service.recordRead(filePath);
-		const result = await service.formatFile(filePath);
+		const result = await service.formatFile(filePath, {
+			sessionRoot: fs.realpathSync(tmpDir),
+		});
 
 		expect(result.anyChanged).toBe(true);
 		expect(result.allSucceeded).toBe(true);
@@ -120,7 +129,9 @@ describe("FormatService", () => {
 
 		const service = new FormatService("test", true);
 		service.recordRead(filePath);
-		const result = await service.formatFile(filePath);
+		const result = await service.formatFile(filePath, {
+			sessionRoot: fs.realpathSync(tmpDir),
+		});
 
 		expect(result.anyChanged).toBe(false);
 		expect(result.allSucceeded).toBe(false);
@@ -139,7 +150,9 @@ describe("FormatService", () => {
 		await new Promise((r) => setTimeout(r, 10));
 		fs.writeFileSync(filePath, "const x = 2;");
 
-		const result = await service.formatFile(filePath);
+		const result = await service.formatFile(filePath, {
+			sessionRoot: fs.realpathSync(tmpDir),
+		});
 
 		expect(result.allSucceeded).toBe(false);
 		expect(result.formatters).toEqual([]);

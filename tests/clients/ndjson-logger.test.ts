@@ -36,22 +36,81 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
-import { createPiMock, makeCtx } from "../support/pi-mock.js";
+import { isUnderDir } from "../../clients/path-utils.js";
+import { piSessionFixture, startPiSession } from "../support/pi-session.js";
 import { removeTempDirSync } from "./test-utils.js";
 
-// flake-shape: never-settling-wait — the timeout witness must hold a real
-// appendFile promise forever to prove shutdown proceeds at the bound.
+// #4937 L2: both `session_shutdown` cases run on a real pi session (tier 2, the
+// inline-factory mode) under this file's one fixture root (pi-session.ts, "one
+// fixture root per file"). The extension runs on THIS test graph's modules, so
+// the degradation-ledger row the wedged drain records is the one the case reads,
+// and the session's own background writes (the project-snapshot persist decision
+// into `latency.log`) are joined by the handle's teardown drain. A path-loaded
+// copy leaves that write unreachable: it landed in whichever case ran next and
+// reddened the global `appendFile` call counts below (#4997 r1, seed 1).
+const fixture = piSessionFixture();
 
 let tmpDir: string;
 let logFile: string;
+
+// #4997 F1 (round 2): appends are routed by target, so a case counts and gates
+// only its own sinks. A tier-2 session's fire-and-forget startup tasks (the
+// `todo` scan's `git` spawn) can log to `<fixture>/home/latency.log` and
+// `sessionstart.log` after that case's teardown, inside whichever case runs
+// next. Under a slow `git` (a plegma worker's node shim, ~0.07 s against
+// ~0.00 s native) those appends landed in a counting case: seeds 424, 202 and
+// 33 red, and a gate that caught one never opened (seed 202 hung 120 s).
+// Every append under the case's `tmpDir` goes to `caseSink.appendFile`, which
+// the cases spy on; every other append goes to the real `appendFile`, never
+// counted and never held. A foreign target is admitted only under a pi-lens
+// home the session writes to: the fixture's `home/`, or the setup's per-worker
+// home that this graph's sinks resolved at first import, before the tier-2 pin
+// (the inline-factory session shares them). Anything else reds the case in
+// `afterEach`, so a writer that outlives its own case and writes outside those
+// homes still fails.
+const realAppendFile = fs.promises.appendFile.bind(fs.promises);
+const caseSink: { appendFile: typeof fs.promises.appendFile } = {
+	appendFile: realAppendFile,
+};
+const foreignAppends: string[] = [];
+const sessionHomes = [process.env.PI_LENS_HOME ?? ""].filter(Boolean);
+/** Gates a case holds an append behind; `afterEach` opens any left shut. */
+const openGates = new Set<() => void>();
+
+/** Whether a path is this case's own: under its `tmpDir`, either spelling. */
+function inCase(target: unknown): boolean {
+	return isUnderDir(String(target), tmpDir);
+}
+
+/** A held append's promise, registered so a red case never strands it. */
+function heldUntil(capture: (release: () => void) => void): Promise<void> {
+	return new Promise<void>((resolve) => {
+		openGates.add(resolve);
+		capture(resolve);
+	});
+}
 
 beforeEach(() => {
 	resetDegradationLedger();
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ndjson-logger-"));
 	logFile = path.join(tmpDir, "test.log");
+	foreignAppends.length = 0;
+	vi.spyOn(fs.promises, "appendFile").mockImplementation(
+		(target, data, options) => {
+			if (inCase(target)) return caseSink.appendFile(target, data, options);
+			foreignAppends.push(String(target));
+			return realAppendFile(target, data, options);
+		},
+	);
 });
 
 afterEach(() => {
+	for (const release of openGates) release();
+	openGates.clear();
+	const admittedHomes = [path.join(fixture.root, "home"), ...sessionHomes];
+	const unexpectedForeign = foreignAppends.filter(
+		(file) => !admittedHomes.some((home) => isUnderDir(file, home)),
+	);
 	vi.restoreAllMocks();
 	// `fs.appendFileSync` is a module-scope `vi.fn()` (see the `vi.mock` above),
 	// not a per-test `vi.spyOn` — `restoreAllMocks()` doesn't touch it at all.
@@ -69,6 +128,7 @@ afterEach(() => {
 	removeTempDirSync(tmpDir);
 	resetSinkWriteFailures();
 	resetSinkRotations();
+	expect(unexpectedForeign).toEqual([]);
 });
 
 function readLines(file: string): string[] {
@@ -77,7 +137,7 @@ function readLines(file: string): string[] {
 
 describe("createNdjsonLogger", () => {
 	it("serializes a burst of log() calls in enqueue order", async () => {
-		const appendFile = vi.spyOn(fs.promises, "appendFile");
+		const appendFile = vi.spyOn(caseSink, "appendFile");
 		const logger = createNdjsonLogger({ filePath: logFile });
 		for (let i = 0; i < 50; i++) {
 			logger.log({ i });
@@ -93,7 +153,7 @@ describe("createNdjsonLogger", () => {
 	});
 
 	it("splits batches at truncate boundaries", async () => {
-		const appendFile = vi.spyOn(fs.promises, "appendFile");
+		const appendFile = vi.spyOn(caseSink, "appendFile");
 		const writeFile = vi.spyOn(fs.promises, "writeFile");
 		const logger = createNdjsonLogger({ filePath: logFile });
 		logger.log({ before: 1 });
@@ -125,16 +185,23 @@ describe("createNdjsonLogger", () => {
 	});
 
 	it("real session_shutdown drains an in-flight writer before exit flushSync", async () => {
-		const { default: registerExtension } = await import("../../index.js");
-		const mock = createPiMock({ "lens-lsp": false });
-		registerExtension(mock.asExtensionAPI());
+		// Tier 2: the extension's own `session_shutdown` handler runs through pi's
+		// extension runner and returns the bounded NDJSON drain. The writer it
+		// awaits is the process-global one this logger registered into, so the held
+		// append is what the handler must wait for. The emit goes to the runner, not
+		// to `handle.dispose()`: dispose settles the sinks itself after the emit and
+		// would mask a handler that drains nothing.
+		const handle = await startPiSession({
+			root: fixture.root,
+			responses: [],
+			inlineFactory: async () => (await import("../../index.js")).default,
+		});
 		let release!: () => void;
-		const held = new Promise<void>((resolve) => {
+		const held = heldUntil((resolve) => {
 			release = resolve;
 		});
-		const realAppendFile = fs.promises.appendFile.bind(fs.promises);
 		const appendFile = vi
-			.spyOn(fs.promises, "appendFile")
+			.spyOn(caseSink, "appendFile")
 			.mockImplementation(async (...args) => {
 				await held;
 				return realAppendFile(...args);
@@ -142,41 +209,87 @@ describe("createNdjsonLogger", () => {
 		const logger = createNdjsonLogger({ filePath: logFile });
 		logger.log({ kind: "shutdown-witness" });
 		await new Promise<void>((resolve) => setImmediate(resolve));
-		const shutdown = mock.emit(
-			"session_shutdown",
-			{ type: "session_shutdown", reason: "quit" },
-			makeCtx({ cwd: tmpDir, sessionId: "shutdown-witness" }),
-		);
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		release();
-		await shutdown;
+		let shutdownSettled = false;
+		const shutdown = handle.session.extensionRunner
+			.emit({ type: "session_shutdown", reason: "quit" } as never)
+			.then((value) => {
+				shutdownSettled = true;
+				return value;
+			});
+		try {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			// The handler holds the emit while the append is in flight: a shutdown
+			// that returned here would have drained nothing.
+			expect(shutdownSettled).toBe(false);
+			release();
+			await shutdown;
+			// The drain wrote the in-flight line before the handler returned, so the
+			// line is on disk before any synchronous flush of this test's own.
+			expect(readLines(logFile)).toHaveLength(1);
+		} finally {
+			// A failed assertion above must not leave the append held: the handle's
+			// teardown drain waits on this same writer.
+			release();
+		}
 		logger.flushSync();
 		expect(appendFile).toHaveBeenCalled();
 		expect(readLines(logFile)).toHaveLength(1);
-	});
+	}, 60_000);
 
 	it("bounds a wedged shutdown drain and records one degradation", async () => {
-		const { default: registerExtension } = await import("../../index.js");
-		const mock = createPiMock({ "lens-lsp": false });
-		registerExtension(mock.asExtensionAPI());
-		vi.spyOn(fs.promises, "appendFile").mockImplementation(
-			() => new Promise<never>(() => {}),
-		);
+		// Tier 2, inline-factory mode: the extension runs on THIS test graph's
+		// modules, so the degradation-ledger row the bounded drain records is the
+		// one this test reads. Earlier cases call vi.resetModules(), so the ledger
+		// is read through a dynamic import taken after the factory's, never the
+		// static import above.
+		const handle = await startPiSession({
+			root: fixture.root,
+			responses: [],
+			inlineFactory: async () => (await import("../../index.js")).default,
+		});
+		const { getDegradationSummary: summaryNow } =
+			await import("../../clients/degradation-ledger.js");
+		// Hold this case's appends behind a gate it opens. A never-settling
+		// promise would stay in the process-global writer map after the case, and
+		// the next case that awaits `flushAllNdjsonWriters()` (the tier-2 teardown
+		// in tests/support/pi-session.ts) would wait on it for good: the CI
+		// shuffle lane hung 60 s on seed 424 (#4997 F1).
+		let release!: () => void;
+		const held = heldUntil((resolve) => {
+			release = resolve;
+		});
+		vi.spyOn(caseSink, "appendFile").mockImplementation(async (...args) => {
+			await held;
+			return realAppendFile(...args);
+		});
 		const logger = createNdjsonLogger({ filePath: logFile });
-		logger.log({ kind: "shutdown-timeout-witness" });
-		await mock.emit(
-			"session_shutdown",
-			{ type: "session_shutdown", reason: "quit" },
-			makeCtx({ cwd: tmpDir, sessionId: "shutdown-timeout-witness" }),
-		);
-		const rows = getDegradationSummary().filter(
-			(row) => row.kind === "hook-await-exceeded",
-		);
-		expect(rows).toHaveLength(1);
-		expect(rows[0]?.latestReasons[0]?.subject).toBe(
-			"session_shutdown:ndjson-writers",
-		);
-	});
+		try {
+			logger.log({ kind: "shutdown-timeout-witness" });
+			await handle.session.extensionRunner.emit({
+				type: "session_shutdown",
+				reason: "quit",
+			} as never);
+			const rows = summaryNow().filter(
+				(row) => row.kind === "hook-await-exceeded",
+			);
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.latestReasons[0]?.subject).toBe(
+				"session_shutdown:ndjson-writers",
+			);
+		} finally {
+			// Leave no live writer state behind: open the gate, then wait until this
+			// case's writer has drained to disk (still inside `tmpDir`, which
+			// `afterEach` removes next). Only this writer: settling the whole
+			// process-global map waited on writers another case held (#4997 F5,
+			// seed 202, 120 s).
+			release();
+			await logger.flush();
+		}
+		// The released append landed: the writer is empty, not abandoned mid-write.
+		expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
+			{ kind: "shutdown-timeout-witness" },
+		]);
+	}, 60_000);
 
 	it("lazily creates the parent directory", async () => {
 		const nested = path.join(tmpDir, "a", "b", "c", "deep.log");
@@ -328,12 +441,11 @@ describe("createNdjsonLogger", () => {
 		// line is not. The async completion handler must still leave the
 		// (now-empty) queue alone.
 		let release: (() => void) | undefined;
-		const realAppendFile = fs.promises.appendFile.bind(fs.promises);
 		const appendFile = vi
-			.spyOn(fs.promises, "appendFile")
+			.spyOn(caseSink, "appendFile")
 			.mockImplementationOnce(async (file, data, options) => {
 				await realAppendFile(file, data, options);
-				await new Promise<void>((resolve) => {
+				await heldUntil((resolve) => {
 					release = resolve;
 				});
 			});
@@ -365,13 +477,12 @@ describe("createNdjsonLogger", () => {
 	});
 
 	it("the real-pi harness waits out the accepted exit-flush duplicate", async () => {
-		const realAppendFile = fs.promises.appendFile.bind(fs.promises);
 		const releases: Array<() => void> = [];
 		const appendFile = vi
-			.spyOn(fs.promises, "appendFile")
+			.spyOn(caseSink, "appendFile")
 			.mockImplementation(async (file, data, options) => {
 				await realAppendFile(file, data, options);
-				await new Promise<void>((resolve) => releases.push(resolve));
+				await heldUntil((resolve) => releases.push(resolve));
 			});
 		const logger = createNdjsonLogger({ filePath: logFile });
 		logger.log({ immediate: true });
@@ -424,11 +535,10 @@ describe("createNdjsonLogger", () => {
 	it("shares the writer and queued operations across module re-evaluation", async () => {
 		const count = process.listenerCount("exit");
 		let releaseFirstAppend: (() => void) | undefined;
-		const realAppendFile = fs.promises.appendFile.bind(fs.promises);
 		const appendFile = vi
-			.spyOn(fs.promises, "appendFile")
+			.spyOn(caseSink, "appendFile")
 			.mockImplementationOnce(async (file, data, options) => {
-				await new Promise<void>((resolve) => {
+				await heldUntil((resolve) => {
 					releaseFirstAppend = resolve;
 				});
 				return realAppendFile(file, data, options);
@@ -487,11 +597,10 @@ describe("createNdjsonLogger", () => {
 	it("preserves the documented late in-flight append after rotation", async () => {
 		fs.writeFileSync(logFile, "seed-data\n");
 		let releaseAppend: (() => void) | undefined;
-		const realAppendFile = fs.promises.appendFile.bind(fs.promises);
 		const appendFile = vi
-			.spyOn(fs.promises, "appendFile")
+			.spyOn(caseSink, "appendFile")
 			.mockImplementationOnce(async (file, data, options) => {
-				await new Promise<void>((resolve) => {
+				await heldUntil((resolve) => {
 					releaseAppend = resolve;
 				});
 				return realAppendFile(file, data, options);
@@ -529,10 +638,9 @@ describe("createNdjsonLogger", () => {
 
 	it("repairs a late append that would otherwise reintroduce pre-truncate data", async () => {
 		let releaseAppend: (() => void) | undefined;
-		const realAppendFile = fs.promises.appendFile.bind(fs.promises);
-		vi.spyOn(fs.promises, "appendFile").mockImplementationOnce(
+		vi.spyOn(caseSink, "appendFile").mockImplementationOnce(
 			async (file, data, options) => {
-				await new Promise<void>((resolve) => {
+				await heldUntil((resolve) => {
 					releaseAppend = resolve;
 				});
 				return realAppendFile(file, data, options);
@@ -557,11 +665,10 @@ describe("createNdjsonLogger", () => {
 
 	it("upgrades a version-1 writer through a parent module graph", async () => {
 		let releaseAppend: (() => void) | undefined;
-		const realAppendFile = fs.promises.appendFile.bind(fs.promises);
 		const appendFile = vi
-			.spyOn(fs.promises, "appendFile")
+			.spyOn(caseSink, "appendFile")
 			.mockImplementationOnce(async (file, data, options) => {
-				await new Promise<void>((resolve) => {
+				await heldUntil((resolve) => {
 					releaseAppend = resolve;
 				});
 				return realAppendFile(file, data, options);
@@ -742,9 +849,8 @@ describe("createNdjsonLogger", () => {
 
 	describe("reopen-and-retry on write failure (#1970)", () => {
 		it("recovers a write that fails once (e.g. a destroyed sink), no loss recorded", async () => {
-			const realAppendFile = fs.promises.appendFile.bind(fs.promises);
 			const appendFile = vi
-				.spyOn(fs.promises, "appendFile")
+				.spyOn(caseSink, "appendFile")
 				.mockImplementationOnce(async () => {
 					const err = new Error(
 						"Cannot call write after a stream was destroyed",
@@ -772,7 +878,7 @@ describe("createNdjsonLogger", () => {
 			) as NodeJS.ErrnoException;
 			err.code = "ERR_STREAM_DESTROYED";
 			const appendFile = vi
-				.spyOn(fs.promises, "appendFile")
+				.spyOn(caseSink, "appendFile")
 				.mockRejectedValue(err);
 
 			const logger = createNdjsonLogger({ filePath: logFile });
@@ -852,7 +958,7 @@ describe("createNdjsonLogger", () => {
 				"Cannot call write after a stream was destroyed",
 			) as NodeJS.ErrnoException;
 			err.code = "ERR_STREAM_DESTROYED";
-			vi.spyOn(fs.promises, "appendFile").mockRejectedValue(err);
+			vi.spyOn(caseSink, "appendFile").mockRejectedValue(err);
 
 			const logger = createNdjsonLogger({ filePath: logFile });
 			logger.log({ lost: true });
@@ -880,7 +986,7 @@ describe("createNdjsonLogger", () => {
 			) as NodeJS.ErrnoException;
 			err.code = "ERR_STREAM_DESTROYED";
 			const appendFile = vi
-				.spyOn(fs.promises, "appendFile")
+				.spyOn(caseSink, "appendFile")
 				.mockRejectedValue(err);
 
 			const logger = createNdjsonLogger({ filePath: logFile });
@@ -908,10 +1014,9 @@ describe("createNdjsonLogger", () => {
 
 			async function triggerRepairReplay(): Promise<RepairReplaySetup> {
 				let releaseAppend: (() => void) | undefined;
-				const realAppendFile = fs.promises.appendFile.bind(fs.promises);
-				vi.spyOn(fs.promises, "appendFile").mockImplementationOnce(
+				vi.spyOn(caseSink, "appendFile").mockImplementationOnce(
 					async (file, data, options) => {
-						await new Promise<void>((resolve) => {
+						await heldUntil((resolve) => {
 							releaseAppend = resolve;
 						});
 						return realAppendFile(file, data, options);
@@ -937,7 +1042,7 @@ describe("createNdjsonLogger", () => {
 				// Call 2 is the repair replay's first attempt at "after" — fails.
 				// Call 3 is applyQueueItemAsync's own retry — falls through to real.
 				const appendFile = vi
-					.spyOn(fs.promises, "appendFile")
+					.spyOn(caseSink, "appendFile")
 					.mockImplementationOnce(async () => {
 						const err = new Error(
 							"Cannot call write after a stream was destroyed",
@@ -968,7 +1073,7 @@ describe("createNdjsonLogger", () => {
 				err.code = "ERR_STREAM_DESTROYED";
 				// Both the repair replay's initial attempt and its one retry fail.
 				const appendFile = vi
-					.spyOn(fs.promises, "appendFile")
+					.spyOn(caseSink, "appendFile")
 					.mockImplementationOnce(async () => {
 						throw err;
 					})

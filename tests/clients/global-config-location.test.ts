@@ -23,6 +23,7 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { removeTempDirSync } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
 
 // Same sink-forwarding mock the other config suites use (#1333): config
 // notices go to the ndjson sink, and the mock forwards messages to
@@ -38,9 +39,9 @@ vi.mock("../../clients/extension-log.js", async (importOriginal) => {
 });
 
 const tmpDirs: string[] = [];
+const setConfigPath = useConfigPath();
 const savedEnv = new Map<string, string | undefined>();
 const OVERRIDDEN_ENV_KEYS = [
-	"PI_LENS_CONFIG_PATH",
 	"PI_CODING_AGENT_DIR",
 	"PI_LENS_HOME",
 	"HOME",
@@ -102,6 +103,7 @@ beforeEach(() => {
 		savedEnv.set(key, process.env[key]);
 		delete process.env[key];
 	}
+	setConfigPath(undefined);
 	resetDegradationLedger();
 	resetGlobalConfigLocationCache();
 	vi.spyOn(console, "error").mockImplementation(() => {});
@@ -124,7 +126,7 @@ describe("global config location resolution", () => {
 		const home = makeTempHome();
 		adoptHomeEnv(home);
 		const override = path.join(home, "custom-config.json");
-		process.env.PI_LENS_CONFIG_PATH = override;
+		setConfigPath(override);
 		const agentDir = path.join(home, "agent");
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		fs.mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
@@ -499,7 +501,7 @@ describe("production resolution memo", () => {
 		const home = makeTempHome();
 		adoptHomeEnv(home);
 		const override = path.join(home, "override.json");
-		process.env.PI_LENS_CONFIG_PATH = override;
+		setConfigPath(override);
 		const { globalConfigPath } = agentDirFixture(home);
 		resetGlobalConfigLocationCache();
 

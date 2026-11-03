@@ -103,6 +103,39 @@ describe("biome-check runner", () => {
 		}
 	});
 
+	// RECURRENCE THIS PREVENTS: #4130 item 3. A biome that resolved and then
+	// failed to spawn returned a bare skip, which the smoke classifier read as
+	// "tool absent".
+	it("names a failed biome spawn on its skip, and an unresolved biome as a plain skip (#4130)", async () => {
+		const env = setupTestEnvironment("pi-lens-biome-check-fault-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(filePath, "const x = 1\n");
+			const runner = (
+				await import("../../../../clients/dispatch/runners/biome-check.js")
+			).default;
+
+			safeSpawnAsync.mockResolvedValue({
+				error: new Error("Process timed out after 30000ms"),
+				status: null,
+				stdout: "",
+				stderr: "",
+			});
+			const broke = await runner.run(createCtx(filePath, env.tmpDir) as never);
+			expect(broke.status).toBe("skipped");
+			expect(broke.skipFault).toBe("did-not-run");
+
+			safeSpawnAsync.mockClear();
+			resolveToolCommandWithInstallFallback.mockResolvedValue(null);
+			const absent = await runner.run(createCtx(filePath, env.tmpDir) as never);
+			expect(absent.status).toBe("skipped");
+			expect(absent.skipFault).toBeUndefined();
+			expect(safeSpawnAsync).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("routes a rule with a real 'Fix: safe' explain answer to fixable/autoFixAvailable (#1810)", async () => {
 		const env = setupTestEnvironment("pi-lens-biome-check-");
 		try {

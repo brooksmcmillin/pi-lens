@@ -111,6 +111,15 @@ let pendingExec = null;
 // message-arrival timing.
 let deferredApplyEdit = null;
 
+// #4801: "FAKE_LSP_HANG_PROJECT_INFO" hangs the tsserver `projectInfo` request
+// (see the advertised commands and the executeCommand branch below).
+const HANG_PROJECT_INFO = ["1", "cancel"].includes(
+	process.env.FAKE_LSP_HANG_PROJECT_INFO ?? "",
+);
+const HANG_DEFINITION = process.env.FAKE_LSP_HANG_DEFINITION === "1";
+const HANG_DOCUMENT_SYMBOL = process.env.FAKE_LSP_HANG_DOCUMENT_SYMBOL === "1";
+let hungProjectInfoId = null;
+
 // #2450 review round 2 (F2): the target line/columns/replacement text are
 // overridable via a second `arguments[1]` object so callers can exercise a real
 // non-{1,1} range - a fixed line-0 edit made every caller's "real range" collide
@@ -160,6 +169,7 @@ function sendApplyEdit(spec) {
 }
 
 const openDocuments = new Map();
+const didCreateUris = new Set();
 
 // #2824: deterministic pull/push wire controls for the LSP wait-hardening
 // matrix. These are environment-configured because the fixture is a separate
@@ -241,6 +251,65 @@ const PUBLISH_SEQUENCE_FIRST_MS = Number(
 	process.env.FAKE_LSP_PUBLISH_SEQUENCE_FIRST_MS ?? "0",
 );
 
+// #4764: `window/showMessage` traffic, so a test can drive the client's own
+// handler over a real wire. `FAKE_LSP_SHOW_MESSAGES` is a JSON array of
+// `{ type, message }` (LSP `MessageType`: 1 Error, 2 Warning, 3 Info, 4 Log);
+// `FAKE_LSP_SHOW_MESSAGE` plus `FAKE_LSP_SHOW_MESSAGE_TYPE` (default 1, Error)
+// spells the single-message case. Messages are sent on `initialized` unless
+// `FAKE_LSP_SHOW_MESSAGE_AFTER_FIRST_PUBLISH=1`, which sends them right after
+// the FIRST publish of `FAKE_LSP_PUBLISH_SEQUENCE` — the order measured from
+// opengrep 1.30.0 offline (an empty publish at +10ms, then the rule-download
+// error in the same tick). `FAKE_LSP_SHOW_MESSAGE_DELAY_MS` (default 0) delays
+// that emission, so a test can choose whether the publish's debounce has
+// already stored the answer when the message arrives.
+const SHOW_MESSAGES = (() => {
+	const raw = process.env.FAKE_LSP_SHOW_MESSAGES;
+	if (raw) {
+		try {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed)) {
+				return parsed
+					.filter((m) => m && typeof m.message === "string")
+					.map((m) => ({ type: Number(m.type ?? 1), message: m.message }));
+			}
+		} catch {
+			/* a malformed array falls through to the single-message knob */
+		}
+	}
+	const message = process.env.FAKE_LSP_SHOW_MESSAGE;
+	if (!message) return [];
+	return [
+		{
+			type: Number(process.env.FAKE_LSP_SHOW_MESSAGE_TYPE ?? "1"),
+			message,
+		},
+	];
+})();
+const SHOW_MESSAGES_AFTER_FIRST_PUBLISH =
+	process.env.FAKE_LSP_SHOW_MESSAGE_AFTER_FIRST_PUBLISH === "1";
+const SHOW_MESSAGE_DELAY_MS = Number(
+	process.env.FAKE_LSP_SHOW_MESSAGE_DELAY_MS ?? "0",
+);
+
+function emitShowMessages() {
+	for (const message of SHOW_MESSAGES) {
+		send({
+			jsonrpc: "2.0",
+			method: "window/showMessage",
+			params: { type: message.type, message: message.message },
+		});
+	}
+}
+
+function scheduleShowMessages() {
+	if (SHOW_MESSAGE_DELAY_MS > 0) {
+		const timer = setTimeout(emitShowMessages, SHOW_MESSAGE_DELAY_MS);
+		timer.unref?.();
+		return;
+	}
+	emitShowMessages();
+}
+
 // #4320: a server that caches a failed module lookup, as Pyrefly 1.3.2 does
 // (measured: `import new_module` keeps its missing-import after the module is
 // created, until the server hears a `Created` watched-files event; `Changed`
@@ -256,13 +325,51 @@ const STALE_MODULE_LOOKUP = process.env.FAKE_LSP_STALE_MODULE_LOOKUP === "1";
 const STALE_MODULE_EXT = process.env.FAKE_LSP_STALE_MODULE_EXT ?? ".lua";
 const failedModuleLookups = new Set();
 
+// #4532: a server whose module search path comes from a config file at its
+// root, as pyright's `pyrightconfig.json` `extraPaths` does (measured, pyright
+// 1.1.414: a config created after the server answered is read only when a
+// `workspace/didChangeWatchedFiles` event names it; the registered watchers
+// are `**/pyrightconfig.json` and `**`). `FAKE_LSP_CONFIG_FILE=<name>` makes a
+// module that is not beside its importer resolve from `<root>/libs` when the
+// config read at initialize, or at the last watched-files event naming
+// `<root>/<name>`, holds `"extraPaths": ["libs"]`. Such an event drops every
+// remembered failed lookup and re-evaluates every open document. Off by
+// default.
+const CONFIG_FILE = process.env.FAKE_LSP_CONFIG_FILE ?? "";
+let configRoot;
+let configExtraDirs = [];
+
+function readServerConfig() {
+	configExtraDirs = [];
+	if (CONFIG_FILE === "" || configRoot === undefined) return;
+	try {
+		const parsed = JSON.parse(
+			fs.readFileSync(path.join(configRoot, CONFIG_FILE), "utf8"),
+		);
+		for (const extra of parsed.extraPaths ?? [])
+			configExtraDirs.push(path.join(configRoot, extra));
+	} catch {
+		// no config (or unreadable): the module search path stays the importer's dir
+	}
+}
+
+function resolvesFromConfig(target) {
+	return configExtraDirs.some((extra) =>
+		fs.existsSync(path.join(extra, path.basename(target))),
+	);
+}
+
 function publishModuleLookups(uri) {
 	const text = openDocuments.get(uri) ?? "";
 	const dir = path.dirname(fileURLToPath(uri));
 	const diagnostics = [];
 	for (const match of text.matchAll(/import\s+"(\.\.?\/[\w/-]+)"/g)) {
 		const target = path.join(dir, `${match[1]}${STALE_MODULE_EXT}`);
-		if (!failedModuleLookups.has(target) && !fs.existsSync(target)) {
+		if (
+			!failedModuleLookups.has(target) &&
+			!fs.existsSync(target) &&
+			!resolvesFromConfig(target)
+		) {
 			failedModuleLookups.add(target);
 		}
 		if (failedModuleLookups.has(target)) {
@@ -396,20 +503,127 @@ function checkerDiagnostics(uri) {
 // Push mode republishes every open document on each change to a view; pull
 // mode (`FAKE_LSP_NO_DIAGNOSTIC_PROVIDER` unset) answers each pull from the
 // views it holds at that moment.
-function checkEveryOpenDocument() {
+//
+// #4782: `FAKE_LSP_DEFER_DEPENDENTS_MS` re-checks only the document whose
+// change or open triggered the pass (`changedUri`) at once; every other open
+// document is re-checked that many ms later, against the views held then
+// (pyright's and typescript-language-server's dependent re-check is a
+// debounced timer, measured +360..400 ms). A watched-files event names no open
+// document, so it defers them all. A drain reply can then come before the
+// dependents' answers.
+function checkEveryOpenDocument(changedUri) {
 	if (process.env.FAKE_LSP_NO_DIAGNOSTIC_PROVIDER !== "1") return;
-	for (const uri of openDocuments.keys())
+	const publish = (uri) =>
 		send({
 			jsonrpc: "2.0",
 			method: "textDocument/publishDiagnostics",
 			params: { uri, diagnostics: checkerDiagnostics(uri) },
 		});
+	const deferMs = Number(process.env.FAKE_LSP_DEFER_DEPENDENTS_MS ?? "");
+	if (!(Number.isFinite(deferMs) && deferMs > 0)) {
+		for (const uri of openDocuments.keys()) publish(uri);
+		return;
+	}
+	if (changedUri !== undefined) publish(changedUri);
+	const dependents = [...openDocuments.keys()].filter(
+		(uri) => uri !== changedUri,
+	);
+	setTimeout(() => {
+		for (const uri of dependents)
+			if (openDocuments.has(uri)) publish(uri);
+	}, deferMs);
+}
+
+// #4763: opengrep's rule-load window. A `refreshed` element sends the param-less
+// `semgrep/rulesRefreshed` notification (opengrep@60ed3b3
+// `Scan_helpers.refresh_rules`): `empty,refreshed,dirty` is the measured cold
+// open of `--config auto` (`[]` at +10 ms, the notification at +0.7..1.0 s, the
+// findings after it). Once it has been sent the rules are loaded, so a LATER
+// open publishes only what follows the `refreshed` element (the warm shape:
+// `dirty` alone). Without a `refreshed` element nothing changes.
+let sequenceRefreshed = false;
+
+// #5131: a recompile-from-disk server (groovy-language-server). It "compiles"
+// one document at a time: `didOpen` and `didChange` publish one error when the
+// text holds `Foo` (an unresolved class), else an empty set, after
+// `FAKE_LSP_RECOMPILE_CLEARS_MS` of compile time for the open. A
+// `workspace/didChangeWatchedFiles` naming an open document recompiles it from
+// the tracker's reset state and publishes an EMPTY set 5 ms after the compile
+// queue drains, whatever the document holds (measured on the real server: the
+// `unable to resolve class Foo` error, then its `[]` 5 ms later, 100 ms after
+// the client's own watched-files notice). Publishes are version-less unless
+// `FAKE_LSP_RECOMPILE_VERSIONED=1` stamps the document version the server last
+// read; `FAKE_LSP_RECOMPILE_NO_WATCHED_CLEAR=1` leaves the notice unanswered;
+// `FAKE_LSP_RECOMPILE_MARK_PUBLISHES=1` follows each publish with a
+// `$/test/publishSent` notification (a `FAKE_LSP_PUBLISH_SEQUENCE` publish too).
+const RECOMPILE_CLEARS_MS = Number(
+	process.env.FAKE_LSP_RECOMPILE_CLEARS_MS ?? "-1",
+);
+const RECOMPILE_VERSIONED = process.env.FAKE_LSP_RECOMPILE_VERSIONED === "1";
+const RECOMPILE_NO_WATCHED_CLEAR =
+	process.env.FAKE_LSP_RECOMPILE_NO_WATCHED_CLEAR === "1";
+const RECOMPILE_MARK_PUBLISHES =
+	process.env.FAKE_LSP_RECOMPILE_MARK_PUBLISHES === "1";
+const recompileVersions = new Map();
+let recompileBusyUntil = 0;
+function recompilePublish(uri, diagnostics, compileMs = 0) {
+	const version = recompileVersions.get(uri);
+	const at = Math.max(Date.now() + compileMs, recompileBusyUntil) + 5;
+	recompileBusyUntil = at;
+	const timer = setTimeout(() => {
+		send({
+			jsonrpc: "2.0",
+			method: "textDocument/publishDiagnostics",
+			params: {
+				uri,
+				diagnostics,
+				...(RECOMPILE_VERSIONED && version !== undefined ? { version } : {}),
+			},
+		});
+		// The client has handled the publish by the time it reads this marker, so
+		// a test joins on it instead of polling.
+		if (RECOMPILE_MARK_PUBLISHES)
+			send({
+				jsonrpc: "2.0",
+				method: "$/test/publishSent",
+				params: { uri, count: diagnostics.length },
+			});
+	}, at - Date.now());
+	timer.unref?.();
+}
+function recompileCompile(uri, text, compileMs) {
+	recompilePublish(
+		uri,
+		text.includes("Foo")
+			? [
+					{
+						severity: 1,
+						source: "fake-recompile",
+						code: "P5131",
+						message: "unable to resolve class Foo",
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 1 },
+						},
+					},
+				]
+			: [],
+		compileMs,
+	);
 }
 
 function publishSequenceFor(uri) {
 	if (PUBLISH_SEQUENCE.length === 0) return false;
-	PUBLISH_SEQUENCE.forEach((shape, index) => {
+	const sequence = sequenceRefreshed
+		? PUBLISH_SEQUENCE.slice(PUBLISH_SEQUENCE.indexOf("refreshed") + 1)
+		: PUBLISH_SEQUENCE;
+	sequence.forEach((shape, index) => {
 		const emit = () => {
+			if (shape === "refreshed") {
+				sequenceRefreshed = true;
+				send({ jsonrpc: "2.0", method: "semgrep/rulesRefreshed" });
+				return;
+			}
 			send({
 				jsonrpc: "2.0",
 				method: "textDocument/publishDiagnostics",
@@ -432,13 +646,27 @@ function publishSequenceFor(uri) {
 							: [],
 				},
 			});
+			// #5131 round 2: the join marker a recompile publish carries, so a test
+			// reads each sequence publish's handled state off the wire, not a sleep.
+			if (RECOMPILE_MARK_PUBLISHES)
+				send({
+					jsonrpc: "2.0",
+					method: "$/test/publishSent",
+					params: { uri, count: shape === "dirty" ? 1 : 0 },
+				});
 		};
 		if (index === 0 && PUBLISH_SEQUENCE_FIRST_MS <= 0) {
 			emit();
+			if (SHOW_MESSAGES_AFTER_FIRST_PUBLISH) scheduleShowMessages();
 			return;
 		}
 		const timer = setTimeout(
-			emit,
+			() => {
+				emit();
+				if (index === 0 && SHOW_MESSAGES_AFTER_FIRST_PUBLISH) {
+					scheduleShowMessages();
+				}
+			},
 			PUBLISH_SEQUENCE_FIRST_MS + index * PUBLISH_SEQUENCE_GAP_MS,
 		);
 		timer.unref?.();
@@ -536,12 +764,38 @@ function send(msg) {
 	process.stdout.write(encode(msg));
 }
 
+// #4758: the settings a client delivers, read off the wire. With
+// FAKE_LSP_TRACE_CONFIG=1 the trace file gets one line each for the
+// initializationOptions, a didChangeConfiguration payload, and (when
+// FAKE_LSP_PULL_SECTIONS is a JSON array of section names) the client's answer
+// to a `workspace/configuration` request the server sends after `initialized`.
+const CONFIG_PULL_ID = "fake-config-pull";
+function traceConfig(what) {
+	if (process.env.FAKE_LSP_TRACE_CONFIG !== "1") return;
+	if (!process.env.FAKE_LSP_TRACE_FILE) return;
+	try {
+		fs.appendFileSync(process.env.FAKE_LSP_TRACE_FILE, `${what}\n`);
+	} catch {}
+}
+
 function handle(raw) {
 	let data;
 	try {
 		data = JSON.parse(raw);
 	} catch {
 		return;
+	}
+	if (data.id === CONFIG_PULL_ID && data.method === undefined) {
+		traceConfig(`config-pull-answer ${JSON.stringify(data.result ?? null)}`);
+		return;
+	}
+	if (data.method === "initialize") {
+		traceConfig(
+			`init-options ${JSON.stringify(data.params?.initializationOptions ?? null)}`,
+		);
+	}
+	if (data.method === "workspace/didChangeConfiguration") {
+		traceConfig(`config-push ${JSON.stringify(data.params?.settings ?? null)}`);
 	}
 	if (process.env.FAKE_LSP_TRACE_FILE) {
 		const trace = (what) => {
@@ -578,6 +832,13 @@ function handle(raw) {
 				`language ${data.params.textDocument.uri} ${data.params.textDocument.languageId}`,
 			);
 		}
+		// #4787: the URIs of each didCreateFiles notification, one line per
+		// notification, so a test counts batches and orders them against didOpen.
+		if (data.method === "workspace/didCreateFiles") {
+			trace(
+				`created ${(data.params?.files ?? []).map((file) => file.uri).join(" ")}`,
+			);
+		}
 		// #4320 r3: which watched-files changes reached this server.
 		if (data.method === "workspace/didChangeWatchedFiles") {
 			for (const change of data.params?.changes ?? []) {
@@ -592,12 +853,31 @@ function handle(raw) {
 		}
 	}
 
+	if (
+		process.env.FAKE_LSP_HANG_PROJECT_INFO === "cancel" &&
+		data.method === "$/cancelRequest" &&
+		hungProjectInfoId !== null &&
+		data.params?.id === hungProjectInfoId
+	) {
+		send({
+			jsonrpc: "2.0",
+			id: hungProjectInfoId,
+			error: { code: -32800, message: "cancelled" },
+		});
+		hungProjectInfoId = null;
+		return;
+	}
+
 	// Initialize handshake. FAKE_LSP_IGNORE_INITIALIZE simulates a hung server
 	// that never completes the handshake, so createLSPClient's
 	// initializeTimeoutMs/withTimeout fires and exercises the initialize-
 	// timeout kill + 2s SIGKILL-backstop path (#1114).
 	if (data.method === "initialize") {
 		if (process.env.FAKE_LSP_IGNORE_INITIALIZE === "1") return;
+		if (CONFIG_FILE !== "" && typeof data.params?.rootUri === "string") {
+			configRoot = fileURLToPath(data.params.rootUri);
+			readServerConfig();
+		}
 		if (CLOSED_FILE_CACHE && typeof data.params?.rootUri === "string") {
 			checkerRoot = fileURLToPath(data.params.rootUri);
 			walkAmbient(checkerRoot);
@@ -612,6 +892,8 @@ function handle(raw) {
 			clientCapabilities?.workspace?.fileOperations?.willRename === true;
 		const clientSupportsDidRename =
 			clientCapabilities?.workspace?.fileOperations?.didRename === true;
+		const clientSupportsDidCreate =
+			clientCapabilities?.workspace?.fileOperations?.didCreate === true;
 		const renameFilter = (globEnv, globDefault) => ({
 			scheme: "file",
 			pattern: {
@@ -633,7 +915,21 @@ function handle(raw) {
 						  !clientSupportsCodeActionResolve
 						? {}
 						: { resolveProvider: true };
-		const workspaceFileOperations =
+		// #4787: merged into the rename operations below, so a case that sets
+		// FAKE_LSP_DID_CREATE and FAKE_LSP_WILL_RENAME keeps both.
+		const didCreateFileOperations =
+			process.env.FAKE_LSP_DID_CREATE === "true" && clientSupportsDidCreate
+				? {
+						didCreate: {
+							filters: renameFilters(
+								"DID_CREATE",
+								"FAKE_LSP_DID_CREATE_GLOB",
+								"**/*",
+							),
+						},
+					}
+				: undefined;
+		const renameFileOperations =
 			process.env.FAKE_LSP_WILL_RENAME === "true"
 				? {
 						willRename: clientSupportsWillRename
@@ -665,6 +961,10 @@ function handle(raw) {
 						: process.env.FAKE_LSP_WILL_RENAME === "malformed"
 							? { willRename: "yes" }
 							: undefined;
+		const workspaceFileOperations =
+			didCreateFileOperations || renameFileOperations
+				? { ...didCreateFileOperations, ...renameFileOperations }
+				: undefined;
 		send({
 			jsonrpc: "2.0",
 			id: data.id,
@@ -725,6 +1025,12 @@ function handle(raw) {
 							"fake.applyEdit",
 							"fake.applyEditDeferred",
 							"fake.releaseDeferredApplyEdit",
+							// #4801: the tsserver escape hatch, whose `projectInfo` request
+							// the server accepts and never answers. "1" ignores a cancel for
+							// it; "cancel" answers the cancel with RequestCancelled. Off by
+							// default so the advertised list the other suites pin does not
+							// move.
+							...(HANG_PROJECT_INFO ? ["typescript.tsserverRequest"] : []),
 						],
 					},
 					// #3310: `FAKE_LSP_NO_DIAGNOSTIC_PROVIDER=1` advertises NO pull
@@ -775,6 +1081,21 @@ function handle(raw) {
 
 	// Ignore notifications without id
 	if (data.method === "initialized") {
+		if (process.env.FAKE_LSP_PULL_SECTIONS) {
+			send({
+				jsonrpc: "2.0",
+				id: CONFIG_PULL_ID,
+				method: "workspace/configuration",
+				params: {
+					items: JSON.parse(process.env.FAKE_LSP_PULL_SECTIONS).map(
+						(section) => ({ section }),
+					),
+				},
+			});
+		}
+		if (SHOW_MESSAGES.length > 0 && !SHOW_MESSAGES_AFTER_FIRST_PUBLISH) {
+			scheduleShowMessages();
+		}
 		// #1969: die mid-session with a chosen exit code and NOTHING on stderr —
 		// the exact ast-grep shape (code=1, empty stderr) whose cause used to
 		// leave no record. Silent by construction: this path writes no stderr.
@@ -844,13 +1165,43 @@ function handle(raw) {
 		return;
 	}
 	if (data.method === "textDocument/didOpen") {
+		if (process.env.FAKE_LSP_DID_CREATE_REQUIRED === "1") {
+			const uri = data.params?.textDocument?.uri;
+			send({
+				jsonrpc: "2.0",
+				method: "textDocument/publishDiagnostics",
+				params: {
+					uri,
+					diagnostics: didCreateUris.has(uri)
+						? [{
+								severity: 1,
+								code: "P4787",
+								message: "finding after didCreate",
+								range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+							}]
+						: [],
+				},
+			});
+		}
 		openDocuments.set(
 			data.params?.textDocument?.uri,
 			data.params?.textDocument?.text ?? "",
 		);
 		publishSequenceFor(data.params?.textDocument?.uri);
+		if (RECOMPILE_CLEARS_MS >= 0) {
+			recompileVersions.set(
+				data.params?.textDocument?.uri,
+				data.params?.textDocument?.version,
+			);
+			recompileCompile(
+				data.params?.textDocument?.uri,
+				data.params?.textDocument?.text ?? "",
+				RECOMPILE_CLEARS_MS,
+			);
+		}
 		if (STALE_MODULE_LOOKUP) publishModuleLookups(data.params?.textDocument?.uri);
-		if (CLOSED_FILE_CACHE) checkEveryOpenDocument();
+		if (CLOSED_FILE_CACHE)
+			checkEveryOpenDocument(data.params?.textDocument?.uri);
 		if (process.env.FAKE_LSP_PUSH_DIAGNOSTIC === "1") {
 			send({
 				jsonrpc: "2.0",
@@ -896,9 +1247,25 @@ function handle(raw) {
 		if (typeof text === "string") {
 			openDocuments.set(data.params?.textDocument?.uri, text);
 		}
+		// #4782: a dependency whose change takes the checker long to analyze.
+		// The work runs BEFORE the republish below, so the dependents' previous
+		// answers (checked against the old bytes) are the latest the client
+		// holds until this change's answers arrive, right before the reply to
+		// any request queued behind it.
+		const slowMarker = process.env.FAKE_LSP_SLOW_CHANGE_TEXT;
+		if (slowMarker && typeof text === "string" && text.includes(slowMarker))
+			burnCpu(Number(process.env.FAKE_LSP_SLOW_CHANGE_MS ?? "400"));
 		publishSequenceFor(data.params?.textDocument?.uri);
+		if (RECOMPILE_CLEARS_MS >= 0 && typeof text === "string") {
+			recompileVersions.set(
+				data.params?.textDocument?.uri,
+				data.params?.textDocument?.version,
+			);
+			recompileCompile(data.params?.textDocument?.uri, text, 0);
+		}
 		if (STALE_MODULE_LOOKUP) publishModuleLookups(data.params?.textDocument?.uri);
-		if (CLOSED_FILE_CACHE) checkEveryOpenDocument();
+		if (CLOSED_FILE_CACHE)
+			checkEveryOpenDocument(data.params?.textDocument?.uri);
 		// #4493 r2: a scanner that re-parses on every change (ast-grep's live
 		// shape). Synchronous, so a request queued behind the changes is answered
 		// only after all of them: what the #1714 aux pacing barrier waits on.
@@ -970,6 +1337,14 @@ function handle(raw) {
 		if (STALE_MODULE_LOOKUP) {
 			let created = false;
 			for (const change of data.params?.changes ?? []) {
+				if (
+					CONFIG_FILE !== "" &&
+					path.basename(fileURLToPath(change.uri)) === CONFIG_FILE
+				) {
+					readServerConfig();
+					failedModuleLookups.clear();
+					created = true;
+				}
 				if (change.type !== 1) continue;
 				created = failedModuleLookups.delete(fileURLToPath(change.uri)) || created;
 			}
@@ -989,6 +1364,10 @@ function handle(raw) {
 			}
 			checkEveryOpenDocument();
 		}
+		if (RECOMPILE_CLEARS_MS >= 0 && !RECOMPILE_NO_WATCHED_CLEAR) {
+			for (const change of data.params?.changes ?? [])
+				if (openDocuments.has(change.uri)) recompilePublish(change.uri, []);
+		}
 		if (process.env.FAKE_LSP_ECHO_WATCHED_FILES) {
 			send({
 				jsonrpc: "2.0",
@@ -998,6 +1377,10 @@ function handle(raw) {
 		}
 		return;
 	}
+	if (data.method === "workspace/didCreateFiles") {
+		for (const file of data.params?.files ?? []) didCreateUris.add(file.uri);
+		return;
+	}
 	if (data.method === "textDocument/publishDiagnostics") return;
 	if (data.method === "exit") {
 		process.exit(0);
@@ -1005,6 +1388,7 @@ function handle(raw) {
 
 	// Document symbol
 	if (data.method === "textDocument/documentSymbol") {
+		if (HANG_DOCUMENT_SYMBOL) return;
 		send({
 			jsonrpc: "2.0",
 			id: data.id,
@@ -1073,6 +1457,7 @@ function handle(raw) {
 	// FAKE_LSP_DEFINITION_DELAY_MS delays the reply so a test can bump the
 	// document version mid-request and exercise the stale-drop path (#276).
 	if (data.method === "textDocument/definition") {
+		if (HANG_DEFINITION) return;
 		const ln = data.params?.position?.line ?? 1;
 		const ch = data.params?.position?.character ?? 6;
 		const reply = () =>
@@ -1311,6 +1696,16 @@ function handle(raw) {
 	// result once the client has responded (so tests are race-free).
 	if (data.method === "workspace/executeCommand") {
 		const cmd = data.params?.command;
+		// #4801: accepted, never answered; a `$/cancelRequest` for it is
+		// ignored, like a wedged server. The trace file shows the cancel.
+		if (
+			HANG_PROJECT_INFO &&
+			cmd === "typescript.tsserverRequest" &&
+			data.params?.arguments?.[0] === "projectInfo"
+		) {
+			hungProjectInfoId = data.id;
+			return;
+		}
 		if (cmd === "fake.applyEdit" || cmd === "fake.applyEditDeferred") {
 			const spec = buildApplyEditSpec(data.params?.arguments);
 			pendingExec = { execId: data.id, command: cmd };

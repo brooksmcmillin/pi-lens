@@ -30,11 +30,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency,
 }));
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
@@ -210,9 +205,12 @@ function rawService(service: unknown): RawService {
 }
 
 describe("#2358 — adaptive wedge window pricing", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -243,9 +241,8 @@ describe("#2358 — adaptive wedge window pricing", () => {
 			makeServer("typescript"),
 			makeServer("ast-grep", "auxiliary"),
 		]);
-		createLSPClient.mockImplementation(
-			async (options: { serverId?: string }) =>
-				options?.serverId === "ast-grep" ? aux : makePrimary("typescript"),
+		createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
+			options?.serverId === "ast-grep" ? aux : makePrimary("typescript"),
 		);
 		const pending = (
 			service as { touchFile: (...args: unknown[]) => Promise<unknown> }

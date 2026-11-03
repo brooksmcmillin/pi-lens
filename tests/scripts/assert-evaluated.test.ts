@@ -314,25 +314,27 @@ describe("checkDocs: the refresh PR refuses a degraded regeneration (#4514)", ()
 		);
 	});
 
-	// #4537: expiry is legitimate, but only HEAD can justify it (#4338 M1).
+	// #4512: no loss is justified any more. The refresh keeps a missed cell's
+	// last known value (marked stale), so a classified cell turning `unknown` is
+	// a regression or a hand edit whatever `firstMissed` stamp HEAD carries.
+	// Recurrence: #4537 admitted the five-cell loss once HEAD's stamp was five
+	// days old, which made the #4338 erasure pass the gate it was written for.
 	it.each([
-		["2026-10-10", true],
-		["2026-10-11", true],
-		["2026-10-12", false],
-		["2026-10-17", false],
-		["garbage", false],
-		["2026-02-30", false],
-		[undefined, false],
+		["2026-10-10"],
+		["2026-10-11"],
+		["2026-10-12"],
+		["2026-10-17"],
+		["garbage"],
+		[undefined],
 	])(
-		"judges the M1 five-cell loss with HEAD firstMissed %s as %s",
-		(stamp, ok) => {
+		"refuses the M1 five-cell loss whatever HEAD's firstMissed is (%s)",
+		(stamp) => {
 			vi.useFakeTimers();
 			vi.setSystemTime(new Date("2026-10-16T23:59:00Z"));
 			try {
 				const state = (firstMissed: string | undefined) =>
 					`\n## Capability matrix refresh state (nightly-generated)\n\n\`\`\`json\n${JSON.stringify({ "first-publish": Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`l${23 + i}`, { firstMissed }])) })}\n\`\`\`\n`;
 				const headMatrix = matrixDoc(Array(28).fill("direct")) + state(stamp);
-				// An expired stamp in the output must not authorize an unstamped HEAD.
 				const flipped =
 					matrixDoc([
 						...Array(23).fill("direct"),
@@ -347,7 +349,9 @@ describe("checkDocs: the refresh PR refuses a degraded regeneration (#4514)", ()
 						? headMatrix
 						: (head[p] ?? null),
 				);
-				expect(records.every((r) => r.ok)).toBe(ok);
+				expect(records.filter((r) => !r.ok).map((r) => r.producer)).toEqual([
+					"probe-clean-signal:docs/lsp-capability-matrix.md#cells",
+				]);
 			} finally {
 				vi.useRealTimers();
 			}

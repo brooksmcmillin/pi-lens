@@ -296,6 +296,8 @@ describe("terragrunt runner", () => {
 
 			expect(result.status).toBe("skipped");
 			expect(result.diagnostics).toEqual([]);
+			// #4130: terragrunt was invoked and gave nothing to parse.
+			expect(result.skipFault).toBe("did-not-run");
 		} finally {
 			env.cleanup();
 		}
@@ -322,6 +324,59 @@ describe("terragrunt runner", () => {
 			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
 
 			expect(result.status).toBe("skipped");
+			expect(result.skipFault).toBe("did-not-run");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// RECURRENCE THIS PREVENTS: #4130 round 2 (PR #4971 thread on terragrunt). A
+	// run killed after it printed parseable findings reached `finishParsedRun`,
+	// which stamped `blocking_diagnostics`: coverage counted the broken run as
+	// usable and smoke rendered it as a pass.
+	it("keeps the findings of a killed run, as a fault and not as coverage", async () => {
+		const env = setupTestEnvironment("pi-lens-terragrunt-runner-");
+		try {
+			const filePath = path.join(env.tmpDir, "terragrunt.hcl");
+			fs.writeFileSync(filePath, "locals {}\n");
+
+			safeSpawnAsync.mockResolvedValue({
+				error: new Error("Process timed out after 30000ms"),
+				failure: "timeout",
+				status: null,
+				stdout: JSON.stringify({
+					invalid_files: [
+						{
+							diagnostics: [
+								{
+									severity: 1,
+									summary: "problem here",
+									range: {
+										filename: "terragrunt.hcl",
+										start: { line: 4, column: 1 },
+									},
+								},
+							],
+						},
+					],
+				}),
+				stderr: "",
+			});
+
+			const runner = (
+				await import("../../../../clients/dispatch/runners/terragrunt.js")
+			).default;
+			const { hasUsableResult } =
+				await import("../../../../clients/dispatch/types.js");
+
+			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
+
+			expect(result.status).toBe("failed");
+			expect(result.failureKind).toBe("did-not-run");
+			expect(result.diagnostics.map((d) => d.message)).toEqual([
+				"problem here",
+			]);
+			expect(hasUsableResult(result)).toBe(false);
 		} finally {
 			env.cleanup();
 		}
@@ -538,6 +593,8 @@ describe("terragrunt runner", () => {
 			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
 
 			expect(result.status).toBe("skipped");
+			// #4130: an absent terragrunt invokes nothing, so it carries no fault.
+			expect(result.skipFault).toBeUndefined();
 			expect(safeSpawnAsync).not.toHaveBeenCalled();
 		} finally {
 			env.cleanup();

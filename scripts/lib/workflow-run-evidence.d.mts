@@ -18,6 +18,7 @@ export declare function evaluateWorkflowRunEvidence(input: {
 	body?: string;
 	readWorkflow: (file: string) => string | null;
 	readBaseWorkflow?: (file: string) => string | null;
+	repository?: string;
 }): string[];
 export declare function isCommentOrWhitespaceOnlyEdit(
 	before: string | null | undefined,

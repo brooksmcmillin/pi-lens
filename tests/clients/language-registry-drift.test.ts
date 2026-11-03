@@ -239,6 +239,32 @@ describe("language registry invariants", () => {
 		expect(getServersForFile(file).map((server) => server.id)).toContain("cpp");
 	});
 
+	it("opens .tfvars in terraform-ls as terraform-vars, not terraform", () => {
+		// terraform-ls validates a variables file only when its `languageId` is
+		// `terraform-vars`; announced as `terraform` it decodes the file as
+		// module code and (with enhanced validation, its default since 0.32)
+		// reports every assignment as "Unexpected attribute"
+		// (hashicorp/vscode-terraform#1672). The id split lives in the registry
+		// entry pair, and both ids ride the SAME kind, so server routing, runner
+		// selection, and formatter policy are unchanged.
+		const vars = resolveLanguage("terraform/env/test.tfvars");
+		const module = resolveLanguage("terraform/env/main.tf");
+		expect(vars?.id).toBe("terraform-vars");
+		expect(vars?.kind).toBe("terraform");
+		expect(module?.id).toBe("terraform");
+		expect(module?.kind).toBe("terraform");
+		// The didOpen/didChange seam (clients/lsp/language.ts getLanguageId).
+		expect(getLanguageId("terraform/env/test.tfvars")).toBe("terraform-vars");
+		expect(getLanguageId("terraform/env/main.tf")).toBe("terraform");
+		// Same server for both extensions (extension-list routing, not kind),
+		// and the projected per-extension map stays the single source.
+		const servers = (path: string) => getServersForFile(path).map((s) => s.id);
+		expect(servers("terraform/env/test.tfvars")).toContain("terraform");
+		expect(servers("terraform/env/main.tf")).toContain("terraform");
+		expect(LANGUAGE_EXTENSIONS[".tfvars"]).toBe("terraform-vars");
+		expect(LANGUAGE_EXTENSIONS[".tf"]).toBe("terraform");
+	});
+
 	it("agrees with detectFileKind on every extension it owns", () => {
 		const conflicts: string[] = [];
 		const gaps: string[] = [];
@@ -811,7 +837,7 @@ describe("SCAN_LANGUAGE_PRIORITY (#2434 fold)", () => {
 		{ goldenKeys: [".hs"], ids: ["haskell"] },
 		{ goldenKeys: [".ex"], ids: ["elixir"] },
 		{ goldenKeys: [".gleam"], ids: ["gleam"] },
-		{ goldenKeys: [".tf"], ids: ["terraform"] },
+		{ goldenKeys: [".tf"], ids: ["terraform", "terraform-vars"] },
 		{ goldenKeys: [".nix"], ids: ["nix"] },
 		{ goldenKeys: [".sh"], ids: ["shell"] },
 		// Widened: the registry's php entry also owns the four alias extensions

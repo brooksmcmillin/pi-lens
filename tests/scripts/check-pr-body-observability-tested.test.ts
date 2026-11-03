@@ -118,6 +118,27 @@ describe("#4597 a named observability record must be read by a test", () => {
 		expect(result.valid).toBe(false);
 	});
 
+	// F1 (#3902 review, round 1): a `TLA+ unaffected:` line whose token is not a
+	// known family declares nothing, so the token stays a record mention. The
+	// strip used to remove any word after the prefix, which hid this record from
+	// the read-back. Recurrence: a malformed declaration that dodged #4597.
+	it("refuses a record a malformed unaffected line names", () => {
+		const result = lint({
+			observability: "TLA+ unaffected: probe-kind-3902",
+			records: ["probe-kind-3902"],
+			tests: {
+				[TEST_FILE]:
+					'it("notes the phase", () => {\n\tconst note = "elsewhere";\n});\n',
+			},
+		});
+		expect(ruleErrors(result)).toEqual([
+			expect.stringContaining(
+				"`probe-kind-3902`, which no test under tests/ reads",
+			),
+		]);
+		expect(result.valid).toBe(false);
+	});
+
 	it("does not count a comment that quotes the record", () => {
 		const result = lint({
 			observability: "The record is `fixture_record_emitted`.",

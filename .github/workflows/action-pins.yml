@@ -24,6 +24,11 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+      # #4683: the interpreter rule PARSES each workflow with js-yaml (a runtime
+      # dependency) instead of scanning its text, so this job needs
+      # node_modules. --ignore-scripts skips `prepare`; nothing here builds.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
       - name: Check action pins
         env:
           GITHUB_TOKEN: ${{ github.token }}

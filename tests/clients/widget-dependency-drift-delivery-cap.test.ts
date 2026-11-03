@@ -31,14 +31,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-
-const logLatency = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/latency-logger.js")>();
-	return { ...actual, logLatency };
-});
+import { afterEach, describe, expect, it } from "vitest";
 
 import { CacheManager } from "../../clients/cache-manager.js";
 import {
@@ -188,7 +181,6 @@ afterEach(() => {
 	cancelLSPIdleReset();
 	resetDegradationLedger();
 	clearWidgetState();
-	logLatency.mockClear();
 });
 
 describe("widget-footer dependency-drift delivery cap (#2275)", () => {

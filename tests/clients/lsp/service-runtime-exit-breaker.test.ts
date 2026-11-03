@@ -40,11 +40,6 @@ const FIXTURE_FILE = path.join(FIXTURE_ROOT, "main.fake");
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
@@ -108,8 +103,11 @@ function makeSpawnServer(id: string) {
 }
 
 describe("LSPService circuit breaker — post-init runtime exits (#1127)", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});
@@ -404,8 +402,11 @@ describe("LSPService circuit breaker — post-init runtime exits (#1127)", () =>
 describe("LSPService circuit breaker — windowed-rate trip (#1142)", () => {
 	const TRIP_COUNT = 5; // RUNTIME_EXIT_WINDOW_TRIP_COUNT (= BROKEN_PERMANENT_AFTER)
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});

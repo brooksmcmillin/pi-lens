@@ -42,11 +42,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 /**
@@ -134,6 +129,9 @@ describe("LSP spawn records count truthfully (#2064)", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		logLatency.mockClear();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();

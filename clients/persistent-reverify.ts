@@ -249,9 +249,13 @@ export async function runPersistentReverify(args: {
 		// primary's silent-clean gates ran to completion and its observation is
 		// as trustworthy as a full confirmation. The literal labels a file the
 		// primary fully answered and keeps a finding the touch just re-derived.
+		// #5017: a touch whose binding says it was computed for other bytes
+		// (`boundToCurrentDisk: false`) observed nothing about these, so its
+		// empty answer drops nothing.
 		if (
 			touchedResult === undefined ||
 			touchedResult.inconclusive === true ||
+			touchedResult.binding?.boundToCurrentDisk === false ||
 			touchedResult.skipReason !== undefined ||
 			(touchedResult.diagnosticsUnsupportedServerIds ?? []).length > 0 ||
 			!touchCompletedConfirmationPolicy(touchedResult)

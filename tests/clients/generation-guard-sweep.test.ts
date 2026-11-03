@@ -70,6 +70,10 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 		"#1682's per-(path, identifier) pull sequences: claimed at request time, re-checked at write time. A GenerationMap candidate, deferred because client.ts is the highest-traffic file in the repo and a behavior-identical proof there needs its own round",
 	"lsp/config.ts":
 		"the unknown-trust notice compares the degradation ledger's session generation only to re-arm a bounded log latch; the ledger owns the counter and reset, so replacing this scalar comparison with a second GenerationSource would duplicate session identity rather than guard a stale write",
+	"formatters.ts":
+		"#4530 (#4776 review H1): a per-directory formatter selection carries the project-trust generation of the lookup that created it, and a read under another generation drops it. The counter is project-trust.ts's own (getProjectTrustGeneration), the same one every availability latch reads; a GenerationSource here would mint a second trust identity mirroring it",
+	"lsp/jvm-runtime.ts":
+		"#4530: the resolved Java environment carries the project-trust generation captured before its PATH probe awaits, and a read under another generation resolves again. The counter is project-trust.ts's own (getProjectTrustGeneration), the same one every availability latch reads; a GenerationSource here would mint a second trust identity mirroring it",
 	"lsp/launch.ts":
 		"the unknown-trust project-local binary notice compares the degradation ledger's session generation only to re-arm a bounded launch warning; the ledger owns the counter and reset, so a second GenerationSource would duplicate the same session identity",
 	"review-graph/builder.ts":

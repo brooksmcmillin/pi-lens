@@ -21,10 +21,12 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	_resetDeferredForTests,
 	_resetStateCacheForTests,
+	getDisposition,
 	markDisposition,
 } from "../../../clients/diagnostic-dispositions.js";
 import {
@@ -34,6 +36,8 @@ import {
 	RunnerRegistry,
 } from "../../../clients/dispatch/dispatcher.js";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
+import { getProjectDataDir } from "../../../clients/file-utils.js";
+import { dataDir444 } from "../../support/data-dir-4-4-4.js";
 import type { RunnerGroup } from "../../../clients/dispatch/types.js";
 import { createMockRunner } from "../../mocks/runner-factory.js";
 import { removeTempDirSync } from "../test-utils.js";
@@ -170,5 +174,105 @@ describe("#1030 disposition base divergence (monorepo nested language root)", ()
 		// language root == project root here (no nested marker).
 		expect(ctx.cwd).toBe(ctx.projectRoot);
 		expect(count).toBe(0);
+	});
+});
+
+/** A store pi-lens 4.4.4 wrote for `aliasproj/src/x.ts` (see its README). */
+const STORE_4_4_4 = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"..",
+	"fixtures",
+	"data-dir-4.4.4",
+	"dispatch-mark",
+	"cache",
+	"diagnostic-dispositions.json",
+);
+
+describe("#4689 disposition store under a session root spelled through a link", () => {
+	// RECURRENCE GUARDED: #4689 review r2 A. The data dir was named from the
+	// caller's form of the root: dispatch holds its identity, while the mark
+	// tool, the turn-end readers and 4.4.4 hold the session's spelling. Under
+	// a root reached through a link the two named different data dirs, so a
+	// mark never silenced the finding it named, and marks written before the
+	// upgrade stopped reaching dispatch.
+	function aliasProject(): { alias: string; fileAbs: string } | undefined {
+		const real = path.join(tmpDir, "realproj");
+		const alias = path.join(tmpDir, "aliasproj");
+		fs.mkdirSync(path.join(real, "src"), { recursive: true });
+		fs.writeFileSync(path.join(real, "src", "x.ts"), FILE_CONTENT);
+		try {
+			fs.symlinkSync("realproj", alias, "dir");
+		} catch {
+			return undefined;
+		}
+		return { alias, fileAbs: path.join(alias, "src", "x.ts") };
+	}
+
+	it("honors a mark the mark tool wrote under the session's link spelling", async (ctx) => {
+		const project = aliasProject();
+		if (!project) return ctx.skip("symlinks unavailable");
+		const { alias, fileAbs } = project;
+		// WRITE exactly as the mark tool does: base = the session's cwd.
+		markDisposition(
+			alias,
+			{ cwd: alias, filePath: fileAbs, ...DIAG, content: FILE_CONTENT },
+			"false-positive",
+		);
+		_resetStateCacheForTests();
+		const { ctx: dispatch, count } = await runDispatch(fileAbs, alias);
+		// Premise: dispatch holds the root's identity, not the spelling.
+		expect(dispatch.projectRoot).toBe(
+			fs.realpathSync.native(alias).replace(/\\/g, "/"),
+		);
+		expect(count).toBe(0);
+	});
+
+	/** Put the 4.4.4 store where 4.4.4 wrote it: the data dir named by the
+	 * session's spelling of the root (`tests/support/data-dir-4-4-4.ts`). */
+	function seed444Store(alias: string): string {
+		const cache = path.join(
+			dataDir444(process.env.PILENS_DATA_DIR ?? "", alias),
+			"cache",
+		);
+		fs.mkdirSync(cache, { recursive: true });
+		const file = path.join(cache, "diagnostic-dispositions.json");
+		fs.copyFileSync(STORE_4_4_4, file);
+		_resetStateCacheForTests();
+		return file;
+	}
+
+	it("honors a mark pi-lens 4.4.4 wrote, once session_start opens the data dir", async (ctx) => {
+		const project = aliasProject();
+		if (!project) return ctx.skip("symlinks unavailable");
+		const { alias, fileAbs } = project;
+		const spelled = seed444Store(alias);
+		// What session_start does with the host's cwd, before any dispatch.
+		getProjectDataDir(alias);
+		const { count } = await runDispatch(fileAbs, alias);
+		expect(count).toBe(0);
+		// The 4.4.4 file stays, so a downgrade still reads its marks.
+		expect(fs.existsSync(spelled)).toBe(true);
+	});
+
+	it("adopts the 4.4.4 store on a read that holds the root's spelling", async (ctx) => {
+		const project = aliasProject();
+		if (!project) return ctx.skip("symlinks unavailable");
+		const { alias, fileAbs } = project;
+		seed444Store(alias);
+		// A turn-end or tool reader holds the host's cwd, the spelling.
+		expect(getDisposition(alias, "dd:164197458e2b")?.reason).toBe(
+			"4.4.4 fixture",
+		);
+		_resetStateCacheForTests();
+		const { count } = await runDispatch(fileAbs, alias);
+		expect(count).toBe(0);
+	});
+
+	it("still reports the finding when nothing marked it (control)", async (ctx) => {
+		const project = aliasProject();
+		if (!project) return ctx.skip("symlinks unavailable");
+		const { count } = await runDispatch(project.fileAbs, project.alias);
+		expect(count).toBe(1);
 	});
 });

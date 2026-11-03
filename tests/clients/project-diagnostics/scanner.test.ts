@@ -114,6 +114,29 @@ describe("scanProjectDiagnostics home ceiling (#747/#250)", () => {
 		expect(snapshot.unsafeRoot).toBe(true);
 	});
 
+	// RECURRENCE GUARDED: #4911. The ceiling compared spellings, so a HOME or a
+	// cwd spelled through a link read as a project under the home and the whole
+	// home tree was walked. Both directions, each with a real directory link.
+	it.each([["home-link"], ["root-link"]] as const)(
+		"refuses to walk the home directory when the %s spelling names it (#4911)",
+		async (kind) => {
+			const home = path.join(tmp, "home");
+			fs.mkdirSync(home, { recursive: true });
+			fs.writeFileSync(path.join(home, "index.ts"), "export const x = 1;\n");
+			const link = path.join(tmp, "link");
+			fs.symlinkSync(home, link, "junction");
+
+			const snapshot = await scanProjectDiagnostics({
+				cwd: kind === "root-link" ? link : home,
+				tier: "cheap",
+				homeDir: kind === "home-link" ? link : home,
+			});
+
+			expect(snapshot.unsafeRoot).toBe(true);
+			expect(snapshot.filesScanned).toBe(0);
+		},
+	);
+
 	it("does NOT persist the refusal snapshot to the cross-session cache", async () => {
 		await scanProjectDiagnostics({ cwd: tmp, tier: "cheap", homeDir: tmp });
 		// A refusal must not poison the cache — a later cached read would wrongly

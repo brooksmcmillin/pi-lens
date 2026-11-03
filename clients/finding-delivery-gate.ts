@@ -102,13 +102,13 @@
  * degrade; they satisfy the same rule by dropping the authority marker
  * alongside the coordinate.
  *
- * ── Retirement (#1944, #1950, #2275) ──────────────────────────────────────
+ * ── Retirement (#1944, #1950, #2275, #4990) ────────────────────────────────
  * Demote-not-drop assumes the agent CAN re-run to confirm. Retirement is what
  * happens when re-serving a demotion forever stops being honest. Every kind
  * of retirement records itself in the degradation ledger under
  * `demoted-finding-retired`, whose subject keeps the store and the file
  * (`inline-blocker:` / `widget-blocker:`), so an empty section can only mean
- * "nothing to say". There are three, and they differ in WHY and in HOW MUCH
+ * "nothing to say". There are four, and they differ in WHY and in HOW MUCH
  * they remove:
  *
  * 1. Past-EOF, unrecoverable (#1944). The file shrank past the cited lines,
@@ -125,7 +125,14 @@
  *    is known not to be suppressed, so the count is deliveries the agent
  *    actually received (#1950 fix round F1).
  *
- * 3. Dependency-drift, widget footer (#2275). The same cap number over the
+ * 3. Self-drift, inline-blocker channel (#4990). The record's own file
+ *    changed under it and a re-run COULD still confirm, so this is case 2's
+ *    cap on the other drift axis: `SELF_DRIFT_MAX_DELIVERIES` deliveries,
+ *    the same last-delivery note, the same ledger kind (reason names the
+ *    axis). The count is per demotion EPISODE: this axis re-arms when the
+ *    recorded bytes come back, and a heal drops the count with the demotion.
+ *
+ * 4. Dependency-drift, widget footer (#2275). The same cap number over the
  *    widget store, which unlike the inline-blocker map backs MORE THAN ONE
  *    surface — `lens_diagnostics mode=all` and `lens_diagnostic_mark` read
  *    the same `allDiagnostics` list the footer draws from. So this retirement
@@ -138,7 +145,7 @@
  *    and the turn-end step drains those marks. Dropping the record instead
  *    would have made an unconfirmed LSP error read as CLEAN on mode=all.
  *
- * The rule the three share: a retirement may remove a finding from the
+ * The rule the four share: a retirement may remove a finding from the
  * surface that has re-served it, never from every surface at once, unless no
  * re-run could ever confirm it (case 1).
  *
@@ -467,9 +474,16 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 	"runtime-turn:trivy-critical-blocker": labeled(
 		RUNTIME_TURN_FILE,
 		"Turn-end 🔴 CRITICAL dependency CVE blocker (trivy).",
-		"Package-pinned finding with no cited file:line to stat — freshness has " +
+		"Package-pinned finding with no cited file:line to stat — this gate has " +
 			"nothing to check drift against. The session_start cache can be " +
-			"arbitrarily old, so its age is stated instead. Also routes through " +
+			"arbitrarily old, so its age is stated instead. #4617: the advisory " +
+			"provenance stamp does have a subject — the dependency declarations the " +
+			"scan reported for the rows this report shows (`trivyEvidenceFiles`, " +
+			"each result's target resolved against the scan root, falling back to " +
+			"`existingDependencyManifests` only when no shown row cites one), so a " +
+			"lockfile edit supersedes the message — nested ones included, not only the " +
+			"manifests at the scan root — even though a package row cannot be stat'd. " +
+			"Also routes through " +
 			"`filterFindingsByDisposition` (#1625) first — a suppressed/false-" +
 			"positive finding never reaches this render, so the age label and the " +
 			"disposition filter compose rather than substitute for each other.",

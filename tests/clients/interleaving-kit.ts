@@ -1,6 +1,7 @@
 /** Small, deterministic coordination helpers for concurrency tests. */
 
 import { inspect } from "node:util";
+import { testTimeoutScale } from "../support/test-timeout-scale.js";
 
 type SpyLike<T extends (...args: any[]) => any> = {
 	mockImplementation(implementation: T): unknown;
@@ -20,8 +21,28 @@ export type WaitForOptions = {
 	yieldControl?: () => Promise<void>;
 };
 
+function budgetNote(budgetMs: number, unscaledMs: number, scale: number) {
+	return `budget ${budgetMs}ms = ${unscaledMs}ms x PI_LENS_TEST_TIMEOUT_SCALE ${scale}`;
+}
+
+/** The first stack frame outside this file, as `path:line:col`. */
+function callerFrame(): string {
+	const frames = (new Error().stack ?? "").split("\n").slice(1);
+	for (const frame of frames) {
+		const location = /\(?([^\s()]+:\d+:\d+)\)?$/.exec(frame.trim())?.[1];
+		if (location && !/interleaving-kit\.[jt]s:/.test(location)) {
+			return location.replace(/^file:\/\//, "");
+		}
+	}
+	return "an unknown caller";
+}
+
 /**
  * Poll until a condition is ready, bounded by wall time.
+ *
+ * `timeoutMs` (the default, or a caller's) is multiplied by
+ * `PI_LENS_TEST_TIMEOUT_SCALE`, so the budget is a backstop that a slow runner
+ * can stretch. An exhausted wait names its caller and the elapsed time.
  *
  * The default timer yield is safe for progress made by another thread or
  * process. A custom tick yield (for example `setImmediate`) is only safe when
@@ -37,7 +58,11 @@ export async function waitFor<T>(
 		yieldControl = () => delay(intervalMs),
 	}: WaitForOptions = {},
 ): Promise<T> {
-	const deadline = Date.now() + timeoutMs;
+	const caller = callerFrame();
+	const scale = testTimeoutScale();
+	const budgetMs = timeoutMs * scale;
+	const started = Date.now();
+	const deadline = started + budgetMs;
 	let value = read();
 	while (!ready(value) && Date.now() < deadline) {
 		await yieldControl();
@@ -45,7 +70,7 @@ export async function waitFor<T>(
 	}
 	if (ready(value)) return value;
 	throw new Error(
-		`waitFor exhausted after ${timeoutMs}ms; last observed value: ${inspect(value, { depth: 4 })}`,
+		`waitFor exhausted after ${Date.now() - started}ms at ${caller} (${budgetNote(budgetMs, timeoutMs, scale)}); last observed value: ${inspect(value, { depth: 4 })}`,
 	);
 }
 
@@ -80,13 +105,17 @@ export function suspendAt<T extends (...args: any[]) => any>(
 		unblock = resolve;
 	});
 	const admissionTimeoutMs = options.admissionTimeoutMs ?? 10_000;
+	const scale = testTimeoutScale();
+	const budgetMs = admissionTimeoutMs * scale;
+	const caller = callerFrame();
+	const started = Date.now();
 	const admissionTimer = setTimeout(() => {
 		rejectAdmission(
 			new Error(
-				`suspendAt seam was not admitted within ${admissionTimeoutMs}ms`,
+				`suspendAt seam was not admitted within ${budgetMs}ms at ${caller} (elapsed ${Date.now() - started}ms; ${budgetNote(budgetMs, admissionTimeoutMs, scale)})`,
 			),
 		);
-	}, admissionTimeoutMs);
+	}, budgetMs);
 	let first = true;
 	let calls = 0;
 

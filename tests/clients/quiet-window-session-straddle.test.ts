@@ -62,6 +62,10 @@ import type {
 import { gatedPromise } from "../support/fault-injection.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { setupTestEnvironment } from "./test-utils.js";
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "../support/lsp-service-seam.js";
 
 // #3512: the stray cases drive the real `computeCascadeForFile`. Its graph and
 // its LSP service are the two boundaries replaced here, as in
@@ -69,7 +73,6 @@ import { setupTestEnvironment } from "./test-utils.js";
 const cascadeMocks = vi.hoisted(() => ({
 	buildOrUpdateGraph: vi.fn(),
 	computeImpactCascade: vi.fn(),
-	getLSPService: vi.fn(),
 }));
 
 vi.mock("../../clients/review-graph/service.js", async (importOriginal) => ({
@@ -85,13 +88,6 @@ vi.mock("../../clients/review-graph/service.js", async (importOriginal) => ({
 		maxDepthReached: 0,
 	}),
 	formatImpactCascade: () => "impact header",
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: cascadeMocks.getLSPService,
 }));
 
 const WAIT_MS = 15_000;
@@ -173,7 +169,11 @@ describe("quiet-window cascade writes across a session replacement (#3499)", () 
 	const originalWait = process.env.PI_LENS_QUIET_WINDOW_WAIT_MS;
 	const originalRegistry = process.env.PI_LENS_INSTANCE_REGISTRY;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// File-wide "no service" (the former `getLSPService: vi.fn()` answered
+		// undefined); the #3512 describe installs its own double per case. Before
+		// the fake clock: the install awaits a dynamic import.
+		await installLspServiceDouble(null);
 		vi.useFakeTimers();
 		process.env.PI_LENS_QUIET_WINDOW_WAIT_MS = String(WAIT_MS);
 		// The heartbeat task is a registry no-op; it still samples, harmlessly.
@@ -410,7 +410,6 @@ describe("quiet-window cascade writes across a session replacement (#3499)", () 
 				changedSymbolsByFile: new Map(),
 			} satisfies ReviewGraph);
 			cascadeMocks.computeImpactCascade.mockReset();
-			cascadeMocks.getLSPService.mockReset();
 		});
 
 		/** Park the cap's worth of computes that never settle. */
@@ -483,7 +482,7 @@ describe("quiet-window cascade writes across a session replacement (#3499)", () 
 					.mockReturnValueOnce(impact(own));
 				const strayTouchEntered = gatedPromise<void>();
 				const strayTouchGate = gatedPromise<void>();
-				cascadeMocks.getLSPService.mockReturnValue({
+				installLspService({
 					...makeLspServiceDouble(),
 					// No passive snapshot: every neighbour takes the active touch.
 					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),

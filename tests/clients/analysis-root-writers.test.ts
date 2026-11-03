@@ -26,8 +26,16 @@ import {
 
 const environments: Array<{ cleanup: () => void }> = [];
 
+// #4867: an ADOPTABLE project root cannot live under the tmp root. A directory
+// created directly at the tmp root is a pi-owned staging path
+// (`isPiOwnedTempPath`), which `resolveAnalysisRoot` refuses, and a deeper tmp
+// fixture would need an unnamespaced parent the real-tmp `pi-lens-` prefix
+// census forbids (#3329). So it stays inside the checkout under the git-ignored
+// `.probe-home`, which is not a direct child of the checkout root (the #4864
+// rule's population) and which every repo walk excludes.
 function registeredProjectRoot(prefix: string): string {
-	const root = fs.mkdtempSync(path.join(process.cwd(), prefix));
+	fs.mkdirSync(path.join(process.cwd(), ".probe-home"), { recursive: true });
+	const root = fs.mkdtempSync(path.join(process.cwd(), ".probe-home", prefix));
 	registerTmpRoot(getTmpRootRegistry(), root, "registered");
 	environments.push({
 		cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
@@ -57,7 +65,7 @@ describe("analysis-root seam", () => {
 		const env = setupTestEnvironment("pi-lens-analysis-root-");
 		environments.push(env);
 		const sessionFile = path.join(env.tmpDir, "src", "file.ts");
-		const adoptedRoot = registeredProjectRoot(".analysis-root-adopted-");
+		const adoptedRoot = registeredProjectRoot("pi-lens-analysis-root-adopted-");
 		fs.mkdirSync(adoptedRoot, { recursive: true });
 		fs.writeFileSync(path.join(adoptedRoot, "package.json"), "{}\n");
 		const adoptedFile = path.join(adoptedRoot, "file.ts");
@@ -93,7 +101,7 @@ describe("analysis-root seam", () => {
 		const env = setupTestEnvironment("pi-lens-analysis-root-marker-");
 		environments.push(env);
 		const unmarkedRoot = registeredUnmarkedRoot();
-		const markedRoot = registeredProjectRoot(".analysis-root-marked-");
+		const markedRoot = registeredProjectRoot("pi-lens-analysis-root-marked-");
 		const unmarked = path.join(unmarkedRoot, "file.ts");
 		fs.mkdirSync(markedRoot, { recursive: true });
 		fs.writeFileSync(path.join(markedRoot, "pyproject.toml"), "[project]\n");
@@ -161,7 +169,9 @@ describe("analysis-root seam", () => {
 		// fixture, allowing a session outside HOME to adopt HOME itself.
 		const env = setupTestEnvironment("pi-lens-analysis-root-home-");
 		environments.push(env);
-		const home = fs.mkdtempSync(path.join(process.cwd(), ".probe-home-test-"));
+		const home = fs.mkdtempSync(
+			path.join(process.cwd(), ".probe-home", "home-ceiling-"),
+		);
 		fs.mkdirSync(home, { recursive: true });
 		fs.writeFileSync(path.join(home, "package.json"), "{}\n");
 		expect(

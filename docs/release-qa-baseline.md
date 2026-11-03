@@ -79,6 +79,7 @@ PR's packed tarball (#2700, the check #2587 was missing). `attw`
 | install-selftest | the runtime dependency graph and the `pi.skills` manifest resolve AS INSTALLED | npm-install | `node <installed>/scripts/install-selftest.mjs --allow-soft` | process exits 0 and no `[FAIL]` line | selftest stdout | `scripts/install-selftest.mjs` verbatim — install-smoke's `smoke` job | #1605 lane 5 (real-host install), narrower: this row asserts the packaged artifact resolves, not that a host classifier parses |
 | skills-registered | a real pi registers the four pi-lens skills from the installed package | pi-rpc | `pi install <installed pkg>` then `pi --mode rpc` plus `{"type":"get_commands"}` | at least 4 commands with `source` `skill`; every `sourceInfo.path` inside the installed package AND no `sourceInfo.source` is `extension:index` (pi's `pi.skills` manifest is the only registrar; the extension's `resources_discover` handler used to re-add the whole directory and undo settings package filters, #1416) | get_commands response JSON | new probe on the #2589 mechanism — the recurrence is #2587; #1416 widened it to the manifest-registrar direction | — |
 | commands-registered | the extension loads and registers its `lens-*` slash commands | pi-rpc | same RPC session as above | at least 1 command with `source` `extension` named `lens-*`, and zero `extension_error` events | same get_commands response plus the event stream | `scripts/rpc-load-check.mjs` assertion — install-smoke's `pi-load` job, which runs it against the PUBLISHED package only | #1605 lane 1 (real-host): the same real-host principle, applied to extension registration rather than stderr classification |
+| lsp-warm-resolved | the extension's session-start LSP warm resolves in the installed candidate | pi-rpc | same RPC session as above | pinned `PI_LENS_HOME/extension.log`, observed for 10 s after `get_commands` (a `warm failed` record ends it early), has an `LSP warm resolved` record and no `warm failed` record of any warm; only records stamped at or after the session start count; the witness proves the LSP module loads, not that a language server spawned; a candidate older than the success record (4.4.3 and earlier) has no positive witness and FAILs | extension log NDJSON | new — the existing pi-rpc rows did not read the session-start warm log; recurrence #4314 | `scripts/rpc-load-check.mjs` (install-smoke `pi-load`) reds on any `warn` record of a published package; this row is the release gate's positive witness |
 | mcp-tools-registered | the MCP mirror advertises the `pilens_*` tool surface | mcp-stdio | `node <installed>/dist/mcp/server.js` then `initialize` plus `tools/list` | every advertised tool name starts `pilens_`, and the set contains analyze, diagnostics, turn_end, lsp_navigation, health | tools/list response JSON | new — no smoke drives the MCP mirror from an install | — |
 | mcp-diagnostics-full | `lens_diagnostics` full mode answers on a fixture repo | mcp-stdio | `tools/call` `pilens_diagnostics` with `mode` `full` and `refreshRunners` `cheap`, POLLED | text carries a `Summary (N files diagnosed this session)` line with N at least 1 | tool result text | new — `tests/clients` covers the handler, nothing covers it through a packaged install | — |
 | mcp-turn-end | the turn-end pipeline runs over the turn's files and returns an advisory | mcp-stdio | `tools/call` `pilens_turn_end` with the fixture file | text carries `Turn-end over N file(s).` with N at least 1 | tool result text | new — `scripts/smoke-availability-lifecycle.mjs` covers lifecycle availability, not the packaged turn-end path | #1605 lane 2 (availability-lifecycle): overlaps the turn-end half; #1605 asserts latch recovery, this row asserts the packaged turn-end path answers at all |
@@ -154,16 +155,28 @@ newest-in-range lane reads it, bounded above so `"*"` can never mean
 matrix has passed on. A newer host enters the window in ONE change: run this
 matrix on it, add it to that test's verified list, and move the workflow's
 ceiling together. P1 is one verified host per minor line from 0.86 onward;
-0.81–0.83 are in-window without a dedicated host, while 0.80, 0.84, and
-0.85 are represented by the existing host list and ratchet. A ceiling past an
-unrun minor still claims that minor, so the verified-minor ratchet names the
-admitted lines explicitly.
+0.86–1.5 are in-window, and every minor line below 0.86 falls outside the
+window entirely, so none needs a dedicated host. A ceiling past an unrun
+minor still claims that minor, so the verified-minor ratchet names the admitted
+lines explicitly.
+
+The floor is 0.86.1 (#4688, maintainer decision 2026-10-20). 0.80–0.85 are
+out of the window: since #4644 pi-lens injects context only from a `context`
+event that carries a system head, and those hosts keep the prompt in
+`agent.state.systemPrompt` and never emit `context_with_system`, so they
+receive no findings and no guidance. Raising the floor was chosen over reviving
+the old hosts; a real 0.80.10 session delivered the staged guidance at
+`91c939e10` and nothing at `e7a0a8aba` (`markerReachedProvider: false` on all
+3 requests).
 
 ### Verified hosts
 
-The certified policy is `>=0.80.10 <1.4.0`. Each listed minor line has a
-release-QA witness; the workflow ceiling and `tests/packaging.test.ts` list are
-updated together.
+The certified policy is `>=0.86.1 <1.6.0`, and this table is the whole verified
+set: `tests/packaging.test.ts` fails when it and `PI_HOST_SUPPORTED_RANGE`
+disagree. Each listed minor line through 1.4 has a release-QA witness; 1.5 was
+certified by maintainer decision on 2026-11-02, with its witness blocked by
+the lane npm guard. The workflow ceiling
+and `tests/packaging.test.ts` list are updated together.
 
 | host | date | pi-lens commit | result |
 | --- | --- | --- | --- |
@@ -174,6 +187,8 @@ updated together.
 | 1.1.0 | 2026-10-08 | 2fda17a53d62267cd9035fa04380bbf0e2de4318 | 15 pass / 1 skipped (git-install-loads) |
 | 1.2.0 | 2026-10-16 | 9400454891d5a1beb0a4d2d9452dece276e22e71 | 15 pass / 1 skipped (git-install-loads) |
 | 1.3.0 | 2026-10-16 | 9400454891d5a1beb0a4d2d9452dece276e22e71 | 15 pass / 1 skipped (git-install-loads) |
+| 1.4.0 | 2026-10-22 | 75a1a3c893ed0ac44a3081dd3d475c1e72349099 | 15 pass / 1 skipped (git-install-loads) |
+| 1.5.0 | 2026-11-02 | e5017388815d476e783fc850b3d05c6ce98bd85e | Maintainer certification; release QA blocked by npm guard (17 untested) |
 
 Re-run any row with `node scripts/release-qa.mjs --pi <host>` at the listed commit.
 

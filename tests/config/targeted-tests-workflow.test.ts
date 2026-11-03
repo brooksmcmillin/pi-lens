@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
@@ -20,6 +20,7 @@ import {
 	stripSource,
 } from "../support/sweep-kit.js";
 import { siblingPin } from "../support/sibling-pin.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const TESTS_ROOT = resolve(ROOT, "tests");
@@ -39,7 +40,7 @@ const WORKFLOW_PATH = resolve(ROOT, ".github/workflows/ci.yml");
 
 const PRODUCTION_ROOTS = "clients|tools|mcp|scripts|commands|index\\.ts";
 const WALK_HELPERS =
-	"listSourceFiles|clientSourceFiles|collectTestFiles|globSync|glob|fastGlob|readdirSync|readdir";
+	"listSourceFiles|clientSourceFiles|collectTestFiles|walkFiles|globSync|glob|fastGlob|readdirSync|readdir";
 
 // Modules whose exports walk a tree, and the export names that do.
 const WALK_MODULES = "fast-glob|glob|node:fs|fs|node:fs/promises|fs/promises";
@@ -61,6 +62,9 @@ const NAMED_IMPORT = new RegExp(
 	`\\bimport\\s*\\{([^}]*)\\}\\s*from\\s*["'](?:${WALK_MODULES})["']`,
 	"g",
 );
+// The repo-wide walker's module, by its path tail (#4104 F4).
+const WALK_FILES_IMPORT =
+	/\bimport\s*\{([^}]*)\}\s*from\s*["'](?:[^"']*\/)?walk-files(?:\.mjs)?["']/g;
 
 // The local names this file binds to a walk helper (#3448): `fg` for
 // `import fg from "fast-glob"`, `g` for `import { glob as g } from "glob"`.
@@ -75,16 +79,33 @@ function walkHelperAliases(source: string): string[] {
 		);
 	}
 	for (const match of codeMatches(source, NAMED_IMPORT)) {
-		for (const specifier of match[1].split(",")) {
-			const [imported, local = imported] = specifier
-				.trim()
-				.replace(/^type\s+/, "")
-				.split(/\s+as\s+/);
-			if (imported && WALK_EXPORTS.has(imported) && local)
-				aliases.add(local.replaceAll("$", "\\$"));
-		}
+		bindNamedWalkers(
+			match[1],
+			(imported) => WALK_EXPORTS.has(imported),
+			aliases,
+		);
+	}
+	// The repo-wide walker (scripts/lib/walk-files.mjs, #4104 F4) is walk-named
+	// too, so an alias of it (`walkFiles as wf`) binds the same way.
+	for (const match of codeMatches(source, WALK_FILES_IMPORT)) {
+		bindNamedWalkers(match[1], (imported) => imported === "walkFiles", aliases);
 	}
 	return [...aliases];
+}
+
+function bindNamedWalkers(
+	specifiers: string,
+	accepts: (imported: string) => boolean,
+	aliases: Set<string>,
+): void {
+	for (const specifier of specifiers.split(",")) {
+		const [imported, local = imported] = specifier
+			.trim()
+			.replace(/^type\s+/, "")
+			.split(/\s+as\s+/);
+		if (imported && accepts(imported) && local)
+			aliases.add(local.replaceAll("$", "\\$"));
+	}
 }
 
 // ── Walks delegated to a tests/support module (#3472) ──────────────────────
@@ -593,7 +614,6 @@ function census(): string[] {
 	censusCache ??= discoveredTreeScanners();
 	return censusCache;
 }
-const CENSUS_TIMEOUT_MS = 30_000;
 
 function readWorkflow() {
 	return yaml.load(readFileSync(WORKFLOW_PATH, "utf8")) as {
@@ -653,7 +673,11 @@ describe("targeted advisory workflow contract (#3215)", () => {
 				"a scanner in both lists is armed by a production change AND a " +
 					"tests/ change; only a scanner that walks both trees may be, and " +
 					"the list is pinned",
-			).toEqual(["tests/config/env-path-key-composition-sweep.test.ts"]);
+			).toEqual([
+				"tests/config/env-path-key-composition-sweep.test.ts",
+				"tests/config/git-fixture-governance.test.ts",
+				"tests/config/path-containment-sweep.test.ts",
+			]);
 			expect(expectedRegistry).toEqual([...new Set(registered)].sort());
 			expect(new Set(registered).size).toBe(
 				registered.length - bothLists.length,
@@ -669,7 +693,7 @@ describe("targeted advisory workflow contract (#3215)", () => {
 				10,
 			);
 		},
-		CENSUS_TIMEOUT_MS,
+		TREE_WALK_TIMEOUT_MS,
 	);
 
 	it(
@@ -713,10 +737,12 @@ describe("targeted advisory workflow contract (#3215)", () => {
 			);
 			expect(stale).toEqual([]);
 		},
-		CENSUS_TIMEOUT_MS,
+		TREE_WALK_TIMEOUT_MS,
 	);
 
-	it("runs the selector on every PR with a full checkout and no gating power", () => {
+	// Recurrence (#3215): the job that kept the shuffle step lost its advisory
+	// shape or its history when the selection step was removed with it.
+	it("runs the changed-test shuffle on every PR with a full checkout and no gating power", () => {
 		const job = readWorkflow().jobs["targeted-tests-advisory"];
 		expect(job?.name).toBe("Targeted tests (advisory)");
 		expect(job?.if).toBe("github.event_name == 'pull_request'");
@@ -731,6 +757,7 @@ describe("targeted advisory workflow contract (#3215)", () => {
 				"targeted-tests-advisory",
 			),
 		);
+		// `git diff <base>...<head>` needs the merge base: a shallow clone has none.
 		expect(checkout?.with?.["fetch-depth"]).toBe(0);
 		const setupNode = job?.steps?.find((step) =>
 			step.uses?.startsWith("actions/setup-node@"),
@@ -744,7 +771,18 @@ describe("targeted advisory workflow contract (#3215)", () => {
 		);
 	});
 
-	it("keeps install/build parity and publishes the selector outcome", () => {
+	// The fork retains targeted selection as advisory coverage beside full CI.
+	it("runs the pre-push selector only in the retained advisory job", () => {
+		const workflow = readWorkflow();
+		const owners = Object.entries(workflow.jobs).flatMap(([id, job]) =>
+			(job.steps ?? [])
+				.filter((step) => step.run?.includes("pre-push-targeted-tests"))
+				.map(() => id),
+		);
+		expect(owners).toEqual(["targeted-tests-advisory"]);
+	});
+
+	it("keeps install/build parity for the shuffle job and the selector summary", () => {
 		const selector = readFileSync(
 			resolve(ROOT, "scripts/pre-push-targeted-tests.mjs"),
 			"utf8",
@@ -753,7 +791,7 @@ describe("targeted advisory workflow contract (#3215)", () => {
 		const runs = job?.steps?.map((step) => step.run).filter(Boolean) ?? [];
 		// Lockfile-locked and script-free (SonarCloud githubactions:S8543 /
 		// S6505 on the copied `npm install`); the grammar download is the one
-		// `prepare` piece the targeted files need, so it is an explicit step.
+		// `prepare` piece the changed files need, so it is an explicit step.
 		expect(runs).toContain("npm ci --no-audit --no-fund --ignore-scripts");
 		expect(runs).toContain(
 			"node scripts/download-grammars.js --core --dest grammars",
@@ -762,10 +800,10 @@ describe("targeted advisory workflow contract (#3215)", () => {
 			runs.indexOf("node scripts/download-grammars.js --core --dest grammars"),
 		).toBeLessThan(runs.indexOf("npm run build"));
 		expect(runs).toContain("npm run build");
-		// #3426 H3432-1: the advisory job is the CI row for the CI-only tier.
-		expect(runs).toContain(
-			"node scripts/pre-push-targeted-tests.mjs --skip-build --include-ci-only",
-		);
+		// #4003: `--ignore-scripts` skips `prepare`, so a changed file that
+		// imports dist/ needs this step.
+		expect(runs).toContain("npm run build:dist");
+		// The local pre-push hook still prints these through the selector.
 		expect(selector).toContain("GITHUB_STEP_SUMMARY");
 		expect(selector).toContain("cap exceeded");
 	});
@@ -828,15 +866,15 @@ describe("targeted advisory workflow contract (#3215)", () => {
 			BASE_SHA: "${{ github.event.pull_request.base.sha }}",
 			HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
 		});
-		// It follows the build and the selector run: the compiled twins exist.
-		expect(index).toBeGreaterThan(
-			steps.findIndex((other) => other.run === "npm run build"),
-		);
-		expect(index).toBeGreaterThan(
-			steps.findIndex((other) => other.name === "Run targeted tests"),
-		);
-		// A red selector must not skip it, and a cancelled run must.
-		expect(step.if).toBe("${{ !cancelled() }}");
+		// #4437: the interleaving kit's waitFor budget scales by this; run
+		// 38618401454 failed on a fixed 3000 ms wait without it.
+		expect(step.env).toMatchObject({ PI_LENS_TEST_TIMEOUT_SCALE: "3" });
+		// It follows both builds: the compiled twins and dist/ exist.
+		for (const build of ["npm run build", "npm run build:dist"]) {
+			expect(index).toBeGreaterThan(
+				steps.findIndex((other) => other.run === build),
+			);
+		}
 		// The script's own budget sits a minute under the step cap (the kill and
 		// the summary, #4456), the step cap under the job's.
 		const stepCap = step["timeout-minutes"] ?? Infinity;
@@ -1038,6 +1076,34 @@ describe("tree-scanner census — walks delegated to tests/support (#3472)", () 
 			{
 				"scan.ts": 'export { default } from "./inner.js";',
 				"inner.ts": "export default (d: string) => listSourceFiles(d);",
+			},
+		],
+		// The repo-wide walker (scripts/lib/walk-files.mjs, #4104) is a walk
+		// helper too: a support module that calls it directly, through a
+		// module-local helper, or through an import alias is a walker. Before
+		// `walkFiles` joined WALK_HELPERS these were missed (#4104 F4).
+		[
+			"a walkFiles call in the support export",
+			'import { counts } from "../support/scan.js";\ncounts("x");',
+			{
+				"scan.ts":
+					"export function counts(d: string) {\n	return walkFiles(d, () => true, () => {});\n}",
+			},
+		],
+		[
+			"a walkFiles call reached through a module-local helper",
+			'import { counts } from "../support/scan.js";\ncounts("x");',
+			{
+				"scan.ts":
+					"export function counts(d: string) {\n	return files(d);\n}\nfunction files(d: string) {\n	return walkFiles(d, () => true, () => {});\n}",
+			},
+		],
+		[
+			"a walkFiles import renamed in the support module",
+			'import { counts } from "../support/scan.js";\ncounts("x");',
+			{
+				"scan.ts":
+					'import { walkFiles as wf } from "../../scripts/lib/walk-files.mjs";\nexport function counts(d: string) {\n	return wf(d, () => true, () => {});\n}',
 			},
 		],
 	])("detects %s", (_label, source, modules) => {
@@ -1259,7 +1325,7 @@ describe("tree-scanner census — walks delegated to tests/support (#3472)", () 
 			expect(TEST_TREE_GOVERNANCE_TESTS).toContain(ratchet);
 			expect(TREE_SCANNING_GOVERNANCE_TESTS).not.toContain(ratchet);
 		},
-		CENSUS_TIMEOUT_MS,
+		TREE_WALK_TIMEOUT_MS,
 	);
 
 	it(
@@ -1270,7 +1336,7 @@ describe("tree-scanner census — walks delegated to tests/support (#3472)", () 
 			expect(TEST_TREE_GOVERNANCE_TESTS).toContain(scanner);
 			expect(TREE_SCANNING_GOVERNANCE_TESTS).not.toContain(scanner);
 		},
-		CENSUS_TIMEOUT_MS,
+		TREE_WALK_TIMEOUT_MS,
 	);
 });
 
@@ -1284,10 +1350,19 @@ describe("CI-only pre-push tier (#3426 H3432-1)", () => {
 		}
 	});
 
-	it("runs the deferred suite in the advisory CI job, never the pre-push hook", () => {
-		const job = readWorkflow().jobs["targeted-tests-advisory"];
-		const runs = job?.steps?.map((step) => step.run).filter(Boolean) ?? [];
-		expect(runs.some((run) => run?.includes("--include-ci-only"))).toBe(true);
+	// Recurrence (#3215): the table's CI row was the advisory job that passed
+	// `--include-ci-only`; with that job gone the row is the gating Unit shards,
+	// which must run the whole collection (no file list narrowing them) and
+	// every deferred file must still exist to be collected.
+	it("runs the deferred suites in the gating Unit shards, never the pre-push hook", () => {
+		const unit = readWorkflow().jobs.test;
+		const runTests = unit?.steps?.find((step) => step.name === "Run tests");
+		expect(runTests?.run).toMatch(
+			/ -- npm test -- --shard=\$\{\{ matrix\.shard \}\}\/\$\{\{ strategy\.job-total \}\} --reporter=/,
+		);
+		for (const file of Object.keys(CI_ONLY_PRE_PUSH_TESTS)) {
+			expect(existsSync(resolve(ROOT, file)), file).toBe(true);
+		}
 		const prePush = readFileSync(resolve(ROOT, ".husky/pre-push"), "utf8");
 		expect(prePush).not.toContain("--include-ci-only");
 	});

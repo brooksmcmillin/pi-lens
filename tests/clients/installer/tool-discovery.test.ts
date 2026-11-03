@@ -1,3 +1,4 @@
+// real-home: mocks node:os with its own `userInfo` that answers a fixture home; reads nothing of the real one.
 import {
 	afterAll,
 	afterEach,
@@ -272,6 +273,9 @@ import {
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
+// The real tmpdir: `node:os` is mocked above (its `tmpdir` names /tmp).
+const realOs = await vi.importActual<typeof import("node:os")>("node:os");
+
 const GITHUB_BIN = path.join(TEST_HOME, ".pi-lens", "bin");
 const EXE = process.platform === "win32" ? ".exe" : "";
 
@@ -283,7 +287,12 @@ const EXE = process.platform === "win32" ? ".exe" : "";
  */
 const pathDirs: string[] = [];
 function pathDirWith(command: string): string {
-	const dir = realFs.mkdtempSync(path.join(process.cwd(), ".tmp-path-cand-"));
+	// Outside the session root (#4530): a PATH entry inside the session
+	// repository is no answer until pi trusts the project, and this file's
+	// cases are about the PATH rung's verification, not its trust.
+	const dir = realFs.mkdtempSync(
+		path.join(realOs.tmpdir(), "pi-lens-path-cand-"),
+	);
 	pathDirs.push(dir);
 	realFs.writeFileSync(path.join(dir, command), "#!/bin/sh\nexit 1\n", {
 		mode: 0o750,

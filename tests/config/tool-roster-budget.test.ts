@@ -142,6 +142,9 @@ describe("tool roster description budget", () => {
 			measured,
 		);
 		// 2026-09-10: budget is the measured after-trim total plus 10%.
+		// #4687 (2026-10-21) re-trimmed the lazy tools' schemas (lsp_navigation,
+		// the three ast-grep tools); the exact per-tool pins below are what
+		// catches a schema regrowing after that trim.
 		expect(total, detail).toBeLessThanOrEqual(baseline.pi.budget);
 		expect(baseline.pi.budget).toBe(
 			Math.ceil((descriptionTotal + schemaTotal) * 1.1),

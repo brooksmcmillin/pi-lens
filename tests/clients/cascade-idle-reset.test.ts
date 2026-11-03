@@ -21,12 +21,10 @@ import type {
 	ImpactCascadeResult,
 	ReviewGraph,
 } from "../../clients/review-graph/types.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const mocks = vi.hoisted(() => ({
-	actualGetLSPService: undefined as undefined | (() => unknown),
-	getLSPService: vi.fn(),
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
 	buildOrUpdateGraph: vi.fn(),
@@ -37,25 +35,10 @@ const mocks = vi.hoisted(() => ({
 	logLatency: vi.fn(),
 }));
 
-vi.mock("../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig: mocks.getServersForFileWithConfig,
-}));
-
 vi.mock("../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/lsp/client.js")>()),
 	createLSPClient: mocks.createLSPClient,
 }));
-
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/lsp/capabilities.js")>();
-	mocks.actualGetLSPService = actual.getLSPService;
-	return {
-		...actual,
-		getLSPService: (...args: unknown[]) => mocks.getLSPService(...args),
-	};
-});
 
 vi.mock("../../clients/review-graph/service.js", async (importOriginal) => ({
 	...(await importOriginal<
@@ -143,8 +126,16 @@ beforeAll(async () => {
 }, 30_000);
 
 beforeEach(async () => {
+	// Before the reset, while the previous case's lifecycle is still installed:
+	// it drops that case's cached service, so the premise describe's real
+	// service is built fresh and the cascade describe installs its double over
+	// a clean singleton (tests/support/lsp-service-seam.ts, step 1).
+	await installLspServiceDouble(null);
 	vi.resetModules();
-	mocks.getLSPService.mockReset();
+	// KEEP (#4709): unarmed, the real registry spawns jedi-language-server and probes npm/pnpm/yarn/bun on PATH; the arm stops both.
+	(await import("../../clients/lsp/config.js"))._setServersForFileForTests(
+		mocks.getServersForFileWithConfig,
+	);
 	mocks.getServersForFileWithConfig
 		.mockReset()
 		.mockImplementation((filePath: string) =>
@@ -167,7 +158,6 @@ beforeEach(async () => {
 describe("#3483 premise: a destroyed generation's touch returns undefined and says so", () => {
 	async function realService() {
 		const lsp = await import("../../clients/lsp/index.js");
-		mocks.getLSPService.mockImplementation(() => mocks.actualGetLSPService?.());
 		return { lsp, service: lsp.getLSPService() };
 	}
 
@@ -240,22 +230,22 @@ describe("#3483 cascade: a neighbour lost to an idle reset stays unconfirmed", (
 		const n1Touched = new Promise<void>((resolve) => {
 			n1Entered = resolve;
 		});
-		mocks.getLSPService.mockReturnValue(
-			makeLspServiceDouble({
-				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
-				checkDestroyed: vi.fn(() => destroyed),
-				touchFile: vi.fn(async (filePath: string) => {
-					if (filePath === n1) {
-						if (options.reset) destroyed = true;
-						n1Entered();
-						return { diags: options.n1Diags };
-					}
-					await n1Touched;
-					// Destroyed: the entry return. Live: no client for this file.
-					return undefined;
-				}),
+		// After the beforeEach's `vi.resetModules()`: the async install evaluates
+		// the fresh graph first, so the subject import below cannot replace it.
+		await installLspServiceDouble({
+			getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+			checkDestroyed: vi.fn(() => destroyed),
+			touchFile: vi.fn(async (filePath: string) => {
+				if (filePath === n1) {
+					if (options.reset) destroyed = true;
+					n1Entered();
+					return { diags: options.n1Diags };
+				}
+				await n1Touched;
+				// Destroyed: the entry return. Live: no client for this file.
+				return undefined;
 			}),
-		);
+		});
 		const { computeCascadeForFile } =
 			await import("../../clients/dispatch/integration.js");
 		try {

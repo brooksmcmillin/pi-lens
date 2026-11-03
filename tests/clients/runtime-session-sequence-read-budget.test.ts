@@ -39,6 +39,7 @@ import {
 	readLatestProjectSequence,
 } from "../../clients/project-changes.js";
 import { getDegradationSummary } from "../../clients/degradation-ledger.js";
+import { HOOK_WALL_BUDGET_MS } from "../../clients/hook-budgets.js";
 import {
 	_resetProjectSnapshotParseCacheForTests,
 	buildProjectSnapshotFromRuntime,
@@ -55,7 +56,10 @@ import {
 	setupTestEnvironment,
 	useTrackedTempDirs,
 } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
+import { waitFor } from "./interleaving-kit.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
+import { observeTimerRelease } from "../support/timer-release.js";
 
 const logLatencySpy = vi.hoisted(() => vi.fn());
 const readLatestProjectSequenceAsyncSpy = vi.hoisted(() => vi.fn());
@@ -75,17 +79,9 @@ vi.mock("../../clients/project-changes.js", async (importOriginal) => {
 	};
 });
 
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() => makeLspServiceDouble()),
-}));
-
 import { handleSessionStart } from "../../clients/runtime-session.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 // Session start and the warmup queue project-snapshot body writes that can
 // recreate a fixture root after its `env.cleanup()`; the drain lets them land.
@@ -164,6 +160,12 @@ function deferred<T>(): {
 	return { promise, resolve };
 }
 
+/**
+ * One real macrotask turn. Fake timers own `setTimeout` in the widened-budget
+ * cell, so a `waitFor` there yields on this, never on the default delay.
+ */
+const yieldTick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 function spyOnSeed(runtime: RuntimeCoordinator): ReturnType<typeof vi.fn> {
 	const seedSpy = vi.fn();
 	const original = runtime.seedProjectSequence.bind(runtime);
@@ -187,7 +189,11 @@ describe("#1162 — bounded session_start sequence read", () => {
 	let prevFirst: boolean | undefined;
 	let prevWarmup: boolean | undefined;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// The real config loader walks up from the session cwd to HOME (#4709);
+		// a pinned fixture HOME keeps that read off the maintainer's home.
+		pinFixtureHome("runtime-session-sequence-read-budget");
+		await installLspServiceDouble();
 		prevArgv = process.argv;
 		prevStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		prevBudget = process.env.PI_LENS_SEQUENCE_READ_BUDGET_MS;
@@ -208,6 +214,7 @@ describe("#1162 — bounded session_start sequence read", () => {
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		process.argv = prevArgv;
 		if (prevStartupMode === undefined) delete process.env.PI_LENS_STARTUP_MODE;
 		else process.env.PI_LENS_STARTUP_MODE = prevStartupMode;
@@ -317,6 +324,30 @@ describe("#1162 — bounded session_start sequence read", () => {
 				}),
 			);
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Shape 4 (#1097): the sequence read's budget timer is released when the read
+	// lands first. A hand-rolled copy that leaves it armed keeps a REF'd tail on a
+	// one-shot `pi --print` process for the rest of the budget.
+	it("releases the sequence read's budget timer once a healthy read lands", async () => {
+		const env = setupTestEnvironment("pi-lens-seq-budget-release-");
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		process.env.PI_LENS_SEQUENCE_READ_BUDGET_MS = "1234";
+		const observer = observeTimerRelease(1234);
+		try {
+			const cwd = makeProject(env);
+			readLatestProjectSequenceAsyncSpy.mockResolvedValue({
+				projectSeq: 3,
+				fileSeqByPath: new Map([["/some/other.ts", 1]]),
+				logEntries: 4,
+			});
+			await handleSessionStart(makeDeps(cwd, new RuntimeCoordinator()));
+			expect(observer.armed()).toHaveLength(1);
+			expect(observer.unreleased()).toEqual([]);
+		} finally {
+			observer.restore();
 			env.cleanup();
 		}
 	});
@@ -496,6 +527,223 @@ describe("#1162 — bounded session_start sequence read", () => {
 					);
 				},
 			});
+		},
+	);
+
+	// Recurrence guarded: quick and full session_start each carried a private
+	// ~60-line copy of the sequence-read -> freshness -> snapshot-load ->
+	// hydrate step (jscpd, 87 duplicated lines) and now share
+	// `readSequenceAndHydrateFreshSnapshot`. A drift between the copies (a
+	// record, the cold-sentinel freshness seq, the hydrate) must red in the
+	// mode that lost it; each cell drives the real `handleSessionStart` in one
+	// mode through the seam.
+	describe.each(["quick", "full"] as const)(
+		"%s mode drives the shared sequence/snapshot step",
+		(mode) => {
+			const exportedPath = (cwd: string) => path.join(cwd, "index.ts");
+			const saveSnapshotAt = (cwd: string, seq: number) =>
+				saveProjectSnapshot(cwd, {
+					version: PROJECT_SNAPSHOT_VERSION,
+					projectRoot: cwd,
+					generatedAt: new Date().toISOString(),
+					seq,
+					files: {},
+					symbols: {},
+					reverseDeps: {},
+					cachedExports: [["x", exportedPath(cwd)]],
+					projectRulesScan: { hasCustomRules: true, rules: [] },
+				});
+			const phaseRecord = (phase: string) =>
+				logLatencySpy.mock.calls
+					.map((call) => call[0] as { phase?: string; metadata?: object })
+					.find((record) => record.phase === phase);
+
+			it("a healthy read confirming a fresh snapshot hydrates the runtime and records both phases", async () => {
+				process.env.PI_LENS_STARTUP_MODE = mode;
+				const env = setupTestEnvironment(`pi-lens-seq-seam-fresh-${mode}-`);
+				process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+				try {
+					const cwd = makeProject(env);
+					// Seq 3 is not the cold sentinel (0). The snapshot is fresh only when
+					// the returned sequence reaches the freshness check: a fallback that
+					// ignores it checks 0 against this snapshot and rejects it (#4977
+					// review, Sourcery: a seq-0 pair passes either way).
+					saveSnapshotAt(cwd, 3);
+					readLatestProjectSequenceAsyncSpy.mockResolvedValue({
+						projectSeq: 3,
+						fileSeqByPath: new Map(),
+						logEntries: 0,
+					});
+					const runtime = new RuntimeCoordinator();
+
+					await handleSessionStart(makeDeps(cwd, runtime));
+
+					expect(runtime.cachedExports.get("x")).toBe(exportedPath(cwd));
+					expect(phaseRecord("session_start_sequence_read")?.metadata).toEqual(
+						expect.objectContaining({ timedOut: false, entries: 0 }),
+					);
+					expect(phaseRecord("session_start_snapshot_load")?.metadata).toEqual(
+						expect.objectContaining({ fresh: true, seq: 3 }),
+					);
+				} finally {
+					env.cleanup();
+				}
+			});
+
+			it("a stalled read never trusts the snapshot at session start, and records the unknown sequence (quick mode then hydrates late, #1785)", async () => {
+				process.env.PI_LENS_STARTUP_MODE = mode;
+				const env = setupTestEnvironment(`pi-lens-seq-seam-stall-${mode}-`);
+				process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+				try {
+					const cwd = makeProject(env);
+					saveSnapshotAt(cwd, 0);
+					const slow = deferred<ProjectSequenceIndex>();
+					readLatestProjectSequenceAsyncSpy.mockImplementation(
+						() => slow.promise,
+					);
+					const runtime = new RuntimeCoordinator();
+					const dbgLines: string[] = [];
+
+					await handleSessionStart(
+						makeDeps(cwd, runtime, {
+							dbg: (msg: string) => dbgLines.push(msg),
+						}),
+					);
+
+					// The seq-0 snapshot would match the cold sentinel; the unknown
+					// freshness seq keeps it from hydrating (#1168 finding 2).
+					expect(runtime.cachedExports.get("x")).toBeUndefined();
+					expect(phaseRecord("session_start_sequence_read")?.metadata).toEqual(
+						expect.objectContaining({ timedOut: true }),
+					);
+					expect(phaseRecord("session_start_snapshot_load")?.metadata).toEqual(
+						expect.objectContaining({ fresh: false, sequenceUnknown: true }),
+					);
+					expect(
+						getDegradationSummary().find(
+							(group) => group.kind === "snapshot-sequence-read-timeout",
+						)?.count,
+					).toBeGreaterThanOrEqual(1);
+
+					// The late read lands. Only quick mode wires the retroactive
+					// hydration (#1785); full mode passes no hook because its cold path
+					// computes this state itself (the rescan below the shared step), so a
+					// late fill from disk is unwanted there. The absence is observable:
+					// the hook emits the "hydrating ... late" line always, and fills
+					// `cachedExports` whenever the snapshot on disk still carries them
+					// (mutation M4, #4977 review F2: wiring the hook into full mode reds
+					// this cell).
+					slow.resolve({ projectSeq: 0, fileSeqByPath: new Map() });
+					// The session's own `.then` on this promise was registered first,
+					// so this continuation runs after the deferred hydration.
+					await slow.promise;
+					const lateHydrationLine = dbgLines.some((line) =>
+						line.includes("hydrating cachedExports/projectRulesScan late"),
+					);
+					if (mode === "quick") {
+						expect(runtime.cachedExports.get("x")).toBe(exportedPath(cwd));
+						expect(lateHydrationLine).toBe(true);
+					} else {
+						expect(runtime.cachedExports.get("x")).toBeUndefined();
+						expect(lateHydrationLine).toBe(false);
+					}
+				} finally {
+					env.cleanup();
+				}
+			});
+
+			// Recurrence guarded: the step's one await of `readSequenceWithBudget`
+			// sat unbounded on a hook path (hook-await-bounds census, #4977 review)
+			// and its own race is capped only by an env-overridable budget, so a
+			// widened budget stalled `session_start` past the hook's wall budget.
+			// The race's own budget is now capped at the wall budget, so the arm
+			// that owns the recovery (the deferred reseed and the #1785 late
+			// hydration) is the one that fires. The first fix wrapped the await in
+			// `bounded()` alone, which abandoned the read and silently dropped that
+			// recovery (#4977 review F1: `runtime.projectSeq` stayed 0 once the read
+			// landed with seq 2).
+			it(
+				"a read the widened sequence budget cannot cut is capped at the session_start wall budget, takes the unknown-sequence path, and still reseeds when it lands",
+				async () => {
+					process.env.PI_LENS_STARTUP_MODE = mode;
+					// 2e9 ms: far above the 5s hook budget, below the 2^31 timer clamp.
+					process.env.PI_LENS_SEQUENCE_READ_BUDGET_MS = "2000000000";
+					const env = setupTestEnvironment(`pi-lens-seq-seam-wall-${mode}-`);
+					process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+					vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+					try {
+						const cwd = makeProject(env);
+						saveSnapshotAt(cwd, 0);
+						const slow = deferred<ProjectSequenceIndex>();
+						readLatestProjectSequenceAsyncSpy.mockImplementation(
+							() => slow.promise,
+						);
+						const runtime = new RuntimeCoordinator();
+
+						let settled = false;
+						void handleSessionStart(makeDeps(cwd, runtime)).then(() => {
+							settled = true;
+						});
+						// The sequence read is reached synchronously, so the clock advances on
+						// the first yield after the call. The wait ends on `settled` under a
+						// real-clock deadline, never on a count of event-loop turns (shape 86).
+						await waitFor(() => settled, Boolean, {
+							yieldControl: async () => {
+								await yieldTick();
+								if (readLatestProjectSequenceAsyncSpy.mock.calls.length > 0) {
+									await vi.advanceTimersByTimeAsync(
+										HOOK_WALL_BUDGET_MS.session_start,
+									);
+								}
+							},
+							timeoutMs: 5_000,
+						});
+
+						expect(runtime.cachedExports.get("x")).toBeUndefined();
+						expect(runtime.projectSeq).toBe(0);
+						expect(
+							phaseRecord("session_start_sequence_read")?.metadata,
+						).toEqual(expect.objectContaining({ timedOut: true, entries: 0 }));
+						expect(
+							phaseRecord("session_start_snapshot_load")?.metadata,
+						).toEqual(
+							expect.objectContaining({ fresh: false, sequenceUnknown: true }),
+						);
+						// The inner arm owns the wait, so the outer `bounded()` never fires
+						// first and writes no degradation row (#4977 review F4). Narrowing
+						// the outer bound to 1000 writes one on every stalled start while the
+						// recovery still runs, so only this line reds that mutant.
+						expect(
+							getDegradationSummary()
+								.find((group) => group.kind === "hook-await-exceeded")
+								?.latestReasons.map((row) => row.subject) ?? [],
+						).not.toContain("session_start:readSequenceWithBudget");
+
+						// The read lands after the wall: the recovery still runs.
+						slow.resolve({
+							projectSeq: 2,
+							fileSeqByPath: new Map([["/some/file.ts", 2]]),
+							logEntries: 2,
+						});
+						await waitFor(
+							() => runtime.projectSeq,
+							(seq) => seq === 2,
+							{
+								yieldControl: yieldTick,
+								timeoutMs: 2_000,
+							},
+						);
+						expect(
+							phaseRecord("session_start_sequence_read_deferred_reseed")
+								?.metadata,
+						).toEqual(expect.objectContaining({ deferred: true, entries: 1 }));
+					} finally {
+						vi.useRealTimers();
+						env.cleanup();
+					}
+				},
+				scaledTestTimeout(15_000),
+			);
 		},
 	);
 
@@ -787,4 +1035,46 @@ describe("#1162 — bounded session_start sequence read", () => {
 			env.cleanup();
 		}
 	});
+
+	// RECURRENCE GUARDED: #4911. The snapshot root's home ceiling compared
+	// spellings, so with a HOME or a cwd spelled through a link the nearest
+	// marker at the home became the snapshot root: the session read (and
+	// later wrote) the whole home's project state. The read is the observable:
+	// its root argument is the snapshot root `session_start` chose. Both
+	// directions, each with a real directory link and the real `os.homedir()`.
+	it.each([["home-link"], ["root-link"]] as const)(
+		"keeps the snapshot root at the cwd when the %s spelling puts the nearest marker at the home (#4911)",
+		async (kind) => {
+			const env = setupTestEnvironment("pi-lens-seq-budget-home-link-");
+			process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+			const pin = pinFixtureHome("runtime-session-4911");
+			try {
+				fs.mkdirSync(path.join(pin.home, ".git"), { recursive: true });
+				fs.mkdirSync(path.join(pin.home, "proj"), { recursive: true });
+				const link = path.join(env.tmpDir, "link");
+				fs.symlinkSync(pin.home, link, "junction");
+				if (kind === "home-link") {
+					vi.stubEnv("HOME", link);
+					vi.stubEnv("USERPROFILE", link);
+				}
+				const cwd = path.join(kind === "root-link" ? link : pin.home, "proj");
+				readLatestProjectSequenceAsyncSpy.mockResolvedValue({
+					projectSeq: 0,
+					fileSeqByPath: new Map(),
+					logEntries: 0,
+				});
+
+				await handleSessionStart(makeDeps(cwd, new RuntimeCoordinator()));
+
+				const roots = new Set(
+					readLatestProjectSequenceAsyncSpy.mock.calls.map((call) => call[0]),
+				);
+				expect([...roots]).toEqual([cwd]);
+			} finally {
+				vi.unstubAllEnvs();
+				pin.restore();
+				env.cleanup();
+			}
+		},
+	);
 });

@@ -19,7 +19,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const logLatency = vi.hoisted(() => vi.fn());
 vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
@@ -47,18 +47,10 @@ import {
 	handleTurnEnd,
 } from "../../clients/runtime-turn.js";
 import { setupTestEnvironment } from "./test-utils.js";
-
-const lspFixture = vi.hoisted(() => ({
-	service: undefined as unknown,
-}));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/lsp/capabilities.js")>();
-	return {
-		...actual,
-		getLSPService: () => lspFixture.service ?? actual.getLSPService(),
-	};
-});
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "../support/lsp-service-seam.js";
 
 const SESSION_ID = "turn-end-disposition-seams-session";
 
@@ -153,8 +145,11 @@ function markFalsePositive(
 	markDisposition(cwd, { cwd, ...target, content }, "false-positive");
 }
 
+beforeEach(async () => {
+	await installLspServiceDouble();
+});
+
 afterEach(() => {
-	lspFixture.service = undefined;
 	cancelLSPIdleReset();
 	resetPendingRunnerFindings();
 	_resetStateCacheForTests();
@@ -718,11 +713,15 @@ describe("actionable-warnings turn-end advisory honors dispositions (#3248)", ()
 				},
 				source: "ts",
 			};
-			lspFixture.service = makeLspServiceDouble({
-				supportsLSP: () => true,
-				getLastKnownDiagnostics: () => [lspDiagnostic],
-				codeAction: async () => [{ title: "Remove warning", kind: "quickfix" }],
-			});
+			installLspService(
+				makeLspServiceDouble({
+					supportsLSP: () => true,
+					getLastKnownDiagnostics: () => [lspDiagnostic],
+					codeAction: async () => [
+						{ title: "Remove warning", kind: "quickfix" },
+					],
+				}),
+			);
 			const runtime = new RuntimeCoordinator();
 			runtime.setTelemetryIdentity({ sessionId: SESSION_ID });
 			const cacheManager = new CacheManager(false);

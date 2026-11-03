@@ -27,6 +27,10 @@ export declare function validateCoverageMap(
 	map: TlaCoverageMap,
 	rootDir?: string,
 ): string[];
+export declare function withoutDeclaredFamilies(
+	text?: string,
+	families?: readonly string[],
+): string;
 export declare function evaluateTlaCoverage(input: {
 	map: TlaCoverageMap;
 	changedFiles?: readonly string[];

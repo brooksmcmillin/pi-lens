@@ -26,6 +26,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
 import { resetGlobalConfigLocationCache } from "../../clients/lens-config.js";
 import { removeTempDirSync } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
 
 const notices: string[] = [];
 
@@ -53,7 +54,7 @@ function write(file: string, value: unknown): void {
 	fs.writeFileSync(file, JSON.stringify(value, null, 2));
 }
 
-let previousConfigPath: string | undefined;
+const setConfigPath = useConfigPath();
 let previousHome: string | undefined;
 let previousAgentDir: string | undefined;
 let previousRealHome: string | undefined;
@@ -61,7 +62,6 @@ let previousRealUserProfile: string | undefined;
 
 beforeEach(() => {
 	notices.length = 0;
-	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	previousHome = process.env.PI_LENS_HOME;
 	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	delete process.env.PI_CODING_AGENT_DIR;
@@ -82,8 +82,6 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = previousHome;
 	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -117,7 +115,7 @@ describe("a migration notice names the file the resolver actually reads (#2426 F
 		const home = tmpRoot("pi-lens-notice-home-");
 		const globalDir = tmpRoot("pi-lens-notice-globaldir-");
 		process.env.PI_LENS_HOME = globalDir;
-		delete process.env.PI_LENS_CONFIG_PATH;
+		setConfigPath(undefined);
 
 		const projectDir = path.join(home, "proj");
 		fs.mkdirSync(projectDir, { recursive: true });

@@ -35,7 +35,6 @@ const NOT_YET_ON_PRIMITIVE: Record<string, string> = {
 
 	// Spawning runners that already consult the spawn outcome with their own
 	// per-tool check. Correct today, not yet unified. #1737.
-	"gleam-check.ts": "reads its own exit status; #1737 strangler",
 	"helm-lint.ts": "reads its own exit status; #1737 strangler",
 	"helm-render.ts": "reads its own exit status; #1737 strangler",
 	"psscriptanalyzer.ts": "reads its own exit status; #1737 strangler",

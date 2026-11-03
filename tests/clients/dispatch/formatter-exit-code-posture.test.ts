@@ -158,6 +158,13 @@ describe("formatter exit-code posture (#1337)", () => {
 	// (clients/dispatch/runners/biome-check.ts) already passed this flag.
 	it("passes --no-errors-on-unmatched on every biome command path", async () => {
 		const { biomeFormatter } = await loadFormatters();
+		// #4530: the planted local biome is admitted only under trust; without
+		// it the lookup fell through to the test runner's own
+		// `node_modules/.bin`, the session repository's bytes. The cell pins the
+		// flag, not trust, so it adopts trust on the module graph it just loaded.
+		const { setProjectTrustState } =
+			await import("../../../clients/project-trust.js");
+		setProjectTrustState("trusted");
 		expect(biomeFormatter.command).toContain("--no-errors-on-unmatched");
 
 		const env = setupTestEnvironment("pi-lens-biome-unmatched-");

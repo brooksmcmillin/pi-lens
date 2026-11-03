@@ -1,0 +1,17 @@
+<!-- This is an auto-generated comment: release notes by coderabbit.ai -->
+
+<!-- coderabbit-ai-generated:v1 -->
+
+## Summary by CodeRabbit
+
+- **New Features**
+  - Improved CI handling for cancelled jobs, including safe reruns of eligible infrastructure interruptions.
+  - Added runtime-cap warnings for checks approaching or exceeding configured limits without changing pass/fail results.
+  - Formal-model checks now distribute work according to measured processing costs for more balanced execution.
+
+- **Bug Fixes**
+  - Sharded test and model-checking results now distinguish completed work from incomplete cancellations, reducing misleading CI outcomes.
+  - Increased the formal-model check timeout from 12 to 20 minutes.
+  - CI verdicts now fail safely when shard evidence is missing, incomplete, or unreadable.
+
+<!-- end of auto-generated comment: release notes by coderabbit.ai -->

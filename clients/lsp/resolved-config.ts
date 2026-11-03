@@ -17,6 +17,7 @@ import {
 import type { Provenance } from "../config-core/provenance.js";
 import { customServerSpecsOf } from "./config.js";
 import { isAuxiliary, type LspServerRole } from "./server-traits.js";
+import { toPosix } from "../path-utils.js";
 
 export interface ResolvedLspServer {
 	readonly kind: "custom" | "override";
@@ -83,7 +84,7 @@ function makeMigrationRecord(
 
 function isLegacyLspFile(file: string | undefined): boolean {
 	if (!file) return false;
-	const normalized = file.replaceAll("\\", "/");
+	const normalized = toPosix(file);
 	return (
 		/(?:^|\/)(?:pi-lens|pi-lsp)\.json$/.test(normalized) ||
 		normalized.endsWith(["", ".pi-lens", "lsp.json"].join("/"))

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getGlobalPiLensDir,
 	getProjectDataDir,
@@ -38,7 +38,8 @@ import {
 	useTrackedTempDirs,
 } from "./test-utils.js";
 import { waitFor as waitForCondition } from "./interleaving-kit.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { dataDir444 } from "../support/data-dir-4-4-4.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 // `handleSessionStart` queues project-snapshot body writes that can recreate a
 // fixture root after its `env.cleanup()`; the drain lets them land first.
@@ -62,18 +63,6 @@ function findDeadPid(): number {
 // afterEach cleanup would then race). supportsLSP:false short-circuits the warm
 // before it opens any file.
 const mockTouchFile = vi.fn(async () => undefined);
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(() =>
-		makeLspServiceDouble({
-			supportsLSP: () => false,
-			touchFile: mockTouchFile,
-		}),
-	),
-}));
-
 // #1767: every test in this file drives `handleSessionStart`, which does
 // real synchronous fs work (detectProjectLanguageProfile, scanProjectRules)
 // plus fire-and-forget background scans (`scheduleStartupScans`) that reach
@@ -137,7 +126,8 @@ function writeConfig(filePath: string, config: Record<string, unknown>): void {
 
 async function runSessionStart(
 	mode: "full" | "quick" | "minimal",
-	setup?: (tmpDir: string) => void,
+	/** May return the spelling of the project root the host starts with. */
+	setup?: (tmpDir: string) => string | void,
 	overrides: {
 		astGrepEnsure?: () => Promise<boolean>;
 		scanExports?: () => Promise<Map<string, string>>;
@@ -149,7 +139,7 @@ async function runSessionStart(
 	} = {},
 ) {
 	const env = setupTestEnvironment("pi-lens-runtime-session-");
-	setup?.(env.tmpDir);
+	const ctxCwd = setup?.(env.tmpDir) || env.tmpDir;
 	// #810 root cause: in "full" mode with a package.json present,
 	// scheduleStartupScans (clients/runtime-session.ts) fires "todo" and
 	// "word-index" as fire-and-forget background tasks (setImmediate) that do
@@ -202,7 +192,7 @@ async function runSessionStart(
 
 	try {
 		const sessionDeps = withResidentBootstrap({
-			ctxCwd: env.tmpDir,
+			ctxCwd,
 			getFlag: (name: string) => {
 				const override = overrides.getFlag?.(name);
 				if (override !== undefined) return override;
@@ -375,6 +365,14 @@ async function runSessionStartPastExportsDefer(
 	}
 	return run;
 }
+
+// The service stub documented above `mockTouchFile`, installed for every case.
+beforeEach(async () => {
+	await installLspServiceDouble({
+		supportsLSP: () => false,
+		touchFile: mockTouchFile,
+	});
+});
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -814,6 +812,46 @@ describe("fixture-loaded startup precedence", () => {
 			await result.env.cleanup();
 		}
 	});
+
+	// RECURRENCE GUARDED: #4689 round 4. The data dir moved from a link
+	// spelling's name to the real path's; the copy of what an earlier version
+	// stored under the spelling must say once whether it carried everything.
+	for (const [label, blockCache, expected] of [
+		["copies every file", false, "the old directory is kept"],
+		["cannot copy a file", true, "could not be copied"],
+	] as const) {
+		it(`records once that adopting a link spelling's data dir ${label}`, async (ctx) => {
+			if (process.platform === "win32")
+				return ctx.skip("the win32 name never moved");
+			let alias = "";
+			const result = await runSessionStart("quick", (tmpDir) => {
+				alias = `${tmpDir}-alias`;
+				fs.symlinkSync(tmpDir, alias, "dir");
+				const dir = getProjectDataDir(tmpDir);
+				const spelled = dataDir444(path.dirname(dir), alias);
+				fs.mkdirSync(path.join(spelled, "cache"), { recursive: true });
+				fs.writeFileSync(path.join(spelled, "cache", "marker.json"), "{}");
+				if (blockCache) {
+					fs.mkdirSync(dir, { recursive: true });
+					fs.writeFileSync(path.join(dir, "cache"), "");
+				}
+				// The host starts under the link's spelling of the root.
+				return alias;
+			});
+			try {
+				const rows = getDegradationSummary().filter(
+					(entry) => entry.kind === "data_dir_migrated",
+				);
+				expect(rows).toHaveLength(1);
+				expect(rows[0]?.count).toBe(1);
+				expect(rows[0]?.latestReasons[0]?.reason).toContain(expected);
+				expect(rows[0]?.latestReasons[0]?.reason).not.toContain("/");
+			} finally {
+				fs.rmSync(alias, { force: true });
+				await result.env.cleanup();
+			}
+		});
+	}
 
 	// Recurrence (#1129 F9 and F3, review of d873c8d74): marking a tmp checkout
 	// ephemeral was silent, and nothing reaped a dead process's data dir.

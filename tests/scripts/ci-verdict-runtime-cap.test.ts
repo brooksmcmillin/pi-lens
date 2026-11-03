@@ -24,15 +24,17 @@ import { describe, expect, it } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
 import { escapeRegExp } from "../../clients/string-utils.js";
 import {
-	checkNamePattern,
 	computeVerdict,
 	formatRuntimeCapLines,
+	readJobTimeCaps,
+} from "../../scripts/ci-verdict.mjs";
+import {
+	checkNamePattern,
 	jobCapEntries,
 	MAX_RUNTIME_CAP_LINES,
-	readJobTimeCaps,
 	RUNTIME_CAP_WARN_RATIO,
 	runtimeCapLines,
-} from "../../scripts/ci-verdict.mjs";
+} from "../../scripts/lib/ci-runtime-cap.mjs";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
@@ -406,10 +408,12 @@ describe("#4680 r4 F1: ci-verdict runs in a checkout that was never built", () =
 				"scripts/ci-verdict.mjs",
 				"scripts/lib/ci-checks.mjs",
 				"scripts/lib/ci-failure-classifier.mjs",
+				"scripts/lib/ci-runtime-cap.mjs",
 				"scripts/lib/github-rest.mjs",
 				"scripts/lib/mutation-pr-comment.mjs",
 				"scripts/lib/mutation-report-render.mjs",
 				"scripts/lib/vitest-summary.mjs",
+				"scripts/update-contributors.mjs",
 			])
 				copyFileSync(join(ROOT, file), join(dir, file));
 			mkdirSync(join(dir, ".github", "workflows"), { recursive: true });

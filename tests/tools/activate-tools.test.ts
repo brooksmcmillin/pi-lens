@@ -39,6 +39,40 @@ describe("pi_lens_activate_tools", () => {
 		}
 	});
 
+	// #4913 recurrence: the catalog is fixed when the factory runs, `--no-tool`
+	// arrives after it, so a catalog tool the flag names must still be refused.
+	it("refuses a catalog tool that is no longer enabled and reports it as rejected", async () => {
+		let active = ["lens_diagnostics"];
+		const setCalls: string[][] = [];
+		const rejected: string[] = [];
+		const pi = {
+			getActiveTools: () => active,
+			setActiveTools: (names: string[]) => {
+				setCalls.push(names);
+				active = names;
+			},
+		};
+		const tool = createActivateToolsTool(pi, CATALOG, {
+			isEnabled: (name) => name !== "ast_grep_search",
+			onRejected: (name) => rejected.push(name),
+		});
+
+		const result = await tool.execute(
+			"1",
+			{ tools: ["ast_grep_search", "lsp_navigation"] },
+			new AbortController().signal,
+			null,
+		);
+
+		expect(rejected).toEqual(["ast_grep_search"]);
+		expect(setCalls).toEqual([["lens_diagnostics", "lsp_navigation"]]);
+		expect(result.details).toEqual({
+			matches: ["lsp_navigation"],
+			added: ["lsp_navigation"],
+			skillPaths: ["/skills/lsp/SKILL.md"],
+		});
+	});
+
 	it("calls setActiveTools additively (merges with the current active set)", async () => {
 		let active = ["lens_diagnostics", "ast_grep_search"];
 		let setCallArgs: string[] | undefined;

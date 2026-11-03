@@ -17,7 +17,7 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 const openFile = vi.fn(
@@ -66,20 +66,21 @@ function warningDiagnostics(count: number): LSPDiagnostic[] {
 	}));
 }
 
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	// The five methods `buildActionableWarningsReport` actually reads, overridden
-	// on a factory-seeded surface (#2592): a sixth one added to the production
-	// path would otherwise TypeError into the report's swallow-all catch and
-	// silently blank this suite's bounds assertions.
-	getLSPService: () =>
-		makeLspServiceDouble({
-			supportsLSP: (filePath: string) => filePath.endsWith(".ts"),
-			openFile,
-			getDiagnostics,
-			codeAction,
-			getLastKnownDiagnostics,
-		}),
-}));
+/**
+ * The five methods `buildActionableWarningsReport` actually reads, overridden on
+ * a factory-seeded surface (#2592): a sixth one added to the production path
+ * would otherwise TypeError into the report's swallow-all catch and silently
+ * blank this suite's bounds assertions.
+ */
+async function installService(): Promise<void> {
+	await installLspServiceDouble({
+		supportsLSP: (filePath: string) => filePath.endsWith(".ts"),
+		openFile,
+		getDiagnostics,
+		codeAction,
+		getLastKnownDiagnostics,
+	});
+}
 
 let tmpDir: string;
 let outsideDir: string;
@@ -99,7 +100,8 @@ function makeFiles(dir: string, count: number, prefix = "f"): string[] {
 	return made;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installService();
 	openFile.mockClear();
 	getDiagnostics.mockClear();
 	codeAction.mockClear();
@@ -150,6 +152,40 @@ describe("#2504 AC3 — project-root filter", () => {
 		for (const p of touched) {
 			expect(p).not.toContain("stray0.ts");
 		}
+	});
+});
+
+describe("#4689 — project-root filter under a session root spelled through a link", () => {
+	// RECURRENCE GUARDED: review r1 F5. The filter compared a file key (path
+	// identity) with the session's link spelling, so in a session rooted at a
+	// link every modified file was skipped as outside the project and no code
+	// action was ever offered.
+	it("enriches the session's own file passed as a key", async (ctx) => {
+		const { buildActionableWarningsReport } = await load();
+		const inside = makeFiles(path.join(tmpDir, "src"), 1)[0];
+		const alias = path.join(outsideDir, "repo-alias");
+		try {
+			fs.symlinkSync(tmpDir, alias, "dir");
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+		const key = normalizeMapKey(path.join(alias, "src", path.basename(inside)));
+		prime(key);
+
+		await buildActionableWarningsReport({
+			cwd: alias,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files: [key],
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+		});
+
+		const asked = getLastKnownDiagnostics.mock.calls.map((c) =>
+			normalizeMapKey(String(c[0])),
+		);
+		expect(asked).toContain(key);
 	});
 });
 

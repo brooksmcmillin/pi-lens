@@ -33,7 +33,16 @@ import {
 	getFormattersForFile,
 	oxfmtFormatter,
 } from "../../../clients/formatters.js";
+import { setProjectTrustState } from "../../../clients/project-trust.js";
 import { setupTestEnvironment } from "../test-utils.js";
+
+// #4530: these cells plant a project-local oxfmt and expect the local branch.
+// Under any pi trust other than `trusted` that branch is refused, and the
+// lookup then fell through to the test runner's own `node_modules/.bin` on
+// PATH, which is the session repository's bytes and is refused too. The file
+// tests oxfmt's contract, not trust, so it adopts trust for its static module
+// graph; the trust rule has its own suite.
+setProjectTrustState("trusted");
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),

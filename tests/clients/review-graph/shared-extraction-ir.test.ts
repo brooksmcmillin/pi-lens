@@ -236,6 +236,40 @@ describe("scanner to review-graph structural IR (#939)", () => {
 		clearReviewGraphFileIr();
 		resetReviewGraphIrStats();
 	});
+
+	// #4949: `syntaxErrors` is optional on ExtractedSymbols. Recurrence: a
+	// required field would reject every IR record published before it existed.
+	it("a tree-sitter record without syntaxErrors is stored and returned as written (#4949)", () => {
+		const cwd = path.join(os.tmpdir(), "ir-legacy-record-root");
+		const hash = reviewGraphIrContentHash("def a(): pass");
+		const legacy = {
+			symbols: [],
+			refs: [],
+			imports: [],
+			coverage: {
+				definitions: "complete" as const,
+				references: "complete" as const,
+				imports: "complete" as const,
+			},
+		};
+		publishReviewGraphFileIr(cwd, {
+			filePath: "/p/legacy.py",
+			contentHash: hash,
+			complete: true,
+			structural: {
+				kind: "tree-sitter",
+				languageId: "python",
+				extracted: legacy,
+			},
+		});
+		const got = getFreshReviewGraphFileIr(cwd, "/p/legacy.py", hash);
+		const extracted =
+			got?.structural?.kind === "tree-sitter"
+				? got.structural.extracted
+				: undefined;
+		expect(extracted).toEqual(legacy);
+		expect(extracted?.syntaxErrors).toBeUndefined();
+	});
 });
 
 // #2442 review F9: the three clients/review-graph/* eviction sites were

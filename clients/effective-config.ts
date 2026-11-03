@@ -49,6 +49,7 @@ import {
 	summarizeConfigResolution,
 } from "./config-resolve.js";
 import { getToolPlan } from "./dispatch/plan.js";
+import { disabledRunnersOf } from "./dispatch/disabled-runners.js";
 import { getAvailableRunners } from "./dispatch/integration.js";
 import { detectFileKind } from "./file-kinds.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
@@ -56,8 +57,10 @@ import { type LanguageEntry, resolveLanguage } from "./language-registry.js";
 import { getPiLensGlobalConfigPath } from "./lens-config.js";
 import {
 	customServerSpecsOf,
+	disabledServerRecords,
 	explainServersForFile,
 	lspConfigOf,
+	newLspConfigProblems,
 	registerLSPConfig,
 	type RegisteredLSPConfig,
 	type ServerSelectionReason,
@@ -144,6 +147,7 @@ export interface EffectiveServerDecision {
 /** Why a runner did or did not make a file's dispatch plan. */
 type ToolSelectionReason =
 	| "selected"
+	| "disabled-by-config"
 	| "not-registered-for-kind"
 	| "no-dispatch-plan";
 
@@ -151,6 +155,11 @@ interface EffectiveToolDecision {
 	readonly id: string;
 	readonly selected: boolean;
 	readonly reason: ToolSelectionReason;
+	/**
+	 * The tier and file that denied the runner (`dispatch.disabledRunners`).
+	 * Present only for a `disabled-by-config` decision.
+	 */
+	readonly decidedBy?: ProvenanceViewEntry;
 	readonly resolvedCwd: string;
 }
 
@@ -224,9 +233,16 @@ function redactServerSpec(entry: unknown): RedactedServerSpec | undefined {
 		return undefined;
 	}
 	const record = entry as Record<string, unknown>;
-	const command =
-		typeof record.command === "string" ? record.command : undefined;
-	const args = Array.isArray(record.args) ? record.args : [];
+	// The argv-array form (#5127): the head is the command token, and the
+	// rest count toward `argvCount` like `args` do.
+	const rawCommand: unknown = record.command;
+	const commandArray = Array.isArray(rawCommand) ? rawCommand : undefined;
+	const head = commandArray ? commandArray[0] : rawCommand;
+	const command = typeof head === "string" ? head : undefined;
+	const args = [
+		...(commandArray?.slice(1) ?? []),
+		...(Array.isArray(record.args) ? record.args : []),
+	];
 	const env =
 		typeof record.env === "object" && record.env !== null
 			? Object.keys(record.env as Record<string, unknown>).sort(compareOrdinal)
@@ -347,10 +363,12 @@ function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
  * explicit argument. Same gate, same answer, no write.
  *
  * ONE RESOLUTION ANSWERS THE WHOLE QUERY (#2427 review round 5, F-R4-1), taken
- * at the FILE's own directory whenever a file is asked about — matching what
- * the runtime registers via `ensureLSPConfigInitialized(path.dirname(filePath))`,
- * because a nested `repo/sub/.pi-lens.json` layer (config.ts header point 3)
- * reaches the runtime's decision no other way (round 4, F1).
+ * at the FILE's own directory whenever a file is asked about. The runtime
+ * registers the nearest config owner (any `PROJECT_CONFIG_LOCATIONS` file) at or above the file
+ * (`resolveSessionConfigRoot`, #2657), because a nested
+ * `repo/sub/.pi-lens.json` layer (config.ts header point 3) reaches the
+ * runtime's decision only through a registered root at or below it (round 4,
+ * F1).
  *
  * Round 4 moved the GATES to that root and left the rest — the redacted spec,
  * every `decidedBy`, the `documents` list — reading a SECOND resolution taken
@@ -434,12 +452,12 @@ export async function effectiveConfig(
 	// and its root is the FILE's own directory whenever a CONFINED file is
 	// asked about.
 	//
-	// The runtime registers LSP config at that directory —
-	// `ensureLSPConfigInitialized(path.dirname(filePath))` in
-	// `runtime-tool-call.ts` — and `getConfigForFile` answers with the deepest
-	// registered ancestor, so a nested `repo/sub/.pi-lens.json` (config.ts
-	// header point 3) only reaches the runtime's decision through the file's
-	// own directory. Round 4 fixed the GATES that way but left every other fact
+	// The runtime registers LSP config at the nearest config owner (any `PROJECT_CONFIG_LOCATIONS` file)
+	// at or above the file (`resolveSessionConfigRoot` in
+	// `runtime-tool-call.ts`, #2657), and `getConfigForFile` answers with the
+	// deepest registered ancestor, so a nested `repo/sub/.pi-lens.json`
+	// (config.ts header point 3) only reaches the runtime's decision through a
+	// registered root at or below it. Round 4 fixed the GATES that way but left every other fact
 	// — the redacted spec, every `decidedBy`, the `documents` list — read off a
 	// second resolution taken at the workspace root, so the query had two
 	// resolution roots and they disagreed: it reported the root's definition of
@@ -472,12 +490,29 @@ export async function effectiveConfig(
 	// uses, not a second, raw-path rendering of it.
 	const homeRelativeCwd = homeRelativePath(cwd, homeDir);
 
+	// The unknown `lsp.disabledServers` ids (#5141) are collected by the same
+	// projection the loader runs, into a problems list this query never reports.
+	const lspProblems = newLspConfigProblems();
+	lspConfigOf(resolution.value, lspProblems);
+
 	const view: EffectiveConfigView = {
 		cwd: homeRelativeCwd,
 		documents: summary.documents,
 		provenance: provenanceView(resolved, homeDir).entries,
 		provenanceCounts: summary.countsByTier,
-		recordCounts: countBy(resolution.records, (record) => record.code),
+		// The unknown `dispatch.disabledRunners` ids are records too: the pure
+		// `disabledRunnersOf` derives them without reporting (this query is not a
+		// dispatch), so a typo'd id shows here even where notifications are off.
+		// The unknown `lsp.disabledServers` ids are the same, through the pure
+		// `disabledServerRecords` (#5141).
+		recordCounts: countBy(
+			[
+				...resolution.records,
+				...disabledRunnersOf(resolution).records,
+				...disabledServerRecords(resolution, lspProblems),
+			],
+			(record) => record.code,
+		),
 		tools: LENS_TOOL_NAMES.map((name) => ({
 			name,
 			enabled: resolveLensToolEnabled(
@@ -500,6 +535,7 @@ export async function effectiveConfig(
 				: {
 						file: await fileView(
 							absolute,
+							resolution,
 							resolved,
 							homeDir,
 							cwd,
@@ -529,14 +565,17 @@ export async function effectiveConfig(
  */
 function toolReason(
 	selected: boolean,
+	disabled: boolean,
 	kind: ReturnType<typeof detectFileKind>,
 ): ToolSelectionReason {
+	if (disabled) return "disabled-by-config";
 	if (selected) return "selected";
 	return kind === undefined ? "no-dispatch-plan" : "not-registered-for-kind";
 }
 
 async function fileView(
 	absolute: string,
+	resolution: PiLensConfigResolution,
 	resolved: Resolved<Record<string, unknown>>,
 	homeDir: string,
 	workspaceCwd: string,
@@ -620,6 +659,13 @@ async function fileView(
 	const planned = kind
 		? (getToolPlan(kind)?.groups.flatMap((group) => group.runnerIds) ?? [])
 		: [];
+	// A denied runner stays in the list, named, so the answer to "why did this
+	// not run" is the denial and its provenance, not an absence. The same
+	// `disabledRunnersOf` the dispatcher's context reads, over this query's own
+	// resolution: one definition of which runners are denied.
+	const disabledRunners = new Map(
+		disabledRunnersOf(resolution).runners.map((runner) => [runner.id, runner]),
+	);
 	// Ordinal, not the default locale sort: this list is the ORDER of a payload
 	// callers compare across machines, and a locale-sensitive comparator can
 	// order the same ids differently under a different ICU build (#2427 review
@@ -627,8 +673,9 @@ async function fileView(
 	const ids = [...new Set([...planned, ...available])].sort(compareOrdinal);
 	const tools: EffectiveToolDecision[] = ids.map((id) => ({
 		id,
-		selected: available.has(id),
-		reason: toolReason(available.has(id), kind),
+		selected: available.has(id) && !disabledRunners.has(id),
+		reason: toolReason(available.has(id), disabledRunners.has(id), kind),
+		...decidedByOrNothing(viewOf(disabledRunners.get(id)?.decidedBy, homeDir)),
 		resolvedCwd: homeRelativePath(
 			resolveToolCwd("runner", id, absolute, {
 				cwd: workspaceCwd,

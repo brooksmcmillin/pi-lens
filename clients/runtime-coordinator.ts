@@ -22,14 +22,23 @@ import {
 import { formatDiagnostics } from "./dispatch/utils/format-utils.js";
 import {
 	inlineBlockerLines,
+	inlineBlockerSourceOf,
 	inlineBlockerSources,
+	isCrossFileBlocker,
 } from "./inline-blocker-fields.js";
 import type { MutationKind } from "./mutating-tool.js";
-import { normalizeMapKey, pathsEqual } from "./path-utils.js";
+import {
+	normalizeMapKey,
+	pathsEqual,
+	realpathOrResolve,
+} from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";
 import { type AnalysisAnchor, owedByContentOnly } from "./line-alignment.js";
-import { PartialApplyRecordStore } from "./partial-edit-apply.js";
+import {
+	type PartialApplyPending,
+	PartialApplyRecordStore,
+} from "./partial-edit-apply.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -52,7 +61,9 @@ import {
 	type LineageHandle,
 	nextOrderTurn,
 	retireScope,
+	scopeCell,
 	type SessionScope,
+	sessionCell,
 } from "./session-scope.js";
 
 /** Keep deferred cascade admission bounded without dropping late findings. */
@@ -297,14 +308,12 @@ export interface InlineBlockerRecord {
 	 * end, since a transient shrink-then-restore of the file must un-demote it.
 	 * `"self-drift"` (#2982) also RE-ARMS, for the same reason in a different
 	 * axis: the record's own bytes changed after the verdict, and bytes that
-	 * change back must un-demote it. It is deliberately NOT
-	 * `"dependency-drift"` — that reason routes through the #1950 delivery cap
-	 * in `runtime-turn.ts`, which retires a record permanently after three
-	 * stale deliveries. That cap was designed for recoverable LSP dependency
-	 * drift; a self-drift record can carry ast-grep or tree-sitter security
-	 * provenance, and walking such a finding out of turn-end rendering because
-	 * an advisory was shown three times is not a policy this gate may apply.
-	 * A re-arming reason needs no cap: it heals on its own when the bytes do.
+	 * change back must un-demote it. Re-arming does not cover an agent rewrite
+	 * that never returns to the recorded bytes, so since #4990 this axis has
+	 * its own delivery cap, `SELF_DRIFT_MAX_DELIVERIES` (`runtime-turn.ts`),
+	 * separate from the #1950 dependency-drift cap. It retires the record
+	 * with a ledger reason that says a re-run can still confirm it, and a
+	 * heal resets the count (`staleDeliveryCount`).
 	 */
 	staleReason?: "dependency-drift" | "past-eof" | "self-drift";
 	/**
@@ -363,12 +372,13 @@ export interface InlineBlockerRecord {
 	diagnostics?: readonly Diagnostic[];
 	/**
 	 * #1950: how many turn ends have re-served this record while `stale`.
-	 * Only incremented for the `"dependency-drift"` reason — `"past-eof"`
-	 * retires after its own single delivery (#1944) and never needs a count.
-	 * Caps a recoverable-but-unconfirmed demotion at
-	 * `DEPENDENCY_DRIFT_MAX_DELIVERIES` deliveries
-	 * (`clients/blocker-freshness.ts`) instead of re-serving it for the rest
-	 * of the session.
+	 * Only incremented for the `"dependency-drift"` and `"self-drift"` reasons
+	 * — `"past-eof"` retires after its own single delivery (#1944) and never
+	 * needs a count. Caps a recoverable-but-unconfirmed demotion at its axis's
+	 * cap, `DEPENDENCY_DRIFT_MAX_DELIVERIES` or `SELF_DRIFT_MAX_DELIVERIES`
+	 * (`clients/blocker-freshness.ts`), instead of re-serving it for the rest
+	 * of the session. The count belongs to one demotion episode: healing a
+	 * self-drift demotion drops it (#4990).
 	 */
 	staleDeliveryCount?: number;
 	/**
@@ -380,7 +390,38 @@ export interface InlineBlockerRecord {
 	 * next write then has no alignment and matches on identity alone.
 	 */
 	analysisAnchor?: AnalysisAnchor;
+	/**
+	 * #4921: the turn session whose write recorded this verdict, named only
+	 * when it is not this coordinator's session (a concurrent in-process
+	 * secondary, #473); an unnamed record is the coordinator's
+	 * (`turnSession`'s own default). Turn-end readers admit only their own
+	 * session's records (`getInlineBlockersSnapshot({ sessionId })`); the
+	 * commit gate reads every record. The latest verdict on a file replaces
+	 * the record and its owner.
+	 */
+	session?: string;
 }
+
+/**
+ * What {@link RuntimeCoordinator.updateGitGuardStatus} last counted for the
+ * commit gate (#4941): the unsuppressed blocker records with their files, the
+ * latest write's own verdict (its file, when known), and the first non-blank
+ * line of that write's output.
+ */
+interface GitGuardMemo {
+	readonly entries: ReadonlyArray<{
+		readonly filePath: string;
+		readonly summary: string;
+	}>;
+	readonly verdict: { readonly filePath: string | undefined } | undefined;
+	readonly firstLine: string | undefined;
+}
+
+const EMPTY_GIT_GUARD_MEMO: GitGuardMemo = {
+	entries: [],
+	verdict: undefined,
+	firstLine: undefined,
+};
 
 /**
  * #3218 criterion 2: the render cap for the turn-end "Resolved this turn"
@@ -418,6 +459,8 @@ export interface ResolvedBlockerFile {
 	writeIndex: number | undefined;
 	/** Retired by `retireInlineBlockerOnConfirmedClean`, not by a clean write. */
 	confirmedClean: boolean;
+	/** #4921: the retired record's `session`: the turn end that may say it. */
+	session?: string;
 	/**
 	 * `turnIndex` when the retire happened. The composer says "this turn" only
 	 * for an entry from its own turn; a carried entry (a turn_end that delivered
@@ -510,32 +553,48 @@ const TOOL_CALL_ATTRIBUTION_CAPACITY = 256;
 const TOOL_CALL_ATTRIBUTION_TTL_MS = 5 * 60_000;
 
 /**
+ * A record narrowed to the rows that survive a retirement. The derived fields
+ * (`summary`, `sources`, `lines`) come from the surviving rows, never from the
+ * old record, so a narrowed record cannot keep a source or a line count that
+ * only a retired row held. The one rebuild every partial retire uses
+ * (`retireUnobservedRunnerBlockers`, `retireInlineBlockerOnConfirmedClean`,
+ * `retireForeignRows`).
+ */
+function narrowedRecord(
+	existing: InlineBlockerRecord,
+	kept: Diagnostic[],
+): InlineBlockerRecord {
+	return {
+		...existing,
+		summary: formatDiagnostics(kept, "blocking").trim(),
+		diagnostics: kept,
+		sources: inlineBlockerSources(kept),
+		lines: inlineBlockerLines(kept, existing.filePath),
+	};
+}
+
+/**
  * #3613 (session-scope S4): per-turn warnings partitioned by the session
  * whose turn produced them. A concurrent secondary (an in-process subagent)
  * adds, reads and clears its own partition on the primary's coordinator, so
- * neither session's turn moves the other's warnings. A partition is removed
- * when its turn drains it, at its session's shutdown, or at the primary's
- * reset.
+ * neither session's turn moves the other's warnings.
+ *
+ * #4965: a partition is a cell on its session's scope (`scopeCell`), so it
+ * ends with that scope: a primary's when its coordinator begins the next
+ * scope, a secondary's at its shutdown. A turn drains it earlier
+ * (`clearTurnWarnings`). Both record kinds share one cell per session. The primary's cell is the coordinator's own scope;
+ * a foreign session's is found by its id (`sessionCell`), and a write for a
+ * session with no live scope is dropped and counted.
  */
-class TurnWarningsBySession<T extends { id: string }> {
-	private readonly bySession = new Map<string, Map<string, T>>();
+interface TurnWarningsCell {
+	readonly actionable: Map<string, ActionableWarningRecord>;
+	readonly codeQuality: Map<string, CodeQualityWarningRecord>;
+}
 
-	add(sessionId: string, items: readonly T[]): void {
-		let partition = this.bySession.get(sessionId);
-		if (!partition) {
-			partition = new Map();
-			this.bySession.set(sessionId, partition);
-		}
-		for (const item of items) partition.set(item.id, item);
-	}
+const TURN_WARNINGS_CELL = "turn-warnings";
 
-	peek(sessionId: string): T[] {
-		return [...(this.bySession.get(sessionId)?.values() ?? [])];
-	}
-
-	clear(sessionId: string): void {
-		this.bySession.delete(sessionId);
-	}
+function newTurnWarningsCell(): TurnWarningsCell {
+	return { actionable: new Map(), codeQuality: new Map() };
 }
 
 export class RuntimeCoordinator {
@@ -642,12 +701,42 @@ export class RuntimeCoordinator {
 	// skip its per-build O(project) walk+stat sweep when only pi-observed edits
 	// occurred. Keyed identically to _fileSeq (normalizeMapKey + path.resolve).
 	private readonly _fileLastProjectSeq = new Map<string, number>();
-	private _gitGuardHasBlockers = false;
-	private _gitGuardSummary = "";
-	private _gitGuardCacheUnknownReason: string | undefined;
+	/**
+	 * The commit gate's memo of the last {@link updateGitGuardStatus}: the
+	 * unsuppressed blocker records it counted, each with its file, so the gate
+	 * can answer for one repository's tree (#4941) and the turn-end readers
+	 * for all of them.
+	 */
+	private _gitGuardMemo: GitGuardMemo = EMPTY_GIT_GUARD_MEMO;
+	/**
+	 * Per project (the `cwd` whose stored record the reason is about), the
+	 * reason that record cannot be confirmed (#4941 r2 F1). One record per
+	 * repository: a failure about B must not replace, and a write about B must
+	 * not clear, the uncertainty about A.
+	 */
+	private readonly _gitGuardCacheUnknown = new PathKeyedMap<string>(
+		normalizeMapKey,
+	);
+	/**
+	 * #4733 r2 F12: per file, a dispatch that never answered
+	 * (`pipeline_crash`, `pipeline_error`). It is about that file, not the
+	 * persisted record, so it lives apart from the record's latch above: only
+	 * that file's own dispatch returning removes it, and no record write or
+	 * delete does. Cleared per session.
+	 */
+	private readonly _gitGuardUnansweredDispatches = new PathKeyedMap<string>(
+		normalizeMapKey,
+	);
 	callGraph: FunctionCallGraph | null = null;
 	wordIndex: WordIndex | null = null;
 	private _readGuard: ReadGuard | null = null;
+	/**
+	 * #4942: the read guard of each concurrent in-process session, keyed by the
+	 * owner `recordSession` names (its session id, opaque here). Entries go at
+	 * the session's shutdown (`forgetTurnSession`) and with the coordinator's
+	 * own reset.
+	 */
+	private readonly _foreignReadGuards = new Map<string, ReadGuard>();
 	private readonly _pendingDeferredMutations =
 		new PathKeyedMap<DeferredMutationRecord>(normalizeMapKey);
 	/** tool_call → tool_result path-attribution correlation (#1642). */
@@ -664,6 +753,19 @@ export class RuntimeCoordinator {
 	private readonly _readWidenings = new BoundedLruCache<string, ReadWidening>(
 		TOOL_CALL_ATTRIBUTION_CAPACITY,
 	);
+	/**
+	 * #5120: a call whose `edits` were rewritten to the matched subset of a
+	 * partly matching batch, keyed by that call's own `event.input`. pi hands
+	 * both hooks one `args` object per call (a fresh clone), so only that
+	 * call's `tool_result` finds the record: a call a later handler blocked
+	 * or an abort ended gets no `tool_result`, and a later call reusing its id
+	 * carries other `args`. The entry dies with its `args`; no id, TTL or
+	 * session reset is involved.
+	 */
+	private readonly _partialApplies = new WeakMap<
+		Record<string, unknown>,
+		PartialApplyPending
+	>();
 	private readonly _lspReadWarmState = new Map<
 		string,
 		{ status: "warming" | "ready"; ts: number }
@@ -719,10 +821,6 @@ export class RuntimeCoordinator {
 	private readonly _resolvedBlockerFilesThisTurn =
 		new PathKeyedMap<ResolvedBlockerFile>(normalizeMapKey);
 	private _resolvedBlockerFilesDropped = 0;
-	private readonly _actionableWarningsThisTurn =
-		new TurnWarningsBySession<ActionableWarningRecord>();
-	private readonly _codeQualityWarningsThisTurn =
-		new TurnWarningsBySession<CodeQualityWarningRecord>();
 	// #484: opt-in per-RUN summary of diagnostics/autofixes/formats,
 	// accumulated across the run's turns and consumed once at the
 	// agent_settled quiet window. The collector itself is always constructed
@@ -764,10 +862,9 @@ export class RuntimeCoordinator {
 		this._reportedThisTurn.clear();
 		this._mutationReceipts = [];
 		this._droppedMutationReceipts = 0;
-		// #3613: the outgoing session's per-turn records; a live secondary's
-		// partition is its own and survives the primary's replacement.
-		this._actionableWarningsThisTurn.clear(this._telemetrySessionId);
-		this._codeQualityWarningsThisTurn.clear(this._telemetrySessionId);
+		// #3613, #4965: the outgoing session's per-turn records live on the scope
+		// this reset superseded, so they end with it; a live secondary's cell is
+		// on its own scope and survives the primary's replacement.
 		this._telemetrySessionId = nextTelemetrySessionId();
 		this._hasStableSessionId = false;
 		this._telemetryModel = "unknown";
@@ -783,10 +880,14 @@ export class RuntimeCoordinator {
 		this._turnStartProjectSeq = 0;
 		this._fileSeq.clear();
 		this._fileLastProjectSeq.clear();
-		this._gitGuardHasBlockers = false;
-		this._gitGuardSummary = "";
-		this._gitGuardCacheUnknownReason = undefined;
+		this._gitGuardMemo = EMPTY_GIT_GUARD_MEMO;
+		this._gitGuardCacheUnknown.clear();
+		this._gitGuardUnansweredDispatches.clear();
 		this._readGuard = null;
+		// A dropped secondary's FileTime bucket stays: a read of its that is in
+		// flight across this reset keeps its tool_call stamp, which its
+		// tool_result needs to see a writer that moved the file (#4942 r7).
+		this._foreignReadGuards.clear();
 		this._pendingDeferredMutations.clear();
 		// #1642 F5: every sibling correlation/state map is cleared here. A
 		// per-session-numbered host reusing tool-call ids across sessions must
@@ -835,17 +936,22 @@ export class RuntimeCoordinator {
 	 * dispatch replaces the record wholesale (`recordInlineBlockers`), so a NEW
 	 * blocker is never born pre-suppressed (#1198 ordering).
 	 *
+	 * #4921: `of` names the turn session whose pass this is; it rewrites only
+	 * that session's records, the ones its pass judged. Omitted: every record.
+	 *
 	 * @returns how many records this call CHANGED — 0 means the gate's view of
 	 * the map is already what the policy just decided.
 	 */
 	applyInlineBlockerPolicyVerdicts(
 		suppressedFilePaths: readonly string[],
+		of?: { sessionId: string | undefined },
 	): number {
 		const suppressed = new Set(
 			suppressedFilePaths.map((filePath) => path.resolve(filePath)),
 		);
 		let changed = 0;
 		for (const [key, entry] of this._pendingInlineBlockers.entries()) {
+			if (of && !this.ownedBy(entry, of.sessionId)) continue;
 			const policySuppressed = suppressed.has(path.resolve(entry.filePath));
 			if ((entry.policySuppressed ?? false) === policySuppressed) continue;
 			this._pendingInlineBlockers.set(key, { ...entry, policySuppressed });
@@ -854,7 +960,16 @@ export class RuntimeCoordinator {
 		return changed;
 	}
 
-	updateGitGuardStatus(hasBlockers: boolean, output: string): void {
+	/**
+	 * `blockerFile` is the file `hasBlockers` speaks for (the write's own); a
+	 * verdict with no file is a repository-less blocker, which every tree's
+	 * commit gate counts (#4941).
+	 */
+	updateGitGuardStatus(
+		hasBlockers: boolean,
+		output: string,
+		blockerFile?: string,
+	): void {
 		// The status is an aggregate over the current per-file map. A clean B
 		// result must not erase an unresolved A result; the pipeline records/clears
 		// the edited file immediately before this method runs.
@@ -864,46 +979,143 @@ export class RuntimeCoordinator {
 		// diagnostics at every turn end, so dropping it there would be silencing
 		// rather than filtering (AGENTS.md shape 10); it just stops counting for
 		// the gate the agent was shown nothing for.
-		const blocking = this.getInlineBlockersSnapshot().filter(
-			(entry) => !entry.policySuppressed,
-		);
-		this._gitGuardHasBlockers = hasBlockers || blocking.length > 0;
-		if (!this._gitGuardHasBlockers) {
-			this._gitGuardSummary = "";
-			return;
+		this._gitGuardMemo = {
+			entries: this.getInlineBlockersSnapshot()
+				.filter((entry) => !entry.policySuppressed)
+				.map((entry) => ({
+					filePath: entry.filePath,
+					summary: entry.summary.trim(),
+				})),
+			verdict: hasBlockers ? { filePath: blockerFile } : undefined,
+			firstLine: output
+				.split("\n")
+				.map((line) => line.trim())
+				.find((line) => line.length > 0),
+		};
+	}
+
+	/**
+	 * The commit gate's status over the blockers `inScope` admits (every one
+	 * when omitted): whether any counts, and the first one's summary. #4941:
+	 * the gate asks for the tree being committed, so a blocker in another
+	 * repository neither refuses the commit nor names its file.
+	 */
+	gitGuardStatus(inScope?: (filePath: string) => boolean): {
+		hasBlockers: boolean;
+		summary: string;
+	} {
+		const { entries, verdict, firstLine } = this._gitGuardMemo;
+		const counted = inScope
+			? entries.filter((entry) => inScope(entry.filePath))
+			: entries;
+		const verdictCounts =
+			verdict !== undefined &&
+			(!inScope || verdict.filePath === undefined || inScope(verdict.filePath));
+		if (!verdictCounts && counted.length === 0) {
+			return { hasBlockers: false, summary: "" };
 		}
-		const firstLine = output
-			.split("\n")
-			.map((line) => line.trim())
-			.find((line) => line.length > 0);
-		const summaries = blocking
-			.map((entry) => entry.summary.trim())
-			.filter(Boolean);
-		this._gitGuardSummary = (
-			summaries[0] ??
-			firstLine ??
-			"Unresolved blockers detected"
-		).slice(0, 160);
+		return {
+			hasBlockers: true,
+			summary: (
+				counted.map((entry) => entry.summary).find(Boolean) ??
+				firstLine ??
+				"Unresolved blockers detected"
+			).slice(0, 160),
+		};
 	}
 
 	get gitGuardHasBlockers(): boolean {
-		return this._gitGuardHasBlockers;
+		return this.gitGuardStatus().hasBlockers;
 	}
 
 	get gitGuardSummary(): string {
-		return this._gitGuardSummary;
+		return this.gitGuardStatus().summary;
 	}
 
-	markGitGuardCacheUnknown(reason: string): void {
-		this._gitGuardCacheUnknownReason = reason;
+	/** `cwd` is the project whose stored record the reason is about (#4941). */
+	markGitGuardCacheUnknown(reason: string, cwd: string): void {
+		this._gitGuardCacheUnknown.set(cwd, reason);
 	}
 
-	clearGitGuardCacheUnknown(): void {
-		this._gitGuardCacheUnknownReason = undefined;
+	/** A write or retirement of `cwd`'s record answers that project's reason only. */
+	clearGitGuardCacheUnknown(cwd: string): void {
+		this._gitGuardCacheUnknown.delete(cwd);
 	}
 
-	get gitGuardCacheUnknownReason(): string | undefined {
-		return this._gitGuardCacheUnknownReason;
+	/**
+	 * The first latched reason about a project `inScope` accepts, or the first
+	 * of all when `inScope` is absent (a command the gate cannot place in a
+	 * tree is judged by every project's reason).
+	 */
+	gitGuardCacheUnknownFor(
+		inScope?: (cwd: string) => boolean,
+	): string | undefined {
+		for (const [cwd, reason] of this._gitGuardCacheUnknown) {
+			if (!inScope || inScope(cwd)) return reason;
+		}
+		return undefined;
+	}
+
+	markGitGuardDispatchUnanswered(filePath: string, reason: string): void {
+		this._gitGuardUnansweredDispatches.set(filePath, reason);
+	}
+
+	/** The file's dispatch returned: it answers its own latch, and only that. */
+	answerGitGuardDispatch(filePath: string): void {
+		this._gitGuardUnansweredDispatches.delete(filePath);
+	}
+
+	/** Every file whose dispatch has not answered, with its reason, in order. */
+	get gitGuardUnansweredDispatches(): ReadonlyArray<{
+		readonly filePath: string;
+		readonly reason: string;
+	}> {
+		return [...this._gitGuardUnansweredDispatches].map(
+			([filePath, reason]) => ({ filePath, reason }),
+		);
+	}
+
+	/** Whether this session holds an inline-blocker entry for the file. */
+	hasInlineBlocker(filePath: string): boolean {
+		return this._pendingInlineBlockers.has(filePath);
+	}
+
+	/**
+	 * #4921: the turn session that owns the file's inline-blocker record, or
+	 * undefined when the file has none.
+	 */
+	inlineBlockerOwner(filePath: string): string | undefined {
+		const entry = this._pendingInlineBlockers.get(filePath);
+		return entry ? (entry.session ?? this._telemetrySessionId) : undefined;
+	}
+
+	/**
+	 * #4921: whether `sessionId`'s turn is this coordinator's own session, the
+	 * rule {@link beginTurn} applies: a turn with no session id of its own is
+	 * the coordinator's. A concurrent in-process secondary's is not.
+	 */
+	isCoordinatorSession(sessionId: string | undefined): boolean {
+		return this.turnSession(sessionId) === this._telemetrySessionId;
+	}
+
+	/** #4921: the `session` a record written by `sessionId`'s turn carries. */
+	private recordSession(sessionId: string | undefined): {
+		session?: string;
+	} {
+		return sessionId === undefined || this.isCoordinatorSession(sessionId)
+			? {}
+			: { session: sessionId };
+	}
+
+	/** #4921: whether a record (or its Resolved note) is `sessionId`'s turn's. */
+	private ownedBy(
+		entry: { session?: string },
+		sessionId: string | undefined,
+	): boolean {
+		return (
+			(entry.session ?? this._telemetrySessionId) ===
+			this.turnSession(sessionId)
+		);
 	}
 
 	/**
@@ -927,8 +1139,7 @@ export class RuntimeCoordinator {
 				turnSession,
 				this._turnIndex + this._foreignTurns / (this._foreignTurns + 1),
 			);
-			this._actionableWarningsThisTurn.clear(turnSession);
-			this._codeQualityWarningsThisTurn.clear(turnSession);
+			this.clearTurnWarnings(turnSession);
 			return;
 		}
 		// #1443: runs sitting here at turn_start were appended AFTER the last
@@ -963,8 +1174,7 @@ export class RuntimeCoordinator {
 		// Inline blockers are session-scoped per-file state. They are cleared only
 		// when that file is re-analyzed clean or the session resets; a new turn must
 		// not let a clean unrelated file erase an unresolved blocker.
-		this._actionableWarningsThisTurn.clear(turnSession);
-		this._codeQualityWarningsThisTurn.clear(turnSession);
+		this.clearTurnWarnings(turnSession);
 		// _turnSummary is deliberately NOT cleared here (#484 rework): the
 		// summary entry is emitted once per RUN at the agent_settled quiet
 		// window (sendMessage during a live stream would STEER the agent, and
@@ -999,6 +1209,12 @@ export class RuntimeCoordinator {
 		/** When set, a durable change-log entry is appended for this cwd. */
 		cwd?: string;
 		changedRange?: ProjectChangeRange;
+		/**
+		 * #4943: the turn session of the writer, which the change-log row names
+		 * (an in-process subagent's write is its own). Omitted, it is this
+		 * coordinator's session, as before.
+		 */
+		sessionId?: string | undefined;
 		onAppendError?: (err: unknown) => void;
 	}): { projectSeq: number; fileSeq: number } {
 		// #3511: a logged mutation takes its seq from the shared change log,
@@ -1016,7 +1232,7 @@ export class RuntimeCoordinator {
 					return {
 						seq: logged.projectSeq,
 						timestamp: new Date().toISOString(),
-						sessionId: this.telemetrySessionId,
+						sessionId: this.turnSession(args.sessionId),
 						turnIndex: this.turnIndex,
 						source: args.source,
 						filePath: path.resolve(args.filePath),
@@ -1707,6 +1923,8 @@ export class RuntimeCoordinator {
 		diagnostics?: readonly Diagnostic[],
 		orderTurn = this._writeOrderTurn,
 		recordedAtMs = Date.now(),
+		/** #4921: the turn session of the write (`ToolResultDeps.sessionId`). */
+		sessionId?: string,
 	): number | undefined {
 		const writeOrder = writeOrderToken(orderTurn, writeIndex);
 		if (
@@ -1720,7 +1938,7 @@ export class RuntimeCoordinator {
 		// retirement of the same file — the agent is blocked on it again, so a
 		// carried "Resolved" entry would be a false claim.
 		this._resolvedBlockerFilesThisTurn.delete(filePath);
-		this._pendingInlineBlockers.set(path.resolve(filePath), {
+		this._pendingInlineBlockers.set(filePath, {
 			filePath,
 			summary,
 			writeIndex,
@@ -1736,6 +1954,7 @@ export class RuntimeCoordinator {
 						recordedHash: contentBaseline.sha256,
 					}
 				: {}),
+			...this.recordSession(sessionId),
 		});
 		return recordedAtMs;
 	}
@@ -1768,8 +1987,14 @@ export class RuntimeCoordinator {
 			recordedAtMs: number;
 			contentBaseline?: { size: number; sha256: string };
 		},
+		/**
+		 * #4943: the turn session of the write the settled runner answered
+		 * (`PendingRunnerFindings.sessionId`). A new record is that session's;
+		 * a merge keeps the existing record's owner.
+		 */
+		sessionId?: string,
 	): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (existing && !existing.diagnostics) return 0;
 		// #4484 round 5 (K3): not the id. A carry that moves a blocker's line
@@ -1792,6 +2017,7 @@ export class RuntimeCoordinator {
 							recordedHash: analysed.contentBaseline.sha256,
 						}
 					: {}),
+				...this.recordSession(sessionId),
 			}),
 			summary: formatDiagnostics(diagnostics, "blocking").trim(),
 			diagnostics,
@@ -1823,7 +2049,7 @@ export class RuntimeCoordinator {
 	getInlineBlockerDiagnostics(
 		filePath: string,
 	): readonly Diagnostic[] | undefined {
-		return this._pendingInlineBlockers.get(path.resolve(filePath))?.diagnostics;
+		return this._pendingInlineBlockers.get(filePath)?.diagnostics;
 	}
 
 	/**
@@ -1857,7 +2083,7 @@ export class RuntimeCoordinator {
 		const existing = this._pendingInlineBlockers.get(filePath);
 		if (existing) {
 			// The display key every record writer uses.
-			const key = path.resolve(filePath);
+			const key = filePath;
 			const { analysisAnchor: _dropped, ...rest } = existing;
 			this._pendingInlineBlockers.set(
 				key,
@@ -1896,7 +2122,7 @@ export class RuntimeCoordinator {
 			unconfirmedServerIds?: readonly string[];
 		},
 	): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (
 			!existing?.diagnostics ||
@@ -1926,13 +2152,7 @@ export class RuntimeCoordinator {
 			this._pendingInlineBlockers.delete(key);
 			return retired.length;
 		}
-		this._pendingInlineBlockers.set(key, {
-			...existing,
-			summary: formatDiagnostics(kept, "blocking").trim(),
-			diagnostics: kept,
-			sources: inlineBlockerSources(kept),
-			lines: inlineBlockerLines(kept, existing.filePath),
-		});
+		this._pendingInlineBlockers.set(key, narrowedRecord(existing, kept));
 		return retired.length;
 	}
 
@@ -1968,6 +2188,7 @@ export class RuntimeCoordinator {
 					: retiringWriteOrder % 2 ** 32,
 			confirmedClean,
 			turnIndex: this._turnIndex,
+			...(record.session === undefined ? {} : { session: record.session }),
 		});
 	}
 
@@ -2000,7 +2221,7 @@ export class RuntimeCoordinator {
 			blocking?: number;
 		},
 	): boolean {
-		const existing = this._pendingInlineBlockers.get(path.resolve(filePath));
+		const existing = this._pendingInlineBlockers.get(filePath);
 		if (existing && (analysis?.blocking ?? 0) > 0) {
 			incrementDegradationCount({
 				kind: "blocker-clear-refused",
@@ -2042,7 +2263,7 @@ export class RuntimeCoordinator {
 				false,
 			);
 		}
-		this._pendingInlineBlockers.delete(path.resolve(filePath));
+		this._pendingInlineBlockers.delete(filePath);
 		return true;
 	}
 
@@ -2060,7 +2281,7 @@ export class RuntimeCoordinator {
 		filePath: string,
 		reason: "dependency-drift" | "past-eof" = "dependency-drift",
 	): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing || existing.stale) return false;
 		this._pendingInlineBlockers.set(key, {
@@ -2083,7 +2304,7 @@ export class RuntimeCoordinator {
 	 * transition, so the caller logs/resyncs exactly once per edge.
 	 */
 	setInlineBlockerPastEofStale(filePath: string, isPastEof: boolean): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (existing.stale && existing.staleReason !== "past-eof") return false;
@@ -2105,11 +2326,12 @@ export class RuntimeCoordinator {
 	 * {@link markInlineBlockerStale}: it RE-ARMS rather than latching, so a
 	 * file whose bytes drift and then come back (a checkout, a revert, an
 	 * editor writing the original content) un-demotes on the next sweep
-	 * instead of staying demoted for the session. That re-arm is what lets
-	 * this axis skip the #1950 delivery cap entirely — a record that can heal
-	 * needs no bounded-noise retirement, and applying the cap here would walk
-	 * an ast-grep or tree-sitter security finding out of turn-end rendering
-	 * permanently (#2982 review).
+	 * instead of staying demoted for the session. That re-arm covers a file whose
+	 * bytes COME BACK; it does not cover an agent rewrite that never returns to
+	 * them, which is why this axis carries its own delivery cap
+	 * (`SELF_DRIFT_MAX_DELIVERIES`, #4990) — a record that heals before the cap
+	 * un-demotes and is never retired, so the security-provenance concern
+	 * (#2982 review) still holds.
 	 *
 	 * Composes with the sibling gates the same way they compose with each
 	 * other: it never touches a record another gate demoted, and never heals a
@@ -2120,7 +2342,7 @@ export class RuntimeCoordinator {
 		filePath: string,
 		isSelfDrift: boolean,
 	): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (existing.stale && existing.staleReason !== "self-drift") return false;
@@ -2132,7 +2354,16 @@ export class RuntimeCoordinator {
 		// `undefined` is a strictness spike the ratchet counts. Healing has to
 		// drop `staleReason` off the rebuilt record, so destructure it away
 		// instead of letting `...existing` carry the old value through.
-		const { staleReason: _cleared, ...rest } = existing;
+		//
+		// The delivery count goes with it (#4990 review F3): it is the cap's
+		// tally for ONE demotion episode, and a heal ends the episode. Carried
+		// across, the next demotion retired on its first delivery with a ledger
+		// reason claiming a full cap the agent never saw.
+		const {
+			staleReason: _cleared,
+			staleDeliveryCount: _clearedCount,
+			...rest
+		} = existing;
 		this._pendingInlineBlockers.set(key, {
 			...rest,
 			stale: isSelfDrift,
@@ -2197,7 +2428,7 @@ export class RuntimeCoordinator {
 		deadLines: readonly number[],
 	): string | undefined {
 		if (deadLines.length === 0) return undefined;
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return undefined;
 		// Only this gate's own demotion. A dependency-drift demotion (#1631)
@@ -2221,24 +2452,24 @@ export class RuntimeCoordinator {
 	 * content is NOT being suppressed.
 	 */
 	peekInlineBlockerStaleDeliveryCount(filePath: string): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		return this._pendingInlineBlockers.get(key)?.staleDeliveryCount ?? 0;
 	}
 
 	/**
 	 * #1950: commit one more turn end that re-served this record while
 	 * `stale`. The caller (`runtime-turn.ts`) only calls this for a
-	 * `"dependency-drift"` demotion — a `"past-eof"` demotion retires after
-	 * its own single delivery (#1944, `retireDemotedPastEofBlocker`) and
-	 * never accumulates a count — and only AFTER confirming the turn's
-	 * content will not be suppressed by the signature dedupe (see
-	 * {@link peekInlineBlockerStaleDeliveryCount}), so this counts ACTUAL
-	 * deliveries the agent saw, not turn-end loop iterations. Returns the new
-	 * count, or 0 when there is no entry to count against (already retired,
-	 * or never recorded).
+	 * `"dependency-drift"` or `"self-drift"` demotion — a `"past-eof"`
+	 * demotion retires after its own single delivery (#1944,
+	 * `retireDemotedPastEofBlocker`) and never accumulates a count — and only
+	 * AFTER confirming the turn's content will not be suppressed by the
+	 * signature dedupe (see {@link peekInlineBlockerStaleDeliveryCount}), so
+	 * this counts ACTUAL deliveries the agent saw, not turn-end loop
+	 * iterations. Returns the new count, or 0 when there is no entry to count
+	 * against (already retired, or never recorded).
 	 */
 	incrementInlineBlockerStaleDelivery(filePath: string): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return 0;
 		const next = (existing.staleDeliveryCount ?? 0) + 1;
@@ -2250,28 +2481,34 @@ export class RuntimeCoordinator {
 	}
 
 	/**
-	 * #1950: retire a dependency-drift demotion once it has been delivered
-	 * `DEPENDENCY_DRIFT_MAX_DELIVERIES` times with no re-run confirming or
-	 * clearing it. Unlike {@link retireDemotedPastEofBlocker}, the record is
-	 * NOT provably unrecoverable — its coordinates are still in bounds, and a
-	 * fresh dispatch of the file could still confirm or clear it. This is a
-	 * bounded-noise cap, not a "this can never resolve" verdict, and the
-	 * caller's ledger reason must say so (`demoted-finding-retired`'s "capped,
-	 * re-run can still confirm" vs. past-EOF's "retired, unrecoverable").
+	 * #1950/#4990: retire a drift demotion once it has been delivered its axis's
+	 * cap with no re-run confirming or clearing it.
+	 * `"dependency-drift"` retires at `DEPENDENCY_DRIFT_MAX_DELIVERIES` and
+	 * `"self-drift"` at `SELF_DRIFT_MAX_DELIVERIES` (both decided by the caller,
+	 * `runtime-turn.ts`, which also owns the count). Unlike
+	 * {@link retireDemotedPastEofBlocker}, the record is NOT provably
+	 * unrecoverable — its coordinates are still in bounds, and a fresh dispatch
+	 * of the file could still confirm or clear it. This is a bounded-noise cap,
+	 * not a "this can never resolve" verdict, and the caller's ledger reason must
+	 * say so (`demoted-finding-retired`'s "capped, re-run can still confirm" vs.
+	 * past-EOF's "retired, unrecoverable").
 	 *
-	 * Only ever touches this gate's OWN demotion (`staleReason ===
-	 * "dependency-drift"`) — a past-EOF demotion on the same file is that
-	 * gate's own record to retire, not this one's.
+	 * Only ever touches the named axis's OWN demotion: a record demoted by a
+	 * sibling gate on the same file is that gate's record to retire, not this
+	 * one's.
 	 *
 	 * @returns true when an entry was retired — the caller records it, so the
 	 * suppression is never silent (#1432 Gap 1).
 	 */
-	retireDemotedDependencyDriftBlocker(filePath: string): boolean {
-		const key = path.resolve(filePath);
+	retireDemotedDriftBlocker(
+		filePath: string,
+		reason: "dependency-drift" | "self-drift",
+	): boolean {
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (!existing.stale) return false;
-		if (existing.staleReason !== "dependency-drift") return false;
+		if (existing.staleReason !== reason) return false;
 		this._pendingInlineBlockers.delete(key);
 		return true;
 	}
@@ -2309,13 +2546,22 @@ export class RuntimeCoordinator {
 	 * `semantic === "blocking"` diagnostic across all runners, so eslint,
 	 * biome-check, actionlint, elixir/gleam-check and ast-grep security rules all
 	 * land in this map. A language-server check knows nothing about any of them,
-	 * so `coveredSources` must be a SUPERSET of the recorded sources or the entry
-	 * stands. This is a commit gate: a record whose provenance is unknown (no
-	 * `sources`) fails CLOSED and is never retired, because "we don't know what
-	 * raised this" must not resolve to "an LSP check can clear it".
+	 * so the coverage test is per ROW (#4990 gap 1): the diagnostics whose source
+	 * the verdict covered leave the record, the rest stay, and a record with no
+	 * structured rows fails CLOSED and is never retired, because "we don't know
+	 * what raised this" must not resolve to "an LSP check can clear it".
 	 *
-	 * @returns true when an entry was retired — the caller logs it, so an
-	 * eviction is never silent (#1432 Gap 1).
+	 * Before #4990 the test was all-or-nothing on `record.sources`, so a record
+	 * with `["lsp", "oxlint"]` outlived a confirmed-clean typescript verdict
+	 * forever: one server cannot speak for the oxlint row, and the oxlint row was
+	 * never re-dispatched either. Per-source row retirement is the same filter
+	 * the record's own builder already applies (`inlineBlockerSources`), so a
+	 * partly-covered record narrows to what the verdict did not speak for and
+	 * keeps gating only on those rows.
+	 *
+	 * @returns true when the record was retired OR narrowed (at least one source
+	 * row left it). The caller records either, so a drop is never silent
+	 * (#1432 Gap 1).
 	 */
 	retireInlineBlockerOnConfirmedClean(
 		filePath: string,
@@ -2323,7 +2569,7 @@ export class RuntimeCoordinator {
 		confirmedAtWriteOrder?: number,
 		coveredSources?: readonly string[],
 	): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (
@@ -2333,16 +2579,139 @@ export class RuntimeCoordinator {
 		) {
 			return false;
 		}
-		// Fail closed on unknown provenance, and on any source the fresh verdict
-		// did not consult. An eslint-origin blocker outliving an LSP-only clean is
-		// the correct outcome — the next dispatch of that file is what clears it.
+		// Fail closed on unknown provenance: "we don't know what raised this" must
+		// not resolve to "an LSP check can clear it".
 		if (!existing.sources || existing.sources.length === 0) return false;
 		const covered = new Set(coveredSources ?? []);
-		if (!existing.sources.every((source) => covered.has(source))) return false;
-		// #3218 criterion 2: this retire is a resolution — name it at turn end.
-		this.noteResolvedBlockerFile(existing, undefined, true);
-		this._pendingInlineBlockers.delete(key);
+		if (existing.sources.every((source) => covered.has(source))) {
+			// #3218 criterion 2: this retire is a resolution — name it at turn end.
+			this.noteResolvedBlockerFile(existing, undefined, true);
+			this._pendingInlineBlockers.delete(key);
+			return true;
+		}
+		// Partial coverage (#4990 gap 1). Without the structured rows there is no
+		// honest per-source split, so the record stands, exactly as before.
+		const diagnostics = existing.diagnostics;
+		if (!diagnostics || diagnostics.length === 0) return false;
+		const kept = diagnostics.filter(
+			(diagnostic) => !covered.has(inlineBlockerSourceOf(diagnostic)),
+		);
+		if (kept.length === diagnostics.length) return false;
+		if (kept.length === 0) {
+			this.noteResolvedBlockerFile(existing, undefined, true);
+			this._pendingInlineBlockers.delete(key);
+			return true;
+		}
+		// The derived fields come from the surviving rows, never from the old
+		// record (`narrowedRecord`).
+		this._pendingInlineBlockers.set(key, narrowedRecord(existing, kept));
 		return true;
+	}
+
+	/**
+	 * #5020: retire the rows of other files' records that cite a file a fresh
+	 * observation has settled. A chart-wide runner (helm-lint, helm-render) or an
+	 * import-following one (mypy, phpstan) reports a blocking row against a file
+	 * it did not dispatch for, so the row lands in the WRITTEN file's record
+	 * (#1641). That record is re-taken only by a dispatch of the written file,
+	 * which the agent has no reason to make once the cited file is fixed or gone:
+	 * `clearInlineBlockers` never ran for it, and the commit gate stayed shut with
+	 * nothing left to fix.
+	 *
+	 * The row is another file's claim, so the cited file's own state retires it
+	 * (`why`), and only two states do. `"cited-file-clean"`: the cited file was
+	 * dispatched and the runner that raised the row answered with no blocker of
+	 * its own on it (the caller proves that; `shouldRetire` is its verdict per
+	 * row). `"cited-file-missing"`: the cited file no longer exists, which the
+	 * #1245 reconcile already decides for a record's OWN file. Everything else
+	 * stays, rows with no structured diagnostics included (fail closed), and so
+	 * does a row that cites no file (`isCrossFileBlocker` is total).
+	 *
+	 * A clean verdict retires only a record it is strictly newer than
+	 * (`confirmedAtWriteOrder`, turn first), as `retireInlineBlockerOnConfirmedClean`
+	 * orders its own: a slow old clean must not erase a newer observation.
+	 *
+	 * `of` limits the retire to one session's records, the partition
+	 * `getInlineBlockersSnapshot` reads. Omitted, every session's record is
+	 * judged.
+	 *
+	 * @returns one entry per record that lost rows, with the session that owns
+	 * it, so the caller can bring the commit gate (the latch and the persisted
+	 * record) back in line. Counted once per file in the degradation ledger.
+	 */
+	retireForeignRows(
+		why: "cited-file-clean" | "cited-file-missing",
+		shouldRetire: (row: Diagnostic) => boolean,
+		confirmedAtWriteOrder?: number,
+		of?: { sessionId: string | undefined },
+	): Array<{ filePath: string; owner: string | undefined }> {
+		const changed: Array<{ filePath: string; owner: string | undefined }> = [];
+		for (const existing of this.getInlineBlockersSnapshot(of)) {
+			const key = existing.filePath;
+			if (
+				confirmedAtWriteOrder !== undefined &&
+				existing.writeOrder !== undefined &&
+				confirmedAtWriteOrder <= existing.writeOrder
+			)
+				continue;
+			const diagnostics = existing.diagnostics;
+			if (!diagnostics) continue;
+			const kept = diagnostics.filter(
+				(row) =>
+					!(isCrossFileBlocker(row, existing.filePath) && shouldRetire(row)),
+			);
+			if (kept.length === diagnostics.length) continue;
+			changed.push({
+				filePath: existing.filePath,
+				owner: existing.session ?? this._telemetrySessionId,
+			});
+			incrementDegradationCount({
+				kind: "cross-file-row-retired",
+				subject: normalizeMapKey(existing.filePath),
+				reason:
+					why === "cited-file-clean"
+						? "a row naming another file left the record: that file was dispatched and its runner reported nothing on it (#5020)"
+						: "a row naming another file left the record: that file no longer exists (#5020)",
+			});
+			if (kept.length === 0) {
+				if (why === "cited-file-clean")
+					this.noteResolvedBlockerFile(existing, undefined, true);
+				this._pendingInlineBlockers.delete(key);
+			} else {
+				this._pendingInlineBlockers.set(key, narrowedRecord(existing, kept));
+			}
+		}
+		return changed;
+	}
+
+	/**
+	 * #5020: the rows whose cited file is gone, for the two reads the commit gate
+	 * depends on (the turn end and the gate's own evaluation). Only an ABSOLUTE
+	 * cite is judged: a relative one is relative to whatever the runner ran in,
+	 * which the record does not keep, so a row that cannot be placed stays
+	 * (fail closed) rather than being resolved against a guess.
+	 *
+	 * Both reads persist what they retire into the caller's own cwd cache, and
+	 * each caller retires only its OWN session's records (`of`, required): the
+	 * acting session's own records, whose cache is the coordinator root's cache
+	 * or the session cwd's, whichever wrote them. A sweep by another session at
+	 * another cwd would write the wrong project's cache and leave the owner's
+	 * record refusing its next commit (PR #5033 round 3, F1 and item 4).
+	 * Another session's dead cite is that session's own turn end or commit gate
+	 * to retire.
+	 */
+	retireForeignRowsOfMissingFiles(of: {
+		sessionId: string | undefined;
+	}): Array<{
+		filePath: string;
+		owner: string | undefined;
+	}> {
+		return this.retireForeignRows(
+			"cited-file-missing",
+			(row) => path.isAbsolute(row.filePath) && !fs.existsSync(row.filePath),
+			undefined,
+			of,
+		);
 	}
 
 	/**
@@ -2363,9 +2732,13 @@ export class RuntimeCoordinator {
 	 * and a line that would not fit the message cap (called in list order).
 	 * The "… and N more" overflow count rides with a batch that lists files and
 	 * is otherwise kept, so a bare tail is never delivered.
+	 *
+	 * #4921: `of` names the consuming turn session; another session's note
+	 * stays for that session's turn end, unseen by `holdBack`.
 	 */
 	consumeResolvedBlockerFiles(
 		holdBack: (entry: ResolvedBlockerFile) => boolean,
+		of?: { sessionId: string | undefined },
 	): {
 		files: ResolvedBlockerFile[];
 		dropped: number;
@@ -2373,7 +2746,8 @@ export class RuntimeCoordinator {
 		const files: ResolvedBlockerFile[] = [];
 		const held: ResolvedBlockerFile[] = [];
 		for (const entry of this._resolvedBlockerFilesThisTurn.values()) {
-			(holdBack(entry) ? held : files).push(entry);
+			if (of && !this.ownedBy(entry, of.sessionId)) held.push(entry);
+			else (holdBack(entry) ? held : files).push(entry);
 		}
 		// Rebuild, never delete-in-place (see `reconcileInlineBlockers`).
 		this._resolvedBlockerFilesThisTurn.clear();
@@ -2418,10 +2792,20 @@ export class RuntimeCoordinator {
 	 * turn or gate a commit. The map is tiny (per-turn blockers) and reads are
 	 * bounded (once per turn_end / tool_result), so the probe cost is
 	 * negligible.
+	 *
+	 * #4921: `of` names a turn session, and the snapshot holds only that
+	 * session's records: what its turn end may deliver, sweep or re-judge.
+	 * Omitted, every record: the commit gate's view, which answers for the
+	 * tree whichever session wrote the blocker.
 	 */
-	getInlineBlockersSnapshot(): InlineBlockerRecord[] {
+	getInlineBlockersSnapshot(of?: {
+		sessionId: string | undefined;
+	}): InlineBlockerRecord[] {
 		this.reconcileInlineBlockers();
-		return [...this._pendingInlineBlockers.values()];
+		const records = [...this._pendingInlineBlockers.values()];
+		return of
+			? records.filter((entry) => this.ownedBy(entry, of.sessionId))
+			: records;
 	}
 
 	consumeInlineBlockers(): InlineBlockerRecord[] {
@@ -2439,37 +2823,63 @@ export class RuntimeCoordinator {
 		return sessionId ?? this._telemetrySessionId;
 	}
 
+	/**
+	 * The cell holding `sessionId`'s turn's warnings. The coordinator's own turn
+	 * is its scope's; a concurrent session's is found by id. `create` builds it
+	 * on first write; without it a missing cell is `undefined`.
+	 */
+	private turnWarnings(
+		sessionId: string | undefined,
+		create: boolean,
+	): TurnWarningsCell | undefined {
+		const turnSession = this.turnSession(sessionId);
+		const init = create ? newTurnWarningsCell : undefined;
+		return turnSession === this._telemetrySessionId
+			? scopeCell<TurnWarningsCell>(this._scope, TURN_WARNINGS_CELL, init)
+			: sessionCell<TurnWarningsCell>(turnSession, TURN_WARNINGS_CELL, init);
+	}
+
+	/** Drain both warning maps of `turnSession`; other sessions' cells are theirs. */
+	private clearTurnWarnings(turnSession: string): void {
+		const cell = this.turnWarnings(turnSession, false);
+		cell?.actionable.clear();
+		cell?.codeQuality.clear();
+	}
+
 	recordActionableWarnings(
 		warnings: ActionableWarningRecord[],
 		sessionId?: string,
 	): void {
-		this._actionableWarningsThisTurn.add(this.turnSession(sessionId), warnings);
+		const cell = this.turnWarnings(sessionId, true);
+		if (cell) for (const item of warnings) cell.actionable.set(item.id, item);
 	}
 
 	peekActionableWarnings(sessionId?: string): ActionableWarningRecord[] {
-		return this._actionableWarningsThisTurn.peek(this.turnSession(sessionId));
+		return [
+			...(this.turnWarnings(sessionId, false)?.actionable.values() ?? []),
+		];
 	}
 
 	clearActionableWarnings(sessionId?: string): void {
-		this._actionableWarningsThisTurn.clear(this.turnSession(sessionId));
+		this.turnWarnings(sessionId, false)?.actionable.clear();
 	}
 
 	recordCodeQualityWarnings(
 		warnings: CodeQualityWarningRecord[],
 		sessionId?: string,
 	): void {
-		this._codeQualityWarningsThisTurn.add(
-			this.turnSession(sessionId),
-			warnings,
-		);
+		const cell = this.turnWarnings(sessionId, true);
+		if (cell) for (const item of warnings) cell.codeQuality.set(item.id, item);
 	}
 
 	peekCodeQualityWarnings(sessionId?: string): CodeQualityWarningRecord[] {
-		return this._codeQualityWarningsThisTurn.peek(this.turnSession(sessionId));
+		return [
+			...(this.turnWarnings(sessionId, false)?.codeQuality.values() ?? []),
+		];
 	}
 
 	clearCodeQualityWarnings(sessionId?: string): void {
-		this._codeQualityWarningsThisTurn.clear(this.turnSession(sessionId));
+		this.turnWarnings(sessionId, false)?.codeQuality.clear();
 	}
 
 	/**
@@ -2505,8 +2915,9 @@ export class RuntimeCoordinator {
 		const turnSession = this.turnSession(sessionId);
 		if (turnSession === this._telemetrySessionId) return;
 		this._foreignTurnKeys.delete(turnSession);
-		this._actionableWarningsThisTurn.clear(turnSession);
-		this._codeQualityWarningsThisTurn.clear(turnSession);
+		this._foreignReadGuards.get(turnSession)?.releaseFileTime();
+		this._foreignReadGuards.delete(turnSession);
+		this.clearTurnWarnings(turnSession);
 	}
 
 	/** #484: the per-run diagnostics/autofix/format collector (accumulates
@@ -2555,6 +2966,24 @@ export class RuntimeCoordinator {
 	}
 
 	/**
+	 * #4942: the read guard of `sessionId`'s turn, so an edit is judged by the
+	 * reads of the session that edits. The owner is the one `recordSession`
+	 * names for the inline blockers (#4921): a turn with no session id of its
+	 * own is the coordinator's, whose guard is {@link readGuard}; a concurrent
+	 * in-process secondary's is its own, built on first use.
+	 */
+	readGuardFor(sessionId: string | undefined): ReadGuard {
+		const owner = this.recordSession(sessionId).session;
+		if (owner === undefined) return this.readGuard;
+		let guard = this._foreignReadGuards.get(owner);
+		if (guard === undefined) {
+			guard = new ReadGuard(owner, {}, this._scope);
+			this._foreignReadGuards.set(owner, guard);
+		}
+		return guard;
+	}
+
+	/**
 	 * Record the canonical target `tool_call` resolved for `toolCallId`
 	 * (#1642). The paired `tool_result` claims this exactly once via
 	 * {@link takeToolCallAttribution} instead of re-deriving a path from its
@@ -2592,6 +3021,22 @@ export class RuntimeCoordinator {
 	markToolCallFileTimeStale(toolCallId: string): void {
 		const attribution = this._toolCallAttributions.get(toolCallId);
 		if (attribution) attribution.fileTimeStale = true;
+	}
+
+	/** #5120: see {@link RuntimeCoordinator._partialApplies}. */
+	markToolCallPartialApply(
+		input: Record<string, unknown>,
+		pending: PartialApplyPending,
+	): void {
+		this._partialApplies.set(input, pending);
+	}
+
+	/**
+	 * #5120: the partial apply of the call whose `tool_result` carries
+	 * `input`. A non-object key is a miss: `WeakMap.get` answers undefined.
+	 */
+	toolCallPartialApply(input: unknown): PartialApplyPending | undefined {
+		return this._partialApplies.get(input as Record<string, unknown>);
 	}
 
 	/**
@@ -2633,7 +3078,7 @@ export class RuntimeCoordinator {
 		analysisRootMode: AnalysisRootMode = "session",
 	): boolean {
 		if (!canWriteAnalysisRoot(analysisRootMode)) return false;
-		const key = path.resolve(filePath);
+		const key = realpathOrResolve(filePath);
 		const now = Date.now();
 		const resolvedOriginCwd = originCwd ?? turnStateCwd;
 		const existing = this._pendingDeferredMutations.get(key);
@@ -2702,7 +3147,7 @@ export class RuntimeCoordinator {
 				batchId: string;
 		  }
 		| undefined {
-		const record = this._pendingDeferredMutations.get(path.resolve(filePath));
+		const record = this._pendingDeferredMutations.get(filePath);
 		if (!record || !record.kinds.has("format")) return undefined;
 		return {
 			ownerSessionId: record.ownerSessionId,
@@ -2755,6 +3200,11 @@ export class RuntimeCoordinator {
 	 *    observability — deleting it here would drop it forever with no
 	 *    origin ever able to reclaim it.
 	 *
+	 * `ownedOnly` is a concurrent secondary's drain (#4943): it claims exactly
+	 * the records its own known session id owns. An ownerless record, another
+	 * session's and a stale orphan are all left for the primary, so a
+	 * secondary with no stable id claims nothing.
+	 *
 	 * Returns the claimed records, the left-queued mismatched-origin records,
 	 * and per-skipped record why it was left behind — callers use this for
 	 * `agent_end`'s latency-log provenance and for the "stale fallback
@@ -2765,6 +3215,7 @@ export class RuntimeCoordinator {
 		now: number,
 		staleAfterMs: number,
 		currentOriginCwd?: string,
+		ownedOnly = false,
 	): {
 		claimed: DeferredFormatRecord[];
 		staleClaimed: DeferredFormatRecord[];
@@ -2776,13 +3227,19 @@ export class RuntimeCoordinator {
 		const deferredToOwner: DeferredFormatRecord[] = [];
 		const droppedOrphans: DeferredFormatRecord[] = [];
 		for (const [key, record] of this._pendingDeferredMutations) {
-			const sameSession =
-				record.ownerSessionId === undefined ||
-				currentSessionId === undefined ||
-				record.ownerSessionId === currentSessionId;
+			const sameSession = ownedOnly
+				? currentSessionId !== undefined &&
+					record.ownerSessionId === currentSessionId
+				: record.ownerSessionId === undefined ||
+					currentSessionId === undefined ||
+					record.ownerSessionId === currentSessionId;
 			if (sameSession) {
 				claimed.push(record);
 				this._pendingDeferredMutations.delete(key);
+				continue;
+			}
+			if (ownedOnly) {
+				deferredToOwner.push(record);
 				continue;
 			}
 			const age = now - record.lastTouchedAt;
@@ -2815,7 +3272,7 @@ export class RuntimeCoordinator {
 	/** Return claimed records that were never started by an aborted drain. */
 	requeueDeferredFormatFiles(records: DeferredFormatRecord[]): void {
 		for (const record of records) {
-			const key = path.resolve(record.filePath);
+			const key = record.filePath;
 			const existing = this._pendingDeferredMutations.get(key);
 			if (existing) {
 				for (const kind of record.kinds) existing.kinds.add(kind);
@@ -2840,12 +3297,14 @@ export class RuntimeCoordinator {
 		now: number,
 		staleAfterMs: number,
 		currentOriginCwd?: string,
+		ownedOnly = false,
 	) {
 		return this.claimDeferredFormatFiles(
 			currentSessionId,
 			now,
 			staleAfterMs,
 			currentOriginCwd,
+			ownedOnly,
 		);
 	}
 

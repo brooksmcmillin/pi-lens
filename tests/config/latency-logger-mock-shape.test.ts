@@ -17,6 +17,7 @@ import {
 	readWalkedFiles,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 /** Every `*.test.ts` under `root`, through the shared walker (#3082): this
  *  file used to hand-roll the identical recursive `readdirSync` walk. */
@@ -73,28 +74,32 @@ function findLatencyMocks({
 }
 
 describe("latency-logger mock shape (#2281)", () => {
-	it("derives every factory and requires a partial import", () => {
-		// Recurrence guard for #2272 and #2281: comments and strings must not
-		// excuse or trigger a code-only latency-logger mock scan.
-		// Floors against 1,098 `.test.ts` files and ~114 latency-mocking files
-		// at authoring time: well below live counts so normal growth never
-		// trips them, but a silently dropped directory does. The population is
-		// `tests/` source, which routine processes (e.g. the 4.1.4
-		// `.changelog/` roll) never delete.
-		const files = walkTestFiles(path.join(repoRoot, "tests"));
-		assertNonEmptyScan("latency-logger test file walk", files.length, 900);
-		// readWalkedFiles: a path that vanished between the walk and the read is
-		// out of the population, not a finding (#3082 — this scan was one of the
-		// four rotating ENOENT victims).
-		const mocks = readWalkedFiles(files).flatMap(findLatencyMocks);
-		assertNonEmptyScan("latency-logger mock scan", mocks.length, 80);
-		const bare = mocks.filter(
-			({ factory }) =>
-				!factory.includes("importActual") &&
-				!factory.includes("importOriginal"),
-		);
-		expect(bare).toEqual([]);
-	});
+	it(
+		"derives every factory and requires a partial import",
+		() => {
+			// Recurrence guard for #2272 and #2281: comments and strings must not
+			// excuse or trigger a code-only latency-logger mock scan.
+			// Floors against 1,098 `.test.ts` files and ~114 latency-mocking files
+			// at authoring time: well below live counts so normal growth never
+			// trips them, but a silently dropped directory does. The population is
+			// `tests/` source, which routine processes (e.g. the 4.1.4
+			// `.changelog/` roll) never delete.
+			const files = walkTestFiles(path.join(repoRoot, "tests"));
+			assertNonEmptyScan("latency-logger test file walk", files.length, 900);
+			// readWalkedFiles: a path that vanished between the walk and the read is
+			// out of the population, not a finding (#3082 — this scan was one of the
+			// four rotating ENOENT victims).
+			const mocks = readWalkedFiles(files).flatMap(findLatencyMocks);
+			assertNonEmptyScan("latency-logger mock scan", mocks.length, 80);
+			const bare = mocks.filter(
+				({ factory }) =>
+					!factory.includes("importActual") &&
+					!factory.includes("importOriginal"),
+			);
+			expect(bare).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("keeps the factory boundary quote-aware when a string inside it carries a bare `)` (#3145 review round 2)", () => {
 		// Regression pin for the #3145 review finding: the `quoteAware` option

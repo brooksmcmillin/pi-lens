@@ -7,6 +7,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
@@ -50,9 +51,13 @@ export function findHandBuiltEntryGates(root: string): string[] {
 }
 
 describe("script entry-module detection is Windows-portable", () => {
-	it("no script compares import.meta.url with a hand-built file:// string", () => {
-		expect(findHandBuiltEntryGates(ROOT)).toEqual([]);
-	});
+	it(
+		"no script compares import.meta.url with a hand-built file:// string",
+		() => {
+			expect(findHandBuiltEntryGates(ROOT)).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("the scan matches every spelling of the shape and ignores a comment quoting it", () => {
 		const scan = (source: string) =>

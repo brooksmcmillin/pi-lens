@@ -39,11 +39,6 @@ afterAll(() => {
 const getServersForFileWithConfig = vi.fn();
 const isDirectLspCommandTemporarilyUnavailable = vi.fn(() => false);
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient: vi.fn(),
 }));
@@ -103,8 +98,11 @@ async function ledgerCount(kind: string): Promise<number> {
 }
 
 describe("LSP per-file skip records are bounded (#1743)", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		latencyCalls.length = 0;
 		// mkdtempSync created FIXTURE_ROOT; each test refreshes only the marker.
 		fs.writeFileSync(path.join(FIXTURE_ROOT, ".fake-root"), "");

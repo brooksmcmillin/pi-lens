@@ -22,9 +22,17 @@ import {
 } from "../../clients/degradation-ledger.js";
 import { _setGrammarManifestForTests } from "../../clients/grammar-source.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
+import {
+	resetUserNotifier,
+	wireUserNotifier,
+} from "../../clients/user-notify.js";
 
-const notifyUserDegradation = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/user-notify.js", () => ({ notifyUserDegradation }));
+const notifyUserDegradation = vi.fn();
+beforeEach(() => {
+	resetUserNotifier();
+	wireUserNotifier(() => notifyUserDegradation);
+});
+afterEach(() => resetUserNotifier());
 
 /** A genuinely valid wasm preamble — passes `hasWasmMagic`/`fileHasWasmMagic`
  * while being nowhere near a real grammar's byte count, standing in for a

@@ -64,6 +64,8 @@ export function makeLspServiceDouble(
 		isDocumentOpen: vi.fn(() => false),
 		notifyExternalFileChange: vi.fn(async () => undefined),
 		announceCreatedFiles: vi.fn(() => undefined),
+		// #4532 gap 13: `lsp_diagnostics` forces a drift sweep before it answers.
+		sweepDocumentDrift: vi.fn(async () => undefined),
 		getBrokenStatus: vi.fn(() => undefined),
 	};
 

@@ -44,21 +44,6 @@ import {
 const touchFileSpy = vi.hoisted(() => vi.fn());
 const logLatencySpy = vi.hoisted(() => vi.fn());
 
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() =>
-		makeLspServiceDouble({
-			touchFile: touchFileSpy,
-			supportsLSP: (file: string) => file.endsWith(".ts"),
-		}),
-	),
-}));
-
 vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 	const actual =
 		await importOriginal<typeof import("../../clients/latency-logger.js")>();
@@ -66,7 +51,9 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 });
 
 import { handleSessionStart } from "../../clients/runtime-session.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 function makeDeps(ctxCwd: string, overrides: Record<string, unknown> = {}) {
 	return withResidentBootstrap({
@@ -137,7 +124,14 @@ describe("quick-mode warmup one-shot retention (#1154)", () => {
 	let previousDataDir: string | undefined;
 	let prevArgv: string[];
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// The real config loader walks up from the session cwd to HOME (#4709);
+		// a pinned fixture HOME keeps that read off the maintainer's home.
+		pinFixtureHome("runtime-session-warmup-oneshot");
+		await installLspServiceDouble({
+			touchFile: touchFileSpy,
+			supportsLSP: (file: string) => file.endsWith(".ts"),
+		});
 		prevFirst = globals.__piLensFirstSessionDone;
 		prevWarmup = globals.__piLensWarmupScheduled;
 		prevDelay = process.env.PI_LENS_WARMUP_DELAY_MS;
@@ -155,6 +149,7 @@ describe("quick-mode warmup one-shot retention (#1154)", () => {
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		globals.__piLensFirstSessionDone = prevFirst;
 		globals.__piLensWarmupScheduled = prevWarmup;
 		if (prevDelay === undefined) delete process.env.PI_LENS_WARMUP_DELAY_MS;

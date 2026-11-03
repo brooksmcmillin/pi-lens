@@ -15,7 +15,7 @@
  * event name. A copy-pasted wrapper naming a different event would mislabel
  * the ledger subject, so it fails too.
  *
- * The declared floor is the count the scan actually sees. index.ts registers 14
+ * The declared floor is the count the scan actually sees. index.ts registers 15
  * handlers today, and the floor is that number: it sat at 12 while the tree
  * carried 13 and then 14, which let a regex that stopped matching one or two of
  * them pass on the remaining twelve. A regex that loses a registration now reds
@@ -28,7 +28,9 @@
  * hooks are wrapped alike; that is the registration the count gained. (An
  * earlier revision of this paragraph said "12" and "seven" and called the count
  * unchanged while correcting a floor that was already stale — the whole roster
- * is stated here instead, so the next delta is checkable.)
+ * is stated here instead, so the next delta is checkable.) #4687 added
+ * `model_select`, which carries a reason: 15 registrations, nine wrapped and
+ * six with a reason.
  */
 
 import * as fs from "node:fs";
@@ -66,6 +68,8 @@ const UNWRAPPED_HANDLER_REASONS: Readonly<Record<string, string>> = {
 		"Delegates straight to handleToolCall, which already owns a total guard recording `tool-call-handler-throw` (clients/runtime-tool-call.ts); the registration body itself reads no ctx property.",
 	session_shutdown:
 		"The stable-id read is inside a try/catch; activation-owned role decides every post-start shutdown, and the pre-start fallback remains behind noteSessionShutdown's probe. A known secondary returns before shared teardown, while an inconclusive pre-start fallback still tears down to avoid leaking the LSP fleet.",
+	model_select:
+		"The handler takes only the event and reads no ctx property: it plans the tool set from `event.model` (#4687), and applyToolSetPlan's body is a total try/catch, so there is no accessor for the SDK to invalidate.",
 	message_end:
 		"The handler body is a total try/catch, and its only ctx reader is getStableSessionId (its own try/catch); activation-owned role classification reads closure state and its pre-session fallback is probe-based. Nothing throws and nothing is skipped: a stale ctx degrades the cache_usage row to an unattributed sessionId instead. Wrapping it would DROP a row whose `message` payload is still valid, so the handler records the attribution loss as a bounded `cache-usage-attribution-stale` ledger entry (subject `message_end`) when `probeCtxActive` confirms the stale ctx, while the row keeps writing. (#1956)",
 };
@@ -134,7 +138,7 @@ describe("session-event stale-ctx guard sweep (#1925)", () => {
 		assertNonEmptyScan(
 			"session-event registration scan",
 			registrations.length,
-			14,
+			15,
 		);
 		expect(registrations.map((entry) => entry.event)).toContain("turn_end");
 	});
@@ -150,7 +154,7 @@ describe("session-event stale-ctx guard sweep (#1925)", () => {
 				.map((entry) => entry.event),
 			exemptions: UNWRAPPED_HANDLER_REASONS,
 			scannedCount: registrations.length,
-			minScanned: 14,
+			minScanned: 15,
 			remediation:
 				"Wrap it with wrapSessionEventHandler(<event>, handler, { dbg }) from clients/session-event-guard.ts — or wrapSessionEventHandlerWithResult(<event>, handler, { dbg, onStaleResult }) when the host consumes the handler's return value — or add the event to UNWRAPPED_HANDLER_REASONS with the mechanism that makes a stale ctx unreachable for it.",
 		});

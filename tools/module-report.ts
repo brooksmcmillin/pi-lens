@@ -17,7 +17,8 @@ import {
 	moduleReport,
 	readEnclosing,
 	readSymbol,
-	renderCompactModuleReport,
+	renderModuleReportPreset,
+	resolveModuleReportPreset,
 } from "../clients/module-report.js";
 import { baseName, compactRenderResult } from "./render-compact.js";
 import { resolveHostToolPath } from "../clients/path-utils.js";
@@ -62,7 +63,9 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 			];
 			if (details?.callbacks) parts.push(`${details.callbacks} callbacks`);
 			const view =
-				details?.view && details.view !== "default" ? ` [${details.view}]` : "";
+				details?.view && details.view !== "summary-text"
+					? ` [${details.view}]`
+					: "";
 			return `module_report ${base}  ${parts.join(" · ")}${view}`;
 		}),
 		parameters: Type.Object({
@@ -82,9 +85,8 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 			),
 			view: Type.Optional(
 				Type.String({
-					enum: ["summary", "default", "compact"],
 					description:
-						"Payload tier. summary returns top-level entries/recommendedReads and section provenance with heavy callback/usedBy/blast-radius payloads omitted. compact (cheapest) returns a line-oriented TEXT rendering of the full report instead of JSON.",
+						'Output preset: projection \u00d7 format. "summary-text" (default) = metric fields off (no usedBy/fanout/complexity fields), text. "summary-json" = same fields, JSON. "full-text" = every field, text. "full-json" = every field, JSON (byte-identical to the pre-#5137 default). Metrics render as a cx:/fan: suffix and flags as [flag]; every field appears in the text cell, `kind` prints raw so it can be reused as read_symbol\'s kind filter, and an unavailable module still renders its callbacks and recommended reads. A summary cell states the omission in its PROVENANCE footer. A maxRefsPerSymbol argument promotes the projection to full and keeps the format.',
 				}),
 			),
 			blastRadius: Type.Optional(
@@ -118,7 +120,7 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 				path: string;
 				maxRefsPerSymbol?: number;
 				focus?: string;
-				view?: "summary" | "default" | "compact";
+				view?: string;
 				blastRadius?: boolean;
 				blastRadiusDepth?: number;
 				callGraph?: boolean;
@@ -136,8 +138,8 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 			try {
 				report = await moduleReport(absFile, cwd, {
 					maxRefsPerSymbol: params.maxRefsPerSymbol,
-					focus: params.focus,
 					view: params.view,
+					focus: params.focus,
 					blastRadius: params.blastRadius,
 					blastRadiusDepth: params.blastRadiusDepth,
 					callGraph: params.callGraph,
@@ -155,15 +157,14 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 					details: { available: false },
 				};
 			}
-			// view:"compact" renders the report as line-oriented text (roughly a
-			// quarter of the JSON cost for the same info) instead of JSON. Every
-			// other view returns compact (unindented) JSON — omitting indentation
-			// alone saves ~30% on the wire without changing the schema. Tests use
-			// JSON.parse for the JSON views, so they are agnostic to whitespace.
-			const text =
-				params.view === "compact"
-					? renderCompactModuleReport(report)
-					: JSON.stringify(report);
+			// Resolve the output preset, then render through the shared preset seam.
+			// The artifact is built once with no view-shaped input; the preset
+			// drops only metric fields (usedBy/fanout/complexity) and picks text vs JSON.
+			const choice = resolveModuleReportPreset(
+				params.view,
+				params.maxRefsPerSymbol,
+			);
+			const text = renderModuleReportPreset(report, choice);
 			return {
 				content: [{ type: "text" as const, text }],
 				isError: !report.available,
@@ -174,7 +175,7 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 					exports: report.summary.exports,
 					callbacks: report.callbacks.length,
 					callbackSupport: report.callbackSupport,
-					view: report.view ?? "default",
+					view: choice.preset,
 				},
 			};
 		},
@@ -188,11 +189,16 @@ type ReadRecord = {
 	endLine: number;
 };
 
+/** What a tool's `execute` receives of the host's context. */
+type ToolCtx = { cwd?: string };
+
 /** `toolCallId`: the host call that delivered the body (#3521 provenance). */
 type ReadRecorder = (
 	filePath: string,
 	symbol: ReadRecord,
 	toolCallId: string,
+	/** The calling session's ctx: the read is credited to its guard (#4942). */
+	ctx: ToolCtx,
 ) => void;
 
 function recordReadCoverage(
@@ -206,6 +212,7 @@ function recordReadCoverage(
 	},
 	phase: string,
 	toolCallId: string,
+	ctx: ToolCtx,
 ): boolean {
 	if (
 		!result.name ||
@@ -225,6 +232,7 @@ function recordReadCoverage(
 				endLine: result.endLine,
 			},
 			toolCallId,
+			ctx,
 		);
 		return true;
 	} catch (err) {
@@ -290,7 +298,7 @@ export function createReadSymbolTool(
 			params: { path: string; symbol: string; kind?: string },
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
-			ctx: { cwd?: string },
+			ctx: ToolCtx,
 		) {
 			const absFile = resolveFile(params.path, ctx.cwd);
 			const cwd = getProjectRoot() || ctx.cwd || ".";
@@ -341,6 +349,7 @@ export function createReadSymbolTool(
 				result,
 				"read_symbol_guard_error",
 				toolCallId,
+				ctx,
 			);
 			const ambiguityNote = result.ambiguous
 				? ` (${result.ambiguous.count} matches — returned the ${result.kind}; pass \`kind\` to disambiguate: ${result.ambiguous.kinds.join(", ")})`
@@ -447,7 +456,7 @@ export function createReadEnclosingTool(
 			},
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
-			ctx: { cwd?: string },
+			ctx: ToolCtx,
 		) {
 			const absFile = resolveFile(params.path, ctx.cwd);
 			const cwd = getProjectRoot() || ctx.cwd || ".";
@@ -509,6 +518,7 @@ export function createReadEnclosingTool(
 				result,
 				"read_enclosing_guard_error",
 				toolCallId,
+				ctx,
 			);
 			const range = result.partial
 				? `${result.startLine}-${result.endLine} (partial of ${result.enclosingStartLine}-${result.enclosingEndLine})`

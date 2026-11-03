@@ -4,11 +4,13 @@ import * as path from "node:path";
 import { type ExtensionLogLevel, logExtension } from "./extension-log.js";
 import {
 	isRealGitMarker,
-	isAtOrAboveHomeDir,
 	isUnderDir,
 	isWindowsPath,
 	nameMatchesMarkerGlob,
 	normalizeEphemeralMapKey,
+	realpathOrResolve,
+	toPosix,
+	walkUpDirs,
 } from "./path-utils.js";
 import {
 	getDegradationLedgerGeneration,
@@ -136,16 +138,20 @@ function syncGeneration(): void {
 	}
 }
 
+/**
+ * `walkUpDirs` resolves `startDir` and `homeDir` to path identities itself, so
+ * the climb names the parents the kernel opens and a caller may pass a
+ * spelling (#4689 item 6, #4966). `resolveToolCwd` hands over the directory
+ * of the file's resolved target.
+ */
 function walkMarkerRoot(
 	startDir: string,
 	markers: readonly string[],
 	homeDir: string,
 ): { root: string | null; marker?: string } {
-	let current = path.resolve(startDir);
-	for (let depth = 0; depth < 64; depth++) {
-		if (isAtOrAboveHomeDir(current, homeDir)) break;
+	for (const current of walkUpDirs(startDir, { homeDir, maxDepth: 64 })) {
 		for (const marker of markers) {
-			const slash = marker.replace(/\\/g, "/").lastIndexOf("/");
+			const slash = toPosix(marker).lastIndexOf("/");
 			const parent = slash >= 0 ? marker.slice(0, slash) : "";
 			const basename = slash >= 0 ? marker.slice(slash + 1) : marker;
 			const target = parent
@@ -167,9 +173,6 @@ function walkMarkerRoot(
 			}
 			if (found) return { root: current, marker };
 		}
-		const parentDir = path.dirname(current);
-		if (parentDir === current) break;
-		current = parentDir;
 	}
 	return { root: null };
 }
@@ -244,11 +247,6 @@ export function resolveToolCwd(
 	file: string,
 	ctx: ToolCwdContext,
 ): ToolCwdResolution {
-	const dispatchRoot = path.resolve(ctx.cwd ?? process.cwd());
-	const absoluteFile = path.resolve(file);
-	const fileDir = path.dirname(absoluteFile);
-	const homeDir = ctx.homeDir ?? os.homedir();
-	const insideDispatch = isUnderDir(absoluteFile, dispatchRoot);
 	if (ctx.serverRoot) {
 		const rootPath = isWindowsPath(ctx.serverRoot) ? path.win32 : path;
 		const serverRoot = rootPath.resolve(ctx.serverRoot);
@@ -256,12 +254,23 @@ export function resolveToolCwd(
 			emitResolution(kind, tool, serverRoot, "server-root");
 		return { cwd: serverRoot };
 	}
+	const dispatchRoot = path.resolve(ctx.cwd ?? process.cwd());
+	// #4689 item 6: the child's project is the one the file LIVES in. A link
+	// spelling (`pkg-a/src/blink.ts` -> `pkg-b/b.ts`) climbs `pkg-a`'s parents
+	// and ran the other package's tool config; the identity's parents are the
+	// ones the kernel opens. One resolution per call, and the home ceiling the
+	// walks compare against is resolved with it so both sit on one axis.
+	const absoluteFile = realpathOrResolve(file);
+	const fileDir = path.dirname(absoluteFile);
+	const homeDir = ctx.homeDir ?? os.homedir();
+	const homeCeiling = realpathOrResolve(homeDir);
+	const insideDispatch = isUnderDir(absoluteFile, dispatchRoot);
 	const markers = markersFor(kind, tool, absoluteFile, ctx);
 	const markerResult = markers.length
 		? findMarkerRoot(
 				fileDir,
 				markers,
-				ctx.allowHomeMarker ? path.parse(homeDir).root : homeDir,
+				ctx.allowHomeMarker ? path.parse(homeCeiling).root : homeCeiling,
 			)
 		: { root: null };
 	const markerRoot = markerResult.root;
@@ -281,7 +290,7 @@ export function resolveToolCwd(
 	}
 	const memo = ctx.toolCwdMemo;
 	if (memo && memo.gitRoot === undefined) {
-		const gitResult = findMarkerRoot(fileDir, [".git"], homeDir);
+		const gitResult = findMarkerRoot(fileDir, [".git"], homeCeiling);
 		memo.gitRoot =
 			gitResult.root && isRealGitMarker(path.join(gitResult.root, ".git"))
 				? gitResult.root
@@ -291,7 +300,7 @@ export function resolveToolCwd(
 		memo && memo.gitRoot !== undefined
 			? memo.gitRoot
 			: (() => {
-					const gitResult = findMarkerRoot(fileDir, [".git"], homeDir);
+					const gitResult = findMarkerRoot(fileDir, [".git"], homeCeiling);
 					return gitResult.root &&
 						isRealGitMarker(path.join(gitResult.root, ".git"))
 						? gitResult.root

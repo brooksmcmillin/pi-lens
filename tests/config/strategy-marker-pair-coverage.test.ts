@@ -49,6 +49,8 @@ const repoRoot = path.resolve(
 export const BEHAVIOUR_MARKERS = [
 	"diagnosticsFence",
 	"emptyFirstPublish",
+	// #4763: opengrep's empty publish before `semgrep/rulesRefreshed`.
+	"emptyUntilRulesRefreshed",
 	// #3548: typos' close-publish marker.
 	"publishesOnClose",
 	"reopenOnResync",
@@ -70,6 +72,16 @@ const PAIR_TESTS: Record<string, PairTest> = {
 		file: "tests/clients/lsp/diagnostics-fence.test.ts",
 		title:
 			"a fence-dropped $shape on the indexing server leaves the hold spent=$spent",
+	},
+	"opengrep:emptyUntilRulesRefreshed+reopenOnResync": {
+		file: "tests/clients/lsp/opengrep-pre-rules-publish-4763.test.ts",
+		title:
+			"PAIR-REOPEN: two opens before the rules load keep #3482's backlog balanced through the notification",
+	},
+	"opengrep:emptyUntilRulesRefreshed+rescansOnSave": {
+		file: "tests/clients/lsp/opengrep-pre-rules-publish-4763.test.ts",
+		title:
+			"PAIR-SAVE: a save inside the rule-load window expects its own rescan publication and stays balanced",
 	},
 	"opengrep:reopenOnResync+rescansOnSave": {
 		file: "tests/clients/lsp/late-auxiliary-findings.test.ts",

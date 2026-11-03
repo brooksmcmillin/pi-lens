@@ -170,6 +170,23 @@ describe("DependencyChecker madge resolution (#766)", () => {
 		expect(madgeCalls()[0][0]).toBe(bin);
 	});
 
+	// #2556 RECURRENCE GUARDED: `isWithin` tested `path.relative(...)
+	// .startsWith("..")`, so a project binary under a directory named `..tools`
+	// (inside the project) was classified `global`.
+	it("classifies a binary under a ..-named project directory as local (#2556)", async () => {
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
+		const bin = installFakeBinary(path.join(tmp, "..tools"));
+		findNodeToolBinary.mockResolvedValue(bin);
+
+		const { stats } = await new DependencyChecker().checkFilesBatch(
+			[writeSource("a.ts", ["./b.js"])],
+			tmp,
+		);
+
+		expect(stats.commandKind).toBe("local");
+	});
+
 	it("reports a global-bin hit as `global`, not `local`", async () => {
 		const { DependencyChecker } =
 			await import("../../clients/dependency-checker.js");

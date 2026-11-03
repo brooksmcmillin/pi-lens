@@ -106,28 +106,65 @@ let recordWriteWarningEmitted = false;
 // in 64.91s through this hook on 2026-09-26 (#3492's range, capped selection).
 // After #3472 widened the census, all 24 registry suites across both lists ran
 // in 23.65s as one `vitest run` at 6 workers (2026-10-03).
-// Suites over the budget on their own
-// move to CI_ONLY_PRE_PUSH_TESTS below.
+// #4557's master merge, replayed after #4724: 11 changed files, 68 test files,
+// 54s end to end with build and self-scan (497s and 366 files before).
+// Suites over the budget on their own, or together in a serialized lane, move
+// to CI_ONLY_PRE_PUSH_TESTS below.
 
-// Suites measured to exceed the documented pre-push budget on their own, so
-// they are excluded from the local pre-push selection and run in CI instead
+// Suites measured to exceed the documented pre-push budget on their own, or
+// armed together in a `maxWorkers: 1` lane whose phase does (#4724), so they
+// are excluded from the local pre-push selection and run in CI instead
 // (#3426 H3432-1). Never a blanket skip: each entry carries a reason and a CI
-// row, and `--include-ci-only` admits them in the CI job that owns them. The
-// governance suite pins this table, the exclusion, and the CI invocation.
+// row (the gating Unit tests shards: every entry is in the default vitest
+// collection, #3215), and `--include-ci-only` admits them in a local run. The
+// governance suite pins this table, the exclusion, and the CI row.
+const REAL_HARNESS_CI_ONLY =
+	"real pi sessions in the serialized real-harness lane (maxWorkers 1, its own phase), and any tests/ change arms all 12 registered suites: 105 s of CI time together (scripts/test-shard-weights.json), and 117 s locally with the route matrix on 2026-10-21, the whole 120s pre-push budget (#4724). Runs in the gating Unit tests job (the default vitest collection; the advisory CI job that also admitted it via --include-ci-only was removed in #3215) and, with --include-ci-only, in a local run.";
+const ROUTE_MATRIX_COLUMNS_CI_ONLY =
+	"real LSP handshakes in the serialized lsp-spawn-heavy lane (maxWorkers 1, its own phase): three columns of the diagnostics route matrix, split out of tests/tools/diagnostics-route-switch-matrix.test.ts (#3801), 20 to 29 s each locally on 2026-10-31, and any production change arms them through their imports. Runs in the gating Unit tests job (the default vitest collection) and, with --include-ci-only, in a local run.";
 export const CI_ONLY_PRE_PUSH_TESTS = {
 	"tests/scripts/guard-bash-hook.test.ts":
-		"spawns ~1,270 real hook child processes: the transcript corpus alone measured 169s and the file measured 211s end to end, over the 120s pre-push budget. Runs in the Targeted tests (advisory) CI job via --include-ci-only and in the gating Unit tests job.",
+		"spawns ~1,270 real hook child processes: the transcript corpus alone measured 169s and the file measured 211s end to end, over the 120s pre-push budget. Runs in the gating Unit tests job (the default vitest collection; the advisory CI job that also admitted it via --include-ci-only was removed in #3215) and, with --include-ci-only, in a local run.",
+	"tests/tools/diagnostics-route-switch-matrix.test.ts":
+		"real LSP handshakes in the serialized lsp-spawn-heavy lane (maxWorkers 1, its own phase), and any production change arms it: 60 s of CI time (scripts/test-shard-weights.json) and 50 s locally alone on 2026-10-21 (#4724). Runs in the gating Unit tests job (the default vitest collection; the advisory CI job that also admitted it via --include-ci-only was removed in #3215) and, with --include-ci-only, in a local run.",
+	"tests/tools/diagnostics-route-switch-matrix-cols-1.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-2.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-3.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-4.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-5.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/real-harness/bridge-reload-ts.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/bridge-reload.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/child-exit.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/diagnostic-provenance.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/lifecycle.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/negative.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/provider-compatibility.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/read-guard-moves.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/scenario-1.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/scenario-2.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/scenario-3.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/tools-enabled.test.ts": REAL_HARNESS_CI_ONLY,
 };
 
 // Tree scanners do not import the changed module, so path mirroring and
 // import resolution cannot discover them. The governance suite pins this
 // executable population against the scanner shape.
 export const TREE_SCANNING_GOVERNANCE_TESTS = [
+	// #4535: walks clients/tools/mcp/scripts + index.ts for every use of
+	// `subscribeDiskChange`, so a subscriber added without a census row reds.
+	"tests/clients/disk-change-census-4535.test.ts",
 	// #3937: walks clients/tools/mcp/scripts + index.ts for bridge-entry
 	// construction sites (provenance fold over the source tree).
 	"tests/clients/mutation-bridge-lineage-epoch-sweep.test.ts",
 	"tests/clients/session-state-conformance.test.ts",
 	"tests/config/glossary-synonym-sweep.test.ts",
+	// #4312: literal runner references must resolve after registry renames.
+	"tests/config/runner-group-id-census.test.ts",
 	// #3968: walks the custom-server config fields and the LSP_SERVERS
 	// projection for config claims gating runtime behavior without fail-closed
 	// enum validation (the covers validation row is the pinned member).
@@ -156,6 +193,9 @@ export const TREE_SCANNING_GOVERNANCE_TESTS = [
 	"tests/clients/availability-classifiedby-ok-sweep.test.ts",
 	"tests/clients/availability-policy-coverage.test.ts",
 	"tests/clients/bounded-telemetry-sweep.test.ts",
+	// Shape 4: walks clients/tools/mcp + index.ts for abort listeners, so an
+	// unreleased race added outside the `untilAborted` seam reds.
+	"tests/clients/abort-listener-release-sweep.test.ts",
 	"tests/clients/single-flight-ratchet.test.ts",
 	"tests/config/bounded-container-guard.test.ts",
 	// #4239: walks scripts/lib for static dist/ imports and checks each is in
@@ -172,10 +212,24 @@ export const TREE_SCANNING_GOVERNANCE_TESTS = [
 	// reads and maps each to a matrix route; a new route must arm it. The whole
 	// file, matrix included, measured ~28 s alone (2026-10-14).
 	"tests/tools/diagnostics-route-switch-matrix.test.ts",
+	// #4689: walks clients/ for raw realpath calls and raw path.resolve keys
+	// outside the path identity seam.
+	"tests/config/path-identity-sweep.test.ts",
+	// #2556: walks clients/, tools/, mcp/, index.ts AND tests/support/ for a
+	// hand-rolled `..` containment test over a `path.relative` result, so it is
+	// a both-tree scanner and is registered in TEST_TREE_GOVERNANCE_TESTS too.
+	"tests/config/path-containment-sweep.test.ts",
 	// #4590: the one scanner that walks BOTH trees (clients/, scripts/ AND
 	// tests/), so it is registered in both lists: a production change arms it
 	// here, a tests/ change through TEST_TREE_GOVERNANCE_TESTS below.
 	"tests/config/env-path-key-composition-sweep.test.ts",
+	// #4104 F4 fold: walks tests/ (.ts) AND scripts/ (.mjs) for Git fixture
+	// identity writes (its own walkFiles helper), so it is registered in both
+	// lists, as the #4590 rule requires for a both-tree scanner.
+	"tests/config/git-fixture-governance.test.ts",
+	// #4946: walks clients/, tools/, mcp/ and index.ts for flag names the code
+	// reads, against the flag registry; a production change arms it.
+	"tests/config/flag-read-registry-sweep.test.ts",
 ];
 
 // Suites that scan the TESTS tree for a test shape (a real spawn, a raw timer
@@ -205,12 +259,25 @@ export const TEST_TREE_GOVERNANCE_TESTS = [
 	"tests/real-harness/tools-enabled.test.ts",
 	// #3518: walks tests/ for unchecked `handleToolCall` calls (recurrence #4182).
 	"tests/config/handler-verdict-sweep.test.ts",
+	// #4632: walks tests/ for files that use the hand-built pi double (recurrence
+	// #4631: host semantics passed CI on the double).
+	"tests/config/pi-mock-importer-sweep.test.ts",
 	// #4381: walks tests/ for log-sink reads with no drain of that sink first.
 	"tests/config/sink-read-drain-sweep.test.ts",
+	// #2556: the tests/support half of the containment ratchet; its production
+	// half is the same file, registered in TREE_SCANNING_GOVERNANCE_TESTS above
+	// (a both-tree scanner, #4590).
+	"tests/config/path-containment-sweep.test.ts",
 	// #4590: the tests/ half of the env PATH-key composition sweep; its
 	// production half is the same file, registered in
 	// TREE_SCANNING_GOVERNANCE_TESTS above (a both-tree scanner).
 	"tests/config/env-path-key-composition-sweep.test.ts",
+	// #4104 F4 fold: the both-tree scanner (tests/ and scripts/), armed by a
+	// tests/ change here as well as by a production change above.
+	"tests/config/git-fixture-governance.test.ts",
+	// #4789: walks tests/ for files that read the real home outside the named
+	// opt-out registry.
+	"tests/config/real-home-reader-registry.test.ts",
 	// #4589: walks tests/ for env writes with no restore in the same file.
 	"tests/config/test-env-restore-sweep.test.ts",
 	// #4589: walks tests/ for listeners with no awaited teardown.
@@ -232,11 +299,23 @@ export const TEST_TREE_GOVERNANCE_TESTS = [
 	// tree, so a tests-tree change must arm it.
 	"tests/support/ast-census.test.ts",
 	"tests/support/host-event-shape-scan.test.ts",
+	// #4104: the tests-tree and win32 walkers' vanished-directory tolerance.
+	"tests/support/source-walkers-vanished-dir.test.ts",
 	// #4522: walks both captured-fixture trees (and asks git which inputs are
 	// ignored), so a fixture change must arm it; neither pass above selects it
 	// because it imports no changed module.
 	"tests/clients/dispatch/smoke-fixture-coverage.test.ts",
 ];
+
+// #4104 (Greptile P2 on PR #4557): the shared repo walker has no direct
+// importer, so the import index selects none of the tests that pin it. A change
+// to a listed source selects its tests as the change's own.
+const SOURCE_OWN_TESTS = {
+	"scripts/lib/walk-files.mjs": [
+		"tests/support/source-walkers-vanished-dir.test.ts",
+		"tests/support/sweep-kit.test.ts",
+	],
+};
 
 export function changesTestTreeFile(file) {
 	return toPosix(file).startsWith("tests/");
@@ -298,7 +377,33 @@ function readStdin() {
 	}
 }
 
-export function resolveDiffRange(input = readStdin()) {
+// A fork's origin/master can lag the upstream/master a branch merged (#4724),
+// so the base is upstream/master when it has commits origin/master lacks.
+// Exit 128 (no upstream remote, as in CI) keeps origin/master.
+export function resolveBaseRef() {
+	try {
+		execFileSync(
+			"git",
+			["merge-base", "--is-ancestor", "upstream/master", "origin/master"],
+			{ stdio: "ignore" },
+		);
+		return "origin/master";
+	} catch (error) {
+		return error?.status === 1 ? "upstream/master" : "origin/master";
+	}
+}
+
+// Every pushed ref diffs against the base branch, the PR diff CI's targeted
+// job selects. The remote tip would count a merged-in master's files as the
+// branch's own: #4557's master merge selected 366 test files for 11 (#4724).
+// `remoteTip` is the range set before that change, kept as the fallback for a
+// base that cannot be resolved: an update diffs `<remote tip>...<sha>`, a new
+// branch `origin/master...HEAD`.
+export function resolveDiffRange(
+	input = readStdin(),
+	base = "origin/master",
+	{ remoteTip = false } = {},
+) {
 	const lines = input
 		.trim()
 		.split(/\r?\n/)
@@ -310,26 +415,22 @@ export function resolveDiffRange(input = readStdin()) {
 			const parts = line.split(/\s+/);
 			const [, localSha, , remoteSha] = parts;
 			if (!localSha || !remoteSha) {
-				return ["origin/master...HEAD"];
+				return [`${base}...HEAD`];
 			}
 			// A zero local sha is a branch deletion. It has no changed files and
 			// must not trigger a build or a failed `git diff` (#3661).
 			if (/^0+$/.test(localSha)) continue;
-			if (/^0+$/.test(remoteSha)) {
-				// New branch (no remote tracking ref yet): retain the baseline
-				// used by CI, while continuing to retain other pushed updates.
-				if (!ranges.includes("origin/master...HEAD"))
-					ranges.push("origin/master...HEAD");
-				continue;
-			}
-			const range = `${remoteSha}...${localSha}`;
+			const range = remoteTip
+				? /^0+$/.test(remoteSha)
+					? "origin/master...HEAD"
+					: `${remoteSha}...${localSha}`
+				: `${base}...${localSha}`;
 			if (!ranges.includes(range)) ranges.push(range);
 		}
 		return ranges.length > 0 ? ranges : null;
 	}
-	// New branch (no remote tracking ref yet) or unreadable stdin: diff
-	// against origin/master, same baseline CI compares PRs against.
-	return ["origin/master...HEAD"];
+	// Unreadable stdin: diff HEAD against the base, as CI does.
+	return [`${base}...HEAD`];
 }
 
 /**
@@ -356,7 +457,7 @@ export function changedFiles(range, { diffFilter, cwd, env } = {}) {
 			.filter((line) => line.length > 0 && !line.startsWith("dist/"));
 	} catch (error) {
 		console.warn(
-			`[pre-push] could not compute diff range "${range}", falling back to a build-only pass: ${error instanceof Error ? error.message : error}`,
+			`[pre-push] could not compute diff range "${range}": ${error instanceof Error ? error.message : error}`,
 		);
 		return null;
 	}
@@ -445,9 +546,9 @@ function buildTestImportIndex(allTests) {
  * @param {string[]} changed
  * @param {string[]} allTests
  * @param {{ includeCiOnly?: boolean, historyPicks?: string[] }} [options]
- *   `includeCiOnly` admits the `CI_ONLY_PRE_PUSH_TESTS` tier (the CI job passes
- *   it); the local pre-push caller leaves it false so a budget-busting suite
- *   never runs there. `historyPicks` are the history pass's additions
+ *   `includeCiOnly` admits the `CI_ONLY_PRE_PUSH_TESTS` tier (a local run
+ *   passes it; no CI job does since #3215); the pre-push hook leaves it false
+ *   so a budget-busting suite never runs there. `historyPicks` are the history pass's additions
  *   (`loadHistorySelection`): bounded by their own cap, so they join the
  *   registries and the change's own tests in surviving the import cap, and
  *   they are never counted toward it.
@@ -475,6 +576,14 @@ export function selectTargetedTests(changed, allTests, options = {}) {
 			if (existsSync(mirror)) {
 				matches.add(toPosix(mirror));
 				if (!own.has(toPosix(mirror))) own.set(toPosix(mirror), "mirror");
+			}
+			const sourceOwn = Object.hasOwn(SOURCE_OWN_TESTS, toPosix(file))
+				? SOURCE_OWN_TESTS[toPosix(file)]
+				: [];
+			for (const test of sourceOwn) {
+				if (!existsSync(test)) continue;
+				matches.add(test);
+				if (!own.has(test)) own.set(test, "mirror");
 			}
 
 			const changedAbsNoExt = toAbsNoExt(file);
@@ -531,7 +640,7 @@ export function selectTargetedTests(changed, allTests, options = {}) {
 	}
 
 	// CI-only tier (#3426 H3432-1): remove the suites measured to exceed the
-	// pre-push budget unless the caller is the CI job that owns them. The
+	// pre-push budget unless the caller asked for them (`--include-ci-only`). The
 	// count is disclosed on the summary surface, never silently dropped.
 	const excludedCiOnly = [];
 	if (options.includeCiOnly !== true) {
@@ -607,6 +716,7 @@ export function writePrePushRecord({
 	vitestExitCode,
 	wallTimeMs,
 	outcome = "tests-not-started",
+	treeBound = false,
 }) {
 	const dir = recordDir(commonDir);
 	mkdirSync(dir, { recursive: true });
@@ -631,6 +741,9 @@ export function writePrePushRecord({
 		vitestExitCode,
 		wallTimeMs,
 		outcome,
+		// Present only when the tests ran in a clean tree at exactly this head:
+		// the one mark `alreadyPassed` trusts (#4726 F1).
+		...(treeBound ? { treeBound: true } : {}),
 	};
 	const target = path.join(dir, `${head}.json`);
 	const temporary = path.join(dir, `.${head}.${process.pid}.${Date.now()}.tmp`);
@@ -681,12 +794,100 @@ export function parseVitestCounts(output) {
 	};
 }
 
-function writeHeadRecords(heads, values) {
+// Every pushed head already passed this exact selection, so the run would
+// repeat it (#4724: an SSH drop after a green hook re-ran it on one head). Only
+// a record the hook marked `treeBound` counts: the tests run in the working
+// tree, so a pass says nothing about a sha that was not that clean tree
+// (#4726 F1).
+// Returns each head's record timestamp, or null when any head lacks one.
+function alreadyPassed(heads, selected) {
+	if (heads.length === 0) return null;
+	let commonDir;
+	try {
+		commonDir = gitCommonDir();
+	} catch {
+		return null;
+	}
+	const want = [...selected].sort().join("\n");
+	const timestamps = [];
+	for (const { head } of heads) {
+		const record = readPrePushRecord(commonDir, head);
+		if (
+			record?.outcome !== "tests-complete" ||
+			record.treeBound !== true ||
+			record.selected
+				.map(({ file }) => file)
+				.sort()
+				.join("\n") !== want
+		)
+			return null;
+		timestamps.push(record.timestamp);
+	}
+	return timestamps;
+}
+
+// One NDJSON row per decision that removes or relaxes the gate for a push, beside
+// the shared test lock (#3717).
+function appendPrePushLog(logPath, row) {
+	mkdirSync(path.dirname(logPath), { recursive: true });
+	appendFileSync(
+		logPath,
+		`${JSON.stringify({ ts: new Date().toISOString(), ...row })}\n`,
+	);
+}
+
+// The checked-out HEAD and the tracked edits on top of it, or null when git
+// cannot say.
+function treeSnapshot() {
+	try {
+		const git = (args) =>
+			execFileSync("git", args, { encoding: "utf8" }).trim();
+		return {
+			head: git(["rev-parse", "HEAD"]),
+			dirty: git(["status", "--porcelain", "--untracked-files=no"]),
+		};
+	} catch {
+		return null;
+	}
+}
+
+// The heads whose bytes the tests ran against: the checked-out HEAD, with no
+// tracked edits both before the run (`before`) and after it, and the same HEAD
+// both times. A tree cleaned mid-run was not the tree the run read (#4726 F6).
+// Anything else fails closed to none.
+function testedHeads(heads, before) {
+	const after = treeSnapshot();
+	if (
+		!before ||
+		!after ||
+		before.dirty !== "" ||
+		after.dirty !== "" ||
+		before.head !== after.head
+	)
+		return [];
+	return heads.filter(({ head }) => head === after.head);
+}
+
+function writeHeadRecords(heads, values, before = null) {
 	if (heads.length === 0) return;
 	try {
 		const commonDir = gitCommonDir();
-		for (const { head, base } of heads)
-			writePrePushRecord({ commonDir, head, base, ...values });
+		// A `tests-complete` outcome is written only for a head the tests ran
+		// against; the others keep their provisional `tests-not-started` record.
+		const passed = values.outcome === "tests-complete";
+		const bound = passed ? testedHeads(heads, before) : [];
+		if (passed && bound.length < heads.length)
+			console.log(
+				"[pre-push] tests passed, but not as a clean checkout of every pushed head; those heads are not recorded as passed.",
+			);
+		for (const entry of passed ? bound : heads)
+			writePrePushRecord({
+				commonDir,
+				head: entry.head,
+				base: entry.base,
+				...values,
+				treeBound: passed,
+			});
 	} catch (error) {
 		if (!recordWriteWarningEmitted) {
 			recordWriteWarningEmitted = true;
@@ -790,24 +991,44 @@ function runTargetedTests(selected) {
 	});
 }
 
+// The union of the files every range changes, or null when any range cannot
+// be diffed.
+function unionChanged(ranges) {
+	const changed = [];
+	for (const range of ranges) {
+		const files = changedFiles(range);
+		if (files === null) return null;
+		for (const file of files) {
+			if (!changed.includes(file)) changed.push(file);
+		}
+	}
+	return changed;
+}
+
 export async function main() {
 	const input = readStdin();
-	const heads = pushHeads(input);
-	const ranges = resolveDiffRange(input);
+	const base = resolveBaseRef();
+	let ranges = resolveDiffRange(input, base);
 	if (ranges === null) {
 		console.log("[pre-push] deletion-only push; skipping build and tests.");
 		return 0;
 	}
-	let changed = [];
-	for (const range of ranges) {
-		const files = changedFiles(range);
-		if (files === null) {
-			changed = null;
-			break;
-		}
-		for (const file of files) {
-			if (!changed.includes(file)) changed.push(file);
-		}
+	// Each record names the comparison base its selection diffed (#4726 F3).
+	let heads = pushHeads(input).map((head) => ({ ...head, base }));
+	let changed = unionChanged(ranges);
+	if (changed === null) {
+		// An unresolvable base range (no origin/master ref, an upstream with no
+		// merge base) selected nothing and passed: fall back to the range set
+		// before #4724, which resolves from the pushed shas (#4726 F2).
+		console.log(
+			`[pre-push] could not diff against ${base}; falling back to the remote-tip range.`,
+		);
+		ranges = resolveDiffRange(input, base, { remoteTip: true });
+		heads = pushHeads(input).map((head) => ({
+			...head,
+			base: /^0+$/.test(head.base) ? "origin/master" : head.base,
+		}));
+		changed = unionChanged(ranges);
 	}
 	if (changed !== null && process.argv.includes("--include-worktree")) {
 		const uncommitted = worktreeChangedFiles();
@@ -872,6 +1093,28 @@ export async function main() {
 			console.warn(
 				`[pre-push] selection too broad (${totalBeforeCap} test files matched ${changed.length} changed file(s), over the ${MAX_SELECTED_TESTS}-file cap); ${describeCappedKeep(selectionReasons, selected)}; rely on CI for the rest.`,
 			);
+	}
+
+	const priorPass = alreadyPassed(heads, selected);
+	if (priorPass) {
+		// The skip removes the gate for this push, so it leaves a durable row
+		// like the lock opt-out does; the record keeps its own timestamp.
+		try {
+			appendPrePushLog(path.join(path.dirname(getLockPath()), "pre-push.log"), {
+				event: "pre-push-skip",
+				heads: heads.map(({ head }) => head),
+				selected: selected.length,
+				recordTimestamps: priorPass,
+			});
+		} catch (error) {
+			console.warn(
+				`[pre-push] could not log the skip; continuing: ${error instanceof Error ? error.message : error}`,
+			);
+		}
+		console.log(
+			`[pre-push] ${heads.map(({ head }) => head.slice(0, 9)).join(", ")} already passed these ${selected.length} test file(s); skipping build and tests.`,
+		);
+		return 0;
 	}
 
 	// The record exists before any build/self-scan work can fail. A later write
@@ -986,6 +1229,7 @@ export async function main() {
 	);
 	for (const test of selected) console.log(`  - ${test}`);
 
+	const before = treeSnapshot();
 	const result = await runTargetedTests(selected);
 	const { code, lockTimeout, error } = result;
 	const outcome = error
@@ -995,15 +1239,19 @@ export async function main() {
 			: code === 0
 				? "tests-complete"
 				: "tests-failed";
-	writeHeadRecords(heads, {
-		selected: selectedRecords,
-		passed: result.passed,
-		failed: result.failed,
-		skipped: result.skipped,
-		vitestExitCode: code,
-		wallTimeMs: Math.round(result.wallTimeMs),
-		outcome,
-	});
+	writeHeadRecords(
+		heads,
+		{
+			selected: selectedRecords,
+			passed: result.passed,
+			failed: result.failed,
+			skipped: result.skipped,
+			vitestExitCode: code,
+			wallTimeMs: Math.round(result.wallTimeMs),
+			outcome,
+		},
+		before,
+	);
 	if (lockTimeout) {
 		const waitedMs = Number(lockTimeout[1]);
 		const holder = lockTimeout[2];
@@ -1013,10 +1261,13 @@ export async function main() {
 			// The opt-out is a decision, so it leaves a durable trace beside the
 			// lock (#3717): stderr scrolls away, the push does not. The lock
 			// directory exists: the wrapper just waited on a file inside it.
-			appendFileSync(
-				logPath,
-				`${JSON.stringify({ ts: new Date().toISOString(), event: "lock-skip", waitedMs, holder, lockPath, selected: selected.length })}\n`,
-			);
+			appendPrePushLog(logPath, {
+				event: "lock-skip",
+				waitedMs,
+				holder,
+				lockPath,
+				selected: selected.length,
+			});
 			console.error(
 				`[pre-push] WARNING: PI_LENS_PREPUSH_LOCK_SKIP=1 opted out of the targeted test run after ${waitedMs / 1000} s (${holder}); the push is ungated, recorded in ${logPath}, and CI remains the real gate.`,
 			);

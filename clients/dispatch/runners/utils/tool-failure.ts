@@ -4,9 +4,12 @@
  */
 import { incrementDegradationCount } from "../../../degradation-ledger.js";
 import { truncateForLedger } from "../../../ledger-bounds.js";
+import type { SpawnResult } from "../../../safe-spawn.js";
 import {
 	type Diagnostic,
 	type DispatchContext,
+	faultResult,
+	faultSkip,
 	findingsResult,
 	type RunnerResult,
 } from "../../types.js";
@@ -14,6 +17,7 @@ import {
 	type ClassifyRunOutcomeInput,
 	classifyRunOutcome,
 	firstOutputLine,
+	processCutShort,
 	type RunOutcome,
 } from "./spawn-outcome.js";
 
@@ -126,13 +130,47 @@ export function skipUnlessToolRan(
 	fields?: ToolFailureInput["fields"],
 ): RunnerResult | null {
 	const outcome = classifyRunOutcome(input);
-	if (outcome.kind === "ran") return null;
+	const kind = outcome.kind;
+	if (kind === "ran") return null;
 	incrementDegradationCount({
 		kind: "runner-empty-result",
 		subject: tool,
 		reason: formatRunOutcomeFailure(tool, outcome, fields),
 	});
-	return { status: "skipped", diagnostics: [], semantic: "none" };
+	return faultSkip(kind);
+}
+
+/**
+ * The one rule for a run the process did not complete (killed, timed out,
+ * spawn error, no exit status) whose output reached the parser anyway (#4130).
+ * Call it right after the parse, before anything reads the diagnostics as a
+ * verdict. A cut-short run is never `succeeded`, never `blocking_diagnostics`
+ * and never a skip with no fault, whatever it printed before it was cut:
+ *
+ * - nothing parsed: `faultSkip("did-not-run")`.
+ * - findings parsed: `failed` with the findings kept and `failureKind:
+ *   "did-not-run"` (the rust-clippy shape). The kind is not
+ *   `blocking_diagnostics`, so `hasUsableResult` is false and smoke fails the
+ *   row, while the user still sees what the tool reported before it died.
+ *
+ * Returns `null` when the process completed: the caller carries on with its
+ * own reading of the output. A runner that bails before it parses
+ * (`skipUnlessToolRan`, a `result.error` guard) drops partial output and
+ * returns `faultSkip` directly; that is the same rule with no findings kept.
+ */
+export function faultIfCutShort(
+	result: SpawnResult,
+	diagnostics: readonly Diagnostic[],
+): RunnerResult | null {
+	if (!processCutShort(result)) return null;
+	if (diagnostics.length === 0) return faultSkip("did-not-run");
+	const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
+	return {
+		status: "failed",
+		diagnostics: [...diagnostics],
+		semantic: hasBlocking ? "blocking" : "warning",
+		failureKind: "did-not-run",
+	};
 }
 
 /**
@@ -353,24 +391,17 @@ export function finishParsedRun(input: FinishParsedRunInput): RunnerResult {
 	if (input.diagnostics.length === 0) {
 		if (status !== 0 && raw.trim().length > 0) {
 			const message = `${input.tool} exited ${status} but its output could not be parsed`;
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: `${input.tool}:parse-error:1`,
-						message,
-						filePath: input.ctx.filePath,
-						line: 1,
-						column: 1,
-						severity: "warning",
-						semantic: "warning",
-						tool: input.tool,
-					},
-				],
-				semantic: "warning",
-				failureKind: "parser_error",
-				failureMessage: message,
-			};
+			return faultResult(
+				{ kind: "parser_error", failureMessage: message },
+				{
+					id: `${input.tool}:parse-error:1`,
+					message,
+					filePath: input.ctx.filePath,
+					line: 1,
+					column: 1,
+					tool: input.tool,
+				},
+			);
 		}
 		return { status: "succeeded", diagnostics: [], semantic: "none" };
 	}

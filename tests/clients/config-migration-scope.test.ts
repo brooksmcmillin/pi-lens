@@ -27,7 +27,12 @@ import {
 	PI_LENS_CONFIG_SCHEMA,
 } from "../../clients/config-schema.js";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
+import {
+	resetUserNotifier,
+	wireUserNotifier,
+} from "../../clients/user-notify.js";
 import { removeTempDirSync } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
 
 const notices: string[] = [];
 const userNotices: string[] = [];
@@ -40,17 +45,6 @@ vi.mock("../../clients/extension-log.js", async (importOriginal) => {
 		...actual,
 		logExtension: (entry: { message: string }) => {
 			notices.push(entry.message);
-		},
-	};
-});
-
-vi.mock("../../clients/user-notify.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/user-notify.js")>();
-	return {
-		...actual,
-		notifyUserDegradation: (message: string) => {
-			userNotices.push(message);
 		},
 	};
 });
@@ -89,21 +83,23 @@ function write(file: string, value: unknown): void {
 	fs.writeFileSync(file, JSON.stringify(value, null, 2));
 }
 
-let previousConfigPath: string | undefined;
+const setConfigPath = useConfigPath();
 let previousHome: string | undefined;
 
 beforeEach(() => {
 	notices.length = 0;
 	userNotices.length = 0;
+	resetUserNotifier();
+	wireUserNotifier(() => (message) => {
+		userNotices.push(message);
+	});
 	ledgerRows.length = 0;
-	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	previousHome = process.env.PI_LENS_HOME;
 	resetIgnoredConfigWarnCache();
 });
 
 afterEach(async () => {
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
+	resetUserNotifier();
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = previousHome;
 	resetIgnoredConfigWarnCache();
@@ -131,12 +127,12 @@ describe("F1: a legacy root LSP key in the GLOBAL config is a migration, not a t
 	it("gives all four legacy root keys a migration notice and no typo notice", async () => {
 		const home = tmpRoot("pi-lens-f1-home-");
 		const globalFile = path.join(home, ".pi-lens", "config.json");
-		process.env.PI_LENS_CONFIG_PATH = globalFile;
+		setConfigPath(globalFile);
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
 		write(globalFile, {
 			servers: {},
 			serverOverrides: {},
-			disabledServers: ["ts"],
+			disabledServers: ["typescript"],
 			warmFiles: ["a.ts"],
 		});
 
@@ -149,7 +145,7 @@ describe("F1: a legacy root LSP key in the GLOBAL config is a migration, not a t
 		// calling them typos is the contradiction under test.
 		const { loadLSPConfig } = await import("../../clients/lsp/config.js");
 		const lsp = await loadLSPConfig(path.join(home, "proj"), home);
-		expect(lsp.disabledServers).toEqual(["ts"]);
+		expect(lsp.disabledServers).toEqual(["typescript"]);
 		expect(lsp.warmFiles).toEqual(["a.ts"]);
 
 		const typos = notices.filter((message) => message.includes("unknown key"));
@@ -422,7 +418,7 @@ describe("#2445: a malformed GLOBAL config is not silent, and is not LSP's", () 
 	it("emits a lens-config notice from the global loader itself", async () => {
 		const home = tmpRoot("pi-lens-2445-home-");
 		const globalFile = path.join(home, ".pi-lens", "config.json");
-		process.env.PI_LENS_CONFIG_PATH = globalFile;
+		setConfigPath(globalFile);
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
 		fs.mkdirSync(path.dirname(globalFile), { recursive: true });
 		fs.writeFileSync(globalFile, '{ "ignore": [ ');
@@ -442,7 +438,7 @@ describe("#2445: a malformed GLOBAL config is not silent, and is not LSP's", () 
 	it("does not let the LSP loader relabel a pi-lens global document as LSP", async () => {
 		const home = tmpRoot("pi-lens-2445b-home-");
 		const globalFile = path.join(home, ".pi-lens", "config.json");
-		process.env.PI_LENS_CONFIG_PATH = globalFile;
+		setConfigPath(globalFile);
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
 		fs.mkdirSync(path.dirname(globalFile), { recursive: true });
 		fs.writeFileSync(globalFile, '{ "ignore": [ ');
@@ -521,12 +517,57 @@ function validFillerFor(key: string): unknown {
 	return true;
 }
 
-const suppressionNoticesFor = (file: string): string[] =>
-	notices.filter(
-		(message) =>
-			message.includes(file) &&
-			message.includes("further config notices were suppressed"),
+const isSuppressionSummaryFor = (message: string, file: string): boolean =>
+	message.includes(file) &&
+	message.includes("further config notices were suppressed");
+
+/**
+ * The notices one file's LEGACY list emitted, by POSITION: the run that starts
+ * at the file's first move notice and holds only that file's move notices and
+ * summaries. The list closes with its own summary, so the legacy summary is the
+ * one inside this run.
+ *
+ * A file that spells every recognized key ends up to two bounded lists, each
+ * with its own summary: the legacy moves, and the global-only settings the
+ * project loader refuses (#4946 added three global-only sections and tipped
+ * that second list past its bound). Matching on the summary's phrase alone
+ * counts both and made these probes depend on how many global-only sections
+ * the registry holds; keeping the first one hid the second. Position tells
+ * them apart, and a lost legacy summary leaves the run without one.
+ */
+function legacyListFor(file: string): { summaries: string[]; end: number } {
+	const start = notices.findIndex(
+		(message) => message.startsWith("deprecated ") && message.includes(file),
 	);
+	if (start < 0) return { summaries: [], end: 0 };
+	let end = start;
+	while (
+		end < notices.length &&
+		((notices[end] as string).startsWith("deprecated ") ||
+			isSuppressionSummaryFor(notices[end] as string, file))
+	) {
+		end += 1;
+	}
+	return {
+		summaries: notices
+			.slice(start, end)
+			.filter((message) => isSuppressionSummaryFor(message, file)),
+		end,
+	};
+}
+
+/** The summary that closes the file's legacy list: exactly one, or none. */
+const suppressionNoticesFor = (file: string): string[] =>
+	legacyListFor(file).summaries;
+
+/**
+ * The summaries after the legacy list: the refused global-only settings list
+ * the PROJECT loader ends (the LSP loader does not produce it).
+ */
+const refusalSuppressionFor = (file: string): string[] =>
+	notices
+		.slice(legacyListFor(file).end)
+		.filter((message) => isSuppressionSummaryFor(message, file));
 
 const deprecationNoticesFor = (file: string): string[] =>
 	deprecationNotices().filter((message) => message.includes(file));
@@ -535,7 +576,7 @@ describe("round 5 F-A/F-B/S-A: every record list goes through the one bound", ()
 	it("bounds a legacy file with more RECOGNIZED keys than the bound", async () => {
 		const home = tmpRoot("pi-lens-r5a-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5a-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		const legacyFile = path.join(projectDir, "pi-lens.json");
 		write(legacyFile, everyRecognizedKey());
@@ -563,12 +604,15 @@ describe("round 5 F-A/F-B/S-A: every record list goes through the one bound", ()
 		);
 		// … and the truncation is COUNTED, not silent.
 		expect(suppressed, detail).toHaveLength(1);
+		// The refused global-only list is its own bounded list with its own
+		// summary (#4946): one, not folded into the legacy one and not lost.
+		expect(refusalSuppressionFor(legacyFile), detail).toHaveLength(1);
 	});
 
 	it("bounds five nested legacy files PER FILE, each with its own count", async () => {
 		const home = tmpRoot("pi-lens-r5b-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5b-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const dirs = ["root", "root/a", "root/a/b", "root/a/b/c", "root/a/b/c/d"];
 		const legacyFiles = dirs.map((relative) =>
 			path.join(home, ...relative.split("/"), "pi-lens.json"),
@@ -590,6 +634,12 @@ describe("round 5 F-A/F-B/S-A: every record list goes through the one bound", ()
 				MAX_MIGRATION_RECORDS,
 			);
 			expect(suppressed, detail).toHaveLength(1);
+			// Only the nearest file's global-only settings are refused (an ancestor
+			// is a legacy document, not the file in force), so only it ends the
+			// second list.
+			expect(refusalSuppressionFor(file), detail).toHaveLength(
+				file === legacyFiles[4] ? 1 : 0,
+			);
 		}
 		// Pre-fix this walk produced 5 x 28 deprecation notices and no
 		// suppression record anywhere.
@@ -602,7 +652,7 @@ describe("round 5 F-A/F-B/S-A: every record list goes through the one bound", ()
 	it("gives the same file the same notice count through either loader", async () => {
 		const home = tmpRoot("pi-lens-r5c-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5c-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		const legacyFile = path.join(projectDir, "pi-lens.json");
 		write(legacyFile, everyRecognizedKey());
@@ -615,6 +665,7 @@ describe("round 5 F-A/F-B/S-A: every record list goes through the one bound", ()
 			moves: deprecationNoticesFor(legacyFile).length,
 			suppressed: suppressionNoticesFor(legacyFile).length,
 		};
+		const projectRefusalSummaries = refusalSuppressionFor(legacyFile).length;
 
 		// Same file, other loader, from a clean latch.
 		notices.length = 0;
@@ -635,6 +686,11 @@ describe("round 5 F-A/F-B/S-A: every record list goes through the one bound", ()
 			`project=${JSON.stringify(viaProject)} lsp=${JSON.stringify(viaLsp)}`,
 		).toEqual(viaLsp);
 		expect(viaProject.suppressed).toBe(1);
+		// The loaders differ in exactly one disclosed way: only the project loader
+		// refuses global-only settings, so only it ends the second bounded list
+		// and discloses that list's truncation.
+		expect(projectRefusalSummaries).toBe(1);
+		expect(refusalSuppressionFor(legacyFile)).toHaveLength(0);
 	});
 });
 
@@ -642,7 +698,7 @@ describe("round 5 F-D: a WARM load replays a bounded ledger, not the raw list", 
 	it("keeps a warm load's config-deprecated rows inside the bound", async () => {
 		const home = tmpRoot("pi-lens-r5d-home-");
 		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5d-global-");
-		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		setConfigPath(path.join(home, "absent", "config.json"));
 		const projectDir = path.join(home, "proj");
 		write(path.join(projectDir, "pi-lens.json"), everyRecognizedKey());
 

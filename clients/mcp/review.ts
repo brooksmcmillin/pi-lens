@@ -24,6 +24,7 @@ import {
 	DEFAULT_MAX_OUTPUT_BYTES,
 } from "../spawn-output-cap.js";
 import type { AnalyzeFileOptions, McpAnalyzeResult } from "./analyze.js";
+import { toPosix } from "../path-utils.js";
 
 /**
  * Which npm script rebuilds the layout the server is running from. A server at
@@ -35,9 +36,7 @@ import type { AnalyzeFileOptions, McpAnalyzeResult } from "./analyze.js";
 export function resolveRebuildScript(
 	serverFilePath: string,
 ): "build" | "build:dist" {
-	return serverFilePath.replace(/\\/g, "/").includes("/dist/")
-		? "build:dist"
-		: "build";
+	return toPosix(serverFilePath).includes("/dist/") ? "build:dist" : "build";
 }
 
 export interface FreshAnalyzeOutcome {

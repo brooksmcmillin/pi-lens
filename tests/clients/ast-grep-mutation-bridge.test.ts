@@ -27,6 +27,7 @@ type Recorded = {
 	provenance?: string;
 	toolCallId?: string;
 	lineage?: LineageHandle;
+	sessionId?: string;
 };
 
 const recorded: Recorded[] = [];
@@ -192,6 +193,82 @@ describe("#4140 the structural ast_grep_replace apply records through the bridge
 		const result = await client.replaceWithRule(RULE, ["src"], false);
 		expect(result.applied).toBe(false);
 		expect(recorded).toHaveLength(0);
+	});
+
+	it("names the calling session on a structural apply, which owns its deferred pass (#4943)", async () => {
+		// RECURRENCE GUARDED: #4943 R1. The structural apply's records named no
+		// session, so a subagent's rewrite was queued under the coordinator.
+		recorded.length = 0;
+		const { client } = clientWithRunner(MATCHES);
+		await client.replaceWithRule(RULE, ["src"], true, {
+			sessionId: "session-sub",
+		});
+		expect(recorded.map((entry) => entry.sessionId)).toEqual([
+			"session-sub",
+			"session-sub",
+		]);
+	});
+});
+
+describe("#4943 ast_grep_replace names the session it was called in", () => {
+	it("tags every rewritten file with the calling session's id", async () => {
+		// RECURRENCE GUARDED: #4943 R1. A subagent's `ast_grep_replace` apply was
+		// queued under the coordinator's id, so the primary's settle formatted it.
+		recorded.length = 0;
+		const client = clientWithExec(execFor(MATCHES));
+		vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+		vi.spyOn(client, "formatMatches").mockReturnValue("");
+		const tool = createAstGrepReplaceTool(client);
+
+		await tool.execute(
+			"call-4943-ast-grep",
+			{ pattern: "var $X", rewrite: "let $X", lang: "typescript", apply: true },
+			new AbortController().signal,
+			undefined,
+			{ cwd: ".", sessionManager: { getSessionId: () => "session-sub" } },
+		);
+
+		expect(recorded.map((entry) => entry.sessionId)).toEqual([
+			"session-sub",
+			"session-sub",
+		]);
+	});
+
+	it("tags a structural apply's rewrites with the calling session's id", async () => {
+		// RECURRENCE GUARDED: #4943 R1. The tool's structural branch
+		// (`insideKind` and its siblings) is a second call site; one that drops
+		// the session queues the subagent's rewrite under the coordinator.
+		recorded.length = 0;
+		const client = new AstGrepClient();
+		(client as unknown as { runner: unknown }).runner = {
+			tempScanDetailedAsync: vi.fn(async () => ({
+				matches: MATCHES,
+				status: 0,
+			})),
+			tempScanWithFixAsync: vi.fn(async () => ({ matches: MATCHES })),
+		};
+		vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+		vi.spyOn(client, "formatMatches").mockReturnValue("");
+		const tool = createAstGrepReplaceTool(client);
+
+		await tool.execute(
+			"call-4943-ast-grep-rule",
+			{
+				pattern: "var $X",
+				rewrite: "let $X",
+				lang: "typescript",
+				insideKind: "function_declaration",
+				apply: true,
+			},
+			new AbortController().signal,
+			undefined,
+			{ cwd: ".", sessionManager: { getSessionId: () => "session-sub" } },
+		);
+
+		expect(recorded.map((entry) => entry.sessionId)).toEqual([
+			"session-sub",
+			"session-sub",
+		]);
 	});
 });
 

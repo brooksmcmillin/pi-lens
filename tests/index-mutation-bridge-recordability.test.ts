@@ -57,9 +57,13 @@ vi.mock("../clients/bootstrap.js", async () => {
 });
 vi.mock("../clients/runtime-session.js", () => ({
 	handleSessionStart: async (deps: {
-		runtime: { projectRoot: string };
+		runtime: { projectRoot: string; resetForSession: () => void };
 		ctxCwd?: string;
 	}) => {
+		// #5146: the real start begins a fresh scope before its first await
+		// (runtime-session.ts). Without it a second cell reuses the scope the
+		// first cell's shutdown retired, and the bridge refuses the retired scope.
+		deps.runtime.resetForSession();
 		if (deps.ctxCwd) deps.runtime.projectRoot = deps.ctxCwd;
 	},
 }));
@@ -74,25 +78,62 @@ import {
 import { normalizeMapKey } from "../clients/path-utils.js";
 import { readChangesSince } from "../clients/project-changes.js";
 import { ReadGuard } from "../clients/read-guard.js";
+import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { useGlobalConfig } from "./support/global-config.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
+
+const setGlobalConfig = useGlobalConfig();
 
 describe("#2465: index.ts's mutation-bridge wiring separates recordability from the no-read-guard stamp", () => {
 	let tmp: string;
 	let prevDataDir: string | undefined;
-
+	// Each cell activates a fresh session; the lifecycle reset keeps one cell's
+	// primary session from making the next cell's session_start a concurrent
+	// secondary (the same isolation index-wiring.test.ts uses between its
+	// activations).
 	beforeEach(() => {
+		_resetSessionLifecycleForTests();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2465-bridge-wiring-"));
 		prevDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(tmp, "data");
 		resetObservedMutationNet();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		// #5146: end the cell's session before its data dir and root go.
+		await endMockSessions();
+		_resetSessionLifecycleForTests();
 		if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 		else process.env.PILENS_DATA_DIR = prevDataDir;
 		resetObservedMutationNet();
 		removeTempDirSync(tmp);
+	});
+
+	// Review F3: the --no-read-guard cell above cannot fail on the stamp gate by
+	// itself (a one-argument toHaveBeenCalledWith never matches the two-argument
+	// recordWritten call). This cell is the positive side: with the guard on,
+	// the same write stamps the read guard with its path and options.
+	it("stamps the read guard for a recordable bridge write when --no-read-guard is not set", async () => {
+		const recordWrittenSpy = vi.spyOn(ReadGuard.prototype, "recordWritten");
+		setGlobalConfig({});
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		await pi.emit(
+			"session_start",
+			{ reason: "startup" },
+			makeCtx({ cwd: tmp, sessionId: "s-2465-stamp" }),
+		);
+		const filePath = path.join(tmp, "stamped.ts");
+		fs.writeFileSync(filePath, "export const a = 1;\n");
+		const accepted = getMutationBridge()?.recordMutation({
+			filePath,
+			kind: "write",
+			consumer: "probe-2465-stamp",
+		});
+		expect(accepted).toBe(true);
+		expect(recordWrittenSpy).toHaveBeenCalledWith(filePath, expect.anything());
 	});
 
 	it("a recordable bridge write under --no-read-guard still gets turn-state, a receipt, and the observed-handled mark, but skips only the read-guard stamp", async () => {
@@ -101,7 +142,8 @@ describe("#2465: index.ts's mutation-bridge wiring separates recordability from 
 		// regardless of which instance index.ts's closure holds.
 		const recordWrittenSpy = vi.spyOn(ReadGuard.prototype, "recordWritten");
 
-		const pi = createPiMock({ "no-read-guard": true });
+		setGlobalConfig({ readGuard: { enabled: false } });
+		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 		await pi.emit(
 			"session_start",
@@ -121,8 +163,8 @@ describe("#2465: index.ts's mutation-bridge wiring separates recordability from 
 		});
 		expect(accepted).toBe(true);
 
-		// The stamp alone is suppressed under --no-read-guard.
-		expect(recordWrittenSpy).not.toHaveBeenCalledWith(filePath);
+		// The stamp alone is suppressed under --no-read-guard: no call at all.
+		expect(recordWrittenSpy).not.toHaveBeenCalled();
 
 		// Turn-state and the change-log receipt are unaffected by the flag —
 		// this is the part that used to be dropped entirely when `isRecordable`

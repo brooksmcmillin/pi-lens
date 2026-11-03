@@ -15,16 +15,9 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TRANSIENT_BASE_COOLDOWN_MS } from "../../../../clients/dispatch/runners/utils/availability-policy.js";
 
-const {
-	safeSpawnAsync,
-	logLatencySpy,
-	recordDegradationSpy,
-	incrementDegradationCountSpy,
-} = vi.hoisted(() => ({
+const { safeSpawnAsync, logLatencySpy } = vi.hoisted(() => ({
 	safeSpawnAsync: vi.fn(),
 	logLatencySpy: vi.fn(),
-	recordDegradationSpy: vi.fn(),
-	incrementDegradationCountSpy: vi.fn(),
 }));
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
@@ -36,17 +29,22 @@ vi.mock("../../../../clients/latency-logger.js", async (importOriginal) => ({
 	logLatency: logLatencySpy,
 	getLastLoggedPhase: () => undefined,
 }));
-vi.mock(
-	"../../../../clients/degradation-ledger.js",
-	async (importOriginal) => ({
-		...(await importOriginal<
-			typeof import("../../../../clients/degradation-ledger.js")
-		>()),
-		recordDegradation: recordDegradationSpy,
-		recordDegradationOnce: vi.fn(),
-		incrementDegradationCount: incrementDegradationCountSpy,
-	}),
-);
+
+/**
+ * The ledger rows `kind` holds. `loadRunner` resets the module registry, so
+ * the ledger the runner wrote to is the one loaded after that reset; read it
+ * through the same registry, never a static import.
+ */
+async function ledgerReasons(
+	kind: string,
+): Promise<Array<{ subject: string; reason: string }>> {
+	const { getDegradationSummary } =
+		await import("../../../../clients/degradation-ledger.js");
+	return (
+		getDegradationSummary().find((group) => group.kind === kind)
+			?.latestReasons ?? []
+	);
+}
 
 /**
  * Fresh module state per test. The memoized verdicts live at module scope, and
@@ -87,6 +85,7 @@ const moduleMissing = { stdout: "", stderr: "", status: 1 };
 
 const fixtureRoots = new Set<string>();
 afterEach(() => {
+	vi.unstubAllEnvs();
 	for (const root of fixtureRoots)
 		fs.rmSync(root, { recursive: true, force: true });
 	fixtureRoots.clear();
@@ -175,8 +174,6 @@ function hostWithFileResult(fileResult: {
 beforeEach(() => {
 	safeSpawnAsync.mockReset();
 	logLatencySpy.mockReset();
-	recordDegradationSpy.mockReset();
-	incrementDegradationCountSpy.mockReset();
 	vi.useFakeTimers({ toFake: ["Date"] });
 	return () => vi.useRealTimers();
 });
@@ -193,6 +190,30 @@ describe("psscriptanalyzer availability (#1490)", () => {
 			timeout: 30000,
 			resourceLabel: "psscriptanalyzer",
 		});
+	});
+
+	// Recurrence (the scanner temp-root fold, refs #4907): the -File script was
+	// joined onto a bare `os.tmpdir()`, so a harness that owns a scanner root
+	// (`PI_LENS_TEST_SCANNER_TMPDIR`) never saw the script a killed analysis
+	// stranded; every sibling scanner already asks `scannerReportParentDir()`.
+	it("writes the -File script under the scanner report root", async () => {
+		const scannerRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-psa-root-"),
+		);
+		fixtureRoots.add(scannerRoot);
+		vi.stubEnv("PI_LENS_TEST_SCANNER_TMPDIR", scannerRoot);
+		const scripts: Array<{ file: string; existed: boolean }> = [];
+		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) => {
+			if (!args.includes("-File")) return ok();
+			const file = args[args.indexOf("-File") + 1];
+			scripts.push({ file, existed: fs.existsSync(file) });
+			return ok("[]");
+		});
+		const runner = await loadRunner();
+		expect((await runner.run(ctx())).status).toBe("succeeded");
+		expect(scripts).toHaveLength(1);
+		expect(path.dirname(scripts[0].file)).toBe(scannerRoot);
+		expect(scripts[0].existed).toBe(true);
 	});
 
 	it("re-probes the interpreter after a timeout once the cooldown expires", async () => {
@@ -339,12 +360,13 @@ describe("psscriptanalyzer execution-policy-blocked -File run (#1540)", () => {
 			cause: "policy-denied",
 			latched: true,
 		});
-		expect(incrementDegradationCountSpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				kind: "grammar-blocked",
-				subject: "psscriptanalyzer",
-				reason: expect.stringMatching(/execution polic/i),
-			}),
+		expect(await ledgerReasons("grammar-blocked")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					subject: "psscriptanalyzer",
+					reason: expect.stringMatching(/execution polic/i),
+				}),
+			]),
 		);
 	});
 
@@ -374,11 +396,12 @@ describe("psscriptanalyzer execution-policy-blocked -File run (#1540)", () => {
 		);
 		expect(execDecision).toBeDefined();
 		expect(execDecision?.metadata).toMatchObject({ outcome: "transient" });
-		expect(incrementDegradationCountSpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				kind: "grammar-blocked",
-				subject: "psscriptanalyzer",
-			}),
+		expect(await ledgerReasons("grammar-blocked")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					subject: "psscriptanalyzer",
+				}),
+			]),
 		);
 	});
 
@@ -522,12 +545,13 @@ describe("psscriptanalyzer exit-0 with unreadable stdout (#1598)", () => {
 		// The pre-fix bug: empty stdout parses to `[]`, and the runner reports
 		// "succeeded" with zero diagnostics -- identical to a real clean file.
 		expect(result.status).not.toBe("succeeded");
-		expect(incrementDegradationCountSpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				kind: "grammar-blocked",
-				subject: "psscriptanalyzer",
-				reason: expect.stringMatching(/empty/i),
-			}),
+		expect(await ledgerReasons("grammar-blocked")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					subject: "psscriptanalyzer",
+					reason: expect.stringMatching(/empty/i),
+				}),
+			]),
 		);
 		const stdoutDecision = decisions().find(
 			(entry) => entry.metadata?.tool === "psscriptanalyzer-stdout",
@@ -545,12 +569,13 @@ describe("psscriptanalyzer exit-0 with unreadable stdout (#1598)", () => {
 
 		const result = await runner.run(ctx());
 		expect(result.status).not.toBe("succeeded");
-		expect(incrementDegradationCountSpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				kind: "grammar-blocked",
-				subject: "psscriptanalyzer",
-				reason: expect.stringMatching(/unparseable/i),
-			}),
+		expect(await ledgerReasons("grammar-blocked")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					subject: "psscriptanalyzer",
+					reason: expect.stringMatching(/unparseable/i),
+				}),
+			]),
 		);
 	});
 

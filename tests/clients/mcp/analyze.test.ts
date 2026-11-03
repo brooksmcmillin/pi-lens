@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DispatchLatencyReport } from "../../../clients/dispatch/dispatcher.js";
-import { makeLspServiceDouble } from "../../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../../support/lsp-service-seam.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 vi.mock("../../../clients/dispatch/dispatcher.js", async (importOriginal) => {
@@ -38,13 +38,6 @@ vi.mock("../../../clients/dispatch/fact-runner.js", async (importOriginal) => {
 // Warm-up must never spawn a real LSP server in unit tests.
 const mockTouchFile = vi.hoisted(() => vi.fn(async () => undefined));
 const mockSupportsLSP = vi.hoisted(() => vi.fn((_file: string) => false));
-vi.mock("../../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () =>
-		makeLspServiceDouble({
-			supportsLSP: mockSupportsLSP,
-			touchFile: mockTouchFile,
-		}),
-}));
 
 // #536: buildOrUpdateGraph is mocked so this suite asserts the GATING logic
 // (updateGraph flag, blockers, file-kind eligibility) without exercising the
@@ -109,7 +102,11 @@ let tmpDir: string;
 let tsFile: string;
 let previousDataDir: string | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble({
+		supportsLSP: mockSupportsLSP,
+		touchFile: mockTouchFile,
+	});
 	previousDataDir = process.env.PILENS_DATA_DIR;
 	resetDispatchBaselines();
 	clearWidgetState();
@@ -753,6 +750,28 @@ describe("analyzeFile", () => {
 		expect(mockBuildOrUpdateGraph).toHaveBeenCalledWith(
 			tmpDir,
 			[tsFile],
+			expect.anything(),
+		);
+	});
+
+	it("updates the graph for a Java file, which the cascade now models (#5040)", async () => {
+		// Recurrence: CASCADE_GRAPH_KINDS is the one file-kind set both the pi
+		// cascade and this warm-analyze seam read. Java was absent from it, so a
+		// warm pilens_analyze of a Java file never fed the graph that
+		// pilens_module_report answers from, while the review graph itself already
+		// resolved Java imports.
+		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
+		const javaFile = path.join(tmpDir, "src", "lib", "Lib.java");
+		fs.mkdirSync(path.dirname(javaFile), { recursive: true });
+		fs.writeFileSync(
+			javaFile,
+			"package lib;\n\npublic class Lib {\n    public static int foo(int x) {\n        return x;\n    }\n}\n",
+		);
+		await analyzeFile(javaFile, tmpDir, { updateGraph: true });
+		expect(mockBuildOrUpdateGraph).toHaveBeenCalledTimes(1);
+		expect(mockBuildOrUpdateGraph).toHaveBeenCalledWith(
+			tmpDir,
+			[javaFile],
 			expect.anything(),
 		);
 	});

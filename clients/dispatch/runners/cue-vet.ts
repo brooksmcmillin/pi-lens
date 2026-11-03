@@ -118,7 +118,8 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult } from "../types.js";
+import { faultResult, faultSkip, findingsResult } from "../types.js";
+import { faultIfCutShort } from "./utils/tool-failure.js";
 import { PRIORITY } from "../priorities.js";
 
 const cue = createAvailabilityChecker("cue", ".exe", ["version"]);
@@ -433,7 +434,7 @@ const cueVetRunner: RunnerDefinition = {
 		}
 
 		if (spawnFailedWithNoOutput(result, `${result.stdout}${result.stderr}`)) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			return faultSkip("did-not-run");
 		}
 
 		// `cue vet` is silent on success (empty stdout, exit 0) — that IS the
@@ -454,30 +455,27 @@ const cueVetRunner: RunnerDefinition = {
 		// never-silently-clean `undefined` fallback as the directory path.
 		const filtered = filterToTouchedFile(errors, fileName, fileDir);
 
+		// #4130: a vet cut short after it printed is a fault whatever it printed.
+		const cutShort = faultIfCutShort(result, filtered ?? []);
+		if (cutShort) return cutShort;
+
 		if (filtered === undefined) {
 			// Nonzero exit, some output, but nothing in it could be attributed to
 			// ANY file — a real failure must not present as zero findings.
 			const message = raw.slice(0, 300) || "cue vet exited non-zero";
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: "cue-vet-unparsed",
-						message,
-						filePath: ctx.filePath,
-						line: 1,
-						column: 1,
-						severity: "error",
-						semantic: "blocking",
-						tool: "cue-vet",
-						rule: "vet",
-						fixable: false,
-					},
-				],
-				semantic: "blocking",
-				failureKind: "unconfirmed_output",
-				failureMessage: message.slice(0, 200),
-			};
+			return faultResult(
+				{ kind: "unconfirmed_output", failureMessage: message },
+				{
+					id: "cue-vet-unparsed",
+					message,
+					filePath: ctx.filePath,
+					line: 1,
+					column: 1,
+					tool: "cue-vet",
+					rule: "vet",
+					fixable: false,
+				},
+			);
 		}
 
 		if (filtered.length === 0) {

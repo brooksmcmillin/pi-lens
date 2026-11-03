@@ -72,6 +72,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const root = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -153,40 +154,44 @@ describe("escapeRegExp single-source-of-truth (#2558)", () => {
 	// Whole-tree walk: 5.27 s under full-suite load on CI (PR #2742 rounds 2
 	// and 3 timed out at the 5 s default). Same budget as the other tree-walk
 	// sweeps (dependency-boundaries.test.ts).
-	it("has no local escaping-helper definition outside the canonical leaf", () => {
-		const files = listCandidateFiles();
-		// Belt-and-suspenders total floor on top of each directory's own floor
-		// above (~1620 at authoring time).
-		assertNonEmptyScan(
-			"clients/tools/mcp/scripts/tests source files",
-			files.length,
-			1400,
-		);
+	it(
+		"has no local escaping-helper definition outside the canonical leaf",
+		() => {
+			const files = listCandidateFiles();
+			// Belt-and-suspenders total floor on top of each directory's own floor
+			// above (~1620 at authoring time).
+			assertNonEmptyScan(
+				"clients/tools/mcp/scripts/tests source files",
+				files.length,
+				1400,
+			);
 
-		const offenders: string[] = [];
-		// readWalkedFile: this population includes the tests/ tree
-		// (`{ dir: "tests", floor: 900 }` above), which a concurrently running
-		// test can mutate; a path that vanished between the walk and the read is
-		// out of the population, not a finding (#3082).
-		for (const file of files) {
-			const rel = relativePosix(root, file);
-			if (rel === CANONICAL_FILE) continue;
-			const raw = readWalkedFile(file);
-			if (raw === undefined) continue;
-			const stripped = stripSource(raw, { strings: "keep" });
-			if (FUNCTION_SHAPE.test(stripped) || ARROW_SHAPE.test(stripped)) {
-				offenders.push(rel);
+			const offenders: string[] = [];
+			// readWalkedFile: this population includes the tests/ tree
+			// (`{ dir: "tests", floor: 900 }` above), which a concurrently running
+			// test can mutate; a path that vanished between the walk and the read is
+			// out of the population, not a finding (#3082).
+			for (const file of files) {
+				const rel = relativePosix(root, file);
+				if (rel === CANONICAL_FILE) continue;
+				const raw = readWalkedFile(file);
+				if (raw === undefined) continue;
+				const stripped = stripSource(raw, { strings: "keep" });
+				if (FUNCTION_SHAPE.test(stripped) || ARROW_SHAPE.test(stripped)) {
+					offenders.push(rel);
+				}
 			}
-		}
 
-		expect(
-			offenders,
-			`new escaping-helper definition(s) found outside ${CANONICAL_FILE} — ` +
-				`import { escapeRegExp } from "clients/string-utils.js" ` +
-				`(or its tests/support/sweep-kit.js re-export) instead of re-copying ` +
-				`the body: ${offenders.join(", ")}`,
-		).toEqual([]);
-	}, 30_000);
+			expect(
+				offenders,
+				`new escaping-helper definition(s) found outside ${CANONICAL_FILE} — ` +
+					`import { escapeRegExp } from "clients/string-utils.js" ` +
+					`(or its tests/support/sweep-kit.js re-export) instead of re-copying ` +
+					`the body: ${offenders.join(", ")}`,
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// The guard's own positive control: the body that shipped as a second copy
 	// in #4680's `scripts/ci-verdict.mjs` must MATCH, or the sweep is a spelling

@@ -7,7 +7,7 @@ import type {
 } from "../../clients/review-graph/types.js";
 import type { GraphBuildInfo } from "../../clients/review-graph/builder.js";
 import { setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 /**
  * #459: computeCascadeForFile should skip rebuilding + re-persisting the
@@ -40,7 +40,6 @@ const mocks = vi.hoisted(() => ({
 		} => ({ seedFile: "", hits: [], truncated: false, maxDepthReached: 0 }),
 	),
 	formatImpactCascade: vi.fn(),
-	getLSPService: vi.fn(),
 	getGraphImportChanges: vi.fn(),
 	getLastGraphBuildInfo: vi.fn(),
 	buildReverseDependencyIndexFromGraph: vi.fn(),
@@ -53,10 +52,6 @@ vi.mock("../../clients/review-graph/service.js", () => ({
 	computeImpactCascade: mocks.computeImpactCascade,
 	computeTransitiveImpact: mocks.computeTransitiveImpact,
 	formatImpactCascade: mocks.formatImpactCascade,
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: mocks.getLSPService,
 }));
 
 vi.mock("../../clients/review-graph/builder.js", async (importOriginal) => {
@@ -139,7 +134,7 @@ describe("reverse-deps index cache (#459)", () => {
 			maxDepthReached: 0,
 		});
 		mocks.formatImpactCascade.mockReset().mockReturnValue("impact header");
-		mocks.getLSPService.mockReset().mockReturnValue(makeLspServiceDouble());
+		await installLspServiceDouble();
 		mocks.getLastGraphBuildInfo.mockReset();
 		mocks.getGraphImportChanges.mockReset().mockReturnValue(undefined);
 		mocks.buildReverseDependencyIndexFromGraph

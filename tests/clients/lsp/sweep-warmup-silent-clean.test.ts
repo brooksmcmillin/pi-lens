@@ -43,11 +43,6 @@ const logLatency = vi.fn();
 // Partial mocks (#2281): spread the real module and override only the two
 // seams this file drives, so a production export added to either module later
 // cannot go missing from the double.
-vi.mock("../../../clients/lsp/config.js", async (importActual) => ({
-	...(await importActual<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", async (importActual) => ({
 	...(await importActual<typeof import("../../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -197,8 +192,11 @@ function syncSubCommands(executeCommand: ReturnType<typeof vi.fn>): string[] {
 
 describe("ensureWarmForSweep on a tier3-silent server (#3187)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -346,8 +344,11 @@ describe("ensureWarmForSweep on a tier3-silent server (#3187)", () => {
 
 describe("runWorkspaceDiagnostics warm-up on a tier3-silent group (#3187)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();

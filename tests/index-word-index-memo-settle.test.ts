@@ -116,7 +116,7 @@ describe("#4124: agent_settled releases the word index memo for its own session"
 	}> = [];
 
 	async function start(sessionId: string) {
-		const pi = createPiMock({ "no-lsp": true });
+		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 		const ctx = makeCtx({ cwd: tmp, sessionId });
 		await pi.emit("session_start", { reason: "startup" }, ctx);

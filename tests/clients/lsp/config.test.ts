@@ -3,6 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../test-utils.js";
+import { useConfigPath } from "../../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 // #1333: these config/telemetry warnings no longer reach the terminal — pi owns
 // it — they go to the ndjson sink in `clients/extension-log.ts`. The sink mock
@@ -92,7 +94,7 @@ describe("loadLSPConfig global configuration (#870)", () => {
 					rust: { initializationOptions: { check: { command: "check" } } },
 					go: { initializationOptions: { gofumpt: true } },
 				},
-				disabledServers: ["global-disabled"],
+				disabledServers: ["typescript"],
 				warmFiles: ["global.ts"],
 			}),
 		);
@@ -142,7 +144,7 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		// `toEqual([])`, which is to say it pinned repository content silently
 		// re-enabling a server the operator had turned off; #2415 AC 3 forbids
 		// exactly that, and `docs/configuration.md` documents the exception.
-		expect(config.disabledServers).toEqual(["global-disabled"]);
+		expect(config.disabledServers).toEqual(["typescript"]);
 		expect(config.warmFiles).toEqual(["project.ts"]);
 	});
 
@@ -406,22 +408,11 @@ describe("loadLSPConfig — the deny union spans key spellings (#2427 round 2)",
 		const projectDir = path.join(home, "proj");
 		fs.mkdirSync(projectDir, { recursive: true });
 		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
-		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
-		process.env.PI_LENS_CONFIG_PATH = path.join(
-			home,
-			".pi-lens",
-			"config.json",
-		);
+		setConfigPath(path.join(home, ".pi-lens", "config.json"));
 		const { loadLSPConfig, resetLSPConfigWarnCache } =
 			await import("../../../clients/lsp/config.js");
 		resetLSPConfigWarnCache();
-		try {
-			return (await loadLSPConfig(projectDir, home)) as never;
-		} finally {
-			if (previousConfigPath === undefined)
-				delete process.env.PI_LENS_CONFIG_PATH;
-			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
-		}
+		return (await loadLSPConfig(projectDir, home)) as never;
 	}
 
 	// Fixture paths, assembled rather than spelled: the layout keys are
@@ -491,9 +482,9 @@ describe("loadLSPConfig — the deny union spans key spellings (#2427 round 2)",
 	it("unions across spellings instead of replacing the legacy one", async () => {
 		const files: Record<string, unknown> = {};
 		files[GLOBAL_LEGACY] = denyAtRoot("typos");
-		files[PROJECT_CANONICAL] = deny("ruff");
+		files[PROJECT_CANONICAL] = deny("rust");
 		const config = await loadWith(files);
-		expect(sorted(config.disabledServers)).toEqual(["ruff", "typos"]);
+		expect(sorted(config.disabledServers)).toEqual(["rust", "typos"]);
 	});
 
 	// Case C-prime — the mirror image: canonical global, legacy project. A user
@@ -501,9 +492,9 @@ describe("loadLSPConfig — the deny union spans key spellings (#2427 round 2)",
 	it("unions when the tiers swap spellings", async () => {
 		const files: Record<string, unknown> = {};
 		files[GLOBAL_CANONICAL] = deny("typos");
-		files[PROJECT_CANONICAL] = denyAtRoot("ruff");
+		files[PROJECT_CANONICAL] = denyAtRoot("rust");
 		const config = await loadWith(files);
-		expect(sorted(config.disabledServers)).toEqual(["ruff", "typos"]);
+		expect(sorted(config.disabledServers)).toEqual(["rust", "typos"]);
 	});
 
 	// Case G — the same split silently CLOBBERED the by-id object merge. A

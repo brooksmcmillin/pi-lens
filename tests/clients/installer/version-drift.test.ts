@@ -1,3 +1,4 @@
+// real-home: mocks node:os with its own `userInfo` that answers a fixture home; reads nothing of the real one.
 import {
 	afterAll,
 	afterEach,

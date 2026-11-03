@@ -47,6 +47,7 @@ import type {
 	TurnEndLane,
 	TurnEndLaneContext,
 	TurnEndLaneGates,
+	TurnEndLanePart,
 	TurnEndLaneParts,
 } from "../lane.js";
 
@@ -128,7 +129,7 @@ function render(
 	// `advisoryParts` is the composer's array, and a lane that pushed into one
 	// would be a render seam the `@delivery-surface:` tag scan cannot see
 	// (`tests/config/turn-end-lane-boundaries.test.ts`).
-	const advisorySections: string[] = [];
+	const advisorySections: TurnEndLanePart[] = [];
 	// #1627/#1625: guard the list that is about to be printed, never the raw
 	// cache length — the header must not print with zero rows beneath it.
 	if (kept.findings.length) {
@@ -149,7 +150,22 @@ function render(
 		if (kept.findings.length > findings.length) {
 			report += `  … and ${kept.findings.length - findings.length} more\n`;
 		}
-		advisorySections.push(report);
+		// #4617: the section reports the call sites it printed, so those files are
+		// the stamp's subject. A CVE with no traced filename reports only its
+		// module, so it contributes no path — and a section left with none
+		// declares nothing, which the composer treats as "the stamp does not
+		// speak for this part" (fail closed) rather than as a fileless part.
+		advisorySections.push({
+			part: report,
+			cites: [
+				...new Set(
+					kept.findings.flatMap((f) => {
+						const callSite = f.trace.find((t) => t.filename)?.filename;
+						return callSite === undefined ? [] : [callSite];
+					}),
+				),
+			],
+		});
 	}
 	return {
 		advisoryParts: advisorySections,

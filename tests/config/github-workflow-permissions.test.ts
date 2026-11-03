@@ -68,12 +68,11 @@ const EXPECTED_PERMISSIONS: Record<
 			sync: { contents: "read", issues: "write" },
 		},
 	},
-	// The fork omits the PR-body gate; title and close-keyword readers remain.
+	// The fork omits the PR-body gate; title and close-keyword readers share one job.
 	".github/workflows/pr-metadata.yml": {
 		workflow: {},
 		jobs: {
-			"pr-title-lint": { contents: "read", "pull-requests": "read" },
-			"close-keyword-lint": { "pull-requests": "read" },
+			"pr-metadata": { contents: "read", "pull-requests": "read" },
 		},
 	},
 };

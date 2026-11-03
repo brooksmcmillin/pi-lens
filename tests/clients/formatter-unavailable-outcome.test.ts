@@ -400,6 +400,11 @@ describe("runFormatPhase feeds the deferred drain (#2413)", () => {
 			filePath,
 			() => fakeService as never,
 			() => {},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			path.dirname(filePath),
 		);
 
 		// Never a formatter FAILURE, and never listed as a formatter that ran.
@@ -441,6 +446,11 @@ describe("runFormatPhase feeds the deferred drain (#2413)", () => {
 			filePath,
 			() => fakeService as never,
 			() => {},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			path.dirname(filePath),
 		);
 
 		expect(result.formatUnavailable).toEqual([]);

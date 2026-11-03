@@ -1,0 +1,23 @@
+{
+	"content": "ℹ️ 1 advisory:\n  L1: prefer const",
+	"hasBlockers": false,
+	"affectedFiles": [],
+	"affectedFilesTruncated": false,
+	"sessionId": "v4-4-4-session",
+	"projectSeqStart": 0,
+	"projectSeqEnd": 1,
+	"fileSeqByPath": {},
+	"fileContentHashes": {},
+	"consumed": false,
+	"provenance": {
+		"revision": {
+			"sessionId": "v4-4-4-session",
+			"projectSeq": 1,
+			"turnIndex": 1,
+			"generation": 0,
+			"capturedAt": 1760000000000
+		},
+		"files": [],
+		"truncated": false
+	}
+}

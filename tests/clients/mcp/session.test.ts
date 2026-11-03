@@ -10,7 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../../clients/cache-manager.js";
-import { makeLspServiceDouble } from "../../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../../support/lsp-service-seam.js";
 import { gatedPromise } from "../../support/fault-injection.js";
 import { removeTempDirSync } from "../test-utils.js";
 
@@ -51,12 +51,6 @@ vi.mock("../../../clients/bootstrap.js", async () => {
 vi.mock("../../../clients/ast-grep-client.js", () => ({
 	AstGrepClient: class {},
 }));
-vi.mock("../../../clients/lsp/capabilities.js", () => ({
-	// `getMcpSessionContext` reads only `getAliveClientCount`; the rest of the
-	// surface comes from the factory (#2592).
-	getLSPService: () => makeLspServiceDouble({ getAliveClientCount: () => 2 }),
-	resetLSPService: vi.fn(),
-}));
 // Hoisted (not inlined in the factory) so the delivery tests can make a consume
 // THROW — the #1274 error path the two-phase protocol exists to survive.
 const runtimeContext = vi.hoisted(() => ({
@@ -81,6 +75,7 @@ const runtimeContext = vi.hoisted(() => ({
 vi.mock("../../../clients/runtime-context.js", () => runtimeContext);
 
 import {
+	MCP_DELIVERY_ADDRESS,
 	_peekInFlightIpcTurnEnds,
 	_resetMcpSessionContext,
 	_resetTurnEndChain,
@@ -93,7 +88,8 @@ import {
 let tmpDir: string;
 let previousDataDir: string | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble({ getAliveClientCount: () => 2 });
 	previousDataDir = process.env.PILENS_DATA_DIR;
 	handleSessionStart.mockClear();
 	handleTurnEnd.mockClear();
@@ -168,11 +164,14 @@ describe("runTurnEnd", () => {
 		expect(deps.host).toBe("mcp");
 		// MCP delivery must classify provenance with the same live runtime as the
 		// in-process context hook; omitting this argument made legacy/stale data
-		// look current on one transport only.
+		// look current on one transport only. #4943 R2: and as the MCP host's
+		// reader, its coordinator id and its one delivery address.
 		expect(runtimeContext.consumeTurnEndFindings).toHaveBeenCalledWith(
 			expect.anything(),
 			tmpDir,
 			expect.anything(),
+			expect.stringMatching(/^lens-/),
+			MCP_DELIVERY_ADDRESS,
 		);
 		expect(runtimeContext.consumeTestFindings).toHaveBeenCalledWith(
 			expect.anything(),
@@ -201,6 +200,11 @@ describe("runTurnEnd", () => {
 		expect(handleTurnEnd).toHaveBeenCalledTimes(2);
 		for (const call of handleTurnEnd.mock.calls) {
 			expect((call[0] as { host?: unknown }).host).toBe("mcp");
+			// #4943 R2: and stage to the one address every MCP server reads as,
+			// not the coordinator id: a session start reassigns it, and a restart cannot read it.
+			expect((call[0] as { deliveryAddress?: unknown }).deliveryAddress).toBe(
+				MCP_DELIVERY_ADDRESS,
+			);
 		}
 	});
 

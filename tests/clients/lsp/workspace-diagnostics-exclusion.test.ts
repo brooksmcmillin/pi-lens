@@ -158,6 +158,28 @@ describe("LSP workspace-diagnostics home ceiling (#747/#250)", () => {
 		expect(files).toEqual([]);
 	});
 
+	// RECURRENCE GUARDED: #4911. The ceiling compared spellings, so a root or a
+	// HOME spelled through a link walked (and pulled diagnostics for) the whole
+	// home tree. Both directions, each with a real directory link.
+	it.each([["home-link"], ["root-link"]] as const)(
+		"refuses to walk the home directory when the %s spelling names it (#4911)",
+		async (kind) => {
+			const home = path.join(tmpDir, "home");
+			fs.mkdirSync(path.join(home, "src"), { recursive: true });
+			fs.writeFileSync(path.join(home, "src", "a.ts"), "export const a = 1;\n");
+			const link = path.join(tmpDir, "link");
+			fs.symlinkSync(home, link, "junction");
+
+			const files = await __collectWorkspaceDiagnosticFilesForTest(
+				kind === "root-link" ? link : home,
+				undefined,
+				undefined,
+				kind === "home-link" ? link : home,
+			);
+			expect(files).toEqual([]);
+		},
+	);
+
 	it("still walks a project directory UNDER the home directory", async () => {
 		write("src/real.ts");
 		// tmpDir sits directly under its parent, so treating the parent as $HOME

@@ -14,16 +14,18 @@ import path from "node:path";
 import {
 	getGlobalPiLensDir,
 	getProjectIgnoreGlobs,
+	isExcludedDirName,
 	isPathIgnoredByProject,
 } from "../file-utils.js";
 import {
 	augmentPythonEnvironment,
 	detectPythonEnvironment,
-	detectPythonVenv,
+	PYTHON_COMPILE_VERDICT_SERVER_ID,
 	pythonEnvironmentToolCandidates,
 } from "../python-environment.js";
 
-export { detectPythonVenv };
+// Re-exported for the callers that ask this module for the venv probe (#4638).
+export { detectPythonVenv } from "../python-environment.js";
 import { STAGE_TMP_PATTERN } from "../atomic-write-staging.js";
 import {
 	DOTNET_CSHARP_ROOT_MARKERS,
@@ -35,14 +37,19 @@ import { extensionsForLanguage } from "../language-registry.js";
 import {
 	CARGO_WORKSPACE_MEMBER_DIALECT,
 	direntsHaveMarkerGlobMatch,
+	isAbsoluteFilePath,
 	isAtOrAboveHomeDir,
 	isFullyQualified,
 	isUnderDir,
 	isWindowsPath,
+	isWithinForm,
 	matchesWorkspaceMemberPattern,
 	normalizeEphemeralMapKey,
 	pathsEqual,
+	realpathOrResolve,
 	toPosix,
+	toProjectRelativePath,
+	walkUpDirs,
 } from "../path-utils.js";
 import {
 	ensureTool,
@@ -64,12 +71,14 @@ import {
 } from "../zizmor-config.js";
 import { logLatency } from "../latency-logger.js";
 import { logSessionStart } from "../sessionstart-logger.js";
+import { readDirEntriesSafeAsync } from "../source-walker.js";
 import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { resolvePackagePath } from "../package-root.js";
 import { resolveToolCwd } from "../tool-cwd.js";
 import {
 	type DirMtimeRecord,
+	dirMtimeIsRacy,
 	dirMtimeRecordsAsync,
 	dirMtimesStillFreshAsync,
 	unknownDirMtimeRecords,
@@ -77,12 +86,17 @@ import {
 import { bounded } from "../deadline-utils.js";
 import {
 	DEFAULT_LSP_SERVER_ROLE,
+	type LspLaunchVariant,
 	type LspReplyOrdering,
+	type LspResendRecheck,
 	type LspServerRole,
 } from "./server-traits.js";
 import { FRESHNESS_CADENCE_MS } from "../freshness-cadence.js";
 import { HOOK_WALL_BUDGET_MS } from "../hook-budgets.js";
-import { recordDegradationOnce } from "../degradation-ledger.js";
+import {
+	getDegradationLedgerGeneration,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import {
 	hasCargoWorkspaceTable,
 	readCargoWorkspaceExclude,
@@ -111,6 +125,10 @@ import {
 	createGenerationSource,
 	type GenerationHandle,
 } from "../generation-guard.js";
+import {
+	isUntrustedProjectPath,
+	recordProjectCommandRefusal,
+} from "../session-repository.js";
 
 // --- Types ---
 
@@ -145,10 +163,24 @@ export type LspRootFallback = {
 	requiresProjectRoot: boolean;
 	cause: "failed" | "unselected" | "none";
 	marker?: string;
+	/**
+	 * #4806: set for a server whose spawn is declined by a bounded search below
+	 * its root ({@link declinesProjectlessRoot}); the directory bound that
+	 * search stops at, so a reason about an absence can name the limit.
+	 */
+	searchBound?: number;
 };
 
-/** The reason text for a root fallback, worded by what actually happened. */
-export function describeRootFallback(fallback: LspRootFallback): string {
+/**
+ * The reason text for a root fallback, worded by what actually happened.
+ * `hosted` is false when no client was acquired for the file (#4806: a
+ * `spawnNeedsProjectFile` server declined at a project-less root), so the
+ * "started at the file's directory" clause would be false.
+ */
+export function describeRootFallback(
+	fallback: LspRootFallback,
+	hosted = true,
+): string {
 	const tail = "so pi-lens cannot confirm the server analysed the file";
 	if (fallback.cause === "failed") {
 		return `${fallback.serverName}: resolving the project root for this file failed, ${tail}`;
@@ -156,13 +188,26 @@ export function describeRootFallback(fallback: LspRootFallback): string {
 	if (fallback.cause === "unselected") {
 		return `${fallback.serverName}: found ${fallback.marker} for this file but pi-lens did not select it as the project root (a test-fixture or git-ignored directory is never used as one), ${tail}`;
 	}
-	return `${fallback.serverName}: no project root found for this file (looked for ${fallback.rootMarkers.join(" / ")}); the server was started at the file's directory and may not have analysed it`;
+	// #4806: only a declined spawn (`!hosted`) rests on the bounded search.
+	const bound =
+		!hosted && fallback.searchBound !== undefined
+			? `, including a bounded search of ${fallback.searchBound} directories below it`
+			: "";
+	const none = `${fallback.serverName}: no project root found for this file (looked for ${fallback.rootMarkers.join(" / ")}${bound})`;
+	return hosted
+		? `${none}; the server was started at the file's directory and may not have analysed it`
+		: none;
 }
 
 /** Resolve a server identity cwd through the shared tool-cwd seam. */
 export async function resolveLspServerCwd(
 	server: Pick<LSPServerInfo, "id" | "root" | "rootMarkers"> &
-		Partial<Pick<LSPServerInfo, "name" | "requiresProjectRoot">>,
+		Partial<
+			Pick<
+				LSPServerInfo,
+				"name" | "requiresProjectRoot" | "spawnNeedsProjectFile"
+			>
+		>,
 	filePath: string,
 	sessionCwd: string,
 	onRootFailure?: (reason: string) => void,
@@ -233,6 +278,9 @@ export async function resolveLspServerCwd(
 						? "unselected"
 						: "none",
 				...(refusedMarker !== undefined && { marker: refusedMarker }),
+				...(server.spawnNeedsProjectFile === true && {
+					searchBound: PROJECT_FILE_SEARCH_MAX_DIRS,
+				}),
 			});
 		}
 		return fallbackCwd?.cwd;
@@ -296,6 +344,7 @@ const PROJECT_BOUNDARY_MARKERS = [
 	"mix.exs",
 	"pubspec.yaml",
 	"Package.swift",
+	"buildServer.json",
 ] as const;
 const PYTHON_BOUNDARY_MARKERS = new Set([
 	"setup.py",
@@ -380,14 +429,15 @@ export function isSameOrWithin(
 			caseInsensitive = posixFilesystemIsCaseInsensitive(resolvedAncestor);
 		}
 	}
-	const relative = pathApi.relative(
-		caseInsensitive ? resolvedAncestor.toLowerCase() : resolvedAncestor,
-		caseInsensitive ? resolvedCandidate.toLowerCase() : resolvedCandidate,
-	);
-	return (
-		relative === "" ||
-		(!relative.startsWith("..") && !pathApi.isAbsolute(relative))
-	);
+	// Win32 path semantics are case-insensitive; a POSIX path is folded only
+	// when the probe says its filesystem is. Both operands reach the shared text
+	// predicate in one form, which compares whole segments.
+	const fold = windowsShaped || caseInsensitive;
+	const form = (resolved: string): string => {
+		const slashed = windowsShaped ? toPosix(resolved) : resolved;
+		return fold ? slashed.toLowerCase() : slashed;
+	};
+	return isWithinForm(form(resolvedCandidate), form(resolvedAncestor));
 }
 
 /** Enforce the session cwd as the hard boundary for LSP client root selection. */
@@ -406,7 +456,14 @@ export function enforceLspRootCeiling(
 	if (filePath && !isSameOrWithin(resolvedCwd, pathApi.resolve(filePath))) {
 		return resolvedRoot;
 	}
-	if (isSameOrWithin(resolvedCwd, resolvedRoot)) return resolvedRoot;
+	// #4689: the root walks return the root's path identity, and a session cwd
+	// may be spelled through a link, so a root outside the cwd's spelling can be
+	// inside the cwd itself. The identity arm runs only after the spelling miss.
+	if (
+		isSameOrWithin(resolvedCwd, resolvedRoot) ||
+		isUnderDir(resolvedRoot, resolvedCwd)
+	)
+		return resolvedRoot;
 
 	const logKey = `${normalizeMapKey(resolvedCwd)}:${normalizeMapKey(resolvedRoot)}`;
 	if (!loggedRootCeilingClamps.has(logKey)) {
@@ -463,21 +520,43 @@ function hasAtomicStageSegment(dir: string): boolean {
 	return pathSegments(dir).some((segment) => STAGE_TMP_PATTERN.test(segment));
 }
 
-async function findGitBoundary(dir: string): Promise<string | undefined> {
-	let current = path.resolve(dir);
-	const fsRoot = path.parse(current).root;
-	while (true) {
-		if (await markerExists(current, ".git")) return current;
-		if (current === fsRoot) return undefined;
-		current = path.dirname(current);
+/**
+ * `memo` is one walk's record of resolved boundaries (#4788 F2): every directory
+ * a probe passes shares the boundary it finds, so an ascending caller probes each
+ * ancestor once instead of re-walking to the boundary at every step.
+ */
+async function findGitBoundary(
+	dir: string,
+	memo?: Map<string, string | undefined>,
+): Promise<string | undefined> {
+	const visited: string[] = [];
+	let found: string | undefined;
+	// Spelled climb: the boundary is compared with the caller's spelling of the
+	// candidate (`gitRoot === candidate`), so the two stay on one axis.
+	for (const current of walkUpDirs(dir, { spelling: true })) {
+		const key = normalizeMapKey(current);
+		if (memo?.has(key)) {
+			found = memo.get(key);
+			break;
+		}
+		visited.push(key);
+		if (await markerExists(current, ".git")) {
+			found = current;
+			break;
+		}
 	}
+	for (const seen of visited) memo?.set(seen, found);
+	return found;
 }
 
-async function isExcludedLspRoot(dir: string): Promise<boolean> {
+async function isExcludedLspRoot(
+	dir: string,
+	gitBoundaries?: Map<string, string | undefined>,
+): Promise<boolean> {
 	const candidate = path.resolve(dir);
 	if (hasFixtureConvention(candidate) || hasAtomicStageSegment(candidate))
 		return true;
-	const gitRoot = await findGitBoundary(candidate);
+	const gitRoot = await findGitBoundary(candidate, gitBoundaries);
 	if (!gitRoot || gitRoot === candidate) return false;
 	// Avoid constructing the matcher when the project has no positive ignore rules.
 	// The matcher remains authoritative (including anchored rules and directory form).
@@ -487,21 +566,27 @@ async function isExcludedLspRoot(dir: string): Promise<boolean> {
 
 async function nearestNonExcludedFallbackRoot(
 	candidate: string,
+	stopDir?: string,
 ): Promise<string> {
-	if (!(await isExcludedLspRoot(candidate))) return path.resolve(candidate);
-	let current = path.dirname(path.resolve(candidate));
-	const fsRoot = path.parse(current).root;
+	const startDir = path.resolve(candidate);
+	const fsRoot = path.parse(startDir).root;
 	let nearestAllowed: string | undefined;
-	while (true) {
-		if (!(await isExcludedLspRoot(current))) {
+	const gitBoundaries = new Map<string, string | undefined>();
+	// Spelled climb, as in `findGitBoundary`: `stopDir` is the caller's key.
+	for (const current of walkUpDirs(startDir, { spelling: true })) {
+		if (!(await isExcludedLspRoot(current, gitBoundaries))) {
 			nearestAllowed ??= current;
 			for (const marker of FALLBACK_PROJECT_MARKERS) {
 				if (await markerExists(current, marker)) return current;
 			}
 		}
-		if (current === fsRoot) break;
-		current = path.dirname(current);
+		if (normalizeEphemeralMapKey(current) === stopDir) break;
 	}
+	// A walk bounded by `stopDir` that met no allowed directory keeps the file's
+	// own directory: the filesystem root is above the boundary it was told to
+	// respect (#4788 F1), and declining would drop TypeScript's diagnostics for
+	// extension files (#123).
+	if (stopDir !== undefined) return nearestAllowed ?? startDir;
 	// No project marker was available. Keep the file attached to a stable,
 	// non-excluded ancestor rather than minting a client inside the fixture/stage.
 	return nearestAllowed ?? fsRoot;
@@ -528,6 +613,14 @@ export interface LSPServerInfo {
 	idleEviction: "transparent" | "resident" | "unmeasured";
 	/** True for entries supplied through `lsp.servers.*`, not the built-in table. */
 	custom?: boolean;
+	/**
+	 * True when the server recompiles an open document from disk on the client's
+	 * own first-open `workspace/didChangeWatchedFiles` and publishes an empty set
+	 * that erases the error it published first (#5131). The client then holds
+	 * that one empty echo. A config-declared server gets the same hold through
+	 * `custom`; a built-in row that shares the behaviour declares it here.
+	 */
+	echoesOwnNotice?: boolean;
 	/** True when startup/indexing can execute project-owned build or plugin code. */
 	executesProjectCode?: boolean;
 	/** Set by compileLspRegistry after the source trust decision is admitted. */
@@ -557,6 +650,23 @@ export interface LSPServerInfo {
 	/** Marker table used by the shared LSP cwd/root seam. */
 	rootMarkers?: readonly string[];
 	/**
+	 * #4760: this server's workspace walk is bounded by its ROOT, and it needs
+	 * no project config, so a file with no marker ancestor is hosted at its own
+	 * directory (the shared `FileDirRoot` fallback) rather than at
+	 * `process.cwd()`. A `$HOME`-cwd session would otherwise hand the scanner
+	 * the whole home tree; measured, opengrep's workspace-targets walk does not
+	 * answer `initialize` inside 150 s there.
+	 *
+	 * `fileDir` (default) is the declared behaviour. `decline` refuses any
+	 * file whose RESOLVED root is at or above `$HOME`, whatever route reached
+	 * it: a file directly in the home directory, an excluded directory
+	 * (`~/testdata`) that `FileDirRoot` walks up past, a `.git` at `$HOME`, or
+	 * the session-cwd ceiling. No such root is small enough to walk, so the
+	 * client is declined before any process starts, with one bounded record
+	 * per session (#4769 review F1).
+	 */
+	looseFileRoot?: "fileDir" | "decline";
+	/**
 	 * The lifecycle-class trait (#1488, #1756 stage 1): "language" = the file's
 	 * primary language server (one is chosen per file); "auxiliary" = a
 	 * cross-cutting, diagnostic-only server (security, spelling, …) that
@@ -585,6 +695,14 @@ export interface LSPServerInfo {
 	 */
 	replyOrdering?: LspReplyOrdering;
 	/**
+	 * #4782 unchanged-bytes re-check trait: whether a didChange carrying the
+	 * bytes the server holds makes it check the document again. Consumed by the
+	 * bash-write primary phase (`resyncHeldPrimaries` in clients/lsp/index.ts);
+	 * see {@link LspResendRecheck} for the measured evidence and the fail-safe
+	 * `unmeasured` default.
+	 */
+	resendRecheck?: LspResendRecheck;
+	/**
 	 * ID of the preferred language server this server backs up. Primary selection
 	 * already tries language servers in registry order; this marker prevents an
 	 * aggregate `clientScope: "all"` diagnostics pass from launching the fallback
@@ -601,6 +719,16 @@ export interface LSPServerInfo {
 	 * documented behaviour.
 	 */
 	requiresProjectRoot?: boolean;
+	/**
+	 * #4806: the server's own process aborts when its cwd has none of its root
+	 * markers anywhere below it (csharp-ls throws "no .csproj/.fsproj or sln
+	 * files found" on a thread-pool thread and the .NET runtime raises SIGABRT).
+	 * Set, the registry declines the spawn before any process starts when
+	 * {@link declinesProjectlessRoot} finds no marker in a bounded search of the
+	 * root's subtree. Omitted (the default for every other server): spawn.
+	 * `requiresProjectRoot` only words an empty answer; this trait gates a spawn.
+	 */
+	spawnNeedsProjectFile?: boolean;
 	/** Simple command name whose absence disables spawn attempts briefly across roots. */
 	availabilityKey?: string;
 	/** Simple binary name whose project-local install must be refused for adopted roots. */
@@ -645,6 +773,21 @@ export interface LSPServerInfo {
 	 * Cascade can read its passive snapshot instead of actively touching neighbors.
 	 */
 	autoPropagateDiagnostics?: boolean;
+	/**
+	 * The configuration section (one name) that this server's `initialization`
+	 * blob IS the contents of, for a server that PULLS its settings under that
+	 * name. rust-analyzer applies `initializationOptions` flat at startup and
+	 * then pulls the `rust-analyzer` section; with no mapping that pull is
+	 * answered `{}` (#4758), and an empty client config is a no-op it skips, so
+	 * today the mapping only makes the pull answer repeat what startup already
+	 * applied. The effect of the pull answer is unmeasured (#4512). The client
+	 * answers the section from the blob (user `serverOverrides` included) and
+	 * leaves `initializationOptions` unwrapped. A server whose settings already
+	 * sit under their section names inside the blob (pyright:
+	 * {@link pyrightInitialization}) omits it. It sits on the server, not the
+	 * spawn result, so a user `command` override that replaces `spawn` keeps it.
+	 */
+	settingsSection?: string;
 	spawn(
 		root: string,
 		options?: LSPSpawnOptions,
@@ -665,7 +808,7 @@ export interface LSPServerInfo {
 				 * variant-carrying server that hasn't been updated to report one yet;
 				 * treat as the classic/default behavior (fail-safe).
 				 */
-				launchVariant?: "classic" | "native-ts7";
+				launchVariant?: LspLaunchVariant;
 		  }
 		| undefined
 	>;
@@ -1548,8 +1691,10 @@ function IgnoreHomeRoot(primary: RootFunction): RootFunction {
 	// separator alone; both sides of the comparison below go through the same
 	// derivation, so adding the seam's slash fold cannot change the verdict for
 	// any spelling the old copy already agreed on, and it makes a mixed-separator
-	// root agree with the home directory it names.
-	const homeKey = normalizeEphemeralMapKey(path.resolve(os.homedir()));
+	// root agree with the home directory it names. #4689: the primary returns
+	// the root's path identity, so the home is taken as its identity too; a
+	// home spelled through a link (`/home -> var/home`) is still refused.
+	const homeKey = normalizeEphemeralMapKey(realpathOrResolve(os.homedir()));
 	return withRootMarkers(async (file: string): Promise<string | undefined> => {
 		const root = await primary(file);
 		if (!root) return undefined;
@@ -1699,8 +1844,74 @@ export function PriorityRoot(
 
 export const FileDirRoot: RootFunction = async (file: string) => {
 	const candidate = path.resolve(path.dirname(file));
-	return nearestNonExcludedFallbackRoot(candidate);
+	return nearestNonExcludedFallbackRoot(
+		candidate,
+		piAgentExtensionsRootKey(file),
+	);
 };
+
+/**
+ * #4760: does this server's root policy refuse the resolved `root`? It does
+ * when the root is at or above `$HOME`, the walk that never finishes; a root
+ * below home (a repo, or `~/bin`) stays eligible. The root, not the file's
+ * directory, is the input: the root is always that directory or an ancestor
+ * of it, so it is the one value that sees every route to `$HOME` (#4769
+ * review F1). Both sides are real paths, so a `$HOME` reached through a
+ * symlink is the same directory (review F3), as `clients/ephemeral-root.ts`
+ * compares for the sibling `lsp-root-declined` writer.
+ */
+export function declinesLooseFileRoot(
+	server: Pick<LSPServerInfo, "looseFileRoot">,
+	root: string,
+): boolean {
+	if (server.looseFileRoot !== "decline") return false;
+	return isAtOrAboveHomeDir(
+		realpathOrResolve(root),
+		realpathOrResolve(os.homedir()),
+	);
+}
+
+/** Directories {@link declinesProjectlessRoot} reads before it gives up. */
+const PROJECT_FILE_SEARCH_MAX_DIRS = 128;
+
+/**
+ * #4806: does this server's spawn policy refuse the resolved `root` because no
+ * project file exists at it or below it? csharp-ls searches its cwd
+ * recursively (`Directory.GetFiles(dir, "*.csproj", SearchOption.AllDirectories)`)
+ * and aborts only when that finds nothing, so this mirrors the recursion
+ * rather than reading the top level alone. The marker rule is the one root
+ * resolution uses (`markerExists` over the server's own `rootMarkers`).
+ *
+ * Bounded: a breadth-first walk (nearest directories first) reads at most
+ * {@link PROJECT_FILE_SEARCH_MAX_DIRS} directories, skipping the excluded
+ * directory names (`isExcludedDirName`). A project deeper than that bound, or
+ * only under an excluded name, reads as absent: a decline, never a spawn,
+ * because the spawn is the process abort. The cost is up to
+ * `1 + rootMarkers.length` directory reads per directory visited, paid only
+ * when a spawn is attempted for a root with no project at its top level.
+ */
+export async function declinesProjectlessRoot(
+	server: Pick<LSPServerInfo, "spawnNeedsProjectFile" | "root" | "rootMarkers">,
+	root: string,
+): Promise<boolean> {
+	if (server.spawnNeedsProjectFile !== true) return false;
+	const markers = server.rootMarkers ?? server.root.rootMarkers ?? [];
+	const queue = [root];
+	for (let visited = 0; visited < PROJECT_FILE_SEARCH_MAX_DIRS; visited++) {
+		const dir = queue.shift();
+		if (dir === undefined) break;
+		for (const marker of markers) {
+			if (await markerExists(dir, marker)) return false;
+		}
+		for (const entry of await readDirEntriesSafeAsync(dir)) {
+			if (visited + queue.length + 1 >= PROJECT_FILE_SEARCH_MAX_DIRS) break;
+			if (entry.isDirectory() && !isExcludedDirName(entry.name)) {
+				queue.push(path.join(dir, entry.name));
+			}
+		}
+	}
+	return true;
+}
 
 export function RootWithFallback(
 	primary: RootFunction,
@@ -1761,7 +1972,7 @@ async function markerExists(dir: string, pattern: string): Promise<boolean> {
 		}
 	}
 
-	const normalized = pattern.replace(/\\/g, "/");
+	const normalized = toPosix(pattern);
 	const slash = normalized.lastIndexOf("/");
 	const basenamePattern = slash >= 0 ? normalized.slice(slash + 1) : normalized;
 	if (!basenamePattern) return false;
@@ -1793,7 +2004,10 @@ async function markerExists(dir: string, pattern: string): Promise<boolean> {
  * and a directory mtime cannot see a change made inside the same timestamp tick
  * as the walk's own stat (1 s granularity on HFS+/FAT and on some network
  * mounts), so `walkedAt` bounds how long a hit may be served without a real
- * walk at all (#3412 review round 1, M-3421-01).
+ * walk at all (#3412 review round 1, M-3421-01). A directory stamped inside
+ * the tick before the walk is not memoized in the first place (#4756,
+ * `dirMtimeIsRacy`), which leaves the cadence bounding only what a stamp
+ * older than the tick can still hide.
  */
 type RootMemoEntry = {
 	root: string;
@@ -1870,9 +2084,14 @@ export function NearestRoot(
 	}
 
 	return withRootMarkers(async (file: string): Promise<string | undefined> => {
-		// Cache key is the resolved directory — all files in the same dir share a root.
-		const startDir = path.resolve(path.dirname(file));
-		const dirKey = normalizeMapKey(startDir);
+		// #4689: the walk starts at the directory of the file's path identity,
+		// the one the kernel opens, so a link spelling and its target climb the
+		// same parents. That directory is also the cache key: every file in it
+		// shares a root, and one identity is one key whatever the spelling. It is
+		// already an identity, so the key needs only the syntactic fold.
+		const identity = realpathOrResolve(file);
+		const startDir = path.dirname(identity);
+		const dirKey = normalizeEphemeralMapKey(startDir);
 
 		// Fast path: already resolved for this directory, nothing the walk looked at
 		// has changed since, and the entry is younger than the shared re-check
@@ -1905,11 +2124,13 @@ export function NearestRoot(
 		// — the conservative direction, by the walk's runtime (~0.2 ms measured).
 		const walkedAt = Date.now();
 		const promise = (async (): Promise<string | undefined> => {
-			let currentDir = startDir;
-			const fsRoot = path.parse(currentDir).root;
-			const stop = stopDir ? path.resolve(stopDir) : fsRoot;
+			const fsRoot = path.parse(startDir).root;
+			// #4689: the stop is the walk's other end, so it is an identity too; a
+			// stop spelled through a link (a junction or subst cwd) never contains
+			// an identity and the walk would break on its first step.
+			const stop = stopDir ? realpathOrResolve(stopDir) : fsRoot;
 
-			while (true) {
+			for (const currentDir of walkUpDirs(startDir)) {
 				if (
 					stop !== fsRoot &&
 					currentDir.startsWith(stop + path.sep) === false &&
@@ -1946,10 +2167,7 @@ export function NearestRoot(
 							break;
 						}
 					}
-					if (excluded) {
-						currentDir = path.dirname(currentDir);
-						continue;
-					}
+					if (excluded) continue;
 				}
 
 				// Check include patterns. Exact marker names stay cheap (`stat`), while
@@ -1957,18 +2175,20 @@ export function NearestRoot(
 				for (const pattern of includePatterns) {
 					if (
 						(await markerExists(currentDir, pattern)) &&
-						(pattern !== ".git" || currentDir !== os.tmpdir()) &&
+						(pattern !== ".git" ||
+							currentDir !== realpathOrResolve(os.tmpdir())) &&
 						!(await isExcludedLspRoot(currentDir))
 					) {
-						return enforceLspRootCeiling(currentDir, process.cwd(), file);
+						// The identity, not the spelling: the memo stores this answer
+						// under the identity's directory, so it may depend on nothing
+						// the spelling adds.
+						return enforceLspRootCeiling(currentDir, process.cwd(), identity);
 					}
 				}
 
 				if (currentDir === stop || currentDir === fsRoot) {
 					break;
 				}
-
-				currentDir = path.dirname(currentDir);
 			}
 
 			return undefined;
@@ -1977,7 +2197,13 @@ export function NearestRoot(
 		inFlight.set(dirKey, promise);
 		try {
 			const result = await promise;
-			if (result !== undefined)
+			// A record stamped inside the file system's timestamp tick before the
+			// walk cannot show a later same-tick change (#4756): the answer is
+			// returned, not memoized.
+			if (
+				result !== undefined &&
+				!probedDirs.some((r) => dirMtimeIsRacy(r.mtimeMs, walkedAt))
+			)
 				cache.set(dirKey, { root: result, probedDirs, walkedAt });
 			return result;
 		} finally {
@@ -2076,8 +2302,12 @@ async function findAncestorFileAmong(
 	candidateSegmentLists: string[][],
 ): Promise<string | undefined> {
 	const fs = await import("node:fs/promises");
-	let currentDir = path.resolve(startDir);
-	while (!isAtOrAboveHomeDir(currentDir)) {
+	// The walk keeps the caller's spelling (a returned binary is classified by
+	// where it is spelled); the home ceiling compares real paths (#4911), so a
+	// HOME or an ancestor spelled through a link still stops it.
+	const home = realpathOrResolve(os.homedir());
+	for (const currentDir of walkUpDirs(startDir, { spelling: true })) {
+		if (isAtOrAboveHomeDir(realpathOrResolve(currentDir), home)) break;
 		for (const segments of candidateSegmentLists) {
 			const candidate = path.join(currentDir, ...segments);
 			try {
@@ -2087,9 +2317,6 @@ async function findAncestorFileAmong(
 				/* not found at this level */
 			}
 		}
-		const parent = path.dirname(currentDir);
-		if (parent === currentDir) break;
-		currentDir = parent;
 	}
 	return undefined;
 }
@@ -2355,6 +2582,8 @@ async function findTsserverPath(
 interface NativeTypeScriptLsp {
 	command: string;
 	version: string;
+	/** The `node_modules` directory the nearest TypeScript 7+ package sits in. */
+	nodeModulesDir: string;
 }
 
 /**
@@ -2367,9 +2596,11 @@ interface NativeTypeScriptLsp {
 async function findNativeTypeScriptLsp(
 	root: string,
 ): Promise<NativeTypeScriptLsp | undefined> {
-	let currentDir = path.resolve(root);
+	// Spelled walk, real-path ceiling, as in `findAncestorFileAmong` (#4911).
+	const home = realpathOrResolve(os.homedir());
 
-	while (!isAtOrAboveHomeDir(currentDir)) {
+	for (const currentDir of walkUpDirs(root, { spelling: true })) {
+		if (isAtOrAboveHomeDir(realpathOrResolve(currentDir), home)) break;
 		const typescriptDir = path.join(currentDir, "node_modules", "typescript");
 		const packageJsonPath = path.join(typescriptDir, "package.json");
 
@@ -2391,9 +2622,6 @@ async function findNativeTypeScriptLsp(
 			} catch {
 				/* typescript dir itself doesn't exist here — keep walking up */
 			}
-			const parent = path.dirname(currentDir);
-			if (parent === currentDir) return undefined;
-			currentDir = parent;
 			continue;
 		}
 
@@ -2429,12 +2657,69 @@ async function findNativeTypeScriptLsp(
 		for (const command of candidates) {
 			try {
 				await access(command);
-				return { command, version };
+				return {
+					command,
+					version,
+					nodeModulesDir: path.join(currentDir, "node_modules"),
+				};
 			} catch {
 				/* not found */
 			}
 		}
 		return undefined;
+	}
+	return undefined;
+}
+
+interface EffectTsgoLsp {
+	command: string;
+	releaseTag: string;
+}
+
+/**
+ * #4914: a project that installed `@effect/tsgo` next to its TypeScript 7+
+ * gets the Effect language service through the project's own `effect-tsgo`
+ * wrapper (`effect-tsgo tsc --lsp --stdio`). Opting in is the install itself.
+ *
+ * `nodeModulesDir` is the level `findNativeTypeScriptLsp` found the nearest
+ * TypeScript 7+ at, and only that level is read: a TypeScript 7 package with
+ * no `@effect/tsgo` beside it, or a malformed one (no readable manifest
+ * version, no bin), answers `undefined` and the caller keeps the native
+ * launch. Never an ancestor's `@effect/tsgo`, which the nearer TypeScript does
+ * not resolve (the same shadowing rule as the compiler itself).
+ */
+async function findEffectTsgoLsp(
+	nodeModulesDir: string,
+): Promise<EffectTsgoLsp | undefined> {
+	let release: unknown;
+	try {
+		const manifest: unknown = JSON.parse(
+			await readFile(
+				path.join(nodeModulesDir, "@effect", "tsgo", "package.json"),
+				"utf8",
+			),
+		);
+		release =
+			typeof manifest === "object" && manifest !== null && "version" in manifest
+				? manifest.version
+				: undefined;
+	} catch {
+		return undefined;
+	}
+	if (typeof release !== "string" || !release) return undefined;
+
+	const localBin = path.join(nodeModulesDir, ".bin", "effect-tsgo");
+	const candidates =
+		process.platform === "win32"
+			? [`${localBin}.cmd`, `${localBin}.exe`, localBin]
+			: [localBin];
+	for (const command of candidates) {
+		try {
+			await access(command);
+			return { command, releaseTag: release };
+		} catch {
+			/* not found */
+		}
 	}
 	return undefined;
 }
@@ -2454,11 +2739,25 @@ function dotnetToolCandidates(tool: string): string[] {
  * Both filename forms for a tool in a directory (`.exe` first on Windows). A
  * managed binary may carry the extension or not depending on how the toolchain
  * dropped it, so we try both.
+ *
+ * #4530 (#4776): these are toolchain dirs (`$GOPATH/bin`, `$CARGO_HOME/bin`),
+ * and the launcher starts a named file without judging it, so an entry that is
+ * the session repository's bytes is dropped here until pi trusts the project.
  */
 function binExeVariants(dir: string, tool: string): string[] {
-	return process.platform === "win32"
-		? [path.join(dir, `${tool}.exe`), path.join(dir, tool)]
-		: [path.join(dir, tool)];
+	const variants =
+		process.platform === "win32"
+			? [path.join(dir, `${tool}.exe`), path.join(dir, tool)]
+			: [path.join(dir, tool)];
+	const admitted: string[] = [];
+	for (const candidate of variants) {
+		if (existsSync(candidate) && isUntrustedProjectPath(candidate)) {
+			recordProjectCommandRefusal(candidate);
+			continue;
+		}
+		admitted.push(candidate);
+	}
+	return admitted;
 }
 
 /**
@@ -2614,10 +2913,22 @@ async function findExtensionBoundedRoot(
 	file: string,
 	extensionRootKey: string,
 ): Promise<string | undefined> {
-	const startDir = path.resolve(path.dirname(file));
-	let currentDir = startDir;
+	// #4689: climb the file's path identity when it lives inside the extensions
+	// root, bounded by that root's identity (a `~/.pi` linked from a dotfiles
+	// checkout spells the boundary its identity never contains). A linked
+	// extension (`extensions/myext -> ~/code/myext`) lives outside the root, so
+	// only its spelled chain meets the boundary; it keeps that chain instead of
+	// climbing to whatever manifest sits above the checkout.
+	const identity = realpathOrResolve(file);
+	const insideBoundary = isUnderDir(identity, extensionRootKey);
+	const boundaryKey = insideBoundary
+		? normalizeEphemeralMapKey(realpathOrResolve(extensionRootKey))
+		: extensionRootKey;
+	const start = path.dirname(insideBoundary ? identity : path.resolve(file));
 	const configMarkers = tsConfigMarkersForFile(file);
-	while (true) {
+	// `start` is already the identity (inside the root) or the spelling the
+	// boundary is written in (a linked extension), so the climb takes it as is.
+	for (const currentDir of walkUpDirs(start, { spelling: true })) {
 		for (const pattern of configMarkers) {
 			try {
 				await stat(path.join(currentDir, pattern));
@@ -2637,11 +2948,9 @@ async function findExtensionBoundedRoot(
 		// Stop at or beyond the extensions root — never walk into the
 		// pi-agent-wide scope.
 		const currentKey = normalizeEphemeralMapKey(path.resolve(currentDir));
-		if (currentKey === extensionRootKey) return undefined;
-		const parent = path.dirname(currentDir);
-		if (parent === currentDir) return undefined;
-		currentDir = parent;
+		if (currentKey === boundaryKey) return undefined;
 	}
+	return undefined;
 }
 
 /**
@@ -2669,7 +2978,14 @@ async function hasAgentLevelProjectMarker(
 
 const TypeScriptRoot: RootFunction = withRootMarkers(
 	DenoExcludeRoot(async (file) => {
-		const extensionRootKey = piAgentExtensionsRootKey(file);
+		// #4689: a file spelled outside the boundary whose identity is inside it
+		// (`checkout/packages/myext -> ~/.pi/agent/extensions/myext`) takes the
+		// boundary from its identity; the walks below climb that identity, and
+		// without the boundary they adopt `~/.pi/agent` (#123). `FileDirRoot`
+		// keeps its spelled boundary: it bounds a climb of the spelling.
+		const extensionRootKey =
+			piAgentExtensionsRootKey(file) ??
+			piAgentExtensionsRootKey(realpathOrResolve(file));
 		if (extensionRootKey) {
 			// Bounded walk so we never adopt a parent (e.g. ~/.pi/agent/) as the
 			// LSP root.
@@ -2698,6 +3014,11 @@ export const TypeScriptServer: LSPServerInfo = {
 	id: "typescript",
 	idleEviction: "transparent",
 	role: "language",
+	// #4782: typescript-language-server 5.3.0 (tsserver 5.9.3) answered every
+	// unchanged-bytes re-send after a delayed dependency 10/10 (measured; see
+	// LspResendRecheck). The native TS 7.0.2 launch is read by pull, which
+	// answers in stream order: 20/20 fresh with the re-send, none inconclusive.
+	resendRecheck: "rechecks",
 	name: "TypeScript Language Server",
 	projectLocalCommand: "typescript-language-server",
 	extensions: JS_TS_LSP_EXTENSIONS,
@@ -2706,6 +3027,56 @@ export const TypeScriptServer: LSPServerInfo = {
 	rootMarkers: TypeScriptRoot.rootMarkers,
 	async spawn(root, options) {
 		const nativeLsp = await findNativeTypeScriptLsp(root);
+		// #4914: the project's `effect-tsgo` wrapper runs the same typescript-go
+		// server with the Effect language service. It is project-supplied code, so
+		// it takes the same trust gate as the compiler; a refusal falls through to
+		// the native launch, which that gate refuses the same way.
+		const effectLsp = nativeLsp
+			? await findEffectTsgoLsp(nativeLsp.nodeModulesDir)
+			: undefined;
+		if (
+			nativeLsp &&
+			effectLsp &&
+			admitProjectSuppliedTsserver(
+				effectLsp.command,
+				root,
+				true,
+				options?.projectCodeAllowed,
+			)
+		) {
+			const env = await getToolEnvironment();
+			try {
+				const proc = await launchLSP(
+					effectLsp.command,
+					["tsc", "--lsp", "--stdio"],
+					{ cwd: root, env },
+				);
+				logSessionStart(
+					`lsp typescript-effect-tsgo: version=${effectLsp.releaseTag} typescript=${nativeLsp.version} command=${effectLsp.command}`,
+				);
+				return {
+					process: proc,
+					source: "direct",
+					launchVariant: "effect-tsgo",
+				};
+			} catch (launchFailure) {
+				// Existence is not launchability: a shim without the exec bit or a
+				// directory at the bin path passes the finder and fails here. The
+				// project worked on the native launch before it installed
+				// `@effect/tsgo`, so it keeps that launch instead of losing the
+				// TypeScript server to the registry's spawn cooldown. A process that
+				// starts and then fails `initialize` is not covered (client.ts).
+				recordDegradationOnce({
+					kind: "lsp-registry-decision",
+					subject: `effect-tsgo-launch:g${getDegradationLedgerGeneration()}:${root}`,
+					reason: `effect-tsgo launch failed, using the native launch: ${launchFailure instanceof Error ? launchFailure.message : String(launchFailure)}`,
+					metadata: {
+						field: "effect-tsgo-launch",
+						launchVariant: "effect-tsgo",
+					},
+				});
+			}
+		}
 		if (
 			nativeLsp &&
 			admitProjectSuppliedTsserver(
@@ -2817,10 +3188,43 @@ export const DenoServer: LSPServerInfo = {
 	},
 };
 
+/**
+ * The settings pi-lens hands pyright and basedpyright, keyed by the sections
+ * those servers PULL (`python`, `python.analysis`, `pyright`).
+ *
+ * pyright reads `initializationOptions` only for `disablePullDiagnostics`, so a
+ * bare `pythonPath` or `openFilesOnly` key was never applied (#4758). Each
+ * setting sits under the section pyright asks for, and the client's
+ * `workspace/configuration` handler answers that request from this tree; the
+ * same tree is the `workspace/didChangeConfiguration` payload.
+ *
+ * `diagnosticMode: "openFilesOnly"` analyses only open files rather than the
+ * full workspace. It avoids the 5–14 s cold-start on large projects caused by
+ * workspace-wide analysis on startup. Deep type checking is still available via
+ * the standalone pyright CLI runner that runs in parallel.
+ */
+export function pyrightInitialization(
+	pythonPath?: string,
+): Record<string, unknown> {
+	return {
+		python: {
+			...(pythonPath ? { pythonPath } : {}),
+			analysis: { diagnosticMode: "openFilesOnly" },
+		},
+	};
+}
+
 export const PythonServer: LSPServerInfo = {
 	id: "python",
 	idleEviction: "transparent",
 	role: "language",
+	// #4782: every binary this row launches answers an unchanged-bytes
+	// didChange for its new version (measured; see LspResendRecheck): pyright
+	// 1.1.414, basedpyright 1.40.2 (idle 3/3, burst under load 6/6) and ty
+	// 0.0.91 (idle 3/3, burst 6/6, burst under load 6/6). ty never re-checks a
+	// dependent on its own after the dependency changes, so it needs the re-send
+	// most.
+	resendRecheck: "rechecks",
 	name: "Pyright Language Server",
 	extensions: KIND_EXTENSIONS["python"],
 	root: RootWithFallback(
@@ -2836,20 +3240,9 @@ export const PythonServer: LSPServerInfo = {
 	),
 	async spawn(root, options) {
 		const pythonEnvironment = await detectPythonEnvironment(root);
-		const env = augmentPythonEnvironment(
-			await getToolEnvironment(),
-			pythonEnvironment,
-		);
+		const toolEnvironment = await getToolEnvironment();
+		const env = augmentPythonEnvironment(toolEnvironment, pythonEnvironment);
 		let source: "direct" | "managed" | "package-manager" = "direct";
-
-		// openFilesOnly: true — analyse only open files rather than the full workspace.
-		// Avoids the 5–14 s cold-start on large projects caused by workspace-wide
-		// analysis on startup. Deep type checking is still available via the standalone
-		// pyright CLI runner that runs in parallel.
-		const pyrightInit = (pythonPath?: string): Record<string, unknown> => ({
-			...(pythonPath ? { pythonPath } : {}),
-			openFilesOnly: true,
-		});
 
 		// Project ownership outranks checker preference: exhaust explicit project
 		// candidates before a bare command can resolve to pi-lens's managed bin or
@@ -2879,7 +3272,7 @@ export const PythonServer: LSPServerInfo = {
 			return {
 				process: projectPyright.process,
 				source: projectPyright.source,
-				initialization: pyrightInit(pythonEnvironment?.pythonPath),
+				initialization: pyrightInitialization(pythonEnvironment?.pythonPath),
 			};
 		}
 
@@ -2916,7 +3309,7 @@ export const PythonServer: LSPServerInfo = {
 			return {
 				process: pathPyright.process,
 				source: pathPyright.source,
-				initialization: pyrightInit(pythonEnvironment?.pythonPath),
+				initialization: pyrightInitialization(pythonEnvironment?.pythonPath),
 			};
 		}
 
@@ -2960,13 +3353,15 @@ export const PythonServer: LSPServerInfo = {
 		return {
 			process: resolved.process,
 			source,
-			initialization: pyrightInit(pythonEnvironment?.pythonPath),
+			initialization: pyrightInitialization(pythonEnvironment?.pythonPath),
 		};
 	},
 };
 
 export const PythonJediServer: LSPServerInfo = {
-	id: "python-jedi",
+	// One identity: `isJediCompileVerdictOutranked` matches `compile` rows by
+	// this id, so the rule and the registration cannot drift (#4638).
+	id: PYTHON_COMPILE_VERDICT_SERVER_ID,
 	idleEviction: "transparent",
 	role: "language",
 	name: "Jedi Language Server",
@@ -2984,23 +3379,65 @@ export const PythonJediServer: LSPServerInfo = {
 		]),
 	),
 	async spawn(root, options) {
+		// #4638: launch jedi from the project's own interpreter first, exactly as
+		// pyright does, so it parses with the environment the project declared
+		// instead of whichever interpreter the managed install happens to carry.
+		// The project tier carries no `managedToolId`: a managed binary is
+		// prepended to `candidates` ahead of everything, which would put it back
+		// in front of the project's environment.
+		const pythonEnvironment = await detectPythonEnvironment(root);
+		const toolEnvironment = await getToolEnvironment();
+		const env = augmentPythonEnvironment(toolEnvironment, pythonEnvironment);
+		const initialization = pythonEnvironment
+			? { workspace: { environmentPath: pythonEnvironment.pythonPath } }
+			: {};
+
+		if (pythonEnvironment) {
+			// A project launch can fail for a reason other than "tool not found"
+			// (a broken shim, a rejected interpreter, an unusable environment). The
+			// fallback is the documented behaviour either way, so a throw is recorded
+			// and does not end the attempt (#4638 review).
+			try {
+				const projectLaunched = await resolveAndLaunch(
+					{
+						candidates: pythonEnvironmentToolCandidates(
+							pythonEnvironment,
+							"jedi-language-server",
+						),
+						args: [],
+						cwd: root,
+						env,
+					},
+					options?.allowInstall,
+				);
+				if (projectLaunched) return { ...projectLaunched, initialization };
+			} catch (err) {
+				recordDegradationOnce({
+					kind: "python-project-launch-failed",
+					subject: root,
+					reason: `jedi could not launch from the project interpreter ${pythonEnvironment.pythonPath}: ${err instanceof Error ? err.message : String(err)}`,
+					metadata: { tool: "jedi-language-server" },
+				});
+			}
+		}
+
+		// No project-owned interpreter (absent, or refused untrusted inside
+		// `detectPythonEnvironment`, which records the one-shot refusal): fall back
+		// to the managed install and then the host PATH, as before. The fallback
+		// gets the UN-augmented environment: with the venv's `bin` first on PATH its
+		// bare name resolves back to the project shim that just failed (#4638 r3 N5).
 		const launched = await resolveAndLaunch(
 			{
 				candidates: ["jedi-language-server"],
 				args: [],
 				cwd: root,
+				env: toolEnvironment,
 				managedToolId: "jedi-language-server",
 			},
 			options?.allowInstall,
 		);
 		if (!launched) return undefined;
-		const pythonPath = await detectPythonVenv(root);
-		return {
-			...launched,
-			initialization: pythonPath
-				? { workspace: { environmentPath: pythonPath } }
-				: {},
-		};
+		return { ...launched, initialization };
 	},
 };
 
@@ -3058,11 +3495,10 @@ function cargoWorkspaceDeclaresMember(
 	parentDir: string,
 	childDir: string,
 ): boolean {
-	const relativePath = path
-		.relative(parentDir, childDir)
-		.split(path.sep)
-		.join("/");
-	if (relativePath === "" || relativePath.startsWith("..")) return false;
+	// Relative (slash-joined) only when the child is strictly below the parent;
+	// the parent itself and an outside path come back absolute.
+	const relativePath = toProjectRelativePath(childDir, parentDir);
+	if (isAbsoluteFilePath(relativePath)) return false;
 	// Reuse the shared, `[workspace]`-scoped readers (review round 2, F4)
 	// instead of hand-composing `extractTomlTableSection` +
 	// `parseTomlStringArray` here — that hand-composition duplicated exactly
@@ -3121,9 +3557,10 @@ function RustWorkspaceRoot(): RootFunction {
 		// it (#1671).
 		const stop = sessionHoistCeiling(sessionCwd, file);
 
-		let current = root;
-		const fsRoot = path.parse(current).root;
-		while (true) {
+		const fsRoot = path.parse(root).root;
+		// `root` is the identity the crate-root walk returned, so the climb takes
+		// it as is.
+		for (const current of walkUpDirs(root, { spelling: true })) {
 			if (stop !== undefined && current === stop) break;
 			const parent = path.dirname(current);
 			if (parent === current || parent === fsRoot) break;
@@ -3146,7 +3583,6 @@ function RustWorkspaceRoot(): RootFunction {
 				// rooted rather than being swept into a workspace it opted out of.
 				break;
 			}
-			current = parent;
 		}
 		return root;
 	}, crateRoot.rootMarkers ?? []);
@@ -3227,23 +3663,18 @@ function JavaWorkspaceRoot(): RootFunction {
 		// <modules> must declare, and it is what actually gets returned — never
 		// the cursor, which can land on a bare gap directory that is not itself
 		// a valid module root (#1671 F2).
-		let current = root;
 		let lastHop = root;
-		const fsRoot = path.parse(current).root;
-		while (true) {
+		const fsRoot = path.parse(root).root;
+		for (const current of walkUpDirs(root, { spelling: true })) {
 			if (stop !== undefined && current === stop) break;
 			const parent = path.dirname(current);
 			if (parent === current || parent === fsRoot) break;
-			if (await markerExists(parent, "pom.xml")) {
-				const parentPom = path.join(parent, "pom.xml");
-				if (!(await declaresMavenModule(parent, parentPom, lastHop))) break;
-				current = parent;
-				lastHop = parent;
-				continue;
-			}
-			// No pom.xml here — a gap directory, not a module boundary. Keep
-			// climbing without advancing `lastHop`.
-			current = parent;
+			// No pom.xml at `parent` is a gap directory, not a module boundary:
+			// keep climbing without advancing `lastHop`.
+			if (!(await markerExists(parent, "pom.xml"))) continue;
+			const parentPom = path.join(parent, "pom.xml");
+			if (!(await declaresMavenModule(parent, parentPom, lastHop))) break;
+			lastHop = parent;
 		}
 		return enforceLspRootCeiling(lastHop, sessionCwd, file);
 	}, moduleRoot.rootMarkers ?? []);
@@ -3256,6 +3687,7 @@ export const RustServer: LSPServerInfo = {
 	// Measured (#3750): rust-analyzer answers an empty result for a detached file.
 	requiresProjectRoot: true,
 	name: "rust-analyzer",
+	settingsSection: "rust-analyzer",
 	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["rust"],
 	// No FileDirRoot fallback (#201): rust-analyzer is a heavy workspace server
@@ -3472,6 +3904,8 @@ export const CSharpServer: LSPServerInfo = {
 	role: "language",
 	// Documented (#3750): csharp-ls needs a solution or project.
 	requiresProjectRoot: true,
+	// Measured (#4806): with none below its cwd csharp-ls aborts the process.
+	spawnNeedsProjectFile: true,
 	name: "csharp-ls",
 	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["csharp"],
@@ -3586,6 +4020,70 @@ export const KotlinServer: LSPServerInfo = {
 	},
 };
 
+/**
+ * groovy-language-server (GroovyLanguageServer/groovy-language-server, #5123).
+ * The project publishes no release, so nothing is downloaded or installed:
+ * a `groovy-language-server` launcher on PATH (Mason builds one) wins, else
+ * `java -jar $GROOVY_LANGUAGE_SERVER_JAR` (`./gradlew build` in the repo
+ * produces the jar). Both run on a JDK >= 17 resolved the way jdtls resolves
+ * it. `.gradle` and `Jenkinsfile` are left to `lsp.servers` config: without
+ * the build classpath they only produce unresolved-class noise.
+ */
+export const GROOVY_LANGUAGE_SERVER_JAR_ENV = "GROOVY_LANGUAGE_SERVER_JAR";
+export const GroovyServer: LSPServerInfo = {
+	id: "groovy",
+	idleEviction: "unmeasured",
+	role: "language",
+	name: "Groovy Language Server",
+	// The server imports the project through the Gradle Tooling API, which
+	// evaluates the project's build scripts.
+	executesProjectCode: true,
+	// The server recompiles an open document from disk on pi-lens's own
+	// first-open watched-files notice and publishes an empty set that erases
+	// the error it just published (#5131).
+	echoesOwnNotice: true,
+	extensions: [".groovy", ".gvy", ".gy", ".gsh"],
+	root: RootWithFallback(
+		createRootDetector(["build.gradle", "settings.gradle"]),
+	),
+	async spawn(root, options) {
+		const env = await resolveJavaRuntimeEnv();
+		const viaLauncher = await resolveAndLaunch(
+			{
+				candidates: ["groovy-language-server"],
+				args: [],
+				cwd: root,
+				...(env ? { env } : {}),
+			},
+			options?.allowInstall,
+		);
+		if (viaLauncher) return viaLauncher;
+		const jar = process.env[GROOVY_LANGUAGE_SERVER_JAR_ENV];
+		const resolvedJar = jar ? path.resolve(jar) : undefined;
+		const jarIsFile = resolvedJar
+			? (statSync(resolvedJar, { throwIfNoEntry: false })?.isFile() ?? false)
+			: false;
+		if (resolvedJar && jarIsFile) {
+			try {
+				const proc = await launchLSP("java", ["-jar", resolvedJar], {
+					cwd: root,
+					...(env ? { env } : {}),
+				});
+				return { process: proc, source: "direct" };
+			} catch (err) {
+				logSessionStart(
+					`lsp launch groovy: java -jar ${jar} failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+				if (!hasSpawnFailureKind(err, "tool-not-found")) throw err;
+			}
+		}
+		logSessionStart(
+			`lsp launch groovy: not installed (no groovy-language-server on PATH; ${GROOVY_LANGUAGE_SERVER_JAR_ENV}=${jar ? `${jar} (${jarIsFile ? "java not found" : "no such file"})` : "unset"}). Run ./gradlew build in GroovyLanguageServer/groovy-language-server, then set ${GROOVY_LANGUAGE_SERVER_JAR_ENV} to build/libs/groovy-language-server-all.jar`,
+		);
+		return undefined;
+	},
+};
+
 export const LeanServer = createInteractiveServer({
 	id: "lean",
 	name: "Lean 4 Language Server",
@@ -3608,7 +4106,9 @@ export const SwiftServer = createInteractiveServer({
 	name: "SourceKit-LSP",
 	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["swift"],
-	root: createRootDetector(["Package.swift"]),
+	// buildServer.json: the BSP config sourcekit-lsp reads for Xcode projects
+	// (xcode-build-server); without it as a root each file is checked alone (#4854).
+	root: createRootDetector(["Package.swift", "buildServer.json"]),
 	language: "swift",
 	command: "sourcekit-lsp",
 });
@@ -4108,7 +4608,7 @@ export const DockerServer: LSPServerInfo = {
  */
 export const DockerOfficialServer: LSPServerInfo = {
 	id: "docker-official",
-	idleEviction: "unmeasured",
+	idleEviction: "transparent",
 	role: "language",
 	name: "Docker Language Server (official)",
 	fallbackFor: "docker",
@@ -4433,8 +4933,10 @@ export const CssServer: LSPServerInfo = {
 // merges its diagnostics with the file's real language server). Running it as a
 // warm LSP server compiles the ruleset once per session instead of paying it on
 // every file (the ~8s CLI-per-file cost #111), bringing per-file scans to ~1.3s.
-// Rules load via `initializationOptions.scan.configuration` (a local rule file
-// if the repo has one, else Opengrep's login-free `auto` set).
+// Rules load via `initializationOptions.scan.configuration`: a local rule file
+// if the repo has one, else the registry pack pi-lens refreshed into its cache
+// (no download at spawn, #4765), else Opengrep's login-free `auto` set until the
+// first refresh lands.
 const OPENGREP_KINDS = [
 	"csharp",
 	"css",
@@ -4468,7 +4970,7 @@ const OPENGREP_EXTENSIONS: readonly string[] = Array.from(
 function opengrepInitialization(root: string): Record<string, unknown> {
 	// As an always-on LSP server, enablement is structural (the server is
 	// registered); resolveOpengrepConfig here only chooses WHICH rules — a local
-	// rule file if present, otherwise `auto`.
+	// rule file if present, else the refreshed pack, else `auto` (#4765).
 	const resolved = resolveOpengrepConfig(root, { enabled: true });
 	return {
 		scan: {
@@ -4489,8 +4991,11 @@ export const OpengrepServer: LSPServerInfo = {
 	extensions: OPENGREP_EXTENSIONS,
 	// Stable per-repo root so ONE warm server serves the whole project (a
 	// per-directory root would spawn a fresh server — and re-pay rule load —
-	// for every folder).
-	root: RootWithFallback(NearestRoot([".git"]), async () => process.cwd()),
+	// for every folder). A loose file needs no project config, so it is hosted
+	// at its own directory (#4760): the `$HOME`-cwd fallback rooted the scanner
+	// at the whole home tree, where its workspace walk never finished.
+	root: RootWithFallback(NearestRoot([".git"])),
+	looseFileRoot: "decline",
 	availabilityKey: "opengrep",
 	// Rule compilation can take a few seconds on the first scan of a session.
 	initializeTimeoutMs: 15000,
@@ -4571,8 +5076,9 @@ export const AstGrepServer: LSPServerInfo = {
 	// (it falls back to napi when the ast-grep binary is absent — Gate B).
 	root: RootWithFallback(
 		createRootDetector(["sgconfig.yml", "sgconfig.yaml"]),
-		RootWithFallback(NearestRoot([".git"]), async () => process.cwd()),
+		RootWithFallback(NearestRoot([".git"])),
 	),
+	looseFileRoot: "decline",
 	availabilityKey: "ast-grep",
 	// #1714: the one auxiliary with a measured wedge ceiling. A `lens_diagnostics
 	// mode=full` sweep of 225 files drove this server into an unrecoverable stall
@@ -4637,14 +5143,16 @@ const ZIZMOR_EXTENSIONS: readonly string[] = KIND_EXTENSIONS["yaml"];
 
 export const ZizmorServer: LSPServerInfo = {
 	id: "zizmor",
-	idleEviction: "unmeasured",
+	idleEviction: "transparent",
 	role: "auxiliary",
 	name: "zizmor Actions Security Scanner",
 	extensions: ZIZMOR_EXTENSIONS,
 	pathFilter: isZizmorAuditTarget,
 	// Stable per-repo root so ONE warm server serves the whole project (like
-	// Opengrep) — config + workflow discovery is repo-relative.
-	root: RootWithFallback(NearestRoot([".git"]), async () => process.cwd()),
+	// Opengrep) — config + workflow discovery is repo-relative. A loose file is
+	// hosted at its own directory (#4760), never at the session cwd.
+	root: RootWithFallback(NearestRoot([".git"])),
+	looseFileRoot: "decline",
 	availabilityKey: "zizmor",
 	async spawn(root, options) {
 		// Forward a token so the online audits run; absent one, zizmor self-selects
@@ -4731,8 +5239,10 @@ export const TyposServer: LSPServerInfo = {
 	name: "typos Spell Checker",
 	extensions: TYPOS_EXTENSIONS,
 	// Stable per-repo root so ONE warm server serves the whole project (like the
-	// other auxiliaries) — typos.toml discovery is repo-relative.
-	root: RootWithFallback(NearestRoot([".git"]), async () => process.cwd()),
+	// other auxiliaries) — typos.toml discovery is repo-relative. A loose file is
+	// hosted at its own directory (#4760), never at the session cwd.
+	root: RootWithFallback(NearestRoot([".git"])),
+	looseFileRoot: "decline",
 	availabilityKey: "typos-lsp",
 	async spawn(root, options) {
 		const launched = await resolveAndLaunch(
@@ -4751,6 +5261,40 @@ export const TyposServer: LSPServerInfo = {
 	autoInstall: async () => Boolean(await ensureTool("typos-lsp")),
 };
 
+// fallow-lsp (#4929) — the TS/JS dead-code, duplication, cycle and complexity
+// analyzer's LSP server. An OPT-IN, LANGUAGE-SCOPED auxiliary: `role:
+// "auxiliary"` keeps it beside the primary server and never in its place, and
+// `extensions` (the registry's one file gate, `fileMatchReason`) limits it to
+// JS/TS files, so a Python, Markdown or YAML file never attaches it. Its
+// profile (clients/dispatch/auxiliary-lsp.ts) is `enabledByDefault: false`
+// behind `--lens-fallow`: with the flag off nothing here is installed or
+// launched. It reads `.fallowrc.json`/`fallow.toml` as data and parses source
+// statically, so it executes no project code (see the trust census). It
+// analyses the whole project graph, so it is rooted at the repository, like
+// the other auxiliaries. Findings are advisory in this cut.
+export const FallowServer: LSPServerInfo = {
+	id: "fallow",
+	idleEviction: "unmeasured",
+	role: "auxiliary",
+	name: "fallow TS/JS Code Health",
+	extensions: JS_TS_LSP_EXTENSIONS,
+	root: RootWithFallback(NearestRoot([".git"])),
+	looseFileRoot: "decline",
+	availabilityKey: "fallow-lsp",
+	spawn(root, options) {
+		return resolveAndLaunchTreeBinary(
+			{
+				candidates: ["fallow-lsp"],
+				bundleToolId: "fallow-lsp",
+				binRelPath: "fallow-lsp",
+				cwd: root,
+				args: [],
+			},
+			options?.allowInstall,
+		);
+	},
+};
+
 export const LSP_SERVERS: LSPServerInfo[] = [
 	TypeScriptServer,
 	DenoServer,
@@ -4766,6 +5310,7 @@ export const LSP_SERVERS: LSPServerInfo[] = [
 	FSharpServer,
 	JavaServer,
 	KotlinServer,
+	GroovyServer,
 	LeanServer,
 	SwiftServer,
 	DartServer,
@@ -4803,6 +5348,7 @@ export const LSP_SERVERS: LSPServerInfo[] = [
 	AstGrepServer,
 	ZizmorServer,
 	TyposServer,
+	FallowServer, // opt-in (--lens-fallow), JS/TS only
 ];
 
 /**

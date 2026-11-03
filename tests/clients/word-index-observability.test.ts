@@ -13,6 +13,8 @@
  * `logWordIndex` is mocked with a spy so the assertions read the exact entries
  * the production code hands the durable logger, without touching disk.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -363,4 +365,35 @@ describe("word-index observability (#958)", () => {
 			env.cleanup();
 		}
 	});
+
+	// RECURRENCE GUARDED: #4911. The refusal compared spellings, so a HOME or a
+	// root spelled through a link started a whole-home walk-and-read. Both
+	// directions, each with a real directory link.
+	it.each([["home-link"], ["root-link"]] as const)(
+		"refuses the build when the %s spelling names the home (#4911)",
+		async (kind) => {
+			const env = setupTestEnvironment("pi-lens-word-refused-link-");
+			try {
+				const { triggerBackgroundWordIndexBuild } =
+					await import("../../clients/word-index.js");
+				const home = path.join(env.tmpDir, "home");
+				createTempFile(home, "index.ts", "export const x = 1;\n");
+				const link = path.join(env.tmpDir, "link");
+				fs.symlinkSync(home, link, "junction");
+
+				const status = triggerBackgroundWordIndexBuild(
+					kind === "root-link" ? link : home,
+					undefined,
+					{ homeDir: kind === "home-link" ? link : home },
+				);
+
+				expect(status.state).toBe("refused");
+				expect(
+					logSpy.mock.calls.some((c) => c[0]?.phase === "cold_build_refused"),
+				).toBe(true);
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
 });

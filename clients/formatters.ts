@@ -16,7 +16,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
-import { findNearestContaining, normalizeMapKey } from "./path-utils.js";
+import {
+	findNearestContaining,
+	normalizeMapKey,
+	realpathOrResolve,
+	walkUpDirs,
+} from "./path-utils.js";
 import { resolveToolCwd } from "./tool-cwd.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
 import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
@@ -44,10 +49,14 @@ import {
 	VENV_BIN_DIRS,
 } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { admittedLookupAnswer } from "./session-repository.js";
 import { establishToolAgreement } from "./tool-agreement.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { probeToolAsync } from "./tool-probe.js";
-import { assertInstallAllowed } from "./project-trust.js";
+import {
+	assertInstallAllowed,
+	getProjectTrustGeneration,
+} from "./project-trust.js";
 import { tryLazyInstallForFormatter } from "./dispatch/runners/utils/lazy-installer.js";
 import { getToolPath } from "./installer/index.js";
 import { getIsolatedNpxSpawnOptions } from "./tool-probe.js";
@@ -249,9 +258,17 @@ async function findUp(
 	stopDir: string = path.parse(startDir).root,
 ): Promise<string[]> {
 	const found: string[] = [];
-	let currentDir = startDir;
-
-	while (currentDir !== stopDir) {
+	// #4689 item 6 (batch 7): the climb starts at the start directory's PATH
+	// IDENTITY, through the one shared upward walk. A link spelling's own
+	// parents are not the file's parents: the config that governs a file lives
+	// on the tree the kernel opens, so `repo/src/linked -> repo/shared` must
+	// read `repo/shared`'s configs and never `repo/src`'s. The `stopDir`
+	// parameter keeps its exact meaning on that axis (the walk stops AT it,
+	// excluding it and everything above), which is why it is a break here
+	// rather than a `walkUpDirs` option; no production caller passes one.
+	const stopIdentity = realpathOrResolve(stopDir);
+	for (const currentDir of walkUpDirs(startDir)) {
+		if (currentDir === stopIdentity) break;
 		// One `readdir` per directory instead of one `access` per target: the
 		// per-target probe made this loop's cost O(targets), so a long target
 		// list (e.g. `FORMATTER_CONFIG_FILES`) paid for every entry at every
@@ -291,9 +308,6 @@ async function findUp(
 			const candidate = path.join(currentDir, target);
 			if (await fileExists(candidate)) found.push(candidate);
 		}
-		const parent = path.dirname(currentDir);
-		if (parent === currentDir) break;
-		currentDir = parent;
 	}
 
 	return found;
@@ -519,9 +533,12 @@ async function which(command: string): Promise<string | null> {
 	const hostStallMs = stallSampler.stop();
 	const elapsedMs = Date.now() - startedAt;
 
+	// #4530: the answer is started later by its path, past the spawn seam's
+	// lookup judgment, so it is judged here: a global entry linking into the
+	// project is no answer until pi trusts the project.
 	const resolved =
 		!result.error && result.status === 0
-			? (result.stdout?.trim().split(/\r?\n/)[0] ?? null)
+			? admittedLookupAnswer(result.stdout ?? "")
 			: null;
 	if (resolved) {
 		entry.resolved = resolved;
@@ -1807,11 +1824,17 @@ const FILENAME_FORMATTER_BASENAMES = new Set(
 	ALL_FORMATTERS.flatMap((f) => f.filenames ?? []),
 );
 
-// Cache for detection results - stores array of enabled formatter names per cwd+ext
-const detectionCache = new BoundedLruCache<
-	string,
-	{ signature: string; entries: Map<string, string[]> }
->(32);
+// Cache for detection results - stores array of enabled formatter names per cwd+ext.
+// #4530 (#4776): a selection answers for the pi trust answer of the lookup that
+// created it, because a lookup into the project is refused only while trust is
+// not `trusted`. An object stamped with an older trust generation is dropped at
+// the next read, including entries a detection still in flight writes into it.
+type FormatterDetectionEntry = {
+	signature: string;
+	trustGeneration: number;
+	entries: Map<string, string[]>;
+};
+const detectionCache = new BoundedLruCache<string, FormatterDetectionEntry>(32);
 // The signature is immutable for a cache generation. This memo is separate
 // from detectionCache because a cwd can have several extension entries, and a
 // warm lookup must not repeat the ancestor walk or stat matched configs.
@@ -1966,7 +1989,12 @@ export async function getFormattersForFile(
 	// polling while still reacting immediately to pi-authored create/remove/
 	// change events. External editor changes remain a documented session-boundary
 	// limitation, like other write-result-owned freshness seams.
+	const trustGeneration = getProjectTrustGeneration();
 	let cached = detectionCache.get(normalizedCwd);
+	if (cached && cached.trustGeneration !== trustGeneration) {
+		detectionCache.delete(normalizedCwd);
+		cached = undefined;
+	}
 	if (cached?.entries.has(cacheKey)) {
 		const enabledNames = cached.entries.get(cacheKey);
 		const selectedFormatterName =
@@ -2004,7 +2032,11 @@ export async function getFormattersForFile(
 		// the earlier entry.
 		cached = detectionCache.get(normalizedCwd);
 		if (!cached) {
-			cached = { signature: configSignature, entries: new Map() };
+			cached = {
+				signature: configSignature,
+				trustGeneration,
+				entries: new Map(),
+			};
 			detectionCache.set(normalizedCwd, cached);
 		}
 	}
@@ -2230,10 +2262,7 @@ export function _getFormatterResetStateForTests(): {
 	>;
 	whichTransientCommands: Set<string>;
 	cooldownRecordedForRetryAtMs: Map<string, number>;
-	detectionCache: BoundedLruCache<
-		string,
-		{ signature: string; entries: Map<string, string[]> }
-	>;
+	detectionCache: BoundedLruCache<string, FormatterDetectionEntry>;
 	formatterSignatureFlights: BoundedLruCache<
 		string,
 		{ promise: Promise<string> }
@@ -2419,7 +2448,9 @@ export async function formatFile(
 	enter?: () => Promise<void>,
 ): Promise<FormatterResult> {
 	try {
-		const absolutePath = path.resolve(filePath);
+		// A symlink is never handed to a formatter (Prettier rejects an
+		// explicitly named link): format the file it resolves to (#4689).
+		const absolutePath = realpathOrResolve(filePath);
 		const cwd = path.dirname(absolutePath);
 		const formatterCwd = resolveToolCwd(
 			"formatter",

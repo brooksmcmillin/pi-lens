@@ -27,6 +27,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const TESTS_ROOT = resolve(ROOT, "tests");
@@ -93,17 +94,21 @@ describe("vi.doMock is undone in multi-test files (#2883)", () => {
 	// (measured 9.9s at load average ~18, run 2026-09-26). Explicit budget
 	// sized from a loaded replay after the stripSource sharing above; see the
 	// PR body's before/after numbers.
-	it("flags no vi.doMock specifier a multi-test file never undoes", () => {
-		const { flagged, filesWithDoMock } = scanTree();
-		// Dead-sweep floor (AGENTS.md shape 10); see FLOOR.
-		assertNonEmptyScan("vi.doMock files", filesWithDoMock, FLOOR);
-		expect(
-			flagged,
-			"vi.doMock specifier(s) never undone in a multi-test file: add " +
-				"`vi.doUnmock(<same specifier>)` to the file's afterEach (vi.resetModules " +
-				"does not clear the mock registry).",
-		).toEqual([]);
-	}, 30_000);
+	it(
+		"flags no vi.doMock specifier a multi-test file never undoes",
+		() => {
+			const { flagged, filesWithDoMock } = scanTree();
+			// Dead-sweep floor (AGENTS.md shape 10); see FLOOR.
+			assertNonEmptyScan("vi.doMock files", filesWithDoMock, FLOOR);
+			expect(
+				flagged,
+				"vi.doMock specifier(s) never undone in a multi-test file: add " +
+					"`vi.doUnmock(<same specifier>)` to the file's afterEach (vi.resetModules " +
+					"does not clear the mock registry).",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 
 describe("the doMock-undo matcher", () => {

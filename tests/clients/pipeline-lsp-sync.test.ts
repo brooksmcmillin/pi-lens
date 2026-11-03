@@ -11,10 +11,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { gatedPromise, starveBudget } from "../support/fault-injection.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(),
-}));
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "../support/lsp-service-seam.js";
 
 const logLatencyMock = vi.fn();
 
@@ -28,7 +28,6 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { resyncLspFile } from "../../clients/pipeline.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
 import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
 
 const getFlag = () => undefined;
@@ -40,16 +39,19 @@ function mockService(
 ) {
 	const touch = vi.fn(touchFile);
 	const spawn = vi.fn(isSpawnInFlight);
-	vi.mocked(getLSPService).mockReturnValue(
+	installLspService(
 		makeLspServiceDouble({
 			supportsLSP: () => true,
 			touchFile: touch,
 			isSpawnInFlight: spawn,
-		}) as any,
+		}),
 	);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	// No service until a case installs one (`getLSPService: vi.fn()` answered
+	// undefined): the cases below that never call `mockService` reach nothing.
+	await installLspServiceDouble(null);
 	starveBudget("PI_LENS_LSP_SYNC_BUDGET_MS", 50);
 	setAmbientAbortSignal(undefined);
 	logLatencyMock.mockClear();
@@ -286,7 +288,7 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 			touchFile: hangingTouch,
 		});
 		expect(typeof service.isSpawnInFlight).toBe("function");
-		vi.mocked(getLSPService).mockReturnValue(service as any);
+		installLspService(service);
 
 		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbgSpy);
 
@@ -323,7 +325,7 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 		const bareAux = vi.fn(() => {
 			order.push("getAuxiliaryClientsForFile");
 		});
-		vi.mocked(getLSPService).mockReturnValue(
+		installLspService(
 			makeLspServiceDouble({
 				supportsLSP: () => true,
 				touchFile: hangingTouch,
@@ -351,7 +353,7 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 		const neverResolvingAux = new Promise<never>(() => {});
 		const getAuxSpy = vi.fn().mockImplementation(() => neverResolvingAux);
 		const completedTouch = vi.fn().mockResolvedValue("done");
-		vi.mocked(getLSPService).mockReturnValue(
+		installLspService(
 			makeLspServiceDouble({
 				supportsLSP: () => true,
 				touchFile: completedTouch,
@@ -420,7 +422,7 @@ describe("resyncLspFile — its outcome names what it did (#3528 r1 F1)", () => 
 	});
 
 	it("unsupported: no server serves the file", async () => {
-		vi.mocked(getLSPService).mockReturnValue(
+		installLspService(
 			makeLspServiceDouble({ supportsLSP: () => false }) as any,
 		);
 		await expect(resync()).resolves.toBe("unsupported");
@@ -442,9 +444,7 @@ describe("resyncLspFile — its outcome names what it did (#3528 r1 F1)", () => 
 	});
 
 	it("failed: the service lookup threw", async () => {
-		vi.mocked(getLSPService).mockImplementation(() => {
-			throw new Error("service unavailable");
-		});
+		await installLspServiceDouble(null);
 		await expect(resync()).resolves.toBe("failed");
 	});
 

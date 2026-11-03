@@ -17,7 +17,7 @@ import {
 } from "../../clients/word-index.js";
 import { countClockReads } from "../support/perf-harness.js";
 import { setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const mocks = vi.hoisted(() => ({
 	buildOrUpdateGraph: vi.fn(),
@@ -29,7 +29,6 @@ const mocks = vi.hoisted(() => ({
 		maxDepthReached: 0,
 	})),
 	formatImpactCascade: vi.fn(),
-	getLSPService: vi.fn(),
 }));
 
 vi.mock("../../clients/review-graph/service.js", () => ({
@@ -37,10 +36,6 @@ vi.mock("../../clients/review-graph/service.js", () => ({
 	computeImpactCascade: mocks.computeImpactCascade,
 	computeTransitiveImpact: mocks.computeTransitiveImpact,
 	formatImpactCascade: mocks.formatImpactCascade,
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: mocks.getLSPService,
 }));
 
 function emptyGraph(): ReviewGraph {
@@ -80,7 +75,7 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 			maxDepthReached: 0,
 		});
 		mocks.formatImpactCascade.mockReset().mockReturnValue(undefined);
-		mocks.getLSPService.mockReset().mockReturnValue(makeLspServiceDouble());
+		await installLspServiceDouble();
 		const { resetDispatchBaselines } =
 			await import("../../clients/dispatch/integration.js");
 		resetDispatchBaselines();

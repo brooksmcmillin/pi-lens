@@ -20,6 +20,22 @@
  * override pointing at a shim that runs the shared fake server, which answers
  * every pull with no findings. A missing server's command points at a path
  * that does not exist.
+ *
+ * WHAT STAYED HERE (#4632 slice 7). Seven of this file's ten cases moved: the
+ * five cause-matrix cells and the two scripts whose line rides the turn it
+ * belongs to now run on a real pi `AgentSession` in
+ * `tests/index-4632-s7-turn-end-ordering.test.ts`, where the next model
+ * request IS the observation. Three cases keep the double, each with the probe
+ * that keeps it:
+ *
+ * - the two cap cases script `RUNTIME_CONFIG.turnEnd.maxChars`, an `as const`
+ *   the loaded copy reads from its OWN module instance; a test-side mutation
+ *   reaches nothing, and a >1000-char payload is not producible at the
+ *   provider boundary.
+ * - "b.ts, then its neighbour c.ts, which nothing imports" depends on the
+ *   environment: in the plegma sandbox it delivered the line on turn 1 (3 of 3,
+ *   both drivers); on the orchestrator's host it passes on master and here. It
+ *   stays on the double until that dependence is understood (#4632 remainder).
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -36,6 +52,8 @@ import {
 	cleanupTestEnvironmentsDrained,
 	setupTestEnvironment,
 } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -52,67 +70,21 @@ const PREFIX = "pi-lens-4403-cascade-";
 // one turn and restore it.
 const turnEndCap = RUNTIME_CONFIG.turnEnd as { maxChars: number };
 
-const FALLBACK_CAUSE =
-	"it is disabled in config by lsp.disabledServers, and its fallback could not be started, or was still starting";
 const cascadeLine = (ids: string, cause: string): string =>
-	`⚠️ Cascade: no language server answered for neighbor files of ${ids} (${cause}), so their cross-file errors were not checked (not a clean result).`;
+	`⚠️ Cascade: no primary language server answered for neighbor files of ${ids} (${cause}), so their cross-file errors were not confirmed (not a clean result).`;
 
-type Case = {
+// The cause matrix moved to the tier-2 file (#4632 slice 7); this file keeps
+// only the cap-bound cells, which need a compile-time constant, and the one
+// expectation that does not hold on master.
+type Setup = {
 	name: string;
 	typescript: "working" | "slow" | "disabled" | "missing";
 	deno: "missing" | "disabled";
-	/** The cascade lines the first turn shows; later turns show none. */
-	firstTurn: string[];
+	/** typos answers a file without the clean marker with one error. */
+	typos?: "reporting";
+	/** `RUNTIME_CONFIG.turnEnd.maxChars` per turn; undefined keeps it. */
+	maxChars?: ReadonlyArray<number | undefined>;
 };
-
-const CASES: readonly Case[] = [
-	{
-		name: "typescript working",
-		typescript: "working",
-		deno: "disabled",
-		firstTurn: [],
-	},
-	// Still starting when b.ts is written: the cascade defers a cold
-	// server's neighbours (clients/lsp/cascade-tier.ts) rather than naming
-	// it, so a session's first edit does not report a server that is only
-	// warming up.
-	{
-		name: "typescript still starting",
-		typescript: "slow",
-		deno: "disabled",
-		firstTurn: [],
-	},
-	{
-		name: "typescript disabled, deno missing",
-		typescript: "disabled",
-		deno: "missing",
-		firstTurn: [cascadeLine("deno, typescript", FALLBACK_CAUSE)],
-	},
-	{
-		name: "typescript disabled, deno disabled",
-		typescript: "disabled",
-		deno: "disabled",
-		// deno stands in only for a disabled typescript, so with both off
-		// both are the file's disabled primaries.
-		firstTurn: [
-			cascadeLine(
-				"typescript, deno",
-				"it is disabled in config by lsp.disabledServers",
-			),
-		],
-	},
-	{
-		name: "typescript missing, deno disabled",
-		typescript: "missing",
-		deno: "disabled",
-		firstTurn: [
-			cascadeLine(
-				"typescript",
-				"it could not be started, or was still starting",
-			),
-		],
-	},
-];
 
 /**
  * a.ts and c.ts import b.ts, d.ts imports a.ts, and f.ts imports e.ts, which
@@ -132,13 +104,6 @@ const FILES: Record<string, (n: number) => string> = {
 
 /** One turn's writes, in order: a file name and the value it is given. */
 type Turn = ReadonlyArray<readonly [name: string, n: number]>;
-
-type Setup = Pick<Case, "name" | "typescript" | "deno"> & {
-	/** typos answers a file without the clean marker with one error. */
-	typos?: "reporting";
-	/** `RUNTIME_CONFIG.turnEnd.maxChars` per turn; undefined keeps it. */
-	maxChars?: ReadonlyArray<number | undefined>;
-};
 
 function makeWorkspace(testCase: Setup): string {
 	const env = setupTestEnvironment(PREFIX);
@@ -237,11 +202,10 @@ async function runTurns(
 	turns: readonly Turn[],
 ): Promise<string[][]> {
 	const workspace = makeWorkspace(testCase);
-	const savedConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	const savedInstall = process.env.PI_LENS_DISABLE_LSP_INSTALL;
 	const configPath = path.join(workspace, "global-config.json");
 	fs.writeFileSync(configPath, "{}\n");
-	process.env.PI_LENS_CONFIG_PATH = configPath;
+	setConfigPath(configPath);
 	process.env.PI_LENS_DISABLE_LSP_INSTALL = "1";
 	let shutdown: (() => Promise<unknown>) | undefined;
 	const savedMaxChars = turnEndCap.maxChars;
@@ -289,8 +253,6 @@ async function runTurns(
 		await shutdown?.();
 		await getLSPService().shutdown();
 		resetLSPService();
-		if (savedConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-		else process.env.PI_LENS_CONFIG_PATH = savedConfigPath;
 		if (savedInstall === undefined)
 			delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
 		else process.env.PI_LENS_DISABLE_LSP_INSTALL = savedInstall;
@@ -311,60 +273,6 @@ describe("a cascade neighbour no primary answered for (#4403 N2)", () => {
 		});
 	});
 
-	for (const testCase of CASES) {
-		it(`${testCase.name}: ${testCase.firstTurn.length > 0 ? "one cause-named line, then none" : "no cascade line"}`, async () => {
-			// Two writes of b.ts in the first turn: the first run is
-			// superseded at turn_end, so the line must ride the second.
-			const turns = await runTurns(testCase, [
-				[
-					["b", 2],
-					["b", 3],
-				],
-				[["b", 4]],
-				[["b", 5]],
-			]);
-			expect(turns).toEqual([testCase.firstTurn, [], []]);
-		}, 180_000);
-	}
-
-	// Round 5 (V1): the server is marked once the line is delivered, so a run
-	// that turn_end drops does not use the line up, and two runs that name the
-	// same server in one turn show it once. typescript missing, deno disabled.
-	const SCRIPTS: ReadonlyArray<{
-		name: string;
-		firstTurn: Turn;
-		expected: string[][];
-	}> = [
-		{
-			// b.ts's run is superseded by the write of its neighbour a.ts, and
-			// a.ts's own run (neighbour d.ts) carries the line.
-			name: "b.ts, then its neighbour a.ts",
-			firstTurn: [
-				["b", 2],
-				["a", 2],
-			],
-			expected: [[UNSTARTED_LINE], [], []],
-		},
-		{
-			// c.ts has no importers, so nothing carries the line in turn 1;
-			// the server is not marked, and turn 2's run names it.
-			name: "b.ts, then its neighbour c.ts, which nothing imports",
-			firstTurn: [
-				["b", 2],
-				["c", 2],
-			],
-			expected: [[], [UNSTARTED_LINE], []],
-		},
-		{
-			// Both runs survive turn_end and both name typescript.
-			name: "b.ts and an unrelated e.ts",
-			firstTurn: [
-				["b", 2],
-				["e", 2],
-			],
-			expected: [[UNSTARTED_LINE], [], []],
-		},
-	];
 	// Round 6 (W1): the line is committed when the section reaches the agent,
 	// not when turn_end composes it. Recurrence: a mark taken at compose
 	// would spend the line on a section the cap cut. g.ts's blocker leads
@@ -413,6 +321,28 @@ describe("a cascade neighbour no primary answered for (#4403 N2)", () => {
 		expect(turns).toEqual([[UNSTARTED_LINE], [], []]);
 	}, 180_000);
 
+	// Round 5 (V1): the server is marked once the line is delivered, so a run
+	// that turn_end drops does not use the line up, and two runs that name the
+	// same server in one turn show it once. typescript missing, deno disabled.
+	// The two scripts whose line rides the turn it belongs to moved to the
+	// tier-2 file (#4632 slice 7). This one stays: its expectation does not hold
+	// on `origin/master` in either driver (see the header).
+	const SCRIPTS: ReadonlyArray<{
+		name: string;
+		firstTurn: Turn;
+		expected: string[][];
+	}> = [
+		{
+			// c.ts has no importers, so nothing carries the line in turn 1;
+			// the server is not marked, and turn 2's run names it.
+			name: "b.ts, then its neighbour c.ts, which nothing imports",
+			firstTurn: [
+				["b", 2],
+				["c", 2],
+			],
+			expected: [[], [UNSTARTED_LINE], []],
+		},
+	];
 	for (const script of SCRIPTS) {
 		it(`delivers the line once: ${script.name}`, async () => {
 			const turns = await runTurns(

@@ -30,6 +30,7 @@ import {
 	DEFAULT_LSP_SERVER_ROLE,
 	DEFAULT_NOTIFY_INFLIGHT_LIMIT,
 	DEFAULT_REPLY_ORDERING,
+	DEFAULT_RESEND_RECHECK,
 	isAuxiliary,
 	serverTraits,
 	STRATEGY_TABLE_TRAITS,
@@ -44,6 +45,7 @@ const SERVER_DEFINITION_TRAITS = [
 	"role",
 	"notifyInflightLimit",
 	"replyOrdering",
+	"resendRecheck",
 ] as const;
 
 /**
@@ -193,9 +195,51 @@ describe("#1756 stage 1 — declared server trait table", () => {
 		expect(DEFAULT_NOTIFY_INFLIGHT_LIMIT).toBe(
 			PRE_FOLD_NOTIFY_INFLIGHT_DEFAULT,
 		);
+		// #4782: an unmeasured server is never sent a document's unchanged bytes
+		// again. One that publishes nothing for them (clangd) would lose its
+		// answer for the document with none coming.
+		expect(DEFAULT_RESEND_RECHECK).toBe("unmeasured");
+		expect(serverTraits({ role: "language" }).resendRecheck).toBe("unmeasured");
+		expect(
+			serverTraits({ role: "language", notifyInflightLimit: 4 }).resendRecheck,
+		).toBe("unmeasured");
 		expect(serverTraits({ role: "auxiliary" }).notifyInflightLimit).toBe(
 			PRE_FOLD_NOTIFY_INFLIGHT_DEFAULT,
 		);
+	});
+
+	// #4829 review r1 F1: the whole #4782 re-send is dark unless these rows say
+	// "rechecks", and a flipped or deleted declaration left every test green.
+	// Each was measured against its binaries (server.ts); a new row joins here
+	// with its measurement, never by omission.
+	it("declares the unchanged-bytes re-check on exactly the measured rows", () => {
+		const rechecks = LSP_SERVERS.filter(
+			(server) => serverTraits(server).resendRecheck === "rechecks",
+		)
+			.map((server) => server.id)
+			.sort();
+		assertNonEmptyScan(
+			"registry rows projected for resendRecheck",
+			LSP_SERVERS.length,
+			30,
+		);
+		expect(rechecks).toEqual(["python", "typescript"]);
+		// #4829 verify r3 F5: the re-send's model (DependencyResend.cfg) sets
+		// `Drain = FALSE` because the phase drains only `single-task-ordered`
+		// clients. A re-checking row that turned ordered would drain, and the
+		// model would keep proving the undrained design.
+		const orderedRechecks = LSP_SERVERS.filter((server) => {
+			const traits = serverTraits(server);
+			return (
+				traits.resendRecheck === "rechecks" &&
+				traits.replyOrdering === "single-task-ordered"
+			);
+		}).map((server) => server.id);
+		expect(
+			orderedRechecks,
+			"A re-checking row is single-task-ordered, so the phase drains it; " +
+				"model the drain (Drain = TRUE) in the DependencyResend configs first.",
+		).toEqual([]);
 	});
 
 	it("orders the notify-inflight trait declaration, then environment, then default", () => {

@@ -72,6 +72,44 @@ describe("ast-grep baseline sgconfig", () => {
 		}
 	});
 
+	// lane: ubuntu Unit tests (creating a symlink needs a privilege on win32).
+	it.skipIf(process.platform === "win32")(
+		"lists one source for a rule dir the project root and the user root reach through different spellings (#4689 batch 8)",
+		() => {
+			// RECURRENCE GUARDED: #4689 batch 8 moved `canonicalDir` onto the
+			// identity seam. A project root that is a link to the user's pi-lens
+			// home names the same `rules/ast-grep-rules/rules` directory twice, and
+			// only the identity key lets `getAstGrepRuleSources` list it once.
+			// Old-versus-new for the swap: an existing dir answers the same string
+			// from `realpathSync.native` and the seam, so this cell is green on both.
+			const scratch = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sgconfig-link-"),
+			);
+			const userHome = path.join(scratch, "home");
+			const alias = path.join(scratch, "alias");
+			const previous = process.env.PI_LENS_HOME;
+			try {
+				fs.mkdirSync(path.join(userHome, "rules", "ast-grep-rules", "rules"), {
+					recursive: true,
+				});
+				fs.symlinkSync("home", alias, "dir");
+				process.env.PI_LENS_HOME = userHome;
+				_resetBaselineSgconfigForTests();
+				const sources = getAstGrepRuleSources(alias).map(
+					({ origin, tier }) => `${origin}:${tier}`,
+				);
+				expect(sources.filter((source) => source.endsWith(":primary"))).toEqual(
+					["project:primary", "bundled:primary"],
+				);
+			} finally {
+				if (previous === undefined) delete process.env.PI_LENS_HOME;
+				else process.env.PI_LENS_HOME = previous;
+				fs.rmSync(scratch, { recursive: true, force: true });
+				_resetBaselineSgconfigForTests();
+			}
+		},
+	);
+
 	it("records an invalid user rule instead of presenting it as clean", () => {
 		const root = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-sgconfig-invalid-project-"),

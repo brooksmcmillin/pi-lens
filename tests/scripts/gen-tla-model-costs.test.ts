@@ -32,6 +32,7 @@ import {
 	costsFromLog,
 	incompleteTableReason,
 	main,
+	statesFromLog,
 	MIN_TABLE_COVERAGE,
 } from "../../scripts/gen-tla-model-costs.mjs";
 import {
@@ -362,5 +363,159 @@ describe("#4672 V4 cost generation — the parser, the median, and a table worth
 		}
 		expect(exitCode).toBe(2);
 		expect(errors.lines.join("\n")).toContain("at least one --log is required");
+	});
+});
+
+// #4714: the checker prints each config's TLC distinct-state count on its
+// result line, and the generator stores the median count beside the seconds.
+// Recurrence: a count that the generator drops would leave the ratchet with
+// nothing to compare, and the table would silently stop recording states.
+describe("#4714 distinct-state counts in the cost table", () => {
+	it("reads the seconds and the count from a line that carries both, and still reads the old line", () => {
+		const text = [
+			"ok   formal/x/New.cfg: expected pass, got pass (5.0s, 1234 distinct states)",
+			"ok   formal/x/Old.cfg: expected pass, got pass (2.5s)",
+		].join("\n");
+		expect(costsFromLog(text)).toEqual(
+			new Map([
+				["formal/x/New.cfg", 5],
+				["formal/x/Old.cfg", 2.5],
+			]),
+		);
+		expect(statesFromLog(text)).toEqual(new Map([["formal/x/New.cfg", 1234]]));
+	});
+
+	it("stores the median count per config, sorted, beside the seconds", () => {
+		const row = (states: number) =>
+			`ok   formal/y/M.cfg: expected pass, got pass (1.0s, ${states} distinct states)`;
+		const table = buildModelCosts([
+			{ source: "1", text: row(100) },
+			{ source: "2", text: row(900) },
+			{ source: "3", text: row(120) },
+		]);
+		expect(table.states).toEqual({ "formal/y/M.cfg": 120 });
+	});
+
+	it("stores no counts from logs that predate the count", () => {
+		const table = buildModelCosts([
+			{
+				source: "1",
+				text: "ok   formal/y/M.cfg: expected pass, got pass (1.0s)",
+			},
+		]);
+		expect(table.states).toEqual({});
+	});
+});
+
+// #4714 F1/F4: `main` is the only writer of the table. Two cases pin it: the
+// payload carries the counts a run printed (a dropped `states` key reds), and a
+// regeneration from old-format logs keeps the counts the file already records
+// (a rewrite to `states: {}` loses every count with no warning).
+// Recurrence: the first regeneration from old logs wrote `states: {}`.
+describe("#4714 main() writes the state counts", () => {
+	function fakeRepo(dir: string) {
+		for (const name of ["A", "B"]) {
+			const family = join(dir, "formal", "fam");
+			mkdirSync(family, { recursive: true });
+			writeFileSync(
+				join(family, `${name}.cfg`),
+				"\\* expect: pass\n\\* module: M\n",
+			);
+		}
+	}
+
+	it("writes the printed count beside the seconds", () => {
+		const { dir, done } = scratch();
+		const logs = captureLogs();
+		try {
+			fakeRepo(dir);
+			const log = join(dir, "shard.log");
+			writeFileSync(
+				log,
+				[
+					"ok   formal/fam/A.cfg: expected pass, got pass (5.0s, 300 distinct states)",
+					"ok   formal/fam/B.cfg: expected pass, got pass (2.0s)",
+				].join("\n"),
+			);
+			const out = join(dir, "table.json");
+			expect(main(["--log", log, "--out", out], { root: dir })).toBe(0);
+			const table = JSON.parse(readFileSync(out, "utf8"));
+			expect(table.files).toEqual({
+				"formal/fam/A.cfg": 5,
+				"formal/fam/B.cfg": 2,
+			});
+			expect(table.states).toEqual({ "formal/fam/A.cfg": 300 });
+		} finally {
+			logs.restore();
+			done();
+		}
+	});
+
+	it("keeps the counts the file already records when the logs predate them", () => {
+		const { dir, done } = scratch();
+		const logs = captureLogs();
+		try {
+			fakeRepo(dir);
+			const out = join(dir, "table.json");
+			writeFileSync(
+				out,
+				JSON.stringify({
+					files: { "formal/fam/A.cfg": 4 },
+					states: { "formal/fam/A.cfg": 136 },
+				}),
+			);
+			const log = join(dir, "old.log");
+			writeFileSync(
+				log,
+				[
+					"ok   formal/fam/A.cfg: expected pass, got pass (5.0s)",
+					"ok   formal/fam/B.cfg: expected pass, got pass (2.0s)",
+				].join("\n"),
+			);
+			expect(main(["--log", log, "--out", out], { root: dir })).toBe(0);
+			const table = JSON.parse(readFileSync(out, "utf8"));
+			expect(table.states).toEqual({ "formal/fam/A.cfg": 136 });
+			// The summary names how many counts the file holds, so a regeneration
+			// that drops them is visible in the run's own output.
+			expect(
+				logs.lines.some((line) => line.includes("1 distinct-state count")),
+			).toBe(true);
+		} finally {
+			logs.restore();
+			done();
+		}
+	});
+
+	// #4838 review F3: the merge put the file's recorded keys first, so a count
+	// kept from the file sat ahead of a newer config measured this run, and the
+	// documented regeneration was not byte-identical to the committed table.
+	it("writes kept and measured counts as one sorted map", () => {
+		const { dir, done } = scratch();
+		const logs = captureLogs();
+		try {
+			fakeRepo(dir);
+			const out = join(dir, "table.json");
+			writeFileSync(
+				out,
+				JSON.stringify({ states: { "formal/fam/B.cfg": 20 } }),
+			);
+			const log = join(dir, "shard.log");
+			writeFileSync(
+				log,
+				[
+					"ok   formal/fam/A.cfg: expected pass, got pass (5.0s, 300 distinct states)",
+					"ok   formal/fam/B.cfg: expected pass, got pass (2.0s)",
+				].join("\n"),
+			);
+			expect(main(["--log", log, "--out", out], { root: dir })).toBe(0);
+			const table = JSON.parse(readFileSync(out, "utf8"));
+			expect(Object.keys(table.states)).toEqual([
+				"formal/fam/A.cfg",
+				"formal/fam/B.cfg",
+			]);
+		} finally {
+			logs.restore();
+			done();
+		}
 	});
 });

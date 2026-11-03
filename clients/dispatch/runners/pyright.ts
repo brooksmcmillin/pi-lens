@@ -22,6 +22,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { faultSkip } from "../types.js";
 import {
 	createAvailabilityChecker,
 	resolveAvailableOrInstall,
@@ -91,7 +92,7 @@ const pyrightRunner: RunnerDefinition = {
 
 		// Pyright returns non-zero when errors found, that's OK
 		if (result.error) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			return faultSkip("did-not-run");
 		}
 
 		const output = (result.stdout || "").trim();

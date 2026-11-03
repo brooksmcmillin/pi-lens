@@ -52,11 +52,6 @@ vi.mock("../../clients/resource-sampler.js", () => ({
 	startSpawnUsageSampler: () => ({ stop: () => null }),
 }));
 
-vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
-	...(await importOriginal()),
-	logLatency: () => {},
-}));
-
 const { safeSpawnAsync } = await import("../../clients/safe-spawn.js");
 
 // An absolute, real path so Windows command resolution succeeds and every

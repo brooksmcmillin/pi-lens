@@ -80,7 +80,8 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/test-history-artifacts"
           # #4030: incremental ingest. Whole CI runs newer than the watermark,
-          # at most 100 a night, oldest first; 5xx responses retry.
+          # at most 100 a night, oldest first; 5xx responses and a cut-off JSON
+          # body ("unexpected end of JSON input") retry.
           node "$RUNNER_TEMP/history-scripts/download-test-history-artifacts.mjs" \
             --repository "$GITHUB_REPOSITORY" \
             --since "$SINCE" \
@@ -245,6 +246,7 @@ jobs:
       tool_layer: ${{ steps.tool_layer.outcome }}
       lsp_handshake: ${{ steps.lsp_handshake.outcome }}
       lsp_gate: ${{ steps.lsp_gate.outcome }}
+      lsp_cascade: ${{ steps.lsp_cascade.outcome }}
       lens_full: ${{ steps.lens_full.outcome }}
       format_layer: ${{ steps.format_layer.outcome }}
       resolution_layer: ${{ steps.resolution_layer.outcome }}
@@ -255,6 +257,7 @@ jobs:
       seed_matrix: ${{ steps.seed_matrix.outcome }}
       lsp_matrix: ${{ steps.lsp_matrix.outcome }}
       clean_signal: ${{ steps.clean_signal.outcome }}
+      save_verdict: ${{ steps.save_verdict.outcome }}
       server_capabilities: ${{ steps.server_capabilities.outcome }}
       idle_measurement: ${{ steps.idle_measurement.outcome }}
       idle_promote: ${{ steps.idle_promote.outcome }}
@@ -300,7 +303,7 @@ jobs:
       # tflint/terraform-ls/rust-analyzer) are fetched by the harness's own
       # --install; ubuntu-latest ships rustup/cargo so rust-analyzer can load.
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -314,7 +317,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1
         continue-on-error: true
         with:
           ruby-version: '3.3'
@@ -484,6 +487,35 @@ jobs:
           PILENS_PUB_DEBUG: "1"
         run: node scripts/probe-clean-signal.mjs --install
 
+      # #3405 acceptance 4: per-server save verdict — does a server publish the
+      # seeded finding WITHOUT a `textDocument/didSave`, or only after one? Before
+      # this step the column was prose moved from a PR body (five measured, seven
+      # read from source, nine unverified) and no command produced it, so nothing
+      # could re-measure it. The probe drives the real client over the same
+      # tool-smoke fixtures and arms the measurement four ways (no save, an
+      # untriggered window, the same bytes plus a save, and a diagnostic-neutral
+      # edit plus a save), then rewrites the three measurement columns of
+      # docs/lsp-capability-matrix.md's "## Save-triggered servers" table, which the
+      # refresh PR below carries. Merge-guarded: a server this runner cannot
+      # install keeps its row. NOT continue-on-error (#4514's shape): the script
+      # exits 0 for every measurement outcome and exits 1 only when it measured NO
+      # row at all (no save-declaring server reached), so a non-zero exit means the
+      # instrument itself died and must red instead of leaving the table looking
+      # measured. A run that stops on its own `--budget-seconds` is a disclosed
+      # partial run and exits 0 (#4999 F4); the log names the rows it did not
+      # reach. `--wait-ms` is one window per arm and is passed to every arm of the
+      # run, so the arms stay comparable. Its outcome is a tracked notifier layer
+      # (`SAVE_VERDICT_OUTCOME` below), so a red night files under this step's name
+      # with this step's log (#4999 F5).
+      - name: LSP save verdict (#3405)
+        id: save_verdict
+        timeout-minutes: 18
+        env:
+          PILENS_PUB_DEBUG: "1"
+        run: |
+          set -o pipefail
+          node scripts/probe-save-verdict.mjs --install --wait-ms 6000 --budget-seconds 600 2>&1 | tee "$RUNNER_TEMP/tool-smoke-save-verdict.log"
+
       # Server capability inventory (#390 item 1): regenerate
       # docs/servercapabilities.md (mode + ws-pull + nav/edit ops + raw caps) —
       # previously never run anywhere, so its ws-pull column (#389) stayed stale.
@@ -574,6 +606,7 @@ jobs:
             tests/config/lsp-first-publish-census.test.ts \
             tests/config/lsp-clean-behavior-census.test.ts \
             tests/config/lsp-idle-eviction-measurement.test.ts \
+            tests/config/lsp-save-verdict-census.test.ts \
             tests/scripts/lsp-matrix-refresh-expiry.test.ts \
             2>&1 | tee "$RUNNER_TEMP/lsp-capability-census.log"
 
@@ -598,6 +631,13 @@ jobs:
             cp --parents clients/lsp/server.ts tests/config/lsp-idle-eviction-reasons.json tests/config/lsp-idle-eviction-registry.test.ts .changelog/3989-lsp-idle-eviction-promote.md "$stage/files/"
             cp "$RUNNER_TEMP/lsp-idle-eviction-promote.md" "$stage/idle-eviction-promote.md"
           fi
+      # `include-hidden-files`: the promotion fragment lands under `.changelog/`,
+      # and upload-artifact v4.4+ drops every name that starts with `.` without
+      # this key, so the artifact arrived without the fragment and the promotion
+      # PR's `git add` died on `pathspec '.changelog/…' did not match any files`
+      # (#3952). `tests/config/lsp-capability-refresh-workflow.test.ts` derives
+      # the staged set of every upload step and reds when one of them drops a
+      # dot path.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && (steps.docs_diff.outputs.changed == 'true' || steps.idle_promote.outputs.promoted == 'true')
         with:
@@ -606,6 +646,7 @@ jobs:
           if-no-files-found: error
           overwrite: true
           retention-days: 1
+          include-hidden-files: true
 
       - name: Format layer (select + reformat through formatter pipeline)
         id: format_layer
@@ -647,6 +688,118 @@ jobs:
           set -o pipefail
           node scripts/smoke-tools.mjs --resolution --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-resolution-layer.log"
 
+      # The cascade layer and its installs run AFTER the best-effort layers and
+      # the other gating layers, just before the evaluated floor: a red cascade
+      # (a live, flakier lane) skips every later step that has no `if:`, and
+      # placed after the gate it would have taken the capability matrix,
+      # clean-signal, save-verdict, capability inventory, idle-eviction, docs
+      # diff, census, Format, lens_full, Resolution and the tool-tree save with
+      # it (#5021 review, CodeRabbit). The handshake census it reads is left by
+      # the handshake layer in the shared PI_LENS_HOME and no later step
+      # rewrites it.
+      #
+      # jdtls has no managed installer (#3400), so the handshake and gate layers
+      # skip it every night and the cascade layer could not cover it.
+      # Provision the pinned milestone here, verified against the digest Eclipse
+      # publishes beside it, and hand its path to the cascade step ALONE (a
+      # step `env`, never `GITHUB_ENV` or `GITHUB_PATH`): the later capability,
+      # clean-signal and idle-eviction measurements keep measuring the same
+      # server population they did before this step existed. The launcher is a
+      # python script (setup-python above) that runs a JDK: 1.63.0's bundles
+      # require JavaSE 25 (osgi.ee), which the JDK 21 above cannot resolve, so
+      # a second JDK is installed without becoming the job default
+      # (`set-default: false` leaves JAVA_HOME and PATH alone) and its path
+      # reaches only the jdtls steps below.
+      # yamllint disable-line rule:line-length
+      - name: Install JDK 25 for the cascade layer's jdtls
+        id: java25
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        continue-on-error: true
+        with:
+          distribution: temurin
+          java-version: '25'
+          set-default: false
+      # A failed download or digest check must not skip the gating layers that
+      # follow (a step without `if:` is skipped after a failed one): the output
+      # `path` is written only after the archive is verified and unpacked, so a
+      # failure leaves it empty, and the cascade step reads java as not
+      # provisioned here (a warning row) while the other three servers still
+      # prove the lane (#5021 review, CodeRabbit).
+      - name: Install jdtls 1.63.0 for the cascade layer
+        id: jdtls
+        continue-on-error: true
+        env:
+          JAVA_HOME: ${{ steps.java25.outputs.path }}
+        run: |
+          set -euo pipefail
+          version="1.63.0"
+          archive="jdt-language-server-1.63.0-202610191322.tar.gz"
+          digest="b1f2abe0b3cccb462cf64fb4a5587c7d09df60cf8be7748b152cbd89d018bdc4"
+          dest="$RUNNER_TEMP/pi-lens-jdtls"
+          mkdir -p "$dest"
+          curl --fail --location --proto '=https' --proto-redir '=https' --silent --show-error \
+            "https://download.eclipse.org/jdtls/milestones/$version/$archive" \
+            --output "$dest/$archive"
+          # Print what the check saw: this step is best-effort, and a mismatch
+          # must not read the same as "no network tonight" (#5021 verify F9).
+          if ! printf '%s  %s\n' "$digest" "$dest/$archive" | sha256sum --check; then
+            echo "::error::jdtls archive failed its pinned digest: expected $digest, got $(sha256sum "$dest/$archive" | cut -d' ' -f1)"
+            exit 1
+          fi
+          tar -xzf "$dest/$archive" -C "$dest"
+          chmod +x "$dest/bin/jdtls"
+          echo "path=$dest/bin/jdtls" >> "$GITHUB_OUTPUT"
+          # Launcher probe (informational): a row for a server that never
+          # answers can only say "spawn-failure"; this prints the launcher's own
+          # exit status, stderr and Equinox configuration log beside it, run as
+          # the lane launches it (from the fixture, no arguments).
+          set +e
+          (cd tests/fixtures/lsp-cascade/java && timeout 30 "$dest/bin/jdtls" </dev/null >"$RUNNER_TEMP/pi-lens-jdtls-probe.out" 2>&1; echo "jdtls launcher probe: exit $?")
+          head -c 2000 "$RUNNER_TEMP/pi-lens-jdtls-probe.out"
+          cat "$dest"/configuration/*.log 2>/dev/null | head -c 3000
+          command -v python3 java || true
+
+      # Cascade layer (#1712): the handshake proves initialize and the clean gate
+      # proves a finding on the file itself; neither proves the path an agent's
+      # write takes to learn it broke an IMPORTER. This edits an exporter in a
+      # 3-file project per priority server (typescript-go, rust-analyzer, gopls,
+      # jdtls), calls the production `computeCascadeForFile`, and requires each
+      # importer to reach a conclusive verdict with the server's own finding. A
+      # server that handshook and then never concludes inside the deadline reds
+      # the step. typescript-go's row also runs the rename phase (#1677): it
+      # restores the exporter, moves it through the rename tool's service call
+      # and requires each importer to reach the verdict its file calls for.
+      # `--times-out` leaves the measured time-to-conclusive per server, uploaded
+      # below as the #1549 budget input; the first measured table is committed
+      # as tests/fixtures/lsp-cascade/measurements.json. The step reads the handshake census above
+      # (same PI_LENS_HOME), so a server that never handshook is a warning, not
+      # a red. One unavailable server (`skip`, a warning) is allowed;
+      # `--min-pass=3` (of four) reds the night when fewer than three rows are a
+      # pass or a known defect, and keeps an all-unavailable night from reading
+      # green. A fixture may declare a known defect (`known-defect`, its own state,
+      # counted as work done; none does today, java's went with #5040): a server
+      # that answers and shows exactly the declared skip is that row, and any
+      # other outcome, or a cascade that concludes, is a red row. A jdtls that is
+      # not provisioned (empty JDTLS_PATH) is a `skip`.
+      - name: LSP cascade layer (edit an exporter, importers conclude)
+        id: lsp_cascade
+        timeout-minutes: 20
+        env:
+          JDTLS_PATH: ${{ steps.jdtls.outputs.path }}
+          JAVA_HOME: ${{ steps.java25.outputs.path }}
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --lsp-cascade --install --verbose --min-pass=3 --times-out="$RUNNER_TEMP/tool-smoke-lsp-cascade-times.json" 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lsp-cascade.log"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: lsp-cascade-times
+          path: ${{ runner.temp }}/tool-smoke-lsp-cascade-times.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 90
+
       # #4514: the four LSP producers above (characterize, clean-signal,
       # capabilities, idle-eviction) exit 0 by design under continue-on-error,
       # so a night that evaluated almost nothing read green for six days
@@ -679,7 +832,7 @@ jobs:
       # a cancel, which can leave a half-written tree. A save problem never
       # reds the job.
       - name: Save the managed tool tree
-        if: ${{ !cancelled() && steps.tool_tree.outputs.cache-hit != 'true' && steps.lens_full.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.tool_tree.outputs.cache-hit != 'true' && steps.lsp_cascade.outcome != 'skipped' }}
         continue-on-error: true
         uses: ./.github/actions/tool-tree-cache
         with:
@@ -719,6 +872,11 @@ jobs:
           cp -f "$RUNNER_TEMP/lsp-capability-census.log" "$stage/" 2>/dev/null || true
           summary="$(node --input-type=module -e "import { DRIFT_SUMMARY_PATH } from './scripts/lib/clean-signal.mjs'; process.stdout.write(DRIFT_SUMMARY_PATH)")"
           cp -f "$summary" "$stage/pilens-clean-signal-drift-summary.json" 2>/dev/null || true
+          # #4512: the stale-cells verdict and body the probe wrote.
+          stale_body="$(node --input-type=module -e "import { STALE_CELLS_BODY_PATH } from './scripts/lib/clean-signal.mjs'; process.stdout.write(STALE_CELLS_BODY_PATH)")"
+          stale_state="$(node --input-type=module -e "import { STALE_CELLS_STATE_PATH } from './scripts/lib/clean-signal.mjs'; process.stdout.write(STALE_CELLS_STATE_PATH)")"
+          cp -f "$stale_body" "$stage/pilens-stale-cells-body.md" 2>/dev/null || true
+          cp -f "$stale_state" "$stage/pilens-stale-cells-state" 2>/dev/null || true
           echo "staged by ${GITHUB_JOB}" > "$stage/staged.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -742,6 +900,7 @@ jobs:
     # Two create-pull-request calls (a push and an API call each).
     timeout-minutes: 10
     permissions:
+      actions: write # dispatch ci.yml and lint.yml on each bot PR head (#5062)
       contents: write # commit-back branch for the LSP-docs refresh PR (#390)
       pull-requests: write # open/update the auto-refresh PR (#390)
     steps:
@@ -769,17 +928,56 @@ jobs:
         id: refresh_guard
         run: node scripts/assert-evaluated.mjs --docs
 
+      # #4512: a PR opened with the repository GITHUB_TOKEN never starts CI (a
+      # token-pushed commit triggers no workflow), so every refresh waited for a
+      # maintainer's close and reopen (#4338 sat open from 2026-10-13). A GitHub
+      # App installation token has no such limit: the docs-refresh PR below is
+      # opened with it when the repository has the App configured, and falls
+      # back to GITHUB_TOKEN (manual close and reopen, as before) when it does
+      # not. The names `LSP_REFRESH_APP_ID` (variable) and
+      # `LSP_REFRESH_APP_PRIVATE_KEY` (secret) are the maintainer's to confirm.
+      # The token is scoped to this PR's two writes and lives for the job.
+      - name: Mint the refresh App token (starts CI on the refresh PR)
+        id: app_token
+        if: vars.LSP_REFRESH_APP_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.LSP_REFRESH_APP_ID }}
+          private-key: ${{ secrets.LSP_REFRESH_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # #4512: write the refresh PR body (it lists the capability flips against
+      # HEAD) and decide whether the refresh is flip-free. Fail closed: only the
+      # columns and sections named in scripts/lib/refresh-flips.mjs are benign.
+      - name: Compose the refresh PR body (capability flips against HEAD)
+        id: landing
+        if: needs.tool-smoke.outputs.docs_changed == 'true' && needs.tool-smoke.outputs.census == 'success'
+        env:
+          APP_TOKEN_MINTED: ${{ steps.app_token.outputs.token != '' }}
+          AUTOMERGE_OPT_IN: ${{ vars.LSP_REFRESH_AUTOMERGE == 'true' }}
+        run: |
+          set -euo pipefail
+          landing=manual
+          if [ "$APP_TOKEN_MINTED" = true ]; then
+            landing=ci-only
+            if [ "$AUTOMERGE_OPT_IN" = true ]; then landing=automerge; fi
+          fi
+          node scripts/lsp-refresh-landing.mjs --body "$RUNNER_TEMP/lsp-refresh-pr-body.md" --landing "$landing" --issues-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/issues?q=is%3Aopen+label%3Anightly-drift"
+
       # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
       # in-place. master has required checks the schedule's GITHUB_TOKEN can't
       # bypass, so we open/UPDATE a single auto-PR (fixed branch, force-pushed each
       # run) instead of pushing to master. Docs change rarely (only when a server's
       # caps/tier change), so this is low-noise. No-ops when nothing changed.
       - name: Open/update LSP-docs refresh PR
+        id: refresh_pr
         if: needs.tool-smoke.outputs.docs_changed == 'true' && needs.tool-smoke.outputs.census == 'success'
         continue-on-error: true
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
           branch: bot/lsp-docs-refresh
           base: master
           add-paths: |
@@ -788,31 +986,51 @@ jobs:
             docs/lsp-idle-eviction.md
           commit-message: 'docs(nightly): refresh LSP capability docs'
           title: 'docs(nightly): refresh LSP capability docs (refs #3217)'
-          body: |
-            Automated refresh of the LSP capability docs from the nightly tool-smoke run.
-
-            - `docs/lsp-capability-matrix.md` — `mode` (characterize-lsp) + `clean-behavior` (probe-clean-signal, Tier 2 vs 3) columns (#460) + a `## silentOnClean drift` footnote (#529, telemetry only — never a gate)
-            - `docs/servercapabilities.md` — advertised capability inventory incl. ws-pull (#389)
-            - `docs/lsp-idle-eviction.md` — per-server idle-eviction safety (#3645): stable columns only (result, reason, respawn, coverage; timings live in the run log). Unlike the two docs above it is regenerated in full each night, not merged: a server the runner cannot spawn reads `unavailable`. A declared-versus-measured finding there is for a maintainer to act on in a follow-up; this refresh changes no policy
-
-            The two matrix docs above are **merged**, never blind-overwritten: a
-            server this ubuntu host couldn't spawn keeps its prior (dev-box)
-            classification, so the nightly can't regress a richer run (#390).
-            `docs/lsp-idle-eviction.md` is the exception: it is regenerated in
-            full, so a server this host cannot spawn reads `unavailable`.
-
-            Refs #460, #390, #529.
-
-            This PR is created with the repository `GITHUB_TOKEN`, which cannot
-            trigger workflow runs. After the bot opens or updates it, a
-            maintainer must close and reopen the PR to arm CI.
+          body-path: ${{ runner.temp }}/lsp-refresh-pr-body.md
           delete-branch: false
 
+      # #4512: a refresh with no capability flips lands without a manual step.
+      # Auto-merge is armed only for a flip-free refresh, only with the App
+      # token (so CI runs on the PR), and only when the repository opted in with
+      # `LSP_REFRESH_AUTOMERGE=true`: docs/pi-lens-merge-policy.md arms merges
+      # after a review verdict, so a bot merge is the maintainer's call. A
+      # refresh WITH flips disarms any auto-merge the previous night armed on
+      # the same branch, because the branch is force-rebuilt every night and
+      # armed auto-merge would otherwise carry tonight's flips to master.
+      - name: Arm auto-merge for a flip-free refresh
+        if: steps.refresh_pr.outputs.pull-request-number != '' && steps.landing.outputs.flip_free == 'true' && steps.app_token.outputs.token != '' && vars.LSP_REFRESH_AUTOMERGE == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.refresh_pr.outputs.pull-request-number }}
+        run: gh pr merge "$PR_NUMBER" --auto --merge
+
+      # Disarms with whichever token updated the PR above, and is not
+      # `continue-on-error`: a refresh with flips whose disarm could not run
+      # (the App token failed to mint tonight, so the PR was updated with
+      # GITHUB_TOKEN) must red the job, not leave last night's arming carrying
+      # tonight's flips. It reads the PR first, so a PR nothing armed is not an
+      # error and a failed read or disable is.
+      - name: Disarm auto-merge when the refresh has flips
+        if: steps.refresh_pr.outputs.pull-request-number != '' && steps.landing.outputs.flip_free != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.refresh_pr.outputs.pull-request-number }}
+        run: |
+          set -euo pipefail
+          armed="$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$armed" = true ]; then gh pr merge "$PR_NUMBER" --disable-auto; fi
+
       # #3989: ONE draft bot PR (own branch, never `bot/lsp-docs-refresh`, whose
-      # body promises no policy change) carrying the promotion edit. Same token
-      # and job permissions as the docs-refresh PR above; nothing widened. Never
-      # auto-merged: the bot cannot arm CI, and a maintainer reviews the table.
+      # body promises no policy change) carrying the promotion edit. The
+      # repository token and the job permissions the docs-refresh PR above falls
+      # back to; the App token (#4512) is for the docs refresh only, so nothing
+      # is widened. Never auto-merged: this PR is opened with the repository
+      # token, which cannot arm CI, and a maintainer reviews the table.
       - name: Open/update idle-eviction promotion PR
+        id: promote_pr
         if: needs.tool-smoke.outputs.promoted == 'true'
         continue-on-error: true
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
@@ -830,6 +1048,46 @@ jobs:
           title: 'perf(lsp): promote measured idle-eviction servers (refs #3989)'
           body-path: ${{ runner.temp }}/pr-inputs/idle-eviction-promote.md
           delete-branch: false
+
+      # #5062: a PR opened or updated with the repository GITHUB_TOKEN starts
+      # no `pull_request` run, so the required checks stayed absent until a
+      # maintainer closed and reopened it. `workflow_dispatch` is the one event
+      # a GITHUB_TOKEN can start, so the same job dispatches every workflow that
+      # produces a required check (those with a `merge_group` trigger, #3754) on
+      # the branch it just pushed. The dispatched jobs report under the
+      # required names, on the PR head. Skipped when the App token opened the
+      # PR (#4512): CI already started, and a second run would only duplicate it.
+      # Not `continue-on-error`: a PR that opened without checks reds the job.
+      # Both dispatch steps close the job, so a failed `gh workflow run` never
+      # skips the auto-merge disarm above or the promotion PR. This one keeps
+      # the implicit `success()`: after a failed disarm it withholds CI, so an
+      # auto-merge armed last night cannot merge tonight's flips (#5062 r3).
+      # Trust boundary: docs/ci-bot-pr-checks.md.
+      - name: Start required CI on the LSP-docs refresh branch
+        if: ${{ (steps.refresh_pr.outputs.pull-request-operation == 'created' || steps.refresh_pr.outputs.pull-request-operation == 'updated') && steps.app_token.outputs.token == '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml --ref bot/lsp-docs-refresh
+          gh workflow run hot-path-latency.yml --ref bot/lsp-docs-refresh
+          gh workflow run lint.yml --ref bot/lsp-docs-refresh
+
+      # #5062: this PR is always opened with GITHUB_TOKEN, so it always needs
+      # the same dispatch (docs/ci-bot-pr-checks.md). Only a dispatch step runs
+      # between its opener and this step, so it runs under `!cancelled()`: a
+      # failed docs-refresh dispatch must not skip it. Nothing arms this draft.
+      - name: Start required CI on the idle-eviction promotion branch
+        if: ${{ !cancelled() && (steps.promote_pr.outputs.pull-request-operation == 'created' || steps.promote_pr.outputs.pull-request-operation == 'updated') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml --ref bot/lsp-idle-evict-promote
+          gh workflow run hot-path-latency.yml --ref bot/lsp-idle-evict-promote
+          gh workflow run lint.yml --ref bot/lsp-idle-evict-promote
 
   # The tracking-issue writers (#4077): the only job here with `issues: write`
   # beside the snapshot notifier below. Every step is `continue-on-error`, and
@@ -896,6 +1154,26 @@ jobs:
             node scripts/upsert-tracking-issue.mjs --title "$TITLE" --label nightly-drift --clean --close-when-clean
           fi
 
+      # #4512: a matrix cell the probe has not re-observed for two consecutive
+      # nights keeps its last known value and is marked stale (never rewritten
+      # to `unknown`, which erased five measured values in #4338). This raises
+      # the raised set on ONE tracking issue, refreshed while the cells stay
+      # stale and closed once none has missed two nights in a row. A missing
+      # verdict (the probe or the matrix refresh did not run) leaves the issue
+      # as it is, like the idle-eviction notifier above.
+      - name: Notify on stale matrix cells (file/update/close tracking issue)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          TITLE='nightly: LSP capability probe missed (stale matrix cells)'
+          STATE=$(cat "$RUNNER_TEMP/pilens-stale-cells-state" 2>/dev/null || echo missing)
+          if [ "$STATE" = drift ]; then
+            gh label create nightly-drift --color B60205 --description 'Nightly automated drift finding' || true
+            node scripts/upsert-tracking-issue.mjs --title "$TITLE" --label nightly-drift --body-file "$RUNNER_TEMP/pilens-stale-cells-body.md"
+          elif [ "$STATE" = clean ]; then
+            node scripts/upsert-tracking-issue.mjs --title "$TITLE" --label nightly-drift --clean --close-when-clean
+          fi
+
       # #2723: the ONLY tracking-issue writer this workflow had before this
       # step (`Notify on silentOnClean drift` above) sits behind the LSP
       # handshake layer with `continue-on-error: true` but no `if: always()`,
@@ -908,8 +1186,8 @@ jobs:
       # independent notifier scoped to the job's actual pass/fail verdict,
       # placed last and gated on `if: always()` so it runs on every outcome,
       # mirroring install-smoke.yml's `Notify install drift` step. Reads the
-      # six gating layers' outcomes + captured logs (the only six steps
-      # above without `continue-on-error`, so the only six whose outcome
+      # eight gating layers' outcomes + captured logs (the only eight steps
+      # above without `continue-on-error`, so the only eight whose outcome
       # can turn the job red) — see scripts/lib/tool-smoke-drift.mjs's module
       # doc. GITHUB_TOKEN is inherited from this job's own env (`issues:
       # write` already granted at job level, #529/#594). Best-effort:
@@ -925,6 +1203,8 @@ jobs:
           LSP_HANDSHAKE_LOG: ${{ runner.temp }}/tool-smoke-lsp-handshake.log
           LSP_GATE_OUTCOME: ${{ needs.tool-smoke.outputs.lsp_gate }}
           LSP_GATE_LOG: ${{ runner.temp }}/tool-smoke-lsp-gate.log
+          LSP_CASCADE_OUTCOME: ${{ needs.tool-smoke.outputs.lsp_cascade }}
+          LSP_CASCADE_LOG: ${{ runner.temp }}/tool-smoke-lsp-cascade.log
           LENS_FULL_OUTCOME: ${{ needs.tool-smoke.outputs.lens_full }}
           LENS_FULL_LOG: ${{ runner.temp }}/tool-smoke-lens-full.log
           FORMAT_LAYER_OUTCOME: ${{ needs.tool-smoke.outputs.format_layer }}
@@ -933,10 +1213,16 @@ jobs:
           RESOLUTION_LAYER_LOG: ${{ runner.temp }}/tool-smoke-resolution-layer.log
           EVALUATED_FLOOR_OUTCOME: ${{ needs.tool-smoke.outputs.evaluated_floor }}
           EVALUATED_FLOOR_LOG: ${{ runner.temp }}/tool-smoke-evaluated-floor.log
-          # #2723 review F3: a job failure BEFORE the six tracked layers
+          # #3405/#4999: the save-verdict probe is not under `continue-on-error`
+          # either, so its failure reds the job and must be filed under its own
+          # name with its log — otherwise the notifier reports "(outside the
+          # tracked layers)" for a step whose evidence it has in hand.
+          SAVE_VERDICT_OUTCOME: ${{ needs.tool-smoke.outputs.save_verdict }}
+          SAVE_VERDICT_LOG: ${{ runner.temp }}/tool-smoke-save-verdict.log
+          # #2723 review F3: a job failure BEFORE the eight tracked layers
           # even start (checkout, a best-effort setup action, npm install,
           # build:dist — twelve steps, none of which set an *_OUTCOME above)
-          # leaves all six "skipped", identically to a genuine
+          # leaves all eight "skipped", identically to a genuine
           # cancellation. The smoke job's own result (`needs.tool-smoke.result`,
           # what `job.status` was before #4077) disambiguates: "failure" only
           # when a non-continue-on-error step actually failed somewhere in it.

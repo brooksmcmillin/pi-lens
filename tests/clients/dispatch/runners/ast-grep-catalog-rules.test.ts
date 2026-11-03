@@ -29,6 +29,14 @@ import {
 	removeTempDirSync,
 	setupTestEnvironment,
 } from "../../test-utils.js";
+import { setProjectTrustState } from "../../../../clients/project-trust.js";
+
+// #4530: the ast-grep CLI under test is this checkout's own devDependency, found
+// through the test runner's `node_modules/.bin` PATH entry. That entry is the
+// session repository's own bytes, which a bare lookup refuses until pi trusts
+// the project. This file tests the tool, not trust, so it adopts trust the way
+// the maintenance hosts do; the trust rule has its own suite.
+setProjectTrustState("trusted");
 
 const RULES_DIR = path.join(process.cwd(), "rules", "ast-grep-rules", "rules");
 

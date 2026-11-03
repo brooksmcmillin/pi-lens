@@ -98,6 +98,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -290,32 +291,10 @@ const REMEDIATION =
  * instead of drifting.
  */
 const SLASH_FOLD_PINS: Readonly<Record<string, number>> = {
-	"clients/actionable-warnings.ts": 1,
-	"clients/cache-manager.ts": 1,
-	"clients/codebase-model.ts": 1,
-	"clients/config-locations.ts": 1,
+	// Held out of the 2026-10-30 fold only because an open PR edits the file
+	// (#5011 for dispatcher.ts, #4628 for index.ts); the next slice folds them.
 	"clients/dispatch/dispatcher.ts": 1,
-	"clients/dispatch/integration.ts": 2,
-	"clients/dispatch/runner-context.ts": 3,
-	"clients/dispatch/runners/actionlint.ts": 1,
-	"clients/feature-hints.ts": 1,
-	"clients/file-role.ts": 2,
-	"clients/file-utils.ts": 2,
-	"clients/finding-identity.ts": 1,
-	"clients/git-guard.ts": 1,
-	"clients/lens-engine.ts": 2,
-	"clients/lsp/client.ts": 1,
-	"clients/lsp/edits.ts": 3,
-	"clients/lsp/index.ts": 2,
-	"clients/lsp/server.ts": 1,
-	"clients/mcp/review.ts": 1,
-	"clients/review-graph/workspace-modules.ts": 4,
-	"clients/rules-scanner.ts": 1,
-	"clients/test-runner-client.ts": 1,
-	"clients/tool-cwd.ts": 1,
-	"clients/zizmor-config.ts": 1,
 	"index.ts": 1,
-	"tools/lsp-navigation.ts": 1,
 };
 
 /**
@@ -340,44 +319,70 @@ const SLASH_FOLD_PINS: Readonly<Record<string, number>> = {
  *   case-variant sibling.)
  * - `runtime-tool-call.ts` — `toPosix(path.resolve(f)).toLowerCase()`, where
  *   the fold is the haystack for lowercase MARKER substrings, not a key.
+ * - `file-utils.ts` — `isWithinPathForm`'s containment form: the two axes
+ *   `path.win32.relative` folds, separators and (on win32) case, in ONE
+ *   expression. Deliberately NOT a map key — it is the form `isWithinForm` is
+ *   handed, and the fold is selected by the VALUE's shape (`isWindowsPath`),
+ *   not the host, so a POSIX path keeps its literal backslashes (#4876 F1) and
+ *   the win32 axis is exercised on every lane (#4876 F4).
+ * - `file-role.ts` — `toPosix(<win32 or posix dirname>).toLowerCase()`, where
+ *   the fold builds the lowercase haystack for the role's directory-name
+ *   substrings (`/tests/`, `/migrations/`), not a key. It was an inline
+ *   `.replace(/\\/g, "/").toLowerCase()` that shape B did not see; the fold onto
+ *   `toPosix` made the adjacency visible, so the row registers it, as
+ *   `runtime-tool-call.ts` does for the same form.
  */
 const CASE_FOLD_PINS: Readonly<Record<string, number>> = {
+	"clients/file-role.ts": 1,
+	"clients/file-utils.ts": 1,
 	"clients/lsp/launch.ts": 1,
 	"clients/mcp/ipc.ts": 1,
 	"clients/runtime-tool-call.ts": 1,
 };
 
 describe("path transformation single-source-of-truth (#1193)", () => {
-	it("has no unpinned raw separator fold outside the canonical leaf", () => {
-		const { slashFolds, scanned } = census();
-		assertNonEmptyScan("clients/tools/mcp/index.ts source files", scanned, 400);
-		const audit = auditSymbolCounts({
-			sweepName: "raw separator fold (#1193 shape A)",
-			counts: slashFolds,
-			pinned: SLASH_FOLD_PINS,
-			remediation: REMEDIATION,
-		});
-		expect(audit.problems).toEqual([]);
-		expect(
-			stalePins(slashFolds, SLASH_FOLD_PINS),
-			"a pinned separator fold is gone — good, now shrink the pin",
-		).toEqual([]);
-	}, 30_000);
+	it(
+		"has no unpinned raw separator fold outside the canonical leaf",
+		() => {
+			const { slashFolds, scanned } = census();
+			assertNonEmptyScan(
+				"clients/tools/mcp/index.ts source files",
+				scanned,
+				400,
+			);
+			const audit = auditSymbolCounts({
+				sweepName: "raw separator fold (#1193 shape A)",
+				counts: slashFolds,
+				pinned: SLASH_FOLD_PINS,
+				remediation: REMEDIATION,
+			});
+			expect(audit.problems).toEqual([]);
+			expect(
+				stalePins(slashFolds, SLASH_FOLD_PINS),
+				"a pinned separator fold is gone — good, now shrink the pin",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("has no unpinned path-key case fold outside the canonical leaf", () => {
-		const { caseFolds } = census();
-		const audit = auditSymbolCounts({
-			sweepName: "path-key case fold (#1193 shape B)",
-			counts: caseFolds,
-			pinned: CASE_FOLD_PINS,
-			remediation: REMEDIATION,
-		});
-		expect(audit.problems).toEqual([]);
-		expect(
-			stalePins(caseFolds, CASE_FOLD_PINS),
-			"a pinned path-key case fold is gone — good, now shrink the pin",
-		).toEqual([]);
-	}, 30_000);
+	it(
+		"has no unpinned path-key case fold outside the canonical leaf",
+		() => {
+			const { caseFolds } = census();
+			const audit = auditSymbolCounts({
+				sweepName: "path-key case fold (#1193 shape B)",
+				counts: caseFolds,
+				pinned: CASE_FOLD_PINS,
+				remediation: REMEDIATION,
+			});
+			expect(audit.problems).toEqual([]);
+			expect(
+				stalePins(caseFolds, CASE_FOLD_PINS),
+				"a pinned path-key case fold is gone — good, now shrink the pin",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("the canonical leaf still owns both transformations", () => {
 		const raw = readFileSync(path.join(REPO_ROOT, CANONICAL_FILE), "utf8");

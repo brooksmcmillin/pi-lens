@@ -48,11 +48,12 @@ const TRANSPARENT_IDS = [
 	"docker",
 	"json",
 	"python-jedi",
+	"docker-official",
+	"zizmor",
 ] as const;
 const NEXT_PHASE_ELIGIBLE_IDS = [
 	"ast-grep",
 	"cue",
-	"docker-official",
 	"gleam",
 	"lua",
 	"terraform",
@@ -60,7 +61,6 @@ const NEXT_PHASE_ELIGIBLE_IDS = [
 	"toml",
 	"typos",
 	"zig",
-	"zizmor",
 ] as const;
 const HOLD_INDEXER_IDS = [
 	"expert",
@@ -79,6 +79,7 @@ const UNPROVEN_IDS = [
 	"elixir",
 	"fsharp",
 	"go",
+	"groovy",
 	"haskell",
 	"java",
 	"nix",
@@ -86,6 +87,7 @@ const UNPROVEN_IDS = [
 	"ruby",
 	"swift",
 	"omnisharp",
+	"fallow",
 ] as const;
 
 export function idleEvictionRegistryIssues(

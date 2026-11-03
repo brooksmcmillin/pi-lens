@@ -16,9 +16,11 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
+import { clearWidgetState } from "../../clients/widget-state.js";
+import { ENVIRONMENT_GAP_MARKER } from "../../clients/lsp/environment-gap.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 
 const freshFetchMocks = vi.hoisted(() => ({
@@ -71,22 +73,8 @@ vi.mock(
 	}),
 );
 
-// Spread the real module rather than hand-listing its exports; see the same
-// note in tests/tools/lens-diagnostics-rule-policy.test.ts.
-vi.mock("../../clients/widget-state.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("../../clients/widget-state.js")>();
-	return {
-		...actual,
-		getFileDiagnosticSummaries: () => [],
-		reconcileStaleWidgetFiles: async () => 0,
-		reconcileStaleWidgetDependencyBlockers: async () => 0,
-		reconcileScanDiagnostics: vi.fn().mockReturnValue(true),
-		reconcileCorrelatedScanDiagnostics: vi.fn(),
-	};
-});
-
 beforeEach(() => {
+	clearWidgetState();
 	freshFetchMocks.fetchFreshProjectDiagnostics.mockReset();
 	freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
 		diagnostics: [],
@@ -95,6 +83,10 @@ beforeEach(() => {
 		timings: {},
 	});
 	resetProjectLensConfigCache();
+});
+
+afterEach(() => {
+	clearWidgetState();
 });
 
 const INFERRED_CONFIG_FILE = "/dev/null/inferredProject1*";
@@ -197,6 +189,64 @@ function run(cwd: string, lspService: unknown) {
 		{ cwd },
 	);
 }
+
+/**
+ * #4532 round 4 (M3): `mode=full` and `lsp_diagnostics` must read the same file
+ * the same way. The environment-gap demotion was wired consumer by consumer and
+ * this sweep was missed, so one file's Node-environment gaps were a warning on
+ * the per-edit route and a BLOCKING finding here (AGENTS.md shape 71).
+ */
+describe("lens_diagnostics mode=full — environment gap demotion (#4532)", () => {
+	it("renders a Node-environment gap as a warning, matching lsp_diagnostics", async () => {
+		await withFixture(async (cwd) => {
+			// `withFixture` plants no `node_modules`, which is the reported root:
+			// the gap rows are what a server reports when it has no `@types/node`.
+			const srcFile = path.join(cwd, "src", "index.ts");
+			const gapRows = [
+				{
+					severity: 1,
+					message:
+						"Cannot find module 'node:crypto' or its corresponding type declarations.",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 20 },
+					},
+					source: "ts",
+					code: 2307,
+				},
+				{
+					severity: 1,
+					message: "Cannot find name 'setTimeout'.",
+					range: {
+						start: { line: 1, character: 0 },
+						end: { line: 1, character: 10 },
+					},
+					source: "ts",
+					code: 2304,
+				},
+			];
+			const lspService = {
+				executeReadOnlyCommandOnLiveClient: vi.fn(async () => ({
+					executed: false,
+				})),
+				runWorkspaceDiagnostics: vi
+					.fn()
+					.mockResolvedValue([
+						{ filePath: srcFile, diagnostics: gapRows, count: gapRows.length },
+					]),
+			};
+			const result = await run(cwd, lspService);
+			const text = String(result.content[0].text);
+
+			// The finding survives and names why it is not a code defect…
+			expect(text).toContain(ENVIRONMENT_GAP_MARKER);
+			// …and it never reaches blocking authority, which is what
+			// `lsp_diagnostics` already does for the same rows.
+			expect(result.details).toMatchObject({ totalBlocking: 0 });
+			expect(text).not.toContain("🔴");
+		});
+	});
+});
 
 describe("lens_diagnostics mode=full — inferred-project demotion (#1640)", () => {
 	it("demotes and labels a test file that belongs to no tsconfig project", async () => {

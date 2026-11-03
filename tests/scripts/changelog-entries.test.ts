@@ -88,8 +88,13 @@ describe("one changelog fragment per PR (#3795)", () => {
 		);
 	};
 	const makeRepo = () => {
+		// #4867: real git fixtures live inside the checkout, under the git-ignored
+		// `.probe-home` -- never at the checkout root. The plegma Bash guard refuses
+		// a git write outside the worker's worktree, and a checkout fixture does not
+		// belong on tmpfs (AGENTS.md, #3526).
+		fs.mkdirSync(path.join(process.cwd(), ".probe-home"), { recursive: true });
 		const dir = fs.mkdtempSync(
-			path.join(process.cwd(), ".tmp-changelog-frag-"),
+			path.join(process.cwd(), ".probe-home", "changelog-frag-"),
 		);
 		dirs.push(dir);
 		gitExecFileSync(["init", "-q", "-b", "fixture-master"], {
@@ -412,8 +417,9 @@ describe("one changelog fragment per PR (#3795)", () => {
 		branchFiles: Record<string, string>,
 		depth: "depth-1" | "full",
 	) => {
+		fs.mkdirSync(path.join(process.cwd(), ".probe-home"), { recursive: true });
 		const origin = fs.mkdtempSync(
-			path.join(process.cwd(), ".tmp-changelog-origin-"),
+			path.join(process.cwd(), ".probe-home", "changelog-origin-"),
 		);
 		dirs.push(origin);
 		const run = (args: string[], cwd = origin) =>
@@ -453,7 +459,7 @@ describe("one changelog fragment per PR (#3795)", () => {
 			"fixture-pr",
 		]);
 		const clone = fs.mkdtempSync(
-			path.join(process.cwd(), ".tmp-changelog-clone-"),
+			path.join(process.cwd(), ".probe-home", "changelog-clone-"),
 		);
 		dirs.push(clone);
 		const depthArgs = depth === "depth-1" ? ["--depth", "1"] : [];

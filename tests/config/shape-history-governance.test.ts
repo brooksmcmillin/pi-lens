@@ -7,13 +7,17 @@ import {
 	parseDefectShapes,
 } from "../../scripts/lib/defect-shapes.mjs";
 
-// Recurrence (#4439): shapes 67 and 68 entered the AGENTS.md catalog on
+// Recurrence (#4439): shapes 67 and 68 entered the defect-shape catalog on
 // 2026-10-14 with no HISTORY.md entry, and nothing checked it. The retro
 // contract (`docs/pi-lens-retro.md` step 4) puts each shape's issues and PRs in
-// HISTORY.md, because AGENTS.md stays lean (agents-governance.test.ts keeps its
-// reference count from growing). A shape has history when HISTORY.md, read as
-// comment-blanked markdown, carries one of the shape's own issue or PR numbers
-// from its catalog entry, or a heading naming `shape N`.
+// HISTORY.md, because the catalog stays lean (agents-governance.test.ts keeps
+// its reference count from growing). A shape has history when HISTORY.md, read
+// as comment-blanked markdown, carries one of the shape's own issue or PR
+// numbers from its catalog entry, or a heading naming `shape N`.
+//
+// #4361: the numbered entries moved out of AGENTS.md into
+// docs/defect-shapes.md, which keeps AGENTS.md's index from carrying them. The
+// scan reads the file that holds the entries.
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 
@@ -24,7 +28,7 @@ const read = (file: string, env?: string): string =>
 	);
 
 /** Catalog shape numbers with no entry in `history`, ascending. */
-function shapesWithoutHistory(agents: string, history: string): number[] {
+function shapesWithoutHistory(catalog: string, history: string): number[] {
 	const blanked = blankMarkdown(history);
 	const referenced = issueNumbers(blanked);
 	const headed = new Set(
@@ -35,7 +39,7 @@ function shapesWithoutHistory(agents: string, history: string): number[] {
 			(match) => Number(match[1]),
 		),
 	);
-	return [...parseDefectShapes(agents)]
+	return [...parseDefectShapes(catalog)]
 		.filter(
 			([number, entry]) =>
 				!headed.has(number) &&
@@ -70,16 +74,16 @@ const NO_HISTORY_BASELINE: readonly number[] = [
 ];
 
 describe("catalog shapes have a HISTORY.md entry (#4439)", () => {
-	const agents = read("AGENTS.md", "PI_LENS_AGENTS_PATH");
+	const catalog = read("docs/defect-shapes.md");
 	const history = read("HISTORY.md", "PI_LENS_HISTORY_PATH");
-	const uncovered = shapesWithoutHistory(agents, history);
+	const uncovered = shapesWithoutHistory(catalog, history);
 
 	const { added, stale } = baselineViolations(uncovered, NO_HISTORY_BASELINE);
 
 	it("lets no shape outside the baseline lack a HISTORY.md entry", () => {
 		expect(
 			added,
-			`shape(s) ${added.join(", ")} in AGENTS.md have no HISTORY.md entry: give each a HISTORY.md section whose heading names it, such as "## 2026-10-14 - model switch drift (shape 68)" (retro step 4), or cite one of its own issues there; never add to the baseline`,
+			`shape(s) ${added.join(", ")} in docs/defect-shapes.md have no HISTORY.md entry: give each a HISTORY.md section whose heading names it, such as "## 2026-10-14 - model switch drift (shape 68)" (retro step 4), or cite one of its own issues there; never add to the baseline`,
 		).toEqual([]);
 	});
 
@@ -91,71 +95,75 @@ describe("catalog shapes have a HISTORY.md entry (#4439)", () => {
 	});
 
 	it("lists only catalog shapes, once each, ascending", () => {
-		const catalog = parseDefectShapes(agents);
-		expect(NO_HISTORY_BASELINE.filter((n) => !catalog.has(n))).toEqual([]);
+		const parsed = parseDefectShapes(catalog);
+		expect(NO_HISTORY_BASELINE.filter((n) => !parsed.has(n))).toEqual([]);
 		expect([...NO_HISTORY_BASELINE]).toEqual(
 			[...new Set(NO_HISTORY_BASELINE)].sort((a, b) => a - b),
 		);
 	});
 
 	it("parses the whole catalog, so the scan is not vacuous", () => {
-		expect(parseDefectShapes(agents).size).toBeGreaterThanOrEqual(68);
+		expect(parseDefectShapes(catalog).size).toBeGreaterThanOrEqual(68);
 	});
 });
 
 describe("blankMarkdown options (#4439)", () => {
-	const text = "- item\n\n    indented\n";
+	const text = "para\n\n    indented\n";
 
 	it("blanks an indented block by default", () => {
-		expect(blankMarkdown(text).trim()).toBe("- item");
+		expect(blankMarkdown(text).trim()).toBe("para");
 	});
 
 	it("keeps an indented block when indentedCode is false", () => {
 		expect(blankMarkdown(text, { indentedCode: false })).toContain("indented");
 	});
+
+	it("keeps a list item's indented continuation, which is content", () => {
+		// GitHub renders `- item\n\n    indented` as a second paragraph of the
+		// item, not as code; the hand scanner this replaced blanked it (#4717).
+		expect(blankMarkdown("- item\n\n    indented\n")).toContain("indented");
+	});
 });
 
 // Recurrence (#4565): the comment rule knew `-->` alone, so it blanked every
 // line after a comment GitHub had already closed, and a gating rule then read
-// a visible answer as absent. Each row names one end the HTML spec gives a
-// comment (13.2.5.43-46) that the parser must agree the renderer has.
+// a visible answer as absent. Each row names one end the renderer gives an
+// inline comment, read by the lexer (#4717); a line that opens with `<!--` is a
+// raw-HTML block instead, which the next describe pins.
 describe("blankMarkdown comment ends (#4565)", () => {
 	const hidden = (markdown: string) => blankMarkdown(markdown);
 
-	it("ends a comment at `--!>` and keeps the text after it", () => {
-		const out = hidden("<!-- secret --!> visible");
-		expect(out).not.toContain("secret");
+	it("keeps an inline `<!-- … --!>` literal, as GitHub renders it", () => {
+		// GitHub prints `<!-- secret --!>` as text: `--!>` ends no inline comment.
+		const out = hidden("text <!-- secret --!> visible");
+		expect(out).toContain("secret");
 		expect(out).toContain("visible");
 	});
 
 	it("reads `<!-->` as a complete empty comment", () => {
-		const out = hidden("<!-->visible");
-		expect(out).toContain("visible");
+		expect(hidden("text <!-->visible")).toContain("visible");
 		expect(blankMarkdown("<!-->")).toBe("     ");
 	});
 
 	it("reads `<!--->` as a complete empty comment", () => {
-		const out = hidden("<!--->visible");
-		expect(out).toContain("visible");
+		expect(hidden("text <!--->visible")).toContain("visible");
 		expect(blankMarkdown("<!--->")).toBe("      ");
 	});
 
 	it("does not end a comment at `--!` without the `>`", () => {
-		// The comment end bang state consumes `!` and returns to the comment
-		// state, so this text is still hidden; only `tail` is visible.
-		const out = hidden("<!-- secret --! still hidden --> tail");
+		const out = hidden("text <!-- secret --! still hidden --> tail");
 		expect(out).not.toContain("still hidden");
 		expect(out).toContain("tail");
 	});
 
 	it("keeps the `-->` end and the unterminated tail", () => {
-		expect(hidden("<!-- secret --> visible")).toContain("visible");
+		expect(hidden("text <!-- secret --> visible")).toContain("visible");
 		expect(hidden("<!-- secret\nhidden")).not.toContain("hidden");
 	});
 
 	it("keeps a comment opener inside a fence literal", () => {
-		// Fences go first: an opener in a fence is text, so it cannot swallow
-		// the visible line after the fence.
+		// An opener in a fence is code, so it cannot swallow the visible line
+		// after the fence.
 		expect(hidden("```\n<!--\n```\nvisible")).toContain("visible");
 	});
 
@@ -163,6 +171,147 @@ describe("blankMarkdown comment ends (#4565)", () => {
 		const out = hidden("<!-->\nafter");
 		expect(out.split("\n")).toHaveLength(2);
 		expect(out.split("\n")[0]).toHaveLength(5);
+		expect(out).toContain("after");
+	});
+});
+
+// Recurrence (#4717 V1, V4, V5, B6): the hand scanner matched `<!--` at any
+// offset, then paired backticks across paragraphs, then missed that a heading
+// ends a paragraph, and read `--!>` as a block end; each review round found one
+// more spelling. The lexer decides now: a line opening `<!--` (after at most
+// three spaces, or inside a list item) starts a raw-HTML block that runs to the
+// line holding `-->` or to the end of its container, and an inline opener is a
+// comment only when the lexer closes it inside its paragraph. Every other
+// spelling is literal text, as GitHub renders it.
+describe("blankMarkdown comment openers (#4717 V1)", () => {
+	const hidden = (markdown: string) => blankMarkdown(markdown);
+
+	it.each([
+		["at a line start", "<!--"],
+		["after three spaces of indent", "   <!--"],
+	])("hides a block comment %s", (_name, opener) => {
+		const out = hidden(`${opener}\nhidden\n-->.\nvisible`);
+		expect(out).not.toContain("hidden");
+		expect(out).toContain("visible");
+	});
+
+	it("runs an unterminated block comment to the end of the text", () => {
+		// CommonMark's HTML block ends at the end of the document when no closer
+		// follows, so the heading below stays hidden.
+		expect(hidden("   <!--\n## Fold check")).not.toContain("Fold check");
+	});
+
+	it.each([
+		["-->", "<!-- note --> after"],
+		["--!>", "<!-- note --!> after"],
+		["<!-->", "<!--> after"],
+		["<!--->", "<!---> after"],
+	])(
+		"keeps the text after a block comment's %s end on its line (#4565)",
+		(_name, line) => {
+			// GitHub prints the block's text after the comment: the browser ends a
+			// comment at each of these, whatever the markdown block around it.
+			const out = hidden(`${line}\n\nnext`);
+			expect(out).not.toContain("note");
+			expect(out).toContain("after");
+			expect(out).toContain("next");
+		},
+	);
+
+	it("hides only the comment of a block that `--!>` ends (B6)", () => {
+		// No `-->` line ends the HTML block, so it runs to the end and GitHub
+		// renders no heading after it (the sections test pins that through the
+		// lexer's headings); the browser still shows the block's text after
+		// `--!>`, as raw text.
+		const out = hidden("<!--\nhidden\n--!>\n\n## Tests\nx");
+		expect(out).not.toContain("hidden");
+		expect(out).toContain("## Tests");
+	});
+
+	it("hides an inline comment that closes in its own paragraph", () => {
+		const out = hidden("text <!-- hidden -->\nvisible");
+		expect(out).not.toContain("hidden");
+		expect(out).toContain("visible");
+	});
+
+	it.each([
+		["has no end at all", "text <!-- literal\nvisible"],
+		[
+			"closes only past a blank line",
+			"text <!-- literal\n\n--> later\nvisible",
+		],
+		[
+			"closes only past a heading (V5)",
+			"text <!-- literal\n## visible\nlater -->",
+		],
+		[
+			"closes only past a heading, CRLF (V5)",
+			"text <!-- literal\r\n## visible\r\nlater -->",
+		],
+	])("keeps an inline opener literal when it %s", (_name, markdown) => {
+		const out = hidden(markdown);
+		expect(out).toContain("literal");
+		expect(out).toContain("visible");
+	});
+
+	it.each([
+		["unclosed", "text `<!--` literal\nvisible"],
+		["with its end inside the span", "text `<!-- note --> now`\nvisible"],
+	])("never opens a comment in a backtick span (%s)", (_name, markdown) => {
+		const out = hidden(markdown);
+		expect(out).toContain("`<!--");
+		expect(out).toContain("visible");
+	});
+
+	it.each([
+		["LF", "\n"],
+		["CRLF", "\r\n"],
+	])(
+		"never pairs backticks across a blank line around a block comment (V4, %s)",
+		(_name, eol) => {
+			const out = hidden(
+				[
+					"One stray ` backtick.",
+					"",
+					"<!--",
+					"## Tests",
+					"hidden",
+					"-->",
+					"",
+					"Another stray ` backtick.",
+				].join(eol),
+			);
+			expect(out).not.toContain("## Tests");
+			expect(out).toContain("Another stray");
+		},
+	);
+
+	it("never lets a backtick inside one comment shield the next comment (V4)", () => {
+		const out = hidden(
+			"<!-- one ` tick -->\n\n<!-- two ` tick\n## Tests\nhidden\n-->",
+		);
+		expect(out).not.toContain("## Tests");
+	});
+
+	it("reads a 4-space opener continuing a paragraph as literal text (B5)", () => {
+		// A 4-space line cannot open an HTML block or interrupt a paragraph, so
+		// its `<!--` is inline and unclosed, and the heading below renders.
+		const out = hidden("para\n    <!--\n## visible");
+		expect(out).toContain("para");
+		expect(out).toContain("## visible");
+	});
+
+	it("hides a comment opener inside a list item", () => {
+		// The catalog fixture `    <!-- (#100)` is this shape: inside a list item
+		// the opener starts an HTML block, so its issue reference never counts.
+		expect(hidden("- para\n  <!--\n  hidden")).not.toContain("hidden");
+	});
+
+	it("keeps CRLF line ends and every line's length", () => {
+		const text = "a <!-- x -->\r\nb\r\n";
+		const out = hidden(text);
+		expect(out).toHaveLength(text.length);
+		expect(out.split("\r\n")).toEqual(["a" + " ".repeat(11), "b", ""]);
 	});
 });
 

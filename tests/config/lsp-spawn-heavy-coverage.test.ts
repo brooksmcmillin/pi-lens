@@ -58,6 +58,7 @@ import {
 	stripSource,
 } from "../support/sweep-kit.js";
 import { vitestCollects } from "../support/vitest-collection.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -143,9 +144,11 @@ const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
 		"real child exit-cause ledger cases; the fixture self-exits on a short delay, no handshake-then-diagnostics wait to starve",
 	"tests/clients/lsp/client-retention-process-scope.test.ts":
 		"real clients across two module instances to prove process-scope retention; handshake only against the instant fixture, no contention budget",
+	"tests/clients/lsp/partial-message-timer.test.ts":
+		"#5169 natural Node host exit is measured in the fully serialized wall-clock-budget lane, after lsp-spawn-heavy; the real fixture still runs",
 	"tests/clients/lsp/service-notify-cpu-liveness.test.ts":
 		"real wedged child and CPU sampling run in the serialized wall-clock-budget phase; the lower-bound wedge assertion needs that quiet phase",
-	"tests/clients/head-move-resync-4493.test.ts":
+	"tests/clients/head-move-resync-4476.test.ts":
 		"#4493: real git repositories plus fake-LSP children through the tool_call/tool_result seams; phased in the serialized wall-clock-budget lane (the flake-shape admission gate requires that lane), and its waits are the hooks' own returns and a request barrier, not a handshake-plus-diagnostics budget",
 	"tests/clients/lsp/managed-fallback-after-trust-refusal-4515.test.ts":
 		"#4515: the only launchLSP call that reaches a spawn is doubled; the project-local candidate it delegates to the real launchLSP is refused by project trust before any spawn (or, under trust, is absent), so no LSP child, handshake or diagnostics wait exists to starve",
@@ -155,6 +158,10 @@ const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
 		"#2042/#3091: the real child is `/bin/sh` launched through `launchLSP` purely to obtain a pid whose `/proc` PPid is this process — there is no language server, no handshake and no diagnostics wait to starve; each leader is killed in the test's cleanup (the #3096 eviction cases hold about 257 live children for about a second) and the assertions read which signal `killProcessTree` issued and the eviction record. It is already phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes without running twice (same shape as the two entries above).",
 	"tests/clients/instance-reaper-pid-reuse.test.ts":
 		"#3539: the one `launchLSP` call starts `/bin/sh -c sleep 30` to read the owner tag out of its /proc environ; no language server, no handshake and no diagnostics wait. The file is phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes.",
+	"tests/clients/session-repository-trust-4530.test.ts":
+		"#4530: each `launchLSP` call starts a planted `/bin/sh` stand-in that writes a marker file and exits, or is refused before any spawn; no language server, no handshake and no diagnostics wait. The file is phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes.",
+	"tests/clients/lsp/effect-tsgo-lsp.test.ts":
+		"#4914: the one real `launchLSP` call is handed a mode-644 shim or a directory at the bin path and fails before any process starts; every launch that would start is doubled, so no LSP child, handshake or diagnostics wait exists to starve",
 	"tests/clients/lsp/initialize-timeout-backstop.test.ts":
 		"POSIX-only real-child initialize-timeout backstop; waits on a 50ms timeout firing then sleeps past kill escalation — deterministic and short",
 	"tests/clients/lsp/lean-real-smoke.test.ts":
@@ -200,51 +207,57 @@ describe("lsp-spawn-heavy Vitest project coverage", () => {
 		},
 	);
 
-	it("phases or documents every test that spawns a real LSP child", () => {
-		const included = lspSpawnHeavyInclude();
-		// Fixture projects carry *.test.ts inputs belonging to the fixture's
-		// own toolchain; vitest never runs them, so the sweep must not count
-		// them either. vitestCollects reads that from vitest.config.ts: the
-		// hand-written `tests/fixtures/` exclude it replaces never matched,
-		// because listSourceFiles passes paths relative to `tests/` (#4399).
-		const files = listSourceFiles(path.join(repoRoot, "tests"), {
-			extensions: [".ts"],
-		}).filter((file) => vitestCollects(relativePosix(repoRoot, file)));
+	it(
+		"phases or documents every test that spawns a real LSP child",
+		() => {
+			const included = lspSpawnHeavyInclude();
+			// Fixture projects carry *.test.ts inputs belonging to the fixture's
+			// own toolchain; vitest never runs them, so the sweep must not count
+			// them either. vitestCollects reads that from vitest.config.ts: the
+			// hand-written `tests/fixtures/` exclude it replaces never matched,
+			// because listSourceFiles passes paths relative to `tests/` (#4399).
+			const files = listSourceFiles(path.join(repoRoot, "tests"), {
+				extensions: [".ts"],
+			}).filter((file) => vitestCollects(relativePosix(repoRoot, file)));
 
-		// readWalkedFiles: a path that vanished between the walk and the read is
-		// out of the population, not a finding (#3082 — this scan was one of the
-		// four rotating ENOENT victims).
-		const candidates = readWalkedFiles(files)
-			.filter(({ source }) => isLspSpawnHeavy(source))
-			.map(({ file }) => relativePosix(repoRoot, file));
+			// readWalkedFiles: a path that vanished between the walk and the read is
+			// out of the population, not a finding (#3082 — this scan was one of the
+			// four rotating ENOENT victims).
+			const candidates = readWalkedFiles(files)
+				.filter(({ source }) => isLspSpawnHeavy(source))
+				.map(({ file }) => relativePosix(repoRoot, file));
 
-		const audit = auditRegistry({
-			sweepName: "lsp-spawn-heavy lane coverage",
-			flagged: candidates,
-			registered: included,
-			exemptions: SPAWN_EXEMPTIONS,
-			minReasonLength: 20,
-			// Calibration: 858 test files scanned on 2026-08-29 (tests/fixtures
-			// excluded); half rounded up is 429, documented floor 430.
-			scannedCount: files.length,
-			minScanned: 430,
-			// Calibration: 20 spawning-test candidates on 2026-09-09 (5 phased,
-			// 15 exempted); half rounded up is 10.
-			minFlagged: 10,
-			remediation:
-				"A test that spawns a real LSP child must run in the lsp-spawn-heavy " +
-				"lane (vitest.config.ts lspSpawnHeavyInclude) or carry a documented " +
-				"exemption in this file, or it shares the default project's fork storm " +
-				"and can starve its own handshake/diagnostics budget without any gate.",
-		});
+			const audit = auditRegistry({
+				sweepName: "lsp-spawn-heavy lane coverage",
+				flagged: candidates,
+				registered: included,
+				exemptions: SPAWN_EXEMPTIONS,
+				minReasonLength: 20,
+				// Calibration: 858 test files scanned on 2026-08-29 (tests/fixtures
+				// excluded); half rounded up is 429, documented floor 430.
+				scannedCount: files.length,
+				minScanned: 430,
+				// Calibration: 20 spawning-test candidates on 2026-09-09 (5 phased,
+				// 15 exempted); half rounded up is 10.
+				minFlagged: 10,
+				remediation:
+					"A test that spawns a real LSP child must run in the lsp-spawn-heavy " +
+					"lane (vitest.config.ts lspSpawnHeavyInclude) or carry a documented " +
+					"exemption in this file, or it shares the default project's fork storm " +
+					"and can starve its own handshake/diagnostics budget without any gate.",
+			});
 
-		expect(audit.problems, audit.problems.join("\n")).toEqual([]);
+			expect(audit.problems, audit.problems.join("\n")).toEqual([]);
 
-		// Reverse check: a renamed or deleted member must not leave a dead glob
-		// behind — the lane silently stops phasing anything at all.
-		const dead = included.filter(
-			(file) => !fs.existsSync(path.join(repoRoot, file)),
-		);
-		expect(dead, "lspSpawnHeavyInclude entries must exist on disk").toEqual([]);
-	});
+			// Reverse check: a renamed or deleted member must not leave a dead glob
+			// behind — the lane silently stops phasing anything at all.
+			const dead = included.filter(
+				(file) => !fs.existsSync(path.join(repoRoot, file)),
+			);
+			expect(dead, "lspSpawnHeavyInclude entries must exist on disk").toEqual(
+				[],
+			);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });

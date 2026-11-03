@@ -19,7 +19,7 @@
  * unknown one fails rather than being skipped, which is what makes "advertise a
  * new capability with no sender" red.
  *
- * Detector policy (AGENTS.md "detectors match code, not prose"): the needle IS
+ * Detector policy (docs/engineering-principles.md "Detectors match code, not prose"): the needle IS
  * a string literal — the wire method name — so the scan keeps strings and
  * blanks COMMENTS (`stripSource(..., { strings: "keep" })`). A comment or a
  * doc-block quoting `"textDocument/didSave"` therefore cannot satisfy the
@@ -36,6 +36,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const PRODUCTION_ROOTS = ["clients", "tools", "mcp"];
@@ -112,6 +113,10 @@ const DISPOSITIONS: Record<string, Disposition> = {
 	"workspace.fileOperations.didRename": {
 		kind: "sends",
 		method: "workspace/didRenameFiles",
+	},
+	"workspace.fileOperations.didCreate": {
+		kind: "sends",
+		method: "workspace/didCreateFiles",
 	},
 
 	"textDocument.synchronization.dynamicRegistration": {
@@ -283,17 +288,21 @@ describe("advertised LSP client capabilities have senders (#3405)", () => {
 	const paths = advertisedPaths(CLIENT_CAPABILITIES);
 	const code = productionCode();
 
-	it("scans a non-empty population on both axes", () => {
-		// The declared floor every sweep owes (sweep-kit's own idiom, which
-		// `tests/config/sweep-floor-coverage.test.ts` is the meta-sweep for): an
-		// empty walk on either axis would make every assertion below vacuously
-		// true. Calibration MEASURED on 2026-09-25 by this test's own walk: 33
-		// advertised capability paths, 482 production source files. The floors are
-		// half of each, rounded down — recalibrate by reading a re-run's numbers,
-		// never by copying a figure out of this comment.
-		assertNonEmptyScan("advertised capability paths", paths.length, 16);
-		assertNonEmptyScan("production source files", code.size, 240);
-	});
+	it(
+		"scans a non-empty population on both axes",
+		() => {
+			// The declared floor every sweep owes (sweep-kit's own idiom, which
+			// `tests/config/sweep-floor-coverage.test.ts` is the meta-sweep for): an
+			// empty walk on either axis would make every assertion below vacuously
+			// true. Calibration MEASURED on 2026-09-25 by this test's own walk: 33
+			// advertised capability paths, 482 production source files. The floors are
+			// half of each, rounded down — recalibrate by reading a re-run's numbers,
+			// never by copying a figure out of this comment.
+			assertNonEmptyScan("advertised capability paths", paths.length, 16);
+			assertNonEmptyScan("production source files", code.size, 240);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("gives every advertised capability a disposition", () => {
 		const undisposed = paths.filter((p) => !DISPOSITIONS[p]);
@@ -306,22 +315,26 @@ describe("advertised LSP client capabilities have senders (#3405)", () => {
 		).toEqual([]);
 	});
 
-	it("finds a real sender or handler for every method a capability implies", () => {
-		const missing: string[] = [];
-		for (const capabilityPath of paths) {
-			const disposition = DISPOSITIONS[capabilityPath];
-			if (disposition?.kind !== "sends" && disposition?.kind !== "consumes") {
-				continue;
+	it(
+		"finds a real sender or handler for every method a capability implies",
+		() => {
+			const missing: string[] = [];
+			for (const capabilityPath of paths) {
+				const disposition = DISPOSITIONS[capabilityPath];
+				if (disposition?.kind !== "sends" && disposition?.kind !== "consumes") {
+					continue;
+				}
+				const needle = `"${disposition.method}"`;
+				const found = [...code].some(([, source]) => source.includes(needle));
+				if (!found) missing.push(`${capabilityPath} -> ${disposition.method}`);
 			}
-			const needle = `"${disposition.method}"`;
-			const found = [...code].some(([, source]) => source.includes(needle));
-			if (!found) missing.push(`${capabilityPath} -> ${disposition.method}`);
-		}
-		expect(
-			missing,
-			`advertised with no sender in clients/, tools/ or mcp/: ${missing.join(", ")}`,
-		).toEqual([]);
-	});
+			expect(
+				missing,
+				`advertised with no sender in clients/, tools/ or mcp/: ${missing.join(", ")}`,
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("keeps the admitted-without-sender set to the one reasoned member", () => {
 		// An admission is a claim the reviewer reads, so the SET is pinned, not

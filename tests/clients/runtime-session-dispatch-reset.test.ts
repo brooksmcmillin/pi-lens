@@ -16,7 +16,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { safeSpawnAsync } from "../../clients/safe-spawn.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 vi.mock("../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 1 })),
@@ -33,16 +35,6 @@ vi.mock("../../clients/installer/index.js", () => ({
 	// noteInstallFailure/suppression lives.
 	isSpawnableCommand: vi.fn(async () => false),
 	resetPathWalkMemo: vi.fn(),
-}));
-
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
 function makeDefaultRuntime() {
@@ -113,7 +105,11 @@ function makeDeps(ctxCwd: string) {
 describe("dispatch availability suppression is reset at session start (#1266)", () => {
 	let tmpDir: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// The real config loader walks up from the session cwd to HOME (#4709);
+		// a pinned fixture HOME keeps that read off the maintainer's home.
+		pinFixtureHome("runtime-session-dispatch-reset");
+		await installLspServiceDouble();
 		vi.clearAllMocks();
 		// Recurrence (#4561, shuffle seed 424): `clearAllMocks()` clears calls,
 		// not implementations, so a case's stubbed probe answers (and its send
@@ -124,6 +120,7 @@ describe("dispatch availability suppression is reset at session start (#1266)", 
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		removeTempDirSync(tmpDir);
 		// #4560: the formatter-reprobe cell creates `${tmpDir}-next` at the tmp
 		// root; a sibling the file made is the file's to remove.

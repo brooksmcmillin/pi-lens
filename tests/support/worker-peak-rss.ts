@@ -63,10 +63,23 @@ export function peakRssProblem(
 	file: string,
 	peakRssMb: number,
 	admissions: Readonly<Record<string, PeakRssAdmission>> = PEAK_RSS_ADMISSIONS,
+	ceilingMb?: number,
 ): string | undefined {
 	const admitted = admissions[file];
-	const ceiling = admitted?.peakRssMb ?? WORKER_PEAK_RSS_BUDGET_MB;
+	// A per-file ceiling only tightens: `Math.min` keeps it from being an
+	// admission under another name.
+	const ceiling =
+		admitted?.peakRssMb ??
+		Math.min(ceilingMb ?? WORKER_PEAK_RSS_BUDGET_MB, WORKER_PEAK_RSS_BUDGET_MB);
 	if (peakRssMb <= ceiling) return undefined;
+	// #4736: a file that pins a TIGHTER ceiling than the shared budget names
+	// its own number; it is not an admission and never raises anything.
+	if (
+		!admitted &&
+		ceilingMb !== undefined &&
+		ceilingMb < WORKER_PEAK_RSS_BUDGET_MB
+	)
+		return `${file} peaked at ${peakRssMb} MB, over its own ${ceilingMb} MB ceiling (tighter than the ${WORKER_PEAK_RSS_BUDGET_MB} MB per-worker budget). Cut the file's footprint; a native-tree walk must turn the event loop between files.`;
 	return admitted
 		? `${file} peaked at ${peakRssMb} MB, above its admitted ${admitted.peakRssMb} MB ceiling in tests/support/worker-peak-rss.ts. An admission is a measured number, not a licence to grow: bring the file back down, or re-measure and raise the entry with its reason.`
 		: `${file} peaked at ${peakRssMb} MB, over the ${WORKER_PEAK_RSS_BUDGET_MB} MB per-worker budget that scripts/lib/worker-budget.mjs divides the runner's memory by to pick maxWorkers (#3058). Cut the file's footprint, or add a measured admission with a reason to tests/support/worker-peak-rss.ts.`;
@@ -111,6 +124,22 @@ export interface PeakRssReport {
 	write: (line: string) => void;
 	platform?: NodeJS.Platform;
 	admissions?: Readonly<Record<string, PeakRssAdmission>>;
+	/**
+	 * #4736: a ceiling BELOW the shared budget that a file pins for itself. It
+	 * rides the same linux-only enforcement as the budget; it is not an
+	 * admission and never raises a ceiling.
+	 */
+	ceilingMb?: number;
+}
+
+/**
+ * This fork's peak RSS in MB: the one unit conversion behind every
+ * `[mem-file]` record and every ceiling check. `maxRSS` is kilobytes on linux
+ * and win32 (libuv normalizes the latter); darwin reports bytes, which is why
+ * enforcement stays linux-only in {@link reportPeakRss}.
+ */
+export function currentPeakRssMb(): number {
+	return Math.round(process.resourceUsage().maxRSS / 1024);
 }
 
 /**
@@ -138,6 +167,11 @@ export function reportPeakRss(report: PeakRssReport): void {
 	if ((report.platform ?? process.platform) !== "linux") return;
 	const warning = peakRssHeadroomWarning(file, peakRssMb, report.admissions);
 	if (warning) write(warning);
-	const problem = peakRssProblem(file, peakRssMb, report.admissions);
+	const problem = peakRssProblem(
+		file,
+		peakRssMb,
+		report.admissions,
+		report.ceilingMb,
+	);
 	if (problem) throw new Error(problem);
 }

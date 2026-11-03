@@ -67,9 +67,16 @@
 		"tests/mcp/session-end.smoke.test.ts",
 		"tests/clients/*.test.ts",
 		"tests/clients/**/*.test.ts",
+		// #2050: the top-level real-host witnesses (a real linked worktree, a
+		// real pi session) are wall-clock lane members, so the lane coverage
+		// gate (#2837) requires them as entries too.
+		"tests/index-*.test.ts",
 		// #4583: a tools test is a wall-clock lane member now, and the lane
 		// coverage gate (#2837) requires every member to be a knip entry.
 		"tests/tools/*.test.ts",
+		// #5146: the pi-mock root-hook witness is a serialized wall-clock lane
+		// member and must remain visible to Knip as a direct test entry.
+		"tests/support/pi-mock.test.ts",
 		"tests/scripts/*.test.ts"
 		// tools/*.ts and vitest's setupFiles are NOT listed here: both are
 		// already reached without help — tools/*.ts via index.ts's and
@@ -120,7 +127,7 @@
 		// knip's stryker plugin infers a separate @stryker-mutator/command-runner
 		// package from `testRunner: "command"` that does not exist.
 		"@stryker-mutator/command-runner",
-		// jscpd (#2706, lint.yml "jscpd (advisory)") is a pinned devDependency
+		// jscpd (#2706, a step of lint.yml "Lint (advisory)") is a pinned devDependency
 		// spawned by path (`node_modules/.bin/jscpd`) from the workflow step and
 		// never imported, so knip cannot credit it.
 		"jscpd",
@@ -186,6 +193,11 @@
 		// row) -- system tools, never npm packages, so no dependency could
 		// provide them. The case skips when the toolchain is absent.
 		"elan",
-		"lake"
+		"lake",
+		// tests/clients/ruff-target-version-real.test.ts (#4638) runs the real
+		// `ruff` binary in the production autofix path: docs/dependencies.md's
+		// PATH row (Python lint/format/autofix, language-default + flow-gated),
+		// never an npm package. The case skips visibly when it is absent.
+		"ruff"
 	]
 }

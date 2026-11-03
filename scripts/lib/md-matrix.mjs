@@ -38,6 +38,12 @@ export const MEASURED_CLEAN_BEHAVIORS = new Set([
 ]);
 
 /**
+ * The matrix `first-publish` values that are a measurement (#4512). `unknown`,
+ * `n/a (pull)` and `TBD` are not, so they never read as a missed probe.
+ */
+export const MEASURED_FIRST_PUBLISHES = new Set(["direct", "empty-first"]);
+
+/**
  * Parse a GitHub-flavoured Markdown table into { header, aligns, rows } where
  * rows is an array of cell-string arrays. Only the FIRST table after `afterLine`
  * (a line whose text includes the marker) is parsed. Returns null if not found.
@@ -526,18 +532,18 @@ export function mergeServerCapabilitiesDoc(priorText, freshText) {
 // Two bounded rules fix that, and both need a per-cell observation memory that
 // outlives one nightly run:
 //
-//  - EXPIRY (first-publish, DATE-based): a `direct` cell whose axis the probe
-//    does not re-observe is stamped once with `firstMissed` (a UTC date) and
-//    degrades to `unknown` once `FIRST_PUBLISH_EXPIRY_DAYS` have elapsed. Only
-//    `direct` is in the population: `empty-first` backs live
-//    `emptyFirstPublish` markers, so expiring it would erase the measurement
-//    behind a marker while the first-publish census stays green. #4615 closes
-//    the other half of that exception: an `empty-first` cell the probe no
-//    longer observes is stamped with the same `firstMissed` clock (never
-//    expired, never slid), so the census can require the cell's evidence to be
-//    current instead of letting the marker/cell pair outlive the instrument
-//    that produced it — the #3310 blindness in the direction that never
-//    expires.
+//  - STALENESS (first-publish and clean-behavior, DATE-based): a measured cell
+//    whose axis the probe does not re-observe KEEPS its last known value and is
+//    marked `stale` with the date of the first miss (#4512). It is never
+//    rewritten to `unknown`: the pre-#4512 expiry turned five `direct` cells
+//    into `unknown` in the #4338 refresh, erasing the last known value, and
+//    nothing raised it. A refresh counts the consecutive nightly misses per
+//    lang and RAISES a lang at `MISSED_PROBE_RAISE_RUNS` (the nightly files one
+//    tracking issue for the raised set). `empty-first` cells back live
+//    `emptyFirstPublish` markers; #4615 stamps their first unobserved night with
+//    the same `firstMissed` clock and the first-publish census reds once that
+//    stamp is `FIRST_PUBLISH_EXPIRY_DAYS` old, so the cell+marker pair cannot
+//    outlive the instrument that produced it — the #3310 blindness.
 //  - HYSTERESIS (clean-behavior/tier, run-based): a change is written only after
 //    `TIER_CHANGE_AGREE_RUNS` consecutive runs observe the same new value, so a
 //    single flapping run (ast-grep 2 -> 2* -> 3 -> 2* across four nightlies)
@@ -553,13 +559,54 @@ export function mergeServerCapabilitiesDoc(priorText, freshText) {
 // ---------------------------------------------------------------------------
 
 /**
- * #3401: elapsed days after the first miss before a `direct` `first-publish`
- * cell degrades to `unknown`. Five days is long enough that a transient runner
- * or toolchain gap does not erase a dev-box measurement, and short enough that
- * a dead cell cannot outlive the instrument that produced it (#3310's lesson).
+ * #4615: elapsed days after which a marker-backed `empty-first` cell's first
+ * miss stamp reds the first-publish census (tests/config/lsp-first-publish-
+ * census.test.ts). Since #4512 no cell is ever expired to `unknown` by the
+ * refresh: a missed probe keeps the last known value and marks it stale.
  * Elapsed calendar days, not runs: a skipped nightly cannot stall it.
  */
 export const FIRST_PUBLISH_EXPIRY_DAYS = 5;
+
+/**
+ * #4512: consecutive nightly misses after which a stale cell is RAISED (the
+ * nightly files it on one tracking issue). One miss is a transient runner or
+ * toolchain gap and stays quiet; two consecutive nights are a pattern.
+ */
+export const MISSED_PROBE_RAISE_RUNS = 2;
+
+/**
+ * #4512: the probe-owned columns a row may be stale in, plus the per-row
+ * provenance the matrix gained: `version` (what the server reported) and
+ * `install` (how pi-lens got it). Appended to an older doc by
+ * `ensureMatrixColumns`; an unmeasured cell is `—`.
+ */
+export const MATRIX_ADDED_COLUMNS = ["version", "install", "stale"];
+
+const MATRIX_EMPTY_CELL = "—";
+
+/**
+ * #4512: give a matrix doc that predates the `version`/`install`/`stale`
+ * columns those columns, every existing row carrying `—`. Idempotent: a doc
+ * that has them is returned unchanged. Returns `text` untouched when the table
+ * is not found (the caller reports that on its own).
+ *
+ * @param {string} text
+ * @param {string} [marker]
+ * @returns {string}
+ */
+export function ensureMatrixColumns(text, marker = "| lang | server |") {
+	const tbl = parseTable(text, marker);
+	if (!tbl) return text;
+	const missing = MATRIX_ADDED_COLUMNS.filter((c) => !tbl.header.includes(c));
+	if (missing.length === 0) return text;
+	const header = [...tbl.header, ...missing];
+	const sep = `|${header.map(() => "---").join("|")}|`;
+	const rows = tbl.rows.map((cells) => [
+		...cells,
+		...missing.map(() => MATRIX_EMPTY_CELL),
+	]);
+	return replaceTable(text, marker, header, sep, rows) ?? text;
+}
 
 /**
  * #3401: consecutive agreeing runs before a `clean-behavior`/`tier` change is
@@ -567,9 +614,6 @@ export const FIRST_PUBLISH_EXPIRY_DAYS = 5;
  * two agreeing nights commit.
  */
 export const TIER_CHANGE_AGREE_RUNS = 2;
-
-/** The one first-publish class the expiry may retire (see the block above). */
-const EXPIRABLE_FIRST_PUBLISH = "direct";
 
 /**
  * Advance one confirmed class through the shared consecutive-observation
@@ -650,6 +694,44 @@ export function parseRefreshState(text) {
 	} catch {
 		return {};
 	}
+}
+
+/** The refresh-state key holding the missed-probe streaks (#4512). */
+export const MISSED_PROBE_KEY = "missed-probe";
+
+/**
+ * #4512: the axes a measured cell can be missed on. One streak per lang and
+ * axis, so a clean-behavior miss on one night and a first-publish miss on the
+ * next are two first misses, never one consecutive pair.
+ */
+const MISSED_PROBE_AXES = ["clean-behavior", "first-publish"];
+
+/**
+ * #4512: keep only well-formed missed-probe streaks, `{ [lang]: { [axis]:
+ * { since, last, misses } } }`: `since` the UTC day of the axis's first miss,
+ * `last` the UTC day the streak was last advanced, `misses` the count of
+ * distinct nightly misses. A hand-edited or old block (the single per-lang
+ * streak this key briefly held before it shipped) cannot carry garbage into the
+ * section: a lang with no well-formed axis is dropped.
+ */
+function sanitizeMissedProbeState(map) {
+	const out = {};
+	if (!map || typeof map !== "object") return out;
+	for (const lang of Object.keys(map).sort(compareStableStrings)) {
+		const axes = {};
+		for (const axis of MISSED_PROBE_AXES) {
+			const e = map[lang]?.[axis];
+			if (
+				isUtcDay(e?.since) &&
+				isUtcDay(e?.last) &&
+				Number.isInteger(e?.misses) &&
+				e.misses > 0
+			)
+				axes[axis] = { since: e.since, last: e.last, misses: e.misses };
+		}
+		if (Object.keys(axes).length) out[lang] = axes;
+	}
+	return out;
 }
 
 /** The refresh-state key holding the idle-eviction promotion bookkeeping (#3989). */
@@ -738,19 +820,22 @@ function renderRefreshStateSection(state) {
 		}
 	}
 	const idleEviction = sanitizeIdleEvictionState(state?.[IDLE_EVICTION_KEY]);
+	const missedProbe = sanitizeMissedProbeState(state?.[MISSED_PROBE_KEY]);
 	const payload = {};
 	if (Object.keys(cleanBehavior).length)
 		payload["clean-behavior"] = cleanBehavior;
 	if (Object.keys(firstPublish).length) payload["first-publish"] = firstPublish;
 	if (Object.keys(idleEviction).length)
 		payload[IDLE_EVICTION_KEY] = idleEviction;
+	if (Object.keys(missedProbe).length) payload[MISSED_PROBE_KEY] = missedProbe;
 	if (Object.keys(payload).length === 0) return [];
 	return [
 		REFRESH_STATE_HEADING,
 		"",
 		"Bookkeeping for the two-run `first-publish`/`clean-behavior` hysteresis, the",
-		"date-based `direct` expiry (#3401) and consecutive-night `idle-eviction`",
-		"counts (#3989). Regenerated every run; never a measurement.",
+		"first-miss stamps (#3401, #4615), the consecutive-night `missed-probe`",
+		"streaks behind the `stale` column (#4512) and consecutive-night",
+		"`idle-eviction` counts (#3989). Regenerated every run; never a measurement.",
 		"",
 		REFRESH_STATE_FENCE,
 		JSON.stringify(payload),
@@ -763,7 +848,7 @@ function renderRefreshStateSection(state) {
  * after the generated drift footnote keeps the drift writer's own "up to the
  * next `## ` heading" scan from swallowing it.
  */
-function replaceRefreshStateSection(text, section) {
+export function replaceRefreshStateSection(text, section) {
 	const lines = String(text).split("\n");
 	const headingIdx = lines.findIndex(
 		(l) => l.trim() === REFRESH_STATE_HEADING.trim(),
@@ -786,19 +871,19 @@ function replaceRefreshStateSection(text, section) {
 }
 
 /**
- * Refresh docs/lsp-capability-matrix.md from one probe run, applying the two
- * #3401 staleness guards. Text in, text out (plus counts) so the nightly's real
+ * Refresh docs/lsp-capability-matrix.md from one probe run, applying the
+ * #3401 hysteresis and the #4512 stale marking. Text in, text out (plus counts) so the nightly's real
  * refresh entry is testable with recorded run inputs and no LSP spawn.
  *
  * @param {string} text  the current doc
  * @param {Array<{ lang: string, firstPublish?: string | null, cleanBehavior?: string | null, tier?: string | null }>} observations
  *   this run's comparable observations, already resolved onto target langs by
  *   the caller (a non-comparable axis is `null`)
- * @param {{ src?: string, marker?: string, agreeRuns?: number, expireDays?: number, now?: Date | number | string, probedLangs?: Iterable<string> }} [opts]
+ * @param {{ src?: string, marker?: string, agreeRuns?: number, now?: Date | number | string, probedLangs?: Iterable<string> }} [opts]
  *   `now` is the injected clock (default: the real one); `probedLangs` scopes a
  *   subset probe: a lang outside it keeps its bookkeeping untouched. Omitted
  *   means a full run.
- * @returns {{ text: string, changed: boolean, reason?: string, expired: number, pending: number, committed: number, expiredLangs: string[], pendingLangs: string[], committedLangs: string[] }}
+ * @returns {{ text: string, changed: boolean, reason?: string, pending: number, committed: number, pendingLangs: string[], committedLangs: string[], staleLangs: string[], raisedLangs: string[] }}
  */
 export function refreshCapabilityMatrix(text, observations, opts = {}) {
 	const marker = opts.marker ?? "| lang | server |";
@@ -807,29 +892,33 @@ export function refreshCapabilityMatrix(text, observations, opts = {}) {
 		1,
 		Number(opts.agreeRuns ?? TIER_CHANGE_AGREE_RUNS),
 	);
-	const expireDays = Math.max(
+	const raiseRuns = Math.max(
 		1,
-		Number(opts.expireDays ?? FIRST_PUBLISH_EXPIRY_DAYS),
+		Number(opts.raiseRuns ?? MISSED_PROBE_RAISE_RUNS),
 	);
 	const today = utcDay(opts.now ?? new Date());
 	const probed = opts.probedLangs ? new Set(opts.probedLangs) : null;
-	const tbl = parseTable(text, marker);
-	if (!tbl) {
+	if (!parseTable(text, marker)) {
 		return {
 			text,
 			changed: false,
 			reason: "capability table not found in doc",
-			expired: 0,
 			pending: 0,
 			committed: 0,
-			expiredLangs: [],
 			pendingLangs: [],
 			committedLangs: [],
+			staleLangs: [],
+			raisedLangs: [],
 		};
 	}
+	// #4512: an older doc gains the version/install/stale columns here, so the
+	// first refresh after the change writes them without a hand edit.
+	const migrated = ensureMatrixColumns(text, marker);
+	const tbl = parseTable(migrated, marker);
 	const idx = (name) => tbl.header.indexOf(name);
 	const langIdx = idx("lang");
 	const srcIdx = idx("src");
+	const staleIdx = idx("stale");
 	const fpIdx = idx("first-publish");
 	const cbIdx = idx("clean-behavior");
 	const tierIdx = idx("tier");
@@ -837,14 +926,17 @@ export function refreshCapabilityMatrix(text, observations, opts = {}) {
 	const prior = parseRefreshState(text);
 	const priorFp = prior["first-publish"] ?? {};
 	const priorCb = prior["clean-behavior"] ?? {};
+	const priorMissed = sanitizeMissedProbeState(prior[MISSED_PROBE_KEY]);
 	const nextState = {
 		"first-publish": {},
 		"clean-behavior": {},
+		[MISSED_PROBE_KEY]: {},
 		// The idle-eviction bookkeeping belongs to its own nightly step; this
 		// refresh must carry it through, not drop it (#3989).
 		[IDLE_EVICTION_KEY]: prior[IDLE_EVICTION_KEY],
 	};
-	const expiredLangs = [];
+	const staleLangs = [];
+	const raisedLangs = [];
 	const pendingLangs = [];
 	const committedLangs = [];
 	const measured = [];
@@ -854,21 +946,24 @@ export function refreshCapabilityMatrix(text, observations, opts = {}) {
 		const cell = { lang };
 		if (probed && !probed.has(lang)) {
 			// A subset probe says nothing about this lang: neither advance nor drop
-			// its bookkeeping (a one-lang dev run must not tick or expire cells).
+			// its bookkeeping (a one-lang dev run must not advance a stale streak or tick a hold).
 			if (priorFp[lang]) nextState["first-publish"][lang] = priorFp[lang];
 			if (priorCb[lang]) nextState["clean-behavior"][lang] = priorCb[lang];
+			if (priorMissed[lang])
+				nextState[MISSED_PROBE_KEY][lang] = priorMissed[lang];
 			measured.push(cell);
 			continue;
 		}
 		if (observed)
 			cell.src = mergeSrc(srcIdx >= 0 ? (cells[srcIdx] ?? "") : "", src);
 		// first-publish: hold a changed comparable class until two consecutive
-		// observations agree, just like clean-behavior. A `direct` cell the probe
-		// no longer observes is stamped with its first miss and, once `expireDays`
-		// have elapsed, expired.
+		// observations agree, just like clean-behavior. A cell the probe no longer
+		// observes keeps its last known value (#4512) and is stamped once with its
+		// first miss (`firstMissed`, never slid); the `stale` column below marks it.
 		const observedFp = observed?.firstPublish ?? null;
 		const currentFp = fpIdx >= 0 ? cells[fpIdx] : "";
-		if (observedFp === "direct" || observedFp === "empty-first") {
+		const fpObserved = MEASURED_FIRST_PUBLISHES.has(observedFp);
+		if (fpObserved) {
 			const held = priorFp[lang];
 			const advanced = advancePendingClass(
 				currentFp,
@@ -888,34 +983,15 @@ export function refreshCapabilityMatrix(text, observations, opts = {}) {
 				};
 				pendingLangs.push(lang);
 			}
-		} else if (currentFp === EXPIRABLE_FIRST_PUBLISH) {
-			// A missing, garbage or future stamp restarts the clock today.
+		} else if (MEASURED_FIRST_PUBLISHES.has(currentFp)) {
+			// A missing, garbage or future stamp restarts the clock today. The
+			// stamp is the #4615 census's evidence for a marker-backed
+			// `empty-first` cell, and the `stale` date for a `direct` one.
 			const elapsed = elapsedDays(priorFp[lang]?.firstMissed, today);
-			if (elapsed !== null && elapsed >= 0) {
-				if (elapsed >= expireDays) {
-					cell["first-publish"] = "unknown";
-					expiredLangs.push(lang);
-				} else {
-					nextState["first-publish"][lang] = priorFp[lang];
-				}
-			} else {
-				nextState["first-publish"][lang] = { firstMissed: today };
-			}
-		} else if (currentFp === "empty-first") {
-			// #4615: an `empty-first` cell is never expired — it backs a live
-			// `emptyFirstPublish` marker — but the same rule made the pair immortal:
-			// a probe that stopped observing this axis left the cell standing with
-			// nothing behind it, which is the #3310 dead-instrument failure again in
-			// the direction that never expires. Stamp the FIRST unobserved night once
-			// (never slid) exactly as a `direct` miss does; the census reds when a
-			// marker-backed `empty-first` cell's stamp is `FIRST_PUBLISH_EXPIRY_DAYS`
-			// old, so the cell outlives nothing it cannot re-measure.
-			const elapsed = elapsedDays(priorFp[lang]?.firstMissed, today);
-			if (elapsed !== null && elapsed >= 0) {
-				nextState["first-publish"][lang] = priorFp[lang];
-			} else {
-				nextState["first-publish"][lang] = { firstMissed: today };
-			}
+			nextState["first-publish"][lang] =
+				elapsed !== null && elapsed >= 0
+					? priorFp[lang]
+					: { firstMissed: today };
 		}
 		// clean-behavior/tier: hold a change until `agreeRuns` runs agree.
 		const observedCb = observed?.cleanBehavior ?? null;
@@ -950,6 +1026,36 @@ export function refreshCapabilityMatrix(text, observations, opts = {}) {
 				}
 			}
 		}
+		// #4512: a measured cell the probe did not re-observe tonight is STALE.
+		// The streak counts distinct nightly misses (a same-day rerun does not
+		// advance it) and ends the night an axis is observed again.
+		const missedAxes = {
+			"clean-behavior":
+				MEASURED_CLEAN_BEHAVIORS.has(cbIdx >= 0 ? cells[cbIdx] : "") &&
+				!observed?.cleanBehavior,
+			"first-publish": MEASURED_FIRST_PUBLISHES.has(currentFp) && !fpObserved,
+		};
+		const streaks = {};
+		for (const axis of MISSED_PROBE_AXES) {
+			if (!missedAxes[axis]) continue;
+			const held = priorMissed[lang]?.[axis];
+			streaks[axis] = held
+				? {
+						since: held.since,
+						last: today,
+						misses: held.last === today ? held.misses : held.misses + 1,
+					}
+				: { since: today, last: today, misses: 1 };
+		}
+		const missed = Object.values(streaks);
+		if (missed.length) {
+			nextState[MISSED_PROBE_KEY][lang] = streaks;
+			cell.stale = `since ${missed.map((x) => x.since).sort(compareStableStrings)[0]}`;
+			staleLangs.push(lang);
+			if (missed.some((x) => x.misses >= raiseRuns)) raisedLangs.push(lang);
+		} else if (staleIdx >= 0 && cells[staleIdx] !== MATRIX_EMPTY_CELL) {
+			cell.stale = MATRIX_EMPTY_CELL;
+		}
 		measured.push(cell);
 	}
 	const merged = mergeRows(tbl.rows, tbl.header, measured, "lang", [
@@ -957,21 +1063,126 @@ export function refreshCapabilityMatrix(text, observations, opts = {}) {
 		"first-publish",
 		"tier",
 		"src",
+		"stale",
 	]);
 	// `replaceTable` only returns null for a table `parseTable` cannot find, and
 	// this same text and marker were parsed above.
 	const out = replaceRefreshStateSection(
-		replaceTable(text, marker, tbl.header, tbl.sep, merged),
+		replaceTable(migrated, marker, tbl.header, tbl.sep, merged),
 		renderRefreshStateSection(nextState),
 	);
 	return {
 		text: out,
 		changed: out !== text,
-		expired: expiredLangs.length,
 		pending: pendingLangs.length,
 		committed: committedLangs.length,
-		expiredLangs,
 		pendingLangs,
 		committedLangs,
+		staleLangs,
+		raisedLangs,
+	};
+}
+
+/**
+ * #4512: the raised stale cells of a refreshed doc, for the tracking issue.
+ * Reads each raised lang's row and its missed-probe streak from the refreshed
+ * text, so the issue shows the last known values the matrix is still holding.
+ *
+ * @param {string} text  the refreshed doc
+ * @param {Iterable<string>} raisedLangs
+ * @param {string} [marker]
+ * @returns {Array<{ lang: string, server: string, cleanBehavior: string, firstPublish: string, since: string, misses: number }>}
+ */
+export function describeRaisedCells(
+	text,
+	raisedLangs,
+	marker = "| lang | server |",
+) {
+	const tbl = parseTable(text, marker);
+	if (!tbl) return [];
+	const col = (name) => tbl.header.indexOf(name);
+	const streaks = sanitizeMissedProbeState(
+		parseRefreshState(text)[MISSED_PROBE_KEY],
+	);
+	const out = [];
+	for (const lang of raisedLangs) {
+		const cells = tbl.rows.find((c) => c[col("lang")] === lang);
+		// The axis missed the most nights in a row is the one that raised the lang.
+		const streak = Object.values(streaks[lang] ?? {}).sort(
+			(a, b) => b.misses - a.misses,
+		)[0];
+		if (!cells || !streak) continue;
+		out.push({
+			lang,
+			server: cells[col("server")] ?? "",
+			cleanBehavior: cells[col("clean-behavior")] ?? "",
+			firstPublish: cells[col("first-publish")] ?? "",
+			since: streak.since,
+			misses: streak.misses,
+		});
+	}
+	return out;
+}
+
+/**
+ * Merge one characterize-lsp run into the capability matrix: the measured
+ * `mode` (and the Tier 1 for a pull server) plus the #4512 provenance
+ * (`version`, `install`). MERGE, don't overwrite: a row this run could not
+ * measure keeps its prior value (#390), and a row absent from the doc is never
+ * appended (the matrix is curated). Rows whose mode came back
+ * `unknown`/`no-lsp`/error are not written, but their provenance still is: a
+ * server that did not answer still ran some version of some install.
+ *
+ * @param {string} text  the current doc
+ * @param {Array<{ lang: string, mode: string }>} rows  this run's mode rows
+ * @param {Map<string, { install: string, version?: string }>} provenance  by lang
+ * @param {string} src  `ci` or `dev`
+ * @param {string} [marker]
+ * @returns {{ text: string, measured: number, rows: number } | null}  `null` when the table is not found
+ */
+export function mergeCharacterization(
+	text,
+	rows,
+	provenance,
+	src,
+	marker = "| lang | server |",
+) {
+	const migrated = ensureMatrixColumns(text, marker);
+	const tbl = parseTable(migrated, marker);
+	if (!tbl) return null;
+	const keyIdx = tbl.header.indexOf("lang");
+	const srcIdx = tbl.header.indexOf("src");
+	const existingByLang = new Map(tbl.rows.map((c) => [c[keyIdx], c]));
+	// Only rows we actually measured a mode for (pull/push-only) are authoritative.
+	// pull => Tier 1 by protocol; push-only tier is decided by the clean-behavior
+	// probe, so `tier` stays untouched for push rows (don't clobber a probed value).
+	const cells = new Map();
+	for (const r of rows) {
+		if (r.mode !== "pull" && r.mode !== "push-only") continue;
+		const cell = { lang: r.lang, mode: r.mode };
+		if (r.mode === "pull") cell.tier = "1";
+		const prior = existingByLang.get(r.lang);
+		cell.src = mergeSrc(prior ? prior[srcIdx] : "", src);
+		cells.set(r.lang, cell);
+	}
+	const measured = cells.size;
+	for (const [lang, p] of provenance) {
+		const cell = cells.get(lang) ?? { lang };
+		cell.install = p.install;
+		if (p.version) cell.version = p.version;
+		cells.set(lang, cell);
+	}
+	const merged = mergeRows(
+		tbl.rows,
+		tbl.header,
+		[...cells.values()],
+		"lang",
+		["mode", "tier", "src", "version", "install"],
+		{ updateOnly: true },
+	);
+	return {
+		text: replaceTable(migrated, marker, tbl.header, tbl.sep, merged) ?? text,
+		measured,
+		rows: tbl.rows.length,
 	};
 }

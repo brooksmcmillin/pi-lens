@@ -7,6 +7,7 @@ import {
 	type AdvisoryProvenance,
 } from "./advisory-provenance.js";
 import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapters/runner-findings.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	translateGuidanceToolNames,
@@ -81,18 +82,62 @@ function turnEndMessage(
 	};
 }
 
-/** Read a turn-end finding without changing its durable delivery state. */
+/**
+ * #4943: the reader the staged turn-end message is for, or undefined when it
+ * is this reader's. One comparison per field: `deliverTo` (the composer's
+ * address) against the reader's `address`; without it, the owner `sessionId`
+ * against the reader's `sessionId`; a record that names neither is anyone's.
+ * A pi request passes its session for both. The MCP host passes its one
+ * address for every server process (`deliverTo` must outlive a restart) and
+ * its coordinator id as the owner, reassigned at each session start (advisory
+ * provenance tells a predecessor's findings apart by it). A reader that passes
+ * no session takes every message. A skip records one ledger row per addressee.
+ */
+function addressedElsewhere(
+	data: Partial<TurnEndFindingsCache>,
+	sessionId: string | undefined,
+	address: string | undefined = sessionId,
+): string | undefined {
+	if (sessionId === undefined) return undefined;
+	const addressee =
+		data.deliverTo !== undefined
+			? data.deliverTo === address
+				? undefined
+				: data.deliverTo
+			: data.sessionId !== undefined && data.sessionId !== sessionId
+				? data.sessionId
+				: undefined;
+	if (addressee === undefined) return undefined;
+	// Once per addressee, not per request: every request of the other session
+	// skips the same message until its owner reads it.
+	recordDegradationOnce({
+		kind: "turn-end-delivery-addressed-elsewhere",
+		subject: addressee,
+		reason:
+			"a staged turn-end message is addressed to another session; it waits for that session's next request",
+	});
+	return addressee;
+}
+
+/**
+ * Read a turn-end finding without changing its durable delivery state.
+ * `sessionId` and `address` name the reader (`addressedElsewhere`).
+ */
 export function peekTurnEndFindings(
 	cacheManager: CacheManager,
 	cwd: string,
 	runtime?: RuntimeCoordinator,
 	logDelivery = false,
+	sessionId?: string,
+	address?: string,
 ): ContextResult | undefined {
 	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
 		"turn-end-findings",
 		cwd,
 	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
+	if (addressedElsewhere(findings.data, sessionId, address) !== undefined)
+		return;
 	const validation = validateAdvisoryProvenance(findings.data, cwd, runtime);
 	if (logDelivery)
 		logProvenanceDecision(
@@ -113,16 +158,27 @@ export function peekTurnEndFindings(
 	};
 }
 
+/**
+ * #4943: `sessionId` is the reading request's session, and `address` the
+ * address a message for it carries (`addressedElsewhere`). A message another
+ * session's turn end composed (`deliverTo`), or the blocker text of a record
+ * another session owns, is that session's: the read leaves it untouched for
+ * that session's next request.
+ */
 export function consumeTurnEndFindings(
 	cacheManager: CacheManager,
 	cwd: string,
 	runtime?: RuntimeCoordinator,
+	sessionId?: string,
+	address?: string,
 ): ContextResult | undefined {
 	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
 		"turn-end-findings",
 		cwd,
 	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
+	if (addressedElsewhere(findings.data, sessionId, address) !== undefined)
+		return;
 	const validation = validateAdvisoryProvenance(findings.data, cwd, runtime);
 	logProvenanceDecision(validation, findings.data.provenance, "turn-end", cwd);
 
@@ -260,16 +316,24 @@ export function consumeTestFindings(
 	return findings;
 }
 
-/** Complete an acknowledged MCP delivery without re-validating or re-rendering it. */
+/**
+ * Complete an acknowledged MCP delivery without re-validating or re-rendering
+ * it. #4943: only a message still addressed to the reader that peeked it; one
+ * a pi turn end staged since is left for its session.
+ */
 export function acknowledgeTurnEndFindings(
 	cacheManager: CacheManager,
 	cwd: string,
+	sessionId?: string,
+	address?: string,
 ): void {
 	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
 		"turn-end-findings",
 		cwd,
 	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
+	if (addressedElsewhere(findings.data, sessionId, address) !== undefined)
+		return;
 	if (
 		findings.data.hasBlockers === true &&
 		typeof findings.data.sessionId === "string"

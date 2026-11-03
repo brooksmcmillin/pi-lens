@@ -53,7 +53,15 @@
  * event handlers.
  */
 import { createHash } from "node:crypto";
-import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";
+import {
+	NO_SESSION_KEY,
+	sessionCell,
+	sessionLookupKey,
+} from "./session-scope.js";
+import {
+	recordDegradation,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { lazyEnvNumber } from "./env-utils.js";
 import { logLatency } from "./latency-logger.js";
 import { compareOrdinal } from "./string-utils.js";
@@ -110,8 +118,12 @@ export type CacheContextInjectionHook = "context" | "context_with_system";
 type CacheMissCause =
 	| "ttl-expired"
 	| "prefix-broke"
+	| "tool-set-changed"
+	| "system-prompt-changed"
 	| "partial-eviction"
 	| "model-provider-changed"
+	| "injection-dropped"
+	| "prefix-shrunk"
 	| "unknown";
 
 /** Why a miss could not be assigned a local cause (#1996). */
@@ -258,8 +270,6 @@ interface SessionAttributionState {
 	 * cannot inherit an earlier turn's request timestamp.
 	 */
 	lastContextAtMs?: number;
-	/** Previous record's `cacheRead`, the baseline a shortfall is measured against. */
-	lastCacheRead?: number;
 	/** A `cache_prefix_break` CHANGE fired since the previous usage record. */
 	prefixBrokeSinceLastUsage: boolean;
 	/** A prefix baseline or unchanged observation was seen since the usage record. */
@@ -268,6 +278,41 @@ interface SessionAttributionState {
 	sequenceHashTruncatedSinceLastUsage: boolean;
 	/** Request hashing encountered cycles, throwing getters, or unreadable data. */
 	requestEvidenceIncompleteSinceLastUsage: boolean;
+	/**
+	 * The last HEALTHY `cacheRead`, the baseline every shortfall is measured
+	 * against (#4687). A miss measured against it does not replace it, so a
+	 * second consecutive rewrite is measured against the last read that was
+	 * whole rather than against the previous miss's remainder. A DURABLE shrink
+	 * does replace it: a request whose whole prompt is below half this number is
+	 * a smaller prompt, and keeping the old number made every following turn a
+	 * fresh false miss (#4718 review F1, F8).
+	 */
+	lastHealthyCacheRead?: number;
+	/** Unbounded hash of the ordered system-message set pi-lens last observed. */
+	lastSystemSetHash?: string;
+	/** The tool loadout folded from those system messages, in replay order. */
+	lastToolLoadout?: string;
+	/** The ordered system-message set changed since the previous usage record. */
+	systemPromptChangedSinceLastUsage: boolean;
+	/** The tool loadout those system messages declare changed. */
+	toolSetChangedSinceLastUsage: boolean;
+	/**
+	 * #4743: a request since the previous usage record stopped re-sending a
+	 * span pi-lens had added to the request before it, so the provider's
+	 * cached prefix ended where that span sat.
+	 */
+	injectionDroppedSinceLastUsage: boolean;
+	/**
+	 * #4743: the rolling digest of every message the previous request sent
+	 * (8 bytes each, see {@link rollingMessageDigests}), the reference the next
+	 * request's first differing index is measured against. `null`: that
+	 * request had no digest (a bound or an unserializable message).
+	 */
+	lastRequestDigests?: Buffer | null;
+	/** Positions in that request where a pi-lens span began (sorted). */
+	lastInjectedPositions?: readonly number[] | undefined;
+	/** Unknown-cause misses recorded for this session (#4687 item 5). */
+	unexplainedMisses: number;
 	/** Characters pi-lens injected since the previous usage record. */
 	injectedCharsSinceLastUsage: number;
 	/** Characters of transcript growth observed since the previous usage record. */
@@ -296,8 +341,12 @@ function emptyCacheMissCauses(): Record<CacheMissCause, number> {
 	return {
 		"ttl-expired": 0,
 		"prefix-broke": 0,
+		"tool-set-changed": 0,
+		"system-prompt-changed": 0,
 		"partial-eviction": 0,
 		"model-provider-changed": 0,
+		"injection-dropped": 0,
+		"prefix-shrunk": 0,
 		unknown: 0,
 	};
 }
@@ -327,19 +376,27 @@ function newCacheUsageSummary(): CacheUsageSessionSummary {
 	};
 }
 
-// Shared cap for every per-session bounded map in this module (also used by
-// `prefixHashBySession` below) — a long-lived process cycling through many
-// sessions cannot grow any of them without limit.
-export const MAX_TRACKED_SESSIONS = 32;
-const attributionBySession = new BoundedLruCache<
-	string,
-	SessionAttributionState
->(MAX_TRACKED_SESSIONS);
+// #4965: this module's per-session state is one cell on the session's scope
+// (`sessionCell`), found by the lookup key `sessionLookupKey` derives from the
+// session id. It ends with the scope, so a long-lived process cycling through
+// sessions cannot grow it, and a retired session's late call finds nothing.
+const CACHE_OBSERVABILITY_CELL = "cache-observability";
+
+/** One session's miss-attribution state and `messages[0]` baseline hash. */
+interface CacheObservabilityCell {
+	attribution: SessionAttributionState | undefined;
+	/** The session's previous `messages[0]` hash; see {@link observeCachePrefix}. */
+	prefixHash: string | undefined;
+}
 
 function newAttributionState(): SessionAttributionState {
 	return {
 		prefixBrokeSinceLastUsage: false,
 		prefixStableSinceLastUsage: false,
+		systemPromptChangedSinceLastUsage: false,
+		toolSetChangedSinceLastUsage: false,
+		injectionDroppedSinceLastUsage: false,
+		unexplainedMisses: 0,
 		sequenceHashTruncatedSinceLastUsage: false,
 		requestEvidenceIncompleteSinceLastUsage: false,
 		injectedCharsSinceLastUsage: 0,
@@ -393,19 +450,30 @@ function findingIdentities(text: string): string[] {
 	return out;
 }
 
+/** The session's cell, created on first write; `undefined` for a session with no live scope. */
+function cacheCellOf(
+	key: string,
+	create: boolean,
+): CacheObservabilityCell | undefined {
+	return sessionCell<CacheObservabilityCell>(
+		key,
+		CACHE_OBSERVABILITY_CELL,
+		create
+			? () => ({ attribution: undefined, prefixHash: undefined })
+			: undefined,
+	);
+}
+
 /**
- * Fetch (creating if absent) one session's attribution state, refreshing LRU
- * recency and evicting the oldest entries past the cap — same bounding as
- * {@link recordSessionHash}, so a long-lived process cycling through sessions
- * cannot grow this map without limit.
+ * Fetch (creating if absent) one session's attribution state. A session with
+ * no live scope gets a state that is not kept (the write is counted by
+ * `sessionCell`), so the classifier sees no baseline and fails closed.
  */
 function attributionFor(key: string): SessionAttributionState {
-	const existing = attributionBySession.get(key);
-	const state = existing ?? newAttributionState();
-	// `get` above already moved an existing entry to MRU; `set` below also
-	// refreshes recency on a create, so every fetch counts as a touch.
-	attributionBySession.set(key, state);
-	return state;
+	const cell = cacheCellOf(key, true);
+	if (!cell) return newAttributionState();
+	cell.attribution ??= newAttributionState();
+	return cell.attribution;
 }
 
 /**
@@ -569,27 +637,52 @@ interface CacheMissVerdict {
  * it (2026-08-21 investigation, 63 sessions, 2,288 turns, 94.2% overall hit
  * rate):
  *
- *   1. `prefix-broke` — a `cache_prefix_break` CHANGE fired in this session
+ *   1. `tool-set-changed` / `system-prompt-changed` — the ordered system-message
+ *      set changed since the previous usage record. A change to the tool
+ *      loadout those messages declare is `tool-set-changed`; any other system
+ *      change is `system-prompt-changed`. Both are DIRECT local observations
+ *      (#4687 item 2): the system set is hashed unbounded, so a long tool
+ *      result can no longer turn the cause into `unknown`.
+ *   2. `prefix-broke` — a `cache_prefix_break` CHANGE fired in this session
  *      since the previous usage record. This is a DIRECT local observation of
  *      the cause, so it outranks the timing heuristics below. The window was
  *      byte-stable throughout, so this verdict should stay rare; if it does
  *      not, #1016's fix has regressed.
- *   2. `model-provider-changed` — both adjacent identities were present and
+ *   3. `model-provider-changed` — both adjacent identities were present and
  *      differ. This is direct local evidence and outranks timing heuristics.
- *   3. Evidence gates — heuristic causes require a REQUEST-time observation,
+ *   3b. `injection-dropped` — a request since the previous usage record first
+ *      differed from the request before it at a position where pi-lens had
+ *      added a span (#4743): the span was request-local, so the next request
+ *      no longer carried it and the cached prefix ended there. Direct local
+ *      evidence from the per-message rolling digest.
+ *   4. `prefix-shrunk` — a low or zero read of a request whose whole prompt
+ *      is itself below half the baseline (`promptShrank`): the prompt got
+ *      smaller (compaction, a trimmed transcript), so the read is low because
+ *      there is less to read, and the compacted turn often reads nothing at
+ *      all (#4718 verify F11). It is decided from the provider's own token
+ *      counts, not from timing, so it outranks the evidence gates; it names
+ *      the turn so the shrink never counts as an unexplained miss (#4718
+ *      review F7).
+ *   5. Evidence gates — heuristic causes require a REQUEST-time observation,
  *      a complete bounded sequence hash, adjacent full provider/model identity,
  *      and well-formed provider usage numbers.
  *      Missing evidence returns a specific unknown reason; it never lets a
- *      plausible but unproved heuristic win.
- *   4. `ttl-expired` — a REQUEST-time gap reached the configured provider TTL.
+ *      plausible but unproved heuristic win. `ttl-expired` is measured from
+ *      the request clock alone, so content-hash truncation does not gate it
+ *      (#4687 item 4: a 20,000-character tool result is ordinary, not evidence
+ *      that the gap is unreadable).
+ *   6. `ttl-expired` — a REQUEST-time gap reached the configured provider TTL.
  *      A message-end fallback includes generation time and cannot prove this.
- *   5. `partial-eviction` — a non-zero but low read, where fresh input runs far
+ *   7. `partial-eviction` — a non-zero but low read, where fresh input runs far
  *      above the new content we measured. pi-lens injections average ~2.7
  *      estimated tokens per turn, so they cannot account for a multiple of the
  *      measured content; the remainder is provider-side eviction, typically at
  *      a context limit. Suppressed when the character accumulators were capped,
- *      because a floor estimate would manufacture the verdict.
- *   6. `unknown` — a real shortfall with no local explanation. A bounded
+ *      because a floor estimate would manufacture the verdict. "Fresh input"
+ *      is every uncached prompt token, `input + cacheWrite`: Anthropic and
+ *      Bedrock carry the re-sent tokens in `cacheWrite`, so `input` alone made
+ *      the rule unreachable on them (#4718 round 3, the F8 shape).
+ *   8. `unknown` — a real shortfall with no local explanation. A bounded
  *      `cacheMissUnknownReason` names the missing or conflicting evidence;
  *      provider behavior is never guessed.
  */
@@ -601,6 +694,8 @@ function classifyCacheMiss(args: {
 	gapBasis: CacheGapBasis;
 	ttlMs: number;
 	prefixBroke: boolean;
+	toolSetChanged: boolean;
+	systemPromptChanged: boolean;
 	prefixStable: boolean;
 	sequenceHashTruncated: boolean;
 	requestEvidenceIncomplete: boolean;
@@ -610,6 +705,8 @@ function classifyCacheMiss(args: {
 	providerUsageMalformed: boolean;
 	estimatedNewTokens: number;
 	attributionCharsCapped: boolean;
+	promptShrank: boolean;
+	injectionDropped: boolean;
 }): CacheMissVerdict | null {
 	const cacheRead = readableTokenCount(args.cacheRead);
 	if (cacheRead === undefined) return null;
@@ -641,10 +738,16 @@ function classifyCacheMiss(args: {
 			unknownReason: "request-correlation-unavailable",
 		};
 	}
+	if (args.toolSetChanged) return { kind, cause: "tool-set-changed" };
+	if (args.systemPromptChanged) {
+		return { kind, cause: "system-prompt-changed" };
+	}
 	if (args.prefixBroke) return { kind, cause: "prefix-broke" };
 	if (args.modelProviderChanged) {
 		return { kind, cause: "model-provider-changed" };
 	}
+	if (args.injectionDropped) return { kind, cause: "injection-dropped" };
+	if (args.promptShrank) return { kind, cause: "prefix-shrunk" };
 	// TTL and transcript-growth claims need the request-side context observation.
 	// A response-time fallback includes generation and can only explain why the
 	// verdict stayed unknown; it cannot establish cache expiry.
@@ -666,13 +769,6 @@ function classifyCacheMiss(args: {
 			unknownReason: "request-evidence-incomplete",
 		};
 	}
-	if (args.sequenceHashTruncated) {
-		return {
-			kind,
-			cause: "unknown",
-			unknownReason: "sequence-hash-truncated",
-		};
-	}
 	if (args.providerUsageMalformed) {
 		return {
 			kind,
@@ -687,8 +783,22 @@ function classifyCacheMiss(args: {
 			unknownReason: "model-provider-unavailable",
 		};
 	}
+	// #4687 item 4: the gap is measured from the request clock, not from the
+	// content hash. A long tool result makes the bounded sequence observation
+	// incomplete, and it used to return `sequence-hash-truncated` here — before
+	// the TTL rule could fire — so an ordinary 20,000-character message hid a
+	// genuine expiry. TTL is proved by the clock, so it runs first; the
+	// truncation gate keeps gating `partial-eviction`, which DOES need to know
+	// what else changed.
 	if (args.interTurnGapMs !== null && args.interTurnGapMs >= args.ttlMs) {
 		return { kind, cause: "ttl-expired" };
+	}
+	if (args.sequenceHashTruncated) {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason: "sequence-hash-truncated",
+		};
 	}
 	if (
 		kind === "low-read" &&
@@ -716,6 +826,163 @@ function classifyCacheMiss(args: {
 		cause: "unknown",
 		unknownReason: "no-local-explanation",
 	};
+}
+
+/**
+ * What one usage record does to the session's prompt-cache baseline. Logged
+ * beside the usage numbers on `cache_usage`, so a reader can tell why a later
+ * shortfall was or was not measured against this read.
+ *
+ * `advanced` — a healthy record IS the prefix this session last read whole;
+ * `shrunk` — a low read whose whole prompt fell below half the baseline
+ * (`promptShrank`), i.e. a durable smaller prompt (compaction, a trimmed
+ * transcript); `held` — a miss that kept the last healthy read (a rewrite, a
+ * zero read, the compacted turn itself when it read nothing, or unreadable
+ * token counts); `switched` — a model or provider
+ * change cleared it; `cleared` — the record carried no readable `cacheRead`.
+ */
+type CacheBaselineDecision =
+	| "advanced"
+	| "shrunk"
+	| "held"
+	| "switched"
+	| "cleared";
+
+/**
+ * Whether this request's whole prompt is SMALLER than the prefix the session
+ * last read whole, by the same ratio that makes a read low (#4718 review F1,
+ * F8).
+ *
+ * pi-ai reports every request's prompt as three disjoint counts on every api:
+ * `cacheRead`, `cacheWrite` and `input` (`totalTokens` is their sum plus
+ * `output`). Providers differ only in where the uncached part lands: Anthropic
+ * and Bedrock report it as `cacheWrite`, while Gemini, Vertex, Mistral and
+ * OpenAI report `cacheWrite: 0` and carry it in `input`. Their sum is the
+ * prompt on all of them, so no provider class is needed. A rewritten prefix
+ * comes back as uncached tokens and keeps the prompt near the old prefix; a
+ * compacted transcript shrinks the prompt itself. Reading `cacheWrite` alone
+ * (round 2) took Gemini's zero write for a shrink, so its second rewrite read
+ * as a hit.
+ *
+ * A prompt below half the baseline is the same "low" the classifier applies
+ * to the read, so a turn held by this rule has a prompt the next turn's read
+ * is not low against: holding can cost one miss, never a stream of them.
+ *
+ * The read does not matter (#4718 verify F11): a compaction changes the
+ * prefix, so the compacted turn usually reads NOTHING from cache (13 of 13
+ * real compactions in the maintainer's log) and its prompt arrives in `input`
+ * or `cacheWrite`. An empty prompt (pi-ai's all-zero usage on an aborted or
+ * errored request) proves nothing, so it is not a shrink. Any unreadable
+ * count fails closed (false: hold and keep the miss).
+ */
+function promptShrank(args: {
+	cacheRead: number | undefined;
+	input: number | undefined;
+	cacheWrite: number | undefined;
+	priorCacheRead: number | undefined;
+}): boolean {
+	const prior = readableTokenCount(args.priorCacheRead);
+	const cacheRead = readableTokenCount(args.cacheRead);
+	const input = readableTokenCount(args.input);
+	const cacheWrite = readableTokenCount(args.cacheWrite);
+	if (
+		prior === undefined ||
+		cacheRead === undefined ||
+		input === undefined ||
+		cacheWrite === undefined
+	) {
+		return false;
+	}
+	const prompt = cacheRead + input + cacheWrite;
+	return prompt > 0 && prompt < prior * LOW_CACHE_READ_RATIO;
+}
+
+/**
+ * Decide the baseline the NEXT turn is measured against (#4687 item 3, #4718
+ * review F1). A baseline that only ever advanced treated a durable prefix
+ * shrink as a permanent miss: the shrink turn's lower read was never written
+ * again, and every later turn re-reported the same shortfall against a prefix
+ * that no longer exists.
+ */
+function nextCacheBaseline(args: {
+	cacheRead: number | undefined;
+	priorCacheRead: number | undefined;
+	kind: CacheMissKind | undefined;
+	modelProviderChanged: boolean;
+	promptShrank: boolean;
+}): { baseline: number | undefined; decision: CacheBaselineDecision } {
+	// A new provider or model tokenizes and caches its own prefix, so the read
+	// of the previous one says nothing about it: start a fresh baseline rather
+	// than measuring the new provider against the old provider's number.
+	if (args.modelProviderChanged) {
+		return { baseline: undefined, decision: "switched" };
+	}
+	if (args.cacheRead === undefined) {
+		return { baseline: undefined, decision: "cleared" };
+	}
+	// Only a low read moves the baseline to the smaller prefix. A zero-read
+	// shrink (the compacted turn itself, #4718 verify F11) holds: moving to 0
+	// would switch off low-read detection for the next turn, which reads the
+	// compacted prefix and shrinks the baseline with real read evidence.
+	if (args.promptShrank && args.kind === "low-read") {
+		return { baseline: args.cacheRead, decision: "shrunk" };
+	}
+	// No kind means no shortfall: a healthy read becomes the new baseline.
+	if (args.kind === undefined) {
+		return { baseline: args.cacheRead, decision: "advanced" };
+	}
+	// A rewrite, a zero read, or counts that cannot prove a smaller prompt: keep
+	// the last healthy read so a second consecutive rewrite is still a miss.
+	return { baseline: args.priorCacheRead, decision: "held" };
+}
+
+/**
+ * Record one unexplained miss (#4687 item 5).
+ *
+ * The FIRST unknown miss in a session counts silently: one provider-side gap
+ * with no local cause is ordinary noise, so it only raises the session's own
+ * counter and the ledger hears nothing. That silence is what the doc says and
+ * what a reader of `/lens-perf` or `pilens_health` sees: no `⚠` line before the
+ * second miss (#4718 review F2, where the first miss already recorded a ledger
+ * entry). From the SECOND on the session has a pattern, so the ledger carries
+ * one bounded `prompt-cache-miss-unexplained` row and every later miss only
+ * raises the count. The row is written through `recordDegradationOnce` exactly
+ * once, so the ledger count is the ADMITTED misses, the session total less the
+ * silent first: 1 after the second miss, 2 after the third. The durable row is
+ * written once, at admission, so its `metadata.misses` always reads 2. The
+ * session's exact total is `cache_usage_summary`'s `cacheMissCauses.unknown`
+ * (#4718 review F10). A shrink is named `prefix-shrunk` and never reaches this
+ * counter (#4718 review F7).
+ */
+function recordUnexplainedMiss(
+	state: SessionAttributionState,
+	subject: string,
+	unknownReason: CacheMissUnknownReason | undefined,
+): void {
+	state.unexplainedMisses += 1;
+	if (state.unexplainedMisses === 1) return;
+	const reason = `prompt-cache miss has no local cause (${unknownReason ?? "unspecified"})`;
+	const metadata = {
+		unknownReason: unknownReason ?? "unspecified",
+		misses: state.unexplainedMisses,
+	};
+	// Both ledger entries are documented no-throw: a telemetry failure never
+	// compromises the observed path. The record object is inlined at each call
+	// so the kind literal sits in the record's own call site.
+	if (state.unexplainedMisses === 2)
+		recordDegradationOnce({
+			kind: "prompt-cache-miss-unexplained",
+			subject,
+			reason,
+			metadata,
+		});
+	else
+		recordDegradation({
+			kind: "prompt-cache-miss-unexplained",
+			subject,
+			reason,
+			metadata,
+		});
 }
 
 function recordCacheUsageSummary(args: {
@@ -912,6 +1179,112 @@ function hashMessageSequence(messages: ReadonlyArray<ContextMessageLike>): {
 	};
 }
 
+/** Bytes kept per message by {@link rollingMessageDigests}. */
+const ROLLING_DIGEST_BYTES = 8;
+
+/**
+ * #4743: bounds on the rolling digest. A transcript past either bound gets no
+ * digest, so the divergence reads `unavailable` and a retained injection is
+ * not re-sent. 10,000 messages is `MAX_REPORTED_MESSAGES`; 16 Mi characters
+ * is four times a one-million-token context at four characters per token.
+ */
+export const MAX_ROLLING_DIGEST_MESSAGES = MAX_REPORTED_MESSAGES;
+export const MAX_ROLLING_DIGEST_CHARS = 16 * 1024 * 1024;
+
+/** Why {@link rollingMessageDigests} returned no digest. */
+export type RollingDigestGap =
+	| "too-many-messages"
+	| "too-many-chars"
+	| "unserializable";
+
+export type RollingDigests =
+	| { complete: true; count: number; digests: Buffer }
+	| { complete: false; gap: RollingDigestGap };
+
+/**
+ * A rolling digest of a message list (#4743): entry `i` hashes messages
+ * `0..i`, each serialized the way a provider receives it (`JSON.stringify`,
+ * insertion order, every field), so two lists share digest `i` exactly when
+ * they share their first `i + 1` messages. Unbounded per message, unlike the
+ * sampled `hashMessageSequence`: one long tool result must not hide where a
+ * request stopped repeating the one before it. Never throws.
+ */
+export function rollingMessageDigests(
+	messages: ReadonlyArray<unknown>,
+): RollingDigests {
+	try {
+		const count = messages.length;
+		if (count > MAX_ROLLING_DIGEST_MESSAGES)
+			return { complete: false, gap: "too-many-messages" };
+		const digests = Buffer.alloc(count * ROLLING_DIGEST_BYTES);
+		const hash = createHash("sha256");
+		let chars = 0;
+		for (let index = 0; index < count; index++) {
+			const serialized = JSON.stringify(messages[index]) ?? "undefined";
+			chars += serialized.length;
+			if (chars > MAX_ROLLING_DIGEST_CHARS)
+				return { complete: false, gap: "too-many-chars" };
+			hash.update(serialized).update("\u0000");
+			hash
+				.copy()
+				.digest()
+				.copy(digests, index * ROLLING_DIGEST_BYTES, 0, ROLLING_DIGEST_BYTES);
+		}
+		return { complete: true, count, digests };
+	} catch {
+		// none: a cycle, a BigInt or a throwing getter leaves the list without a
+		// digest; the gap is the return value, and both callers record it
+		// (cache_context's `rollingDigestGap`, the ledger's
+		// `context-injection-retain-declined` row).
+		return { complete: false, gap: "unserializable" };
+	}
+}
+
+/** Digest of messages `0..index` as hex, or undefined past the list. */
+export function rollingDigestAt(
+	digests: RollingDigests,
+	index: number,
+): string | undefined {
+	if (!digests.complete || index < 0 || index >= digests.count) return;
+	const start = index * ROLLING_DIGEST_BYTES;
+	return digests.digests.toString("hex", start, start + ROLLING_DIGEST_BYTES);
+}
+
+/**
+ * The first message index where `current` stops repeating `previous`, or
+ * undefined when `previous` is a whole prefix of `current` (append-only).
+ */
+function firstDifferingMessageIndex(
+	previous: Buffer,
+	current: Buffer,
+): number | undefined {
+	const previousCount = previous.length / ROLLING_DIGEST_BYTES;
+	const currentCount = current.length / ROLLING_DIGEST_BYTES;
+	const shared = Math.min(previousCount, currentCount);
+	for (let index = 0; index < shared; index++) {
+		const start = index * ROLLING_DIGEST_BYTES;
+		if (
+			previous.compare(
+				current,
+				start,
+				start + ROLLING_DIGEST_BYTES,
+				start,
+				start + ROLLING_DIGEST_BYTES,
+			) !== 0
+		)
+			return index;
+	}
+	return currentCount < previousCount ? currentCount : undefined;
+}
+
+/**
+ * Where this request stops repeating the session's previous one (#4743).
+ * `baseline`: no earlier request; `append-only`: the earlier request is a
+ * whole prefix of this one; `diverged`: they differ from
+ * `firstDifferingMessageIndex` on; `unavailable`: either list has no digest.
+ */
+type PrefixDivergence = "baseline" | "append-only" | "diverged" | "unavailable";
+
 /** Per-measurement bounds, so the caller picks the population's own cap. */
 interface MeasureLimits {
 	maxChars: number;
@@ -1009,19 +1382,81 @@ function sessionKey(sessionId?: string): string {
 	return sessionId?.trim() ? sessionId.trim() : NO_SESSION_KEY;
 }
 
+/** #4743: the retained-injection ledger's work on one request. */
+export interface CacheContextRetention {
+	/** Retained entries re-sent on this request. */
+	reemitted: number;
+	/** Their rendered bytes. */
+	reemittedBytes: number;
+	/** Entries deleted because the transcript before their anchor changed. */
+	pruned: number;
+	/** This request's new injection was added to the ledger. */
+	retainedNew: boolean;
+	/** Why a new injection was not retained, or the ledger was cleared. */
+	declined?: string;
+}
+
 /**
- * A stable host session id is the only safe cross-event identity. When it is
- * absent, keep primary and concurrent-secondary observations in separate
- * buckets and let classification fail closed instead of allowing a secondary
- * to overwrite the primary's baseline.
+ * Compare this request's rolling digest with the session's previous request
+ * and arm `injection-dropped` when the first difference lands where pi-lens
+ * had added a span (#4743). Returns the bounded record fields.
  */
-function attributionKey(
-	sessionId?: string,
-	sessionRole?: "primary" | "concurrent-secondary",
-): string {
-	const key = sessionKey(sessionId);
-	if (key !== NO_SESSION_KEY) return key;
-	return `${sessionRole ?? "unknown"}:${key}`;
+function observePrefixDivergence(
+	state: SessionAttributionState,
+	resultMessages: ReadonlyArray<ContextMessageLike>,
+	injectedPositions: readonly number[],
+): {
+	prefixDivergence: PrefixDivergence;
+	firstDifferingMessageIndex: number | null;
+	previousRequestMessageCount: number | null;
+	divergedAtInjection: boolean;
+	rollingDigestGap: RollingDigestGap | null;
+	injectedSpanCount: number;
+} {
+	const current = rollingMessageDigests(resultMessages);
+	const previous = state.lastRequestDigests;
+	const previousPositions = state.lastInjectedPositions ?? [];
+	state.lastRequestDigests = current.complete ? current.digests : null;
+	state.lastInjectedPositions = current.complete
+		? injectedPositions
+		: undefined;
+	const base = {
+		previousRequestMessageCount: previous
+			? previous.length / ROLLING_DIGEST_BYTES
+			: null,
+		rollingDigestGap: current.complete ? null : current.gap,
+		injectedSpanCount: injectedPositions.length,
+	};
+	if (!current.complete || previous === null)
+		return {
+			...base,
+			prefixDivergence: "unavailable",
+			firstDifferingMessageIndex: null,
+			divergedAtInjection: false,
+		};
+	if (previous === undefined)
+		return {
+			...base,
+			prefixDivergence: "baseline",
+			firstDifferingMessageIndex: null,
+			divergedAtInjection: false,
+		};
+	const index = firstDifferingMessageIndex(previous, current.digests);
+	if (index === undefined)
+		return {
+			...base,
+			prefixDivergence: "append-only",
+			firstDifferingMessageIndex: null,
+			divergedAtInjection: false,
+		};
+	const atInjection = previousPositions.includes(index);
+	if (atInjection) state.injectionDroppedSinceLastUsage = true;
+	return {
+		...base,
+		prefixDivergence: "diverged",
+		firstDifferingMessageIndex: index,
+		divergedAtInjection: atInjection,
+	};
 }
 
 /**
@@ -1051,6 +1486,15 @@ export function observeCacheContext(args: {
 	placement?: CacheContextPlacement;
 	/** The request hook that carried this observation (#4631). */
 	injectionHook?: CacheContextInjectionHook;
+	/**
+	 * #4743: positions in `resultMessages` where a pi-lens span begins (a
+	 * modified message or the first of an inserted run), new or retained. The
+	 * NEXT request's first differing index is attributed to a dropped injection
+	 * when it lands on one of these.
+	 */
+	injectedPositions?: readonly number[];
+	/** #4743: what the retained-injection ledger did, when its flag is on. */
+	retention?: CacheContextRetention;
 	dbg?: (msg: string) => void;
 }): void {
 	try {
@@ -1082,7 +1526,7 @@ export function observeCacheContext(args: {
 			};
 		});
 		const state = attributionFor(
-			attributionKey(args.sessionId, args.sessionRole),
+			sessionLookupKey(args.sessionId, args.sessionRole),
 		);
 		for (const slice of injectionSlices) {
 			const key = sourceKey(slice.source);
@@ -1117,7 +1561,7 @@ export function observeCacheContext(args: {
 			existingMessages.length > MAX_REPORTED_MESSAGES ||
 			resultMessages.length > MAX_REPORTED_MESSAGES;
 		recordContextAttribution(
-			attributionKey(args.sessionId, args.sessionRole),
+			sessionLookupKey(args.sessionId, args.sessionRole),
 			existingMessages,
 			sizes,
 		);
@@ -1128,6 +1572,11 @@ export function observeCacheContext(args: {
 			afterSequence.contentTruncated;
 		state.requestEvidenceIncompleteSinceLastUsage ||=
 			beforeSequence.incomplete || afterSequence.incomplete;
+		const divergence = observePrefixDivergence(
+			state,
+			resultMessages,
+			args.injectedPositions ?? [],
+		);
 
 		logLatency({
 			type: "phase",
@@ -1191,6 +1640,9 @@ export function observeCacheContext(args: {
 					beforeSequence.contentTruncated || afterSequence.contentTruncated,
 				sequenceHashIncomplete:
 					beforeSequence.incomplete || afterSequence.incomplete,
+				// #4743: where this request stopped repeating the previous one.
+				...divergence,
+				...(args.retention ? { retention: args.retention } : {}),
 			},
 		});
 	} catch (err) {
@@ -1199,7 +1651,7 @@ export function observeCacheContext(args: {
 		// from an observation whose hashing/measurement never completed.
 		try {
 			const state = attributionFor(
-				attributionKey(args.sessionId, args.sessionRole),
+				sessionLookupKey(args.sessionId, args.sessionRole),
 			);
 			state.lastContextAtMs = Date.now();
 			state.requestEvidenceIncompleteSinceLastUsage = true;
@@ -1237,7 +1689,7 @@ export function logCacheUsage(
 		const usageRecord = usage as unknown as Record<string, unknown>;
 		// #1071: attribute the shortfall in-process, from state this module already
 		// keeps, so nothing re-reads latency.log.
-		const stateKey = attributionKey(context?.sessionId, context?.sessionRole);
+		const stateKey = sessionLookupKey(context?.sessionId, context?.sessionRole);
 		const state = attributionFor(stateKey);
 		const nowMs = Date.now();
 		const gap = resolveInterTurnGap(state, nowMs);
@@ -1273,7 +1725,7 @@ export function logCacheUsage(
 			.map(([field]) => field);
 		const providerUsageMalformed = malformedProviderUsageFields.length > 0;
 		const cacheRead = cacheReadEvidence.value;
-		const priorCacheReadValue = readableTokenCount(state.lastCacheRead);
+		const priorCacheReadValue = readableTokenCount(state.lastHealthyCacheRead);
 		// SAFETY: `msg` passed the AssistantMessageLike role check above; the
 		// record view backs only the guarded identity-field probes below, each
 		// re-validated by `identityEvidence` at its own boundary.
@@ -1306,25 +1758,43 @@ export function logCacheUsage(
 			state.injectedCharsSinceLastUsage +
 				state.newTranscriptCharsSinceLastUsage,
 		);
+		// One derivation read by both the classifier and the unexplained-miss
+		// counter (#4718 review F5).
+		const stableSessionIdentity =
+			sessionKey(context?.sessionId) !== NO_SESSION_KEY;
+		// One derivation read by the classifier (the `prefix-shrunk` cause) and by
+		// the baseline rule (`shrunk`), so the two can never disagree (#4718
+		// review F7). The raw `input` is passed: a missing one must not read as 0.
+		const shrank = promptShrank({
+			cacheRead,
+			input: inputEvidence.value,
+			cacheWrite: cacheWriteEvidence.value,
+			priorCacheRead: priorCacheReadValue,
+		});
 		const verdict = classifyCacheMiss({
 			cacheRead,
-			// Missing/malformed input cannot prove fresh-input pressure. The explicit
-			// malformed gate below also keeps every heuristic fail-closed.
-			input: inputEvidence.value ?? 0,
+			// Every uncached prompt token, wherever the provider puts it (see
+			// `promptShrank`). Missing/malformed counts cannot prove fresh-input
+			// pressure; the explicit malformed gate keeps every heuristic fail-closed.
+			input: (inputEvidence.value ?? 0) + (cacheWriteEvidence.value ?? 0),
 			priorCacheRead: priorCacheReadValue,
 			interTurnGapMs,
 			gapBasis: gap.basis,
 			ttlMs,
 			prefixBroke: state.prefixBrokeSinceLastUsage,
+			toolSetChanged: state.toolSetChangedSinceLastUsage,
+			systemPromptChanged: state.systemPromptChangedSinceLastUsage,
 			prefixStable: state.prefixStableSinceLastUsage,
 			sequenceHashTruncated: state.sequenceHashTruncatedSinceLastUsage,
 			requestEvidenceIncomplete: state.requestEvidenceIncompleteSinceLastUsage,
-			stableSessionIdentity: sessionKey(context?.sessionId) !== NO_SESSION_KEY,
+			stableSessionIdentity,
 			modelProviderChanged,
 			modelProviderEvidenceAvailable,
 			providerUsageMalformed,
 			estimatedNewTokens,
 			attributionCharsCapped: state.attributionCharsCapped,
+			promptShrank: shrank,
+			injectionDropped: state.injectionDroppedSinceLastUsage,
 		});
 		const unknownReason: CacheMissUnknownReason | undefined =
 			providerUsageMalformed
@@ -1341,6 +1811,19 @@ export function logCacheUsage(
 			verdict,
 			unknownReason,
 		});
+		// #4718 review F5: without a stable session id every miss lands in one
+		// shared `<no-session>` bucket, so two different sessions would combine
+		// toward the second-miss row and the row would claim "no local cause" for
+		// what is really a telemetry gap. The classifier already fails such a
+		// record closed (`request-correlation-unavailable`); the ledger simply
+		// does not count it.
+		if (verdict?.cause === "unknown" && stableSessionIdentity) {
+			recordUnexplainedMiss(
+				state,
+				sessionKey(context?.sessionId),
+				unknownReason,
+			);
+		}
 		const priorCacheRead = priorCacheReadValue ?? null;
 		const injectedCharsSinceLastTurn = state.injectedCharsSinceLastUsage;
 		const newTranscriptCharsSinceLastTurn =
@@ -1357,15 +1840,30 @@ export function logCacheUsage(
 		// This record is the turn boundary: reset the per-turn accumulators and
 		// re-arm the prefix-break flag so the next verdict describes the NEXT gap.
 		state.lastUsageAtMs = nowMs;
-		// A record whose `cacheRead` is absent or non-finite carries no baseline.
-		// Clear the stored one rather than keeping it: the next turn's gap would be
-		// one turn long while its baseline was two turns old, and a verdict built
-		// on that mismatch is worse than no verdict (#1071 review round 1, F4).
-		state.lastCacheRead = cacheRead;
+		// #1071 review round 1, F4: a record whose `cacheRead` is absent or
+		// non-finite carries no baseline, so clear the stored one rather than
+		// keeping it. #4687 item 3: a MISS does not replace the baseline, so a
+		// second consecutive rewrite is measured against the last healthy read
+		// instead of against the previous miss's remainder. #4718 review F1: a
+		// durable SHRINK does replace it, or every later turn re-reports a
+		// shortfall against a prefix the provider no longer holds; and a model or
+		// provider switch clears it, because the new provider's prefix is its own.
+		// `nextCacheBaseline` owns that rule and names the decision it took.
+		const cacheBaseline = nextCacheBaseline({
+			cacheRead,
+			priorCacheRead: priorCacheReadValue,
+			kind: verdict?.kind,
+			modelProviderChanged,
+			promptShrank: shrank,
+		});
+		state.lastHealthyCacheRead = cacheBaseline.baseline;
 		state.lastProviderIdentityHash = currentProvider.hash;
 		state.lastModelIdentityHash = currentModel.hash;
 		state.prefixBrokeSinceLastUsage = false;
 		state.prefixStableSinceLastUsage = false;
+		state.toolSetChangedSinceLastUsage = false;
+		state.systemPromptChangedSinceLastUsage = false;
+		state.injectionDroppedSinceLastUsage = false;
 		state.sequenceHashTruncatedSinceLastUsage = false;
 		state.requestEvidenceIncompleteSinceLastUsage = false;
 		state.injectedCharsSinceLastUsage = 0;
@@ -1396,6 +1894,10 @@ export function logCacheUsage(
 				modelIdentityTruncated: currentModel.status === "truncated",
 				cacheRead: cacheReadEvidence.value ?? null,
 				cacheWrite: cacheWriteEvidence.value ?? null,
+				// What this record did to the baseline the NEXT shortfall is measured
+				// against (#4718 review F1). `held` keeps the last healthy read;
+				// `shrunk` replaces it with this record's smaller read.
+				cacheBaseline: cacheBaseline.decision,
 				input: inputEvidence.value ?? null,
 				output: outputEvidence.value ?? null,
 				// `Usage.cost` is a breakdown object; the total is the headline number.
@@ -1466,25 +1968,137 @@ export function logCacheUsage(
  * Enumerating the fields at fault would re-create the same shape for the next
  * host field, so the serialization covers whatever the message carries. The
  * parameter's DECLARED shape stays the two fields its callers are guaranteed to
- * have; the runtime object is the host's whole message, and `JSON.stringify`
+ * have; the runtime object is the host's whole message, and the serializer
  * reads every own field of it, not the declared two. A stable head stays stable
  * — pi hands the transcript's own object across turns, and the tier-2 cells pin
  * that byte-for-byte — and a rebuilt one is visible whatever recency field the
  * host re-stamps.
+ *
+ * #4687 item 6: keys are serialized in canonical (ordinal) order, so a head
+ * whose fields were rebuilt in a different insertion order is the SAME head.
+ * `JSON.stringify` follows insertion order, so an equal host object could hash
+ * differently and read as a prefix break.
  */
+
+/**
+ * JSON-shaped serialization with object keys in canonical order.
+ *
+ * Mirrors `JSON.stringify`'s value rules (undefined-valued object keys are
+ * omitted, array holes/undefined/functions/NaN/Infinity become `null`) while
+ * sorting each object's own keys, so two equal values built in a different key
+ * order produce the same string. A cycle or a throwing getter propagates to the
+ * caller's guard instead of being silently normalized away.
+ */
+function canonicalJsonValue(value: unknown, seen: Set<object>): string {
+	if (value === null) return "null";
+	const kind = typeof value;
+	if (kind === "string") return JSON.stringify(value);
+	if (kind === "number")
+		return Number.isFinite(value as number) ? String(value) : "null";
+	if (kind === "boolean") return (value as boolean) ? "true" : "false";
+	if (kind === "bigint") return JSON.stringify(String(value));
+	// undefined, function and symbol serialize as absent (object) or null
+	// (array); both callers below decide which, matching JSON.stringify.
+	if (kind !== "object") return "null";
+	const object = value as object;
+	if (seen.has(object)) return '"[cycle]"';
+	seen.add(object);
+	try {
+		const toJSON = (object as { toJSON?: unknown }).toJSON;
+		if (typeof toJSON === "function")
+			return canonicalJsonValue(toJSON.call(object), seen);
+		if (Array.isArray(object)) {
+			return `[${object
+				.map((item) =>
+					item === undefined || typeof item === "function"
+						? "null"
+						: canonicalJsonValue(item, seen),
+				)
+				.join(",")}]`;
+		}
+		const entries = object as Record<string, unknown>;
+		const fields: string[] = [];
+		for (const key of Object.keys(entries).sort(compareOrdinal)) {
+			const item = entries[key];
+			if (item === undefined || typeof item === "function") continue;
+			fields.push(`${JSON.stringify(key)}:${canonicalJsonValue(item, seen)}`);
+		}
+		return `{${fields.join(",")}}`;
+	} finally {
+		seen.delete(object);
+	}
+}
+
 function hashFirstMessage(first: {
 	role?: unknown;
 	content?: unknown;
 }): string {
 	// Keep the original full local hash semantics for the existing
-	// `cache_prefix_break` signal. The new `cache_context` hashes above are the
-	// bounded hashes; this signal must not silently miss a suffix-only change.
-	const serialized = JSON.stringify(first);
+	// `cache_prefix_break` signal — every field, no truncation — with canonical
+	// key order so an equal head cannot read as changed (#4687 item 6).
+	const serialized = canonicalJsonValue(first, new Set<object>());
 	return createHash("sha256").update(serialized).digest("hex");
 }
 
 /**
- * Per-session baseline hash of `messages[0]`, keyed by the STABLE pi session id
+ * The tool names one system message adds or removes. pi writes the loadout
+ * delta into these arrays (see `tests/support/pi-session.ts`'s
+ * `replayToolNames` and `tests/index-4632-s6-dynamic-tooling.test.ts`); anything
+ * else on the message is ignored.
+ */
+function toolNamesFrom(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const names: string[] = [];
+	for (const entry of value) {
+		const name =
+			entry && typeof entry === "object"
+				? (entry as { name?: unknown }).name
+				: undefined;
+		if (typeof name === "string") names.push(name);
+	}
+	return names;
+}
+
+/**
+ * Hash the ORDERED set of system messages the provider receives, unbounded, and
+ * fold the tool loadout they declare (#4687 item 2).
+ *
+ * Bounded hashing is what produced `unknown / sequence-hash-truncated` on a
+ * real activation: one ordinary long tool result pushed the sequence past its
+ * content cap, so the miss after pi-lens's own `tool_set_mutation` had no
+ * cause. This hash never truncates, and it covers every system message rather
+ * than `messages[0]`, because pi appends a tool/prompt delta as a NEW system
+ * message mid-transcript — the head the first-message hash watches never moves.
+ *
+ * The loadout is folded in message order with pi's own replay rule (a removal
+ * deletes, an addition appends), so a reordered tool table is a change while a
+ * system message that only carries prompt text is not.
+ */
+function hashSystemMessages(messages: ReadonlyArray<ContextMessageLike>): {
+	hash: string;
+	toolLoadout: string;
+} {
+	const hash = createHash("sha256");
+	const loadout = new Map<string, true>();
+	for (const message of messages) {
+		if (!message || typeof message !== "object" || message.role !== "system")
+			continue;
+		hash.update(canonicalJsonValue(message, new Set<object>())).update(";");
+		const entry = message as {
+			toolsAdded?: unknown;
+			toolsRemoved?: unknown;
+		};
+		for (const name of toolNamesFrom(entry.toolsRemoved)) loadout.delete(name);
+		for (const name of toolNamesFrom(entry.toolsAdded)) loadout.set(name, true);
+	}
+	return {
+		hash: hash.digest("hex"),
+		toolLoadout: [...loadout.keys()].join("\n"),
+	};
+}
+
+/**
+ * Per-session baseline hash of `messages[0]`, looked up by the STABLE pi session id
  * (`ctx.sessionManager.getSessionId()`). A single module-scoped var was wrong:
  * in ONE process, multiple logical conversations touch this module, and they
  * must not share a baseline —
@@ -1493,42 +2107,23 @@ function hashFirstMessage(first: {
  *     benign session boundary logs a spurious `cache_prefix_break`, and a
  *     concurrent subagent + its parent stomp each other's baseline, each
  *     emitting a false positive — fatal for a signal whose value is trust);
- *   - an IN-PROCESS reload / resume reuses the SAME id → the baseline is still in
- *     this map, so a genuine break is caught (no blinding reset). NOTE: a full
- *     process restart (quit → `pi --session <id>`) starts a NEW process with an
- *     empty map, so the first post-restart `context` re-anchors a fresh baseline
- *     rather than comparing across the restart. That's acceptable here — this is a
- *     pure observability signal (at worst a missed `cache_prefix_break` log on the
- *     first post-restart turn, never a user-facing action) — unlike genuine
+ *   - an IN-PROCESS reload / resume reuses the SAME id but starts a new
+ *     session scope (the old one's shutdown clears and retires its own), so
+ *     the first `context` after it re-anchors a fresh baseline rather than
+ *     comparing across the restart, as a full process restart (quit →
+ *     `pi --session <id>`) does. That's acceptable here — this is a pure
+ *     observability signal (at worst a missed `cache_prefix_break` log on the
+ *     first turn after a restart, never a user-facing action) — unlike genuine
  *     session state (read guard #1041, widget #190) which IS rehydrated from the
  *     sidecar.
  *
- * Bounded as insertion-ordered FIFO (evict oldest-inserted past the cap,
- * refreshed on every WRITE by {@link recordSessionHash}'s delete+set — a
- * plain read never reorders) so a long-lived process cycling through many
- * sessions can't grow this unbounded. Shares {@link MAX_TRACKED_SESSIONS}
- * with `attributionBySession` above.
- */
-const prefixHashBySession = new BoundedFifoMap<string, string>(
-	MAX_TRACKED_SESSIONS,
-);
-
-/**
- * Reported key used when no session id is available (undefined/empty). Internal
- * attribution additionally separates primary and concurrent-secondary roles;
- * neither role may overwrite the other's baseline when stable identity is
- * absent.
- */
-const NO_SESSION_KEY = "<no-session>";
-
-/**
- * Store `hash` for `key`, refreshing its LRU recency (re-insert moves it to the
- * newest position since `Map` preserves insertion order) and evicting the
- * oldest-inserted entries once the cap is exceeded.
+ * #4965: the hash is a field of the session's scope cell
+ * ({@link CacheObservabilityCell}), so it ends with the session's scope.
+ * A session with no live scope keeps no baseline.
  */
 function recordSessionHash(key: string, hash: string): void {
-	prefixHashBySession.delete(key);
-	prefixHashBySession.set(key, hash);
+	const cell = cacheCellOf(key, true);
+	if (cell) cell.prefixHash = hash;
 }
 
 /**
@@ -1574,11 +2169,27 @@ export function observeCachePrefix(
 		if (!first || typeof first !== "object") return "empty";
 		const firstMessageRole =
 			typeof first.role === "string" ? first.role : "unknown";
-		const key = attributionKey(sessionId, sessionRole);
+		const key = sessionLookupKey(sessionId, sessionRole);
 		const reportedSessionId = sessionKey(sessionId);
 		const currentHash = hashFirstMessage(first);
-		const previousHash = prefixHashBySession.get(key);
+		const previousHash = cacheCellOf(key, false)?.prefixHash;
 		const state = attributionFor(key);
+		// #4687 item 2: the ordered system-message set is the signal a mid-list
+		// tool/prompt delta moves; the head hash above never sees it. The tool
+		// loadout folded from those messages decides WHICH of the two new causes
+		// applies.
+		const systemEvidence = hashSystemMessages(messages);
+		if (
+			state.lastSystemSetHash !== undefined &&
+			state.lastSystemSetHash !== systemEvidence.hash
+		) {
+			state.systemPromptChangedSinceLastUsage = true;
+			if (state.lastToolLoadout !== systemEvidence.toolLoadout) {
+				state.toolSetChangedSinceLastUsage = true;
+			}
+		}
+		state.lastSystemSetHash = systemEvidence.hash;
+		state.lastToolLoadout = systemEvidence.toolLoadout;
 		if (previousHash === undefined) {
 			// Baseline: record this session's starting prefix so a later break has a
 			// reference point in the log. `previousHash: null` marks the baseline.
@@ -1648,12 +2259,14 @@ export function clearCachePrefixSession(
 	sessionId?: string,
 	sessionRole?: "primary" | "concurrent-secondary",
 ): void {
-	const key = attributionKey(sessionId, sessionRole);
-	prefixHashBySession.delete(key);
+	const key = sessionLookupKey(sessionId, sessionRole);
+	const cell = cacheCellOf(key, false);
+	if (!cell) return;
+	cell.prefixHash = undefined;
 	// The miss-attribution state has the same lifetime and the same reason to be
 	// reclaimed at session end; leaving it would let a reused session id inherit
 	// a stale gap baseline and a stale prefix-break flag.
-	attributionBySession.delete(key);
+	cell.attribution = undefined;
 }
 
 /** Record the exact quiet-window summary content handed to pi.sendMessage. */
@@ -1662,7 +2275,7 @@ export function recordTurnEndAdvisoryBytes(
 	bytes: number,
 	sessionRole: "primary" | "concurrent-secondary" = "primary",
 ): void {
-	const state = attributionFor(attributionKey(sessionId, sessionRole));
+	const state = attributionFor(sessionLookupKey(sessionId, sessionRole));
 	state.turnEndAdvisoryBytes = Math.min(
 		MAX_INJECTED_BYTES,
 		state.turnEndAdvisoryBytes + Math.max(0, bytes),
@@ -1685,7 +2298,7 @@ export function recordToolResultDelivery(args: {
 	truncated: boolean;
 }): void {
 	const state = attributionFor(
-		attributionKey(args.sessionId, args.sessionRole),
+		sessionLookupKey(args.sessionId, args.sessionRole),
 	);
 	const bytes = Number.isFinite(args.bytes)
 		? Math.max(0, Math.floor(args.bytes))
@@ -1706,9 +2319,10 @@ export function emitCacheUsageSummaryAtSessionEnd(
 	sessionId?: string,
 	sessionRole?: "primary" | "concurrent-secondary",
 ): void {
-	const key = attributionKey(sessionId, sessionRole);
-	const state = attributionBySession.get(key);
-	if (!state || state.summary.usageRecords === 0) return;
+	const key = sessionLookupKey(sessionId, sessionRole);
+	const cell = cacheCellOf(key, false);
+	const state = cell?.attribution;
+	if (!cell || !state || state.summary.usageRecords === 0) return;
 	logLatency({
 		type: "phase",
 		filePath: "<pi-lens>",
@@ -1727,55 +2341,5 @@ export function emitCacheUsageSummaryAtSessionEnd(
 			},
 		},
 	});
-	attributionBySession.delete(key);
-}
-
-/**
- * Clear all per-session prefix hashes and miss-attribution state. For tests and
- * session boundaries. Both maps are cleared together so a test can never start
- * with a half-reset session.
- */
-export function resetCachePrefixObservation(): void {
-	prefixHashBySession.clear();
-	attributionBySession.clear();
-}
-
-export function resetCacheFindingIdentitiesSession(
-	sessionId?: string,
-	sessionRole?: "primary" | "concurrent-secondary",
-): void {
-	const state = attributionBySession.get(
-		attributionKey(sessionId, sessionRole),
-	);
-	if (!state) return;
-	state.findingIdentities.clear();
-	state.findingIdentityCapRecorded = false;
-}
-
-export function _attributionBySessionHasForTests(key: string): boolean {
-	return attributionBySession.has(key);
-}
-export function _prefixHashBySessionHasForTests(key: string): boolean {
-	return prefixHashBySession.has(key);
-}
-/** #2442 test-only: drive attributionFor's fetch-or-create touch directly
- *  (every call refreshes LRU recency, matching production — see
- *  attributionFor's own doc comment). */
-export function _touchAttributionForTests(key: string): void {
-	attributionFor(key);
-}
-/** #2442 test-only: drive recordSessionHash's write-refresh directly. */
-export function _recordSessionHashForTests(key: string, hash: string): void {
-	recordSessionHash(key, hash);
-}
-/**
- * #2442 test-only: the exact `prefixHashBySession.get(key)` that
- * `observeCachePrefix` performs to fetch a session's previous hash. A
- * `.has()` reorders nothing on either bounded class, so only a real `get`
- * can pin FIFO-vs-LRU behavior (#2442 review F4).
- */
-export function _prefixHashBySessionGetForTests(
-	key: string,
-): string | undefined {
-	return prefixHashBySession.get(key);
+	cell.attribution = undefined;
 }

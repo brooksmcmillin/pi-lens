@@ -11,7 +11,14 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import { createFileTime } from "../../clients/file-time.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
+import {
+	beginScope,
+	bindSessionId,
+	retireScope,
+	type SessionScope,
+} from "../../clients/session-scope.js";
 
 describe("RuntimeCoordinator", () => {
 	it("resetForSession clears recorded tool-call path attributions (#1642 F5)", () => {
@@ -62,12 +69,24 @@ describe("RuntimeCoordinator", () => {
 	});
 	const rules = (records: { rule?: string }[]) => records.map((r) => r.rule);
 
+	/**
+	 * #4965: what a concurrent secondary's `session_start` does in index.ts: it
+	 * begins the session's scope and binds it to the session id, so the
+	 * coordinator finds the secondary's per-turn cells by id.
+	 */
+	const startSecondary = (sessionId: string): SessionScope => {
+		const scope = beginScope({ role: "secondary" });
+		bindSessionId(scope, sessionId);
+		return scope;
+	};
+
 	it("resetForSession drops the outgoing session's turn warnings and keeps a concurrent session's (#3613)", () => {
 		// The recurrences: a reset that clears every partition drops a live
 		// subagent's warnings at the primary's /new, and one that clears none
 		// carries a /reload's (same session id) old warnings into its turn.
 		const runtime = new RuntimeCoordinator();
 		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+		startSecondary("subagent-session");
 		runtime.recordCodeQualityWarnings([quality("own")]);
 		runtime.recordCodeQualityWarnings([quality("sub")], "subagent-session");
 
@@ -84,6 +103,7 @@ describe("RuntimeCoordinator", () => {
 		// The recurrence: a secondary shutdown with no session id of its own,
 		// or the coordinator's id, cleared the primary's partition.
 		const runtime = new RuntimeCoordinator();
+		startSecondary("subagent-session");
 		runtime.recordCodeQualityWarnings([quality("own")]);
 		runtime.recordCodeQualityWarnings([quality("sub")], "subagent-session");
 
@@ -96,6 +116,218 @@ describe("RuntimeCoordinator", () => {
 			kept,
 			sub: rules(runtime.peekCodeQualityWarnings("subagent-session")),
 		}).toEqual({ kept: ["own"], sub: [] });
+	});
+
+	/** #4965: one actionable record; the actionable store is the seam's other tenant. */
+	const actionable = (name: string) => ({
+		id: `act:${name}`,
+		filePath: path.resolve("src/actionable.ts"),
+		displayPath: "src/actionable.ts",
+		line: 1,
+		severity: "warning" as const,
+		tool: "ast-grep",
+		rule: name,
+		message: name,
+		actions: [],
+		suppressed: false,
+		origin: "dispatch" as const,
+	});
+
+	it("the actionable-warning partitions follow the same session rules as the code-quality ones (#4965)", () => {
+		// RECURRENCE GUARDED: #4965 moved both stores onto scope cells. A drain that
+		// dropped every session's partition, or none, would only show on the half a
+		// test exercised: the first cut covered code-quality alone.
+		const runtime = new RuntimeCoordinator();
+		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+		const peek = (sessionId?: string) =>
+			rules(runtime.peekActionableWarnings(sessionId));
+		for (const id of ["sub-a", "sub-b", "sub-c"]) startSecondary(id);
+
+		runtime.recordActionableWarnings([actionable("own")]);
+		runtime.recordActionableWarnings([actionable("sub-a")], "sub-a");
+		runtime.recordActionableWarnings([actionable("sub-b")], "sub-b");
+		runtime.recordActionableWarnings([actionable("sub-b2")], "sub-b");
+		expect({ own: peek(), a: peek("sub-a"), b: peek("sub-b") }).toEqual({
+			own: ["own"],
+			a: ["sub-a"],
+			b: ["sub-b", "sub-b2"],
+		});
+
+		runtime.forgetTurnSession("sub-a");
+		expect({ own: peek(), a: peek("sub-a"), b: peek("sub-b") }).toEqual({
+			own: ["own"],
+			a: [],
+			b: ["sub-b", "sub-b2"],
+		});
+
+		runtime.beginTurn("sub-b");
+		expect({ own: peek(), b: peek("sub-b") }).toEqual({
+			own: ["own"],
+			b: [],
+		});
+
+		runtime.recordActionableWarnings([actionable("sub-c")], "sub-c");
+		runtime.resetForSession();
+		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+		expect({ own: peek(), c: peek("sub-c") }).toEqual({
+			own: [],
+			c: ["sub-c"],
+		});
+
+		runtime.clearActionableWarnings("sub-c");
+		expect(peek("sub-c")).toEqual([]);
+	});
+
+	it("a concurrent session's turn warnings end with its scope, without a forgetTurnSession call (#4965)", () => {
+		// RECURRENCE GUARDED: shape 72. The partitions were a process table that
+		// only an explicit forget (or the coordinator's reset) ended, so a
+		// secondary retired by any other path left both partitions behind.
+		const runtime = new RuntimeCoordinator();
+		const sub = startSecondary("sub-retired");
+		runtime.recordActionableWarnings([actionable("a")], "sub-retired");
+		runtime.recordCodeQualityWarnings([quality("q")], "sub-retired");
+
+		retireScope(sub, "shutdown");
+
+		expect({
+			actionable: rules(runtime.peekActionableWarnings("sub-retired")),
+			quality: rules(runtime.peekCodeQualityWarnings("sub-retired")),
+		}).toEqual({ actionable: [], quality: [] });
+	});
+
+	it("a write for a session with no live scope is dropped and counted once per store (#4965)", () => {
+		// RECURRENCE GUARDED: the resurrection a process table allowed. A late
+		// tool result for a retired session (or one that never started here)
+		// re-created its partition, which nothing then ended.
+		resetDegradationLedger();
+		const runtime = new RuntimeCoordinator();
+		const sub = startSecondary("sub-late");
+		retireScope(sub, "shutdown");
+
+		runtime.recordActionableWarnings([actionable("late")], "sub-late");
+		runtime.recordCodeQualityWarnings([quality("late")], "sub-late");
+		runtime.recordCodeQualityWarnings([quality("late2")], "never-started");
+
+		expect({
+			actionable: rules(runtime.peekActionableWarnings("sub-late")),
+			quality: rules(runtime.peekCodeQualityWarnings("sub-late")),
+			neverStarted: rules(runtime.peekCodeQualityWarnings("never-started")),
+		}).toEqual({ actionable: [], quality: [], neverStarted: [] });
+		const [missed] = getDegradationSummary().filter(
+			(group) => group.kind === "session-scope-lookup-missed",
+		);
+		expect({
+			count: missed?.count,
+			subjects: missed?.latestReasons.map((r) => r.subject).sort(),
+		}).toEqual({
+			count: 3,
+			subjects: ["turn-warnings"],
+		});
+	});
+
+	it("readGuardFor keys one guard per owner and answers the coordinator's own for its turns (#4942)", () => {
+		// RECURRENCE GUARDED: #4942. One guard for every session of the process
+		// let a subagent's read license the primary's edit. A turn with no
+		// session id of its own, or the coordinator's, is the coordinator's
+		// (`recordSession`'s rule, #4921); any other id is its own guard, the
+		// same object on every call.
+		const runtime = new RuntimeCoordinator();
+		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+		const sub = runtime.readGuardFor("subagent-session");
+
+		expect({
+			undefinedIsOwn: runtime.readGuardFor(undefined) === runtime.readGuard,
+			ownIdIsOwn: runtime.readGuardFor("primary-session") === runtime.readGuard,
+			subIsSeparate: sub !== runtime.readGuard,
+			subIsStable: runtime.readGuardFor("subagent-session") === sub,
+			twoSubsDiffer: runtime.readGuardFor("other-session") !== sub,
+		}).toEqual({
+			undefinedIsOwn: true,
+			ownIdIsOwn: true,
+			subIsSeparate: true,
+			subIsStable: true,
+			twoSubsDiffer: true,
+		});
+	});
+
+	it("readGuardFor ends a concurrent session's guard at its shutdown and the coordinator's reset (#4942)", () => {
+		// RECURRENCE GUARDED: #4942's resource axis. A guard per owner with no
+		// release is bounded along sessions-at-once and unbounded along
+		// sessions-over-time. A shutdown drops its own guard only, never the
+		// coordinator's; a reset drops the coordinator's and every owner's.
+		const runtime = new RuntimeCoordinator();
+		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+		const own = runtime.readGuard;
+		const subA = runtime.readGuardFor("sub-a");
+		const subB = runtime.readGuardFor("sub-b");
+
+		runtime.forgetTurnSession("sub-a");
+		runtime.forgetTurnSession(undefined);
+		runtime.forgetTurnSession("primary-session");
+		const afterShutdown = {
+			aRebuilt: runtime.readGuardFor("sub-a") !== subA,
+			bKept: runtime.readGuardFor("sub-b") === subB,
+			ownKept: runtime.readGuard === own,
+		};
+		runtime.resetForSession();
+		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+
+		expect({
+			afterShutdown,
+			bRebuiltByReset: runtime.readGuardFor("sub-b") !== subB,
+			ownRebuiltByReset: runtime.readGuard !== own,
+		}).toEqual({
+			afterShutdown: { aRebuilt: true, bKept: true, ownKept: true },
+			bRebuiltByReset: true,
+			ownRebuiltByReset: true,
+		});
+	});
+
+	it("forgetTurnSession releases the session's FileTime bucket and leaves the others (#4942 F8)", () => {
+		// RECURRENCE GUARDED: #4955 review F8 (AGENTS shape 46). A secondary's
+		// ReadGuard stamps files into the process-global FileTime map keyed by
+		// session id; deleting the guard object left one bucket per retired
+		// secondary session. The coordinator's own bucket and a live
+		// secondary's must survive.
+		const dir = mkdtempSync(path.join(tmpdir(), "pi-lens-f8-"));
+		try {
+			const file = path.join(dir, "a.ts");
+			writeFileSync(file, "export const a = 1;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.setSessionLifecycle({ sessionId: "primary-f8" });
+			runtime.readGuard.recordWritten(file);
+			runtime.readGuardFor("sub-f8-a").recordWritten(file);
+			const liveSecondary = runtime.readGuardFor("sub-f8-b");
+			liveSecondary.recordWritten(file);
+			// #4955 review F14: releasing the bucket must not move the shared
+			// branch epoch, so the coordinator's and the live secondary's stay put.
+			const epochsBefore = {
+				primary: runtime.readGuard.currentBranchEpoch,
+				liveSecondary: liveSecondary.currentBranchEpoch,
+			};
+
+			runtime.forgetTurnSession("sub-f8-a");
+
+			expect({
+				forgotten: createFileTime("sub-f8-a").get(file),
+				liveSecondary: createFileTime("sub-f8-b").get(file) !== undefined,
+				primary:
+					createFileTime(runtime.telemetrySessionId).get(file) !== undefined,
+				epochs: {
+					primary: runtime.readGuard.currentBranchEpoch,
+					liveSecondary: liveSecondary.currentBranchEpoch,
+				},
+			}).toEqual({
+				forgotten: undefined,
+				liveSecondary: true,
+				primary: true,
+				epochs: epochsBefore,
+			});
+			runtime.forgetTurnSession("sub-f8-b");
+			createFileTime(runtime.telemetrySessionId).clear();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("makes edit autofix deferral sticky after a write until beginTurn", () => {
@@ -991,6 +1223,155 @@ describe("RuntimeCoordinator", () => {
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}
+		});
+	});
+
+	describe("inline blockers belong to the turn session that wrote them (#4921)", () => {
+		// A concurrent in-process subagent (#473) shares this coordinator; its
+		// writes and the primary's land in one path-keyed map. Real files: the
+		// snapshot drops a record whose file is gone (#1245).
+		let dir = "";
+		let primaryFile = "";
+		let subagentFile = "";
+		beforeEach(() => {
+			dir = mkdtempSync(path.join(tmpdir(), "pi-lens-4921-owner-"));
+			primaryFile = path.join(dir, "primary.ts");
+			subagentFile = path.join(dir, "subagent.ts");
+			writeFileSync(primaryFile, "debugger;\n");
+			writeFileSync(subagentFile, "debugger;\n");
+		});
+		afterEach(() => rmSync(dir, { recursive: true, force: true }));
+		const PRIMARY = "primary-session";
+		const SUBAGENT = "subagent-session";
+		const record = (
+			runtime: RuntimeCoordinator,
+			filePath: string,
+			sessionId: string | undefined,
+		) =>
+			runtime.recordInlineBlockers(
+				filePath,
+				"🔴 STOP",
+				1,
+				undefined,
+				[1],
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				sessionId,
+			);
+		const files = (records: { filePath: string }[]) =>
+			records.map((entry) => entry.filePath);
+		const twoSessions = (): RuntimeCoordinator => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setSessionLifecycle({ sessionId: PRIMARY });
+			record(runtime, primaryFile, PRIMARY);
+			record(runtime, subagentFile, SUBAGENT);
+			return runtime;
+		};
+
+		it("shows each turn session only its own records, and the commit gate every record", () => {
+			// RECURRENCE GUARDED: #4921. The subagent's turn end read the whole
+			// map and told it about the primary's file.
+			const runtime = twoSessions();
+			expect({
+				primary: files(
+					runtime.getInlineBlockersSnapshot({ sessionId: PRIMARY }),
+				),
+				subagent: files(
+					runtime.getInlineBlockersSnapshot({ sessionId: SUBAGENT }),
+				),
+				// A turn with no session id of its own is the coordinator's.
+				unnamed: files(
+					runtime.getInlineBlockersSnapshot({ sessionId: undefined }),
+				),
+				gate: files(runtime.getInlineBlockersSnapshot()).sort(),
+			}).toEqual({
+				primary: [primaryFile],
+				subagent: [subagentFile],
+				unnamed: [primaryFile],
+				gate: [primaryFile, subagentFile].sort(),
+			});
+		});
+
+		it("files a settled collect-later blocker under the session whose write it answered (#4943)", () => {
+			// RECURRENCE GUARDED: #4943 (the #4940 review's probe P6). The recorder
+			// took no session, so a subagent's settled deferred-runner blocker
+			// became a coordinator-owned record and the primary's turn end
+			// delivered it as its own.
+			const runtime = new RuntimeCoordinator();
+			runtime.setSessionLifecycle({ sessionId: PRIMARY });
+			const blocking: Diagnostic = {
+				id: "late-1",
+				message: "late blocker",
+				filePath: subagentFile,
+				line: 1,
+				column: 1,
+				severity: "error",
+				semantic: "blocking",
+				tool: "slow-runner",
+				runnerId: "slow-runner",
+			};
+			const analysed = { recordedAtMs: Date.now() };
+			runtime.recordDeferredInlineBlockers(
+				subagentFile,
+				[blocking],
+				analysed,
+				SUBAGENT,
+			);
+			runtime.recordDeferredInlineBlockers(
+				primaryFile,
+				[{ ...blocking, filePath: primaryFile }],
+				analysed,
+				PRIMARY,
+			);
+			expect({
+				primary: files(
+					runtime.getInlineBlockersSnapshot({ sessionId: PRIMARY }),
+				),
+				subagent: files(
+					runtime.getInlineBlockersSnapshot({ sessionId: SUBAGENT }),
+				),
+			}).toEqual({ primary: [primaryFile], subagent: [subagentFile] });
+		});
+
+		it("lets one session's policy pass set verdicts on its own records only", () => {
+			// RECURRENCE GUARDED: the pass rewrites the whole verdict axis it
+			// judged; run over every record, the subagent's empty pass cleared
+			// the primary's suppression and reopened its commit gate latch.
+			const runtime = twoSessions();
+			runtime.applyInlineBlockerPolicyVerdicts([primaryFile], {
+				sessionId: PRIMARY,
+			});
+			runtime.applyInlineBlockerPolicyVerdicts([], { sessionId: SUBAGENT });
+			const verdicts = Object.fromEntries(
+				runtime
+					.getInlineBlockersSnapshot()
+					.map((entry) => [entry.filePath, entry.policySuppressed ?? false]),
+			);
+			expect(verdicts).toEqual({
+				[primaryFile]: true,
+				[subagentFile]: false,
+			});
+		});
+
+		it("says Resolved only to the session whose blocker a clean write retired", () => {
+			// RECURRENCE GUARDED: the Resolved note is the same store's; the
+			// primary's turn end consumed the subagent's note.
+			const runtime = twoSessions();
+			expect(runtime.clearInlineBlockers(subagentFile, 2)).toBe(true);
+			expect(
+				runtime.consumeResolvedBlockerFiles(() => false, {
+					sessionId: PRIMARY,
+				}).files,
+			).toEqual([]);
+			expect(
+				files(
+					runtime.consumeResolvedBlockerFiles(() => false, {
+						sessionId: SUBAGENT,
+					}).files,
+				),
+			).toEqual([subagentFile]);
 		});
 	});
 });

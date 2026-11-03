@@ -1,17 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getProjectDataDir } from "../clients/file-utils.js";
 import { takeHandoff } from "../clients/session-scope.js";
-import {
-	afterAll,
-	afterEach,
-	beforeEach,
-	describe,
-	expect,
-	it,
-	vi,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const activationToolFactoryOverride = vi.hoisted(() => ({
 	enabled: false,
@@ -151,8 +142,6 @@ vi.mock("../clients/quiet-window.js", async (importOriginal) => {
 	};
 });
 
-import { CacheManager } from "../clients/cache-manager.js";
-import { snapshotAdvisoryProvenance } from "../clients/advisory-provenance.js";
 import { getLatencyLogPath } from "../clients/latency-logger.js";
 import { LENS_FLAGS } from "../clients/lens-flag-registry.js";
 import {
@@ -179,9 +168,10 @@ import {
 	makeContextWithSystemEvent,
 	makeSessionStartEvent,
 } from "./support/host-event-factory.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
+import { useGlobalConfig } from "./support/global-config.js";
 import {
-	cleanupTestEnvironmentsDrained,
 	removeTempDirSync,
 	setupTestEnvironment,
 } from "./clients/test-utils.js";
@@ -302,34 +292,13 @@ const EXPECTED_HOOKS = [
 	"context_with_system",
 ];
 
-/**
- * turn_end and a `/fork` or `/reload` shutdown persist the session stores
- * (#3612) fire-and-forget (#2523): yield until a wall-clock deadline so the
- * sidecar's atomic rename is visible, and never lands after cleanup. The
- * deadline covers thread-pool latency; a yield-count cap does not (#4134).
- */
-async function sidecarWritten(cwd: string, sessionId: string): Promise<void> {
-	const sidecar = path.join(
-		getProjectDataDir(cwd),
-		"sessions",
-		`${sessionId}.json`,
-	);
-	const deadline = Date.now() + 10_000;
-	while (Date.now() < deadline && !fs.existsSync(sidecar))
-		await new Promise<void>((resolve) => setImmediate(resolve));
-	expect(fs.existsSync(sidecar), sidecar).toBe(true);
-}
+const setGlobalConfig = useGlobalConfig();
 
-/** A turn ends after the activation, as every real one does. */
-async function endTurnAndPersist(
-	pi: ReturnType<typeof createPiMock>,
-	ctx: unknown,
-	cwd: string,
-	sessionId: string,
-): Promise<void> {
-	await pi.emit("turn_end", {}, ctx);
-	await sidecarWritten(cwd, sessionId);
-}
+// #5146: the file's cases start sessions in many shapes, some with their own
+// fixture roots inside the case, so one root hook ends whatever is still open.
+afterEach(async () => {
+	await endMockSessions();
+});
 
 describe("index.ts extension wiring", () => {
 	it.each(["reject", "throw"])(
@@ -621,21 +590,13 @@ describe("index.ts extension wiring", () => {
 		// failure. Keep the matrix across both registration-time feature flags and
 		// assert each registration group so a bypassed group cannot hide behind a
 		// passing helper-only test.
-		it.each([
-			{ compactToolLine: false, supportsActiveTools: false },
-			{ compactToolLine: false, supportsActiveTools: true },
-			{ compactToolLine: true, supportsActiveTools: false },
-			{ compactToolLine: true, supportsActiveTools: true },
-		])(
-			"registers non-empty descriptions through the host seam (compact=$compactToolLine, dynamic=$supportsActiveTools)",
-			({ compactToolLine, supportsActiveTools }) => {
+		it.each([{ supportsActiveTools: false }, { supportsActiveTools: true }])(
+			"registers non-empty descriptions through the host seam (dynamic=$supportsActiveTools)",
+			({ supportsActiveTools }) => {
 				activationToolFactoryOverride.enabled = true;
 				activationToolFactoryOverride.description = undefined;
 				try {
-					const pi = createPiMock(
-						compactToolLine ? { "lens-compact-tool-line": true } : {},
-						{ supportsActiveTools },
-					);
+					const pi = createPiMock({ supportsActiveTools });
 					extension(pi.asExtensionAPI());
 					expect(
 						(pi.getTool("pi_lens_activate_tools") as { description?: unknown })
@@ -707,97 +668,61 @@ describe("index.ts extension wiring", () => {
 		});
 
 		it("does not register a tool disabled by project config through the real path", () => {
-			const tempDir = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-tool-config-"),
-			);
-			const configPath = path.join(tempDir, "config.json");
-			fs.writeFileSync(
-				configPath,
-				JSON.stringify({
-					tools: { ast_grep_replace: { enabled: false } },
-				}),
-			);
-			const prior = process.env.PI_LENS_CONFIG_PATH;
-			process.env.PI_LENS_CONFIG_PATH = configPath;
-			try {
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				expect(pi.getTool("ast_grep_replace")).toBeUndefined();
-				expect(pi.getTool("pi_lens_activate_tools")).toBeDefined();
-			} finally {
-				if (prior === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-				else process.env.PI_LENS_CONFIG_PATH = prior;
-				removeTempDirSync(tempDir);
-			}
+			setGlobalConfig({ tools: { ast_grep_replace: { enabled: false } } });
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+			expect(pi.getTool("ast_grep_replace")).toBeUndefined();
+			expect(pi.getTool("pi_lens_activate_tools")).toBeDefined();
 		});
 
 		it("reports the effective tool surface and rejects disabled activation", async () => {
-			const tempDir = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-health-tool-config-"),
+			setGlobalConfig({
+				tools: {
+					ast_grep_replace: { enabled: false },
+					health: { enabled: false },
+				},
+			});
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+			const ctx = makeCtx();
+			await pi.runCommand("lens-health", "", ctx);
+			const health = ctx.notifications.map((n) => n.message).join("\n");
+			expect(health).toContain("Tools enabled:");
+			expect(health).toContain(
+				"Tools disabled: ast_grep_replace, health (2 total)",
 			);
-			const configPath = path.join(tempDir, "config.json");
-			fs.writeFileSync(
-				configPath,
-				JSON.stringify({
-					tools: {
-						ast_grep_replace: { enabled: false },
-						health: { enabled: false },
-					},
-				}),
+			expect(health).not.toContain(
+				"Tools disabled: ast_grep_replace, health and",
 			);
-			const prior = process.env.PI_LENS_CONFIG_PATH;
-			process.env.PI_LENS_CONFIG_PATH = configPath;
-			try {
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				const ctx = makeCtx();
-				await pi.runCommand("lens-health", "", ctx);
-				const health = ctx.notifications.map((n) => n.message).join("\n");
-				expect(health).toContain("Tools enabled:");
-				expect(health).toContain(
-					"Tools disabled: ast_grep_replace, health (2 total)",
-				);
-				expect(health).not.toContain(
-					"Tools disabled: ast_grep_replace, health and",
-				);
-				expect(health).toContain("Skills: managed by pi package filters");
+			expect(health).toContain("Skills: managed by pi package filters");
 
-				const activation = pi.getTool("pi_lens_activate_tools") as
-					| {
-							execute: (
-								toolCallId: string,
-								params: Record<string, unknown>,
-								signal: AbortSignal | undefined,
-								onUpdate: unknown,
-								ctx: unknown,
-							) => Promise<{
-								isError?: boolean;
-								content?: Array<{ text?: string }>;
-							}>;
-					  }
-					| undefined;
-				expect(activation).toBeDefined();
-				const result = await activation?.execute(
-					"disabled-tool",
-					{ tools: ["ast_grep_replace"] },
-					undefined,
-					undefined,
-					ctx,
-				);
-				expect(result?.isError).toBe(true);
-				expect(result?.content?.[0]?.text).toContain("No valid tool names");
-			} finally {
-				if (prior === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-				else process.env.PI_LENS_CONFIG_PATH = prior;
-				removeTempDirSync(tempDir);
-			}
+			const activation = pi.getTool("pi_lens_activate_tools") as
+				| {
+						execute: (
+							toolCallId: string,
+							params: Record<string, unknown>,
+							signal: AbortSignal | undefined,
+							onUpdate: unknown,
+							ctx: unknown,
+						) => Promise<{
+							isError?: boolean;
+							content?: Array<{ text?: string }>;
+						}>;
+				  }
+				| undefined;
+			expect(activation).toBeDefined();
+			const result = await activation?.execute(
+				"disabled-tool",
+				{ tools: ["ast_grep_replace"] },
+				undefined,
+				undefined,
+				ctx,
+			);
+			expect(result?.isError).toBe(true);
+			expect(result?.content?.[0]?.text).toContain("No valid tool names");
 		});
 
 		it("bounds a long disabled-tool list on the health surface", async () => {
-			const tempDir = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-health-tool-cap-"),
-			);
-			const configPath = path.join(tempDir, "config.json");
 			const disabledTools = [
 				"ast_grep_search",
 				"ast_grep_replace",
@@ -817,38 +742,20 @@ describe("index.ts extension wiring", () => {
 				"project_scan",
 				"rebuild",
 			] as const;
-			fs.writeFileSync(
-				configPath,
-				JSON.stringify({
-					tools: Object.fromEntries(
-						disabledTools.map((name) => [name, { enabled: false }]),
-					),
-				}),
-			);
-			const prior = process.env.PI_LENS_CONFIG_PATH;
-			process.env.PI_LENS_CONFIG_PATH = configPath;
-			try {
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				const ctx = makeCtx();
-				await pi.runCommand("lens-health", "", ctx);
-				const health = ctx.notifications.map((n) => n.message).join("\n");
-				expect(health).toContain(
-					"Tools disabled: ast_grep_search, ast_grep_replace, ast_grep_outline, lsp_navigation, lens_diagnostics, lens_diagnostic_mark, symbol_search, module_report and 9 more (17 total)",
-				);
-				expect(health).not.toContain("project_report");
-			} finally {
-				if (prior === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-				else process.env.PI_LENS_CONFIG_PATH = prior;
-				removeTempDirSync(tempDir);
-			}
-		});
-
-		it("does not register a tool disabled by --no-tool through the real path", () => {
-			const pi = createPiMock({ "no-tool": "ast_grep_replace" });
+			setGlobalConfig({
+				tools: Object.fromEntries(
+					disabledTools.map((name) => [name, { enabled: false }]),
+				),
+			});
+			const pi = createPiMock();
 			extension(pi.asExtensionAPI());
-			expect(pi.getTool("ast_grep_replace")).toBeUndefined();
-			expect(pi.getTool("ast_grep_search")).toBeDefined();
+			const ctx = makeCtx();
+			await pi.runCommand("lens-health", "", ctx);
+			const health = ctx.notifications.map((n) => n.message).join("\n");
+			expect(health).toContain(
+				"Tools disabled: ast_grep_search, ast_grep_replace, ast_grep_outline, lsp_navigation, lens_diagnostics, lens_diagnostic_mark, symbol_search, module_report and 9 more (17 total)",
+			);
+			expect(health).not.toContain("project_report");
 		});
 
 		// #771: symbol_search's ergonomics additions (paths/lang filters) must
@@ -869,63 +776,13 @@ describe("index.ts extension wiring", () => {
 			expect(properties).toHaveProperty("limit");
 		});
 
-		// #dynamic-tooling: 5 situational tools are registered but start
-		// inactive on a host that supports pi's dynamic tool loading
-		// (pi.getActiveTools/setActiveTools); the 6 always-active tools plus
-		// the loader itself stay active. Newly-activated tools only need to
-		// be visible from the NEXT turn, so this only asserts load-time state.
-		// #643: the deactivation call moved from synchronous registration into
-		// the session_start handler (the correct lifecycle point — see
-		// index.ts), so this test now fires session_start before asserting.
-		it("registers the 5 situational tools inactive and everything else active on a dynamic-tooling host", async () => {
-			const tmp = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-wiring-session-start-"),
-			);
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				await pi.emit("session_start", {}, makeCtx({ cwd: tmp }));
-
-				const LAZY_TOOLS = [
-					"ast_grep_search",
-					"ast_grep_replace",
-					"ast_grep_outline",
-					"lsp_navigation",
-					"lens_diagnostic_mark",
-				];
-				const ALWAYS_ACTIVE = [
-					"lens_diagnostics",
-					"symbol_search",
-					"project_report",
-					"module_report",
-					"read_symbol",
-					"read_enclosing",
-					"pi_lens_activate_tools",
-				];
-
-				for (const t of LAZY_TOOLS) {
-					expect(pi.getTool(t), `tool registered: ${t}`).toBeDefined();
-					expect(pi.activeTools.has(t), `should start inactive: ${t}`).toBe(
-						false,
-					);
-				}
-				for (const t of ALWAYS_ACTIVE) {
-					expect(pi.getTool(t), `tool registered: ${t}`).toBeDefined();
-					expect(pi.activeTools.has(t), `should start active: ${t}`).toBe(true);
-				}
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
-		// Feature-detection fallback: a host without getActiveTools/setActiveTools
-		// (older pi, or any host not implementing dynamic tooling) must not throw,
-		// and every tool — including the 6 normally-lazy ones — stays statically
-		// active, matching pi-lens's behavior before this feature existed.
+		// Slice 6 of #4632 moved the dynamic-tooling cases that a real host can
+		// drive to `tests/index-4632-s6-dynamic-tooling.test.ts` (tier 2): pi's own
+		// active tool set, the real `pi_lens_activate_tools` tool, and pi's own
+		// new/resume/fork/reload replacements. Two claims stay here, each a payload
+		// this host cannot produce: a host WITHOUT `getActiveTools`/`setActiveTools`
+		// (the feature-detection fallback), and a `/new` whose successor names the
+		// CURRENT session file (pi always mints a fresh one).
 		// #643: assert through session_start, the call's new (correct) home.
 		it("falls back to all tools statically active on a host without dynamic-tooling support", async () => {
 			const tmp = fs.mkdtempSync(
@@ -934,7 +791,7 @@ describe("index.ts extension wiring", () => {
 			const prevDataDir = process.env.PILENS_DATA_DIR;
 			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
 			try {
-				const pi = createPiMock({}, { supportsActiveTools: false });
+				const pi = createPiMock({ supportsActiveTools: false });
 
 				expect(() => extension(pi.asExtensionAPI())).not.toThrow();
 				await pi.emit("session_start", {}, makeCtx({ cwd: tmp }));
@@ -946,322 +803,6 @@ describe("index.ts extension wiring", () => {
 					// skipped the deactivation step entirely (the graceful fallback).
 					expect(pi.activeTools.has(t), `should stay active: ${t}`).toBe(true);
 				}
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
-		// #1453: the host hands the rebuilt session an all-active tool set.
-		// #3589/#3612: pi re-runs the factory for a fork or a reload, so the
-		// rebuilt session starts in a SECOND activation, as here; one mock
-		// activation receiving both events is the shape that hid #3589. Resume
-		// restores from the session's own sidecar, which a real turn_end writes;
-		// the real-runtime witness "restores a resumed session's activations
-		// after a process restart" covers it.
-		it.each(["fork", "reload"])(
-			"restores the parent's tool posture on %s session_start",
-			async (reason) => {
-				// #3306: these three roots are the ONLY ones in this file that
-				// outlive it. `removeTempDirSync(tmp)` in the `finally` below does
-				// remove the directory — measured — but this scenario's
-				// `session_start` leaves a `recent-touches` append in flight against
-				// the `PILENS_DATA_DIR` captured HERE, and that append recreates the
-				// root after the case has ended (measured: the `fork` root's
-				// `data/repo-<hash>/recent-touches.json` is written while the
-				// `resume` case is running). The repo's answer to a deferred fixture
-				// producer is the tracked-root seam plus the drained sweep at file
-				// end, not a second removal loop of this file's own.
-				const { tmpDir: tmp, cleanup } = setupTestEnvironment(
-					`pi-lens-wiring-${reason}-`,
-				);
-				const prevDataDir = process.env.PILENS_DATA_DIR;
-				process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-				try {
-					_resetSessionLifecycleForTests();
-					const pi = createPiMock();
-					extension(pi.asExtensionAPI());
-					const ctx = makeCtx({
-						cwd: tmp,
-						sessionId: `cache-${reason}`,
-						sessionFile: path.join(tmp, `${reason}-session.jsonl`),
-					});
-					await pi.emit("session_start", { reason: "startup" }, ctx);
-					const loader = pi.getTool("pi_lens_activate_tools") as {
-						execute: (...args: unknown[]) => Promise<unknown>;
-					};
-					await loader.execute(
-						"activate",
-						{ tools: ["ast_grep_search"] },
-						undefined,
-						undefined,
-						ctx,
-					);
-					const parentPosture = new Set(pi.activeTools);
-					expect(parentPosture.has("ast_grep_search")).toBe(true);
-					expect(parentPosture.has("ast_grep_replace")).toBe(false);
-
-					// A fork's successor announces itself on the file pi names at
-					// shutdown; a reload keeps its file and names none.
-					await pi.emit(
-						"session_shutdown",
-						{
-							reason,
-							targetSessionFile:
-								reason === "reload"
-									? undefined
-									: ctx.sessionManager.getSessionFile(),
-						},
-						ctx,
-					);
-					const rebuilt = createPiMock();
-					extension(rebuilt.asExtensionAPI());
-					for (const name of rebuilt.tools.keys())
-						rebuilt.activeTools.add(name);
-					await rebuilt.emit("session_start", { reason }, ctx);
-					// Character-for-character the parent's set: the advertised tool
-					// list still matches the cached prompt prefix AND the model's
-					// activation survived.
-					expect([...rebuilt.activeTools].sort()).toEqual(
-						[...parentPosture].sort(),
-					);
-					expect(rebuilt.activeTools.has("ast_grep_search")).toBe(true);
-					expect(rebuilt.activeTools.has("ast_grep_replace")).toBe(false);
-					expect(rebuilt.activeTools.has("lsp_navigation")).toBe(false);
-				} finally {
-					if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-					else process.env.PILENS_DATA_DIR = prevDataDir;
-					cleanup();
-				}
-			},
-		);
-
-		// #3306: the three roots above stay TRACKED after `cleanup()` so this sweep
-		// still has a handle on the one a deferred `recent-touches` append
-		// recreated. It runs before the setup file's own teardown check, because
-		// vitest runs `afterAll` hooks in reverse registration order and the setup
-		// file registered first.
-		afterAll(async () => {
-			await cleanupTestEnvironmentsDrained("pi-lens-wiring-");
-		});
-
-		it("restores activation after a factory re-run for the same session file", async () => {
-			const tmp = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-factory-rebuild-"),
-			);
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				_resetSessionLifecycleForTests();
-				const sessionFile = path.join(tmp, "conversation.jsonl");
-				const ctx = makeCtx({
-					cwd: tmp,
-					sessionId: "factory-rebuild",
-					sessionFile,
-				});
-				const first = createPiMock();
-				extension(first.asExtensionAPI());
-				await first.emit("session_start", { reason: "startup" }, ctx);
-				const loader = first.getTool("pi_lens_activate_tools") as {
-					execute: (...args: unknown[]) => Promise<unknown>;
-				};
-				await loader.execute(
-					"factory-rebuild",
-					{ tools: ["ast_grep_search"] },
-					undefined,
-					undefined,
-					ctx,
-				);
-
-				// pi shuts the old activation down before it re-runs the factory.
-				await first.emit("session_shutdown", { reason: "reload" }, ctx);
-				const rebuilt = createPiMock();
-				extension(rebuilt.asExtensionAPI());
-				for (const name of rebuilt.tools.keys()) rebuilt.activeTools.add(name);
-				await rebuilt.emit("session_start", { reason: "reload" }, ctx);
-
-				expect(rebuilt.activeTools.has("ast_grep_search")).toBe(true);
-				expect(rebuilt.activeTools.has("ast_grep_replace")).toBe(false);
-				await sidecarWritten(tmp, "factory-rebuild");
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
-		it("inherits activation from the parent session file on a fork", async () => {
-			const tmp = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-wiring-fork-"),
-			);
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				_resetSessionLifecycleForTests();
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				const parentFile = path.join(tmp, "parent.jsonl");
-				const childFile = path.join(tmp, "child.jsonl");
-				const parent = makeCtx({
-					cwd: tmp,
-					sessionId: "fork-parent",
-					sessionFile: parentFile,
-				});
-				const child = makeCtx({
-					cwd: tmp,
-					sessionId: "fork-child",
-					sessionFile: childFile,
-				});
-				await pi.emit("session_start", { reason: "startup" }, parent);
-				const loader = pi.getTool("pi_lens_activate_tools") as {
-					execute: (...args: unknown[]) => Promise<unknown>;
-				};
-				await loader.execute(
-					"activate",
-					{ tools: ["ast_grep_search"] },
-					undefined,
-					undefined,
-					parent,
-				);
-				await pi.emit(
-					"session_shutdown",
-					{ reason: "fork", targetSessionFile: childFile },
-					parent,
-				);
-				// #3521: pi re-runs the extension factory for the forked runtime,
-				// so the child's session_start reaches a SECOND activation that
-				// shares only the module with the parent's.
-				const forked = createPiMock();
-				extension(forked.asExtensionAPI());
-				for (const name of forked.tools.keys()) forked.activeTools.add(name);
-				await forked.emit(
-					"session_start",
-					{ reason: "fork", previousSessionFile: parentFile },
-					child,
-				);
-				expect(forked.activeTools.has("ast_grep_search")).toBe(true);
-				expect(forked.activeTools.has("ast_grep_replace")).toBe(false);
-				await sidecarWritten(tmp, "fork-parent");
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
-		it("keeps the departing conversation's posture when /new changes session file", async () => {
-			const tmp = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-wiring-new-retain-"),
-			);
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				_resetSessionLifecycleForTests();
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				const departing = makeCtx({
-					cwd: tmp,
-					sessionId: "new-departing",
-					sessionFile: path.join(tmp, "departing.jsonl"),
-				});
-				const replacement = makeCtx({
-					cwd: tmp,
-					sessionId: "new-replacement",
-					sessionFile: path.join(tmp, "replacement.jsonl"),
-				});
-				await pi.emit("session_start", { reason: "startup" }, departing);
-				const loader = pi.getTool("pi_lens_activate_tools") as {
-					execute: (...args: unknown[]) => Promise<unknown>;
-				};
-				await loader.execute(
-					"activate",
-					{ tools: ["ast_grep_search"] },
-					undefined,
-					undefined,
-					departing,
-				);
-				await endTurnAndPersist(pi, departing, tmp, "new-departing");
-
-				await pi.emit(
-					"session_shutdown",
-					{
-						type: "session_shutdown",
-						reason: "new",
-						targetSessionFile: path.join(tmp, "replacement.jsonl"),
-					},
-					departing,
-				);
-				for (const name of pi.tools.keys()) pi.activeTools.add(name);
-				await pi.emit(
-					"session_start",
-					{
-						reason: "new",
-						previousSessionFile: path.join(tmp, "departing.jsonl"),
-					},
-					replacement,
-				);
-				await pi.emit(
-					"session_shutdown",
-					{
-						type: "session_shutdown",
-						reason: "resume",
-						targetSessionFile: path.join(tmp, "departing.jsonl"),
-					},
-					replacement,
-				);
-				for (const name of pi.tools.keys()) pi.activeTools.add(name);
-				await pi.emit("session_start", { reason: "resume" }, departing);
-
-				expect(pi.activeTools.has("ast_grep_search")).toBe(true);
-				expect(pi.activeTools.has("ast_grep_replace")).toBe(false);
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
-		it("does not restore activation for a different session file on resume", async () => {
-			const tmp = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-wiring-identity-"),
-			);
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				_resetSessionLifecycleForTests();
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				const first = makeCtx({
-					cwd: tmp,
-					sessionId: "identity-a",
-					sessionFile: path.join(tmp, "a.jsonl"),
-				});
-				const second = makeCtx({
-					cwd: tmp,
-					sessionId: "identity-b",
-					sessionFile: path.join(tmp, "b.jsonl"),
-				});
-				await pi.emit("session_start", { reason: "startup" }, first);
-				const loader = pi.getTool("pi_lens_activate_tools") as {
-					execute: (...args: unknown[]) => Promise<unknown>;
-				};
-				await loader.execute(
-					"activate",
-					{ tools: ["ast_grep_search"] },
-					undefined,
-					undefined,
-					first,
-				);
-				await pi.emit(
-					"session_shutdown",
-					{ reason: "resume", targetSessionFile: path.join(tmp, "b.jsonl") },
-					first,
-				);
-				for (const name of pi.tools.keys()) pi.activeTools.add(name);
-				await pi.emit("session_start", { reason: "resume" }, second);
-
-				expect(pi.activeTools.has("ast_grep_search")).toBe(false);
 			} finally {
 				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 				else process.env.PILENS_DATA_DIR = prevDataDir;
@@ -1316,128 +857,6 @@ describe("index.ts extension wiring", () => {
 			}
 		});
 
-		// A genuinely new conversation drops the activation memory: the rebuilt
-		// all-active set shrinks back to the bare baseline.
-		it("forgets the previous conversation's activations on a new session", async () => {
-			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wiring-new-"));
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				_resetSessionLifecycleForTests();
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				const ctx = makeCtx({
-					cwd: tmp,
-					sessionId: "cache-new",
-					sessionFile: path.join(tmp, "new-session.jsonl"),
-				});
-				await pi.emit("session_start", { reason: "startup" }, ctx);
-				const loader = pi.getTool("pi_lens_activate_tools") as {
-					execute: (...args: unknown[]) => Promise<unknown>;
-				};
-				await loader.execute(
-					"activate",
-					{ tools: ["ast_grep_search"] },
-					undefined,
-					undefined,
-					ctx,
-				);
-				expect(pi.activeTools.has("ast_grep_search")).toBe(true);
-
-				// pi-mock bound: this lifecycle assertion does not re-run the factory or reproduce host ordering.
-				await pi.simulateSessionShutdownAndRebuild("new", ctx);
-
-				expect(pi.activeTools.has("ast_grep_search")).toBe(false);
-				expect(pi.activeTools.has("lens_diagnostics")).toBe(true);
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
-		// Round 4: `session_shutdown` with reason "quit" performs no
-		// activation-memory mutation — real pi exits on quit, so a clear
-		// there is production-inert. Re-adding one reds this case: the same
-		// file resumes with its posture intact.
-		it("retains remembered posture across a quit shutdown", async () => {
-			const tmp = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-wiring-quit-"),
-			);
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				_resetSessionLifecycleForTests();
-				const pi = createPiMock();
-				extension(pi.asExtensionAPI());
-				const ctx = makeCtx({
-					cwd: tmp,
-					sessionId: "cache-quit",
-					sessionFile: path.join(tmp, "quit-session.jsonl"),
-				});
-				await pi.emit("session_start", { reason: "startup" }, ctx);
-				const loader = pi.getTool("pi_lens_activate_tools") as {
-					execute: (...args: unknown[]) => Promise<unknown>;
-				};
-				await loader.execute(
-					"activate",
-					{ tools: ["ast_grep_search"] },
-					undefined,
-					undefined,
-					ctx,
-				);
-				expect(pi.activeTools.has("ast_grep_search")).toBe(true);
-				await endTurnAndPersist(pi, ctx, tmp, "cache-quit");
-
-				// pi-mock bound: this lifecycle assertion does not re-run the factory or reproduce host ordering.
-				await pi.simulateSessionShutdownAndRebuild("quit", ctx);
-
-				// The host rebuilds all-active, as on every replacement; the
-				// same file resumes with its posture intact.
-				for (const name of pi.tools.keys()) pi.activeTools.add(name);
-				await pi.emit("session_start", { reason: "resume" }, ctx);
-
-				expect(pi.activeTools.has("ast_grep_search")).toBe(true);
-				expect(pi.activeTools.has("ast_grep_replace")).toBe(false);
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
-		it("keeps every tool statically active when lazy tooling is disabled", async () => {
-			const tmp = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-wiring-static-tools-"),
-			);
-			const prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-			try {
-				_resetSessionLifecycleForTests();
-				const pi = createPiMock({ "no-lazy-tools": true });
-				extension(pi.asExtensionAPI());
-				const ctx = makeCtx({ cwd: tmp, sessionId: "static" });
-				await pi.emit("session_start", { reason: "startup" }, ctx);
-
-				for (const tool of EXPECTED_TOOLS) {
-					expect(pi.activeTools.has(tool), tool).toBe(true);
-				}
-
-				// Still all-active after a rebuild: under the opt-out pi-lens never
-				// touches the set, on any reason.
-				for (const name of pi.tools.keys()) pi.activeTools.add(name);
-				await pi.emit("session_start", { reason: "fork" }, ctx);
-
-				for (const tool of EXPECTED_TOOLS) {
-					expect(pi.activeTools.has(tool), tool).toBe(true);
-				}
-			} finally {
-				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-				else process.env.PILENS_DATA_DIR = prevDataDir;
-				removeTempDirSync(tmp);
-			}
-		});
-
 		// #1327: opt-in compact one-line tool rendering, gated by
 		// `lens-compact-tool-line` / `ui.compactToolLine`. Off by default — the
 		// off path must register the ORIGINAL tool definitions untouched (no
@@ -1462,56 +881,6 @@ describe("index.ts extension wiring", () => {
 						`${t}.renderResult should still exist`,
 					).toBeTypeOf("function");
 				}
-			});
-
-			it("flag on: wraps tools that have renderResult with a compact renderCall + one-line renderResult", async () => {
-				const pi = createPiMock({ "lens-compact-tool-line": true });
-				extension(pi.asExtensionAPI());
-
-				const tool = pi.getTool("lens_diagnostics") as {
-					renderCall?: (...a: unknown[]) => { render: (w: number) => string[] };
-					renderResult?: (...a: unknown[]) => {
-						render: (w: number) => string[];
-					};
-				};
-				expect(tool.renderCall).toBeTypeOf("function");
-				expect(tool.renderResult).toBeTypeOf("function");
-
-				const theme = {
-					fg: (_c: string, t: string) => t,
-					bold: (t: string) => t,
-				};
-				const ctx = {
-					args: { mode: "all" },
-					toolCallId: "x",
-					invalidate: () => {},
-					lastComponent: undefined,
-					state: {},
-					cwd: "/repo",
-					executionStarted: true,
-					argsComplete: true,
-					isPartial: false,
-					expanded: false,
-					showImages: false,
-					isError: false,
-				};
-
-				// Call row blanks out once a settled result exists (collapsed).
-				const callComponent = tool.renderCall?.({ mode: "all" }, theme, ctx);
-				expect(callComponent?.render(80)).toEqual([]);
-
-				const resultComponent = tool.renderResult?.(
-					{
-						content: [],
-						details: { mode: "all", totalBlocking: 0, filesWithIssues: 0 },
-					},
-					{ expanded: false, isPartial: false },
-					theme,
-					ctx,
-				);
-				const lines = resultComponent?.render(200) ?? [];
-				expect(lines).toHaveLength(1);
-				expect(lines[0]).toContain("lens_diagnostics");
 			});
 
 			it("registers the lens-compact-tool-line flag from the registry (name + description + default false)", () => {
@@ -1641,89 +1010,6 @@ describe("index.ts extension wiring", () => {
 			expect((result as { systemPrompt: string }).systemPrompt).not.toContain(
 				"pi-lens-lsp-navigation",
 			);
-		});
-	});
-
-	describe("context injection gating + toggle", () => {
-		let tmp: string;
-		let prevDataDir: string | undefined;
-
-		beforeEach(() => {
-			tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wiring-"));
-			prevDataDir = process.env.PILENS_DATA_DIR;
-			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
-		});
-
-		afterEach(() => {
-			if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-			else process.env.PILENS_DATA_DIR = prevDataDir;
-			removeTempDirSync(tmp);
-		});
-
-		function seedTurnEndFindings(
-			cwd: string,
-			content: string,
-			sessionId: string,
-		): void {
-			const file = path.join(cwd, "unchanged.ts");
-			fs.writeFileSync(file, "export const unchanged = true;\n");
-			const provenance = snapshotAdvisoryProvenance({
-				cwd,
-				runtime: { telemetrySessionId: sessionId, projectSeq: 0, turnIndex: 0 },
-				generation: 1,
-				files: [{ path: file, role: "affected" }],
-			});
-			new CacheManager().writeCache(
-				"turn-end-findings",
-				{ content, provenance },
-				cwd,
-			);
-		}
-
-		it("suppresses injection when --no-lens-context is set, then injects after /lens-context-toggle", async () => {
-			// Start OFF deterministically via the CLI flag (env → CLI → config).
-			_resetSessionLifecycleForTests();
-			const pi = createPiMock({ "no-lens-context": true });
-			extension(pi.asExtensionAPI());
-			// #1681: the host never puts sessionId on the session_start event — see
-			// index.ts's own comment at the `stableSessionId` read ("the event
-			// carries none"). It belongs on ctx, via makeCtx below.
-			await pi.emit(
-				"session_start",
-				makeSessionStartEvent(),
-				makeCtx({ cwd: tmp, sessionId: "wiring-session" }),
-			);
-			seedTurnEndFindings(tmp, "TESTFINDINGS_XYZZY", "wiring-session");
-
-			const existing = [{ role: "system", content: "orig" }];
-
-			// Gated off: the context hook returns nothing and leaves findings intact.
-			const off = await pi.emit(
-				"context",
-				{ messages: existing },
-				makeCtx({ cwd: tmp }),
-			);
-			expect(off).toBeUndefined();
-
-			// Flip it on through the real command handler.
-			await pi.runCommand("lens-context-toggle", "", makeCtx({ cwd: tmp }));
-
-			// Now the same hook injects the cached findings into the transcript.
-			// The lone existing message is a `system` message (not a plain user
-			// prompt), so the #1016/#3693 placement guard appends the findings after it
-			// rather than prepending — the original message stays first (so a real
-			// user prompt / system preamble keeps its position and the prompt-cache
-			// prefix), and the findings land at the tail.
-			const on = (await pi.emit(
-				"context",
-				{ messages: existing },
-				makeCtx({ cwd: tmp }),
-			)) as { messages: Array<{ role: string; content: string }> } | undefined;
-
-			expect(on?.messages, "expected injected messages").toBeDefined();
-			expect(on?.messages[0]).toEqual({ role: "system", content: "orig" });
-			expect(on?.messages.at(-1)?.content).toMatch(/TESTFINDINGS_XYZZY/);
-			expect(on?.messages.at(-1)?.content).toContain("Address 🔴 blockers");
 		});
 	});
 
@@ -2342,7 +1628,7 @@ describe("ui.compactWidget mount seam (#3959)", () => {
 
 	// Walk the real extension → session_start → setWidget path to grab the
 	// factory and instantiate the component it returns.
-	async function mountWidget(flags: Record<string, boolean | string>) {
+	async function mountWidget(config: Record<string, unknown>) {
 		// Earlier tests leave a primary registration behind; without a reset this
 		// session_start is classified concurrent-secondary and skips mounting.
 		_resetSessionLifecycleForTests();
@@ -2352,7 +1638,8 @@ describe("ui.compactWidget mount seam (#3959)", () => {
 		// the flag is decided by the mock alone.
 		process.env.PI_LENS_HOME = tmpDir;
 		try {
-			const pi = createPiMock(flags);
+			setGlobalConfig(config);
+			const pi = createPiMock();
 			extension(pi.asExtensionAPI());
 			const ctx = makeCtx({
 				cwd: process.cwd(),
@@ -2379,7 +1666,7 @@ describe("ui.compactWidget mount seam (#3959)", () => {
 
 	it("renders one compact line when lens-compact-widget is enabled", async () => {
 		try {
-			const component = await mountWidget({ "lens-compact-widget": true });
+			const component = await mountWidget({ ui: { compactWidget: true } });
 			// The session_start store restore during mounting clears widget state,
 			// so seed the fixture only after mounting.
 			seedSummaryFixture();

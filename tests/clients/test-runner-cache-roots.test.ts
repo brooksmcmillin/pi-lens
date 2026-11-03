@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
 import { TestRunnerClient } from "../../clients/test-runner-client.js";
 
 const tempRoots: string[] = [];
@@ -109,6 +110,103 @@ describe("TestRunnerClient project-root caches (#2048)", () => {
 			"export default { test: { include: ['changed/**/*.test.ts'] } }\n",
 		);
 		expect(client.parseVitestTestGlobs(alias)).toEqual(rootGlobs);
+	});
+
+	// #4689 batch 2: a cwd that does not exist yet has no realpath, so the key
+	// came from its spelling and a link spelling of the same future directory
+	// split from the real one. The identity of the nearest existing ancestor
+	// plus the missing tail (`realpathOrResolve`) names both spellings alike.
+	// Recurrence: master keys `alias/later` and `root/later` apart.
+	it("keys a cwd that does not exist yet by its path identity, through either spelling (#4689)", () => {
+		const { root, alias } = makeProject();
+		const client = new TestRunnerClient();
+
+		const viaAlias = client._getCanonicalProjectRootForTests(
+			path.join(alias, "later"),
+		);
+		const viaRoot = client._getCanonicalProjectRootForTests(
+			path.join(root, "later"),
+		);
+
+		expect(viaAlias).toBe(viaRoot);
+		expect(viaAlias).toBe(
+			normalizeEphemeralMapKey(
+				path.join(fs.realpathSync.native(root), "later"),
+			),
+		);
+	});
+
+	// #4689 batch 2 round 2: `path.resolve` folds `..` before the identity is
+	// derived, so `lnk/../pkg` (lnk -> deep/inner) keyed `parent/pkg` while the
+	// kernel opens `deep/pkg`. Recurrence: #4853 F1, the same shape in the
+	// coordinator, and CodeRabbit's note on this file's `canonicalFailedPath`.
+	it("keys a cwd spelled with `..` after a link by the kernel's identity (#4689)", (ctx) => {
+		const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-4689-dd-"));
+		tempRoots.push(parent);
+		fs.mkdirSync(path.join(parent, "deep", "inner"), { recursive: true });
+		fs.mkdirSync(path.join(parent, "deep", "pkg"));
+		fs.mkdirSync(path.join(parent, "pkg"));
+		// A host without symlink support must skip this cell, not fail its
+		// setup: only the `..`-after-a-link reading is under test here.
+		try {
+			linkAlias(path.join(parent, "deep", "inner"), path.join(parent, "lnk"));
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+		const client = new TestRunnerClient();
+
+		const key = client._getCanonicalProjectRootForTests(
+			// not path.join: it folds the `..` lexically, which is the defect
+			[parent, "lnk", "..", "pkg"].join(path.sep),
+		);
+
+		expect(key).toBe(
+			normalizeEphemeralMapKey(
+				path.join(fs.realpathSync.native(parent), "deep", "pkg"),
+			),
+		);
+	});
+
+	// #4689 batch 2 round 3 (verify F7): dropping the `absolute` local moved
+	// `resolved` from `existsSync(path.resolve(cwd))` to `existsSync(cwd)`. That
+	// is a behaviour change, not a simplification: `lnk/../pkg` with `lnk`
+	// missing folds to an existing `pkg`, so the folded probe counted as
+	// resolved, memoized the folded key, and the link appearing later never
+	// corrected it — #2077's own defect class, one level up. Recurrence: the
+	// round's mutation D (`existsSync(cwd)` back to `existsSync(path.resolve(cwd))`)
+	// survived every suite that touches this helper until this cell existed.
+	it("re-derives a cwd whose folded spelling resolved before its link existed (#4689)", (ctx) => {
+		const parent = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-4689-resolved-"),
+		);
+		tempRoots.push(parent);
+		fs.mkdirSync(path.join(parent, "deep", "inner"), { recursive: true });
+		fs.mkdirSync(path.join(parent, "deep", "pkg"));
+		fs.mkdirSync(path.join(parent, "pkg"));
+		const spelling = [parent, "lnk", "..", "pkg"].join(path.sep);
+		const client = new TestRunnerClient();
+
+		// `lnk` does not exist yet, so the kernel cannot open this spelling at
+		// all, even though `path.resolve` folds it to the real `parent/pkg`.
+		expect(client._getCanonicalProjectRootForTests(spelling)).toBe(
+			normalizeEphemeralMapKey(
+				path.join(fs.realpathSync.native(parent), "pkg"),
+			),
+		);
+
+		try {
+			linkAlias(path.join(parent, "deep", "inner"), path.join(parent, "lnk"));
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+
+		// Same spelling, now through the link: the kernel opens `deep/pkg`, so
+		// the memo must not serve the pre-link key.
+		expect(client._getCanonicalProjectRootForTests(spelling)).toBe(
+			normalizeEphemeralMapKey(
+				path.join(fs.realpathSync.native(parent), "deep", "pkg"),
+			),
+		);
 	});
 
 	it("shares caches across a confirmed Windows separator and case alias", (ctx) => {

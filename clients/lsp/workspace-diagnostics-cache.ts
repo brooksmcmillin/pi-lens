@@ -4,7 +4,12 @@ import { getProjectDataDir } from "../file-utils.js";
 import { writeFileAtomic } from "../atomic-write.js";
 import { readJsonCache } from "../json-cache-read.js";
 import { createGenerationMap } from "../generation-guard.js";
-import { isUnderDir, normalizeMapKey } from "../path-utils.js";
+import {
+	isUnderDir,
+	normalizeMapKey,
+	relativeInside,
+	walkUpDirs,
+} from "../path-utils.js";
 import { loadReverseDependencyIndexFromSnapshot } from "../reverse-deps.js";
 import { freshnessFromMtime } from "../freshness.js";
 import { CONTENT_HASH_MAX_BYTES, hashFileBytes } from "../content-stamp.js";
@@ -216,22 +221,13 @@ export function clearWorkspaceDiagnosticsCacheAtAndAbove(
 	const root = path.resolve(cwd);
 	const workspaceRoot = path.resolve(ceiling);
 	clearWorkspaceDiagnosticsCache(root);
-	const relative = path.relative(workspaceRoot, root);
-	if (
-		relative.startsWith(".." + path.sep) ||
-		relative === ".." ||
-		path.isAbsolute(relative)
-	) {
-		return;
-	}
+	if (relativeInside(workspaceRoot, root) === undefined) return;
 	if (normalizeMapKey(root) === normalizeMapKey(workspaceRoot)) return;
-	let ancestor = path.dirname(root);
-	while (true) {
+	// Spelled climb: the caches are registered under the caller's spelling of
+	// each root, and `workspaceRoot` is that spelling too.
+	for (const ancestor of walkUpDirs(path.dirname(root), { spelling: true })) {
 		clearWorkspaceDiagnosticsCache(ancestor);
 		if (normalizeMapKey(ancestor) === normalizeMapKey(workspaceRoot)) return;
-		const parent = path.dirname(ancestor);
-		if (parent === ancestor) return;
-		ancestor = parent;
 	}
 }
 

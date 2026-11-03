@@ -91,7 +91,7 @@ function installPackages(dir) {
 	const specs = [...new Set(CONTRACTS.map((c) => c.package))];
 	console.log(`installing ${specs.join(", ")} into ${dir} ...`);
 	// Windows `npm` is a `.cmd` shim that only runs under shell mode (same
-	// reasoning as safeSpawnAsync — see AGENTS.md "Runner process model").
+	// reasoning as safeSpawnAsync — see HISTORY.md "Runner process model").
 	const isWindows = process.platform === "win32";
 	execFileSync(
 		"npm",

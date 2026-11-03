@@ -27,6 +27,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { HOST_PROVIDED_PACKAGES } from "./lib/host-provided-deps.mjs";
+import { isMainModule } from "./lib/is-main-module.mjs";
 import {
 	appendBounded,
 	buildStubAliases,
@@ -226,10 +227,6 @@ export async function run(work = main) {
 	}
 }
 
-const invokedPath = process.argv[1];
-const invokedDirectly =
-	typeof invokedPath === "string" &&
-	pathToFileURL(path.resolve(invokedPath)).href === import.meta.url;
-if (invokedDirectly) {
+if (isMainModule(import.meta.url)) {
 	await run();
 }

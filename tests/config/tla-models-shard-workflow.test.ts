@@ -62,7 +62,9 @@ describe("#3918 sharded TLA+ models workflow contract", () => {
 		);
 		expect(named.map(([id]) => id)).toEqual(["tla-models"]);
 		const aggregate = JOBS["tla-models"];
-		expect(asList(aggregate.needs)).toEqual(["tla-shards"]);
+		// #5082: `changes` joins so the aggregate can tell "formal/ proven
+		// unchanged, no shard started" from "a shard is missing".
+		expect(asList(aggregate.needs)).toEqual(["changes", "tla-shards"]);
 		expect(aggregate.if).toBe("always()");
 		expect(aggregate.env?.SHARDS_RESULT).toBe("${{ needs.tla-shards.result }}");
 		const step = aggregate.steps?.find(
@@ -170,10 +172,10 @@ describe("#3918 sharded TLA+ models workflow contract", () => {
 		const table = loadModelCosts(ROOT);
 		// Every lookup goes through `modelCostId`, the production key seam: a
 		// hand-built `resolve(config).slice(ROOT.length + 1)` keeps the HOST
-		// separator, so on a Windows runner every one of the 811 lookups misses,
+		// separator, so on a Windows runner every lookup in the corpus misses,
 		// every config falls back to `table.max`, and the balance assertion below
-		// is then 1.00x by construction -- vacuous (F1, AGENTS.md "Windows path
-		// shapes" 1/2). The miss guard is what keeps that from passing silently.
+		// is then 1.00x by construction -- vacuous (F1, docs/pi-lens-reviewer.md "Windows path
+		// shapes"). The miss guard is what keeps that from passing silently.
 		const misses = listModelConfigs(ROOT).filter(
 			(config) => !(modelCostId(ROOT, config) in table.files),
 		);
@@ -191,12 +193,16 @@ describe("#3918 sharded TLA+ models workflow contract", () => {
 		assertNonEmptyScan("measured shard costs", byShard.length, 2);
 		const heaviest = Math.max(...byShard);
 		const lightest = Math.min(...byShard);
-		// Greedy LPT on 811 configs lands within a few seconds of the ideal; 5%
+		// Greedy LPT on the full corpus (833 configs at #4714) lands within a few seconds of the ideal; 5%
 		// admits one regenerated table's rounding without admitting a real tail.
 		expect(heaviest / lightest).toBeLessThan(1.05);
 		// And the counterfactual the fix exists for: the count-based round-robin
 		// over the same table is NOT balanced, so this assertion cannot be
-		// satisfied by a table that ignores the costs.
+		// satisfied by a table that ignores the costs. The round-robin spread
+		// moves with each config's sorted position, not with the table: one
+		// added config took it from 2.07x (811 configs) to 2.00x, a second to
+		// 1.47x (#4704). The bound stays well clear of the 1.05 above, which is
+		// all a cost-blind table needs to fail (it lands near 1.00x).
 		const roundRobin = Array.from({ length: total }, (_, index) =>
 			listModelConfigs(ROOT)
 				.filter((_, position) => position % total === index)
@@ -209,7 +215,7 @@ describe("#3918 sharded TLA+ models workflow contract", () => {
 		expect(
 			Math.max(...roundRobin) / Math.min(...roundRobin),
 			"the count-based split this PR replaced should still be measurably worse; if it is not, the table or the corpus changed shape and the note in ci.yml is stale",
-		).toBeGreaterThan(1.5);
+		).toBeGreaterThan(1.25);
 	});
 
 	// A cost row for a config that no longer exists is a table that was not
@@ -322,11 +328,15 @@ describe("#3918 sharded TLA+ models workflow contract", () => {
 	// per-shard sum sit 0.64x apart on shard 1/4 -- so the published line
 	// printed `COST-TABLE DRIFT` on a healthy run, one shard of four. A warning
 	// that cries wolf is worse than none: no shard of this run may print it.
+	// The ratios are re-pinned on each cost-table regeneration (#4714 regen from
+	// run 40147263648): each is this fixture run's measured shard seconds over
+	// the seconds the table projects for that shard, so a new table or a new
+	// fixture run moves it. The pin still asserts no DRIFT line.
 	it.each([
-		["1of4", "0.64x"],
-		["2of4", "1.14x"],
-		["3of4", "1.05x"],
-		["4of4", "1.03x"],
+		["1of4", "0.65x"],
+		["2of4", "1.65x"],
+		["3of4", "1.00x"],
+		["4of4", "1.47x"],
 	] as const)(
 		"does not call the table stale for shard %s of the healthy run 39435284236",
 		(shard, ratio) => {

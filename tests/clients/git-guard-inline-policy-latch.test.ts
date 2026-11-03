@@ -19,7 +19,7 @@
  * decides, from one state. `editDispatch` below is the exact call sequence
  * `handleToolResult` makes (`clients/runtime-tool-result.ts:2526-2549`); the
  * pi host entry that calls it for real is witnessed by
- * `tests/index-3248-git-guard-latch-witness.test.ts`.
+ * `tests/index-4632-s4-tool-call-verdict.test.ts` (tier 2, the real pi session).
  */
 
 import { createHash } from "node:crypto";
@@ -37,6 +37,7 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 import { CacheManager } from "../../clients/cache-manager.js";
 import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
 import {
+	_resetDeferredForTests,
 	_resetStateCacheForTests,
 	markDisposition,
 } from "../../clients/diagnostic-dispositions.js";
@@ -171,6 +172,22 @@ function markFalsePositive(cwd: string, diagnostic: Diagnostic): void {
 	);
 }
 
+/** Record a session `defer` for a diagnostic through the real owner. */
+function markDefer(cwd: string, diagnostic: Diagnostic): void {
+	markDisposition(
+		cwd,
+		{
+			cwd,
+			filePath: diagnostic.filePath,
+			tool: diagnostic.tool,
+			rule: diagnostic.rule,
+			message: diagnostic.message,
+			line: diagnostic.line,
+		},
+		"defer",
+	);
+}
+
 function registerEdit(
 	cacheManager: CacheManager,
 	cwd: string,
@@ -223,6 +240,10 @@ afterEach(() => {
 	cancelLSPIdleReset();
 	resetDegradationLedger();
 	_resetStateCacheForTests();
+	// #4701 F1: a `defer` is process-scoped state in the owner until the
+	// session boundary, so a case that records one must not hand it to the next
+	// case (the cost guard reads it).
+	_resetDeferredForTests();
 	logLatency.mockClear();
 	vi.useRealTimers();
 });
@@ -261,6 +282,56 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			// The persisted record is resynced in the same guard, not left
 			// claiming a blocker for a later session or a later read to trip on.
 			expect(guardRecord(cacheManager, cwd)?.hasBlockers ?? false).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("clears the latch and the record on a turn that only marked", async () => {
+		// #4698: the same disposition, made on a turn that wrote NO file. The
+		// policy pass that reconciles the latch sits below `handleTurnEnd`'s
+		// `files.length === 0` early return, so before this case the mark took,
+		// the banner said nothing, and the latch kept the marked record gating the
+		// next commit. No `registerEdit` here: that is the whole point.
+		const env = setupTestEnvironment("pi-lens-4698-mark-only-");
+		try {
+			const cwd = env.tmpDir;
+			const filePath = path.join(cwd, "app.ts");
+			fs.writeFileSync(filePath, "alpha();\nbeta();\n");
+
+			const runtime = newRuntime();
+			runtime.projectRoot = cwd;
+			const cacheManager = new CacheManager(false);
+			const diagnostics = [
+				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
+				blockingDiagnostic(filePath, 2, "beta is unsafe"),
+			];
+			editDispatch(runtime, cacheManager, cwd, filePath, diagnostics);
+			expect(evaluateGitGuard(runtime, cacheManager, cwd).block).toBe(true);
+			for (const diagnostic of diagnostics) markFalsePositive(cwd, diagnostic);
+
+			logLatency.mockClear();
+			runtime.beginTurn();
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+
+			// The gate the agent reaches next agrees with the mark …
+			expect(runtime.gitGuardHasBlockers).toBe(false);
+			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
+				block: false,
+			});
+			// … the record it would fall back on is gone too …
+			expect(guardRecord(cacheManager, cwd)?.hasBlockers ?? false).toBe(false);
+			// … and the turn left the ONE record a reader explains the flip with,
+			// the same literal and the same fields the edit turn writes.
+			const rows = inlinePolicyRows();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.metadata).toMatchObject({
+				records: 1,
+				candidates: 2,
+				dispositionSuppressed: 2,
+				guardFilesSuppressed: 1,
+				guardLatchCleared: true,
+			});
 		} finally {
 			env.cleanup();
 		}
@@ -337,14 +408,14 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 		}
 	});
 
-	it("keeps the gate closed for a DEMOTED blocker, which no mark ever reached", async () => {
+	it("keeps the gate closed for a DEMOTED blocker with no mark", async () => {
 		// Decided from the existing retire semantics, not invented here:
 		// demotion takes a record out of the authoritative CHANNEL, it is not a
 		// resolution, and `clients/blocker-freshness.ts:89` pins that the commit
-		// gate is unaffected by it. The policy never runs on a stale record
-		// (`clients/runtime-turn.ts` takes the stale branch first), so a demoted
-		// record can never be a policy survivor — and must never be counted as
-		// suppressed either.
+		// gate is unaffected by it. Since #4990 the demoted arm runs the same
+		// policy stack, so the agent's own mark is the ONE thing that can take it
+		// out of the gate (the next case). Without a mark the gate still counts
+		// it.
 		const env = setupTestEnvironment("pi-lens-3248-demoted-");
 		try {
 			const cwd = env.tmpDir;
@@ -359,10 +430,6 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			expect(runtime.markInlineBlockerStale(filePath, "dependency-drift")).toBe(
 				true,
 			);
-			// Even with the mark in the store, the demoted record is not the
-			// policy's to suppress.
-			markFalsePositive(cwd, diagnostic);
-
 			registerEdit(cacheManager, cwd, filePath);
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 
@@ -537,12 +604,27 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
 			]);
 			expect(runtime.gitGuardHasBlockers).toBe(true);
+			// Marked BEFORE the delete: a mark needs the bytes it anchors against.
+			markFalsePositive(
+				cwd,
+				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
+			);
 			fs.rmSync(filePath);
 			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
 
 			registerEdit(cacheManager, cwd, other);
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 
+			expect(runtime.gitGuardHasBlockers).toBe(true);
+
+			// #4698: the read-only turn shares the pin. The map holds no record for
+			// the deleted file, so the quiet turn judges nothing — it must not
+			// re-derive a latch whose population is gone, and writes no row.
+			logLatency.mockClear();
+			runtime.beginTurn();
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+
+			expect(inlinePolicyRows()).toHaveLength(0);
 			expect(runtime.gitGuardHasBlockers).toBe(true);
 		} finally {
 			env.cleanup();
@@ -595,9 +677,10 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 	it("still allows the commit after an unjudged turn end that changed nothing", async () => {
 		// The other direction of the same rule, so the fix cannot become "any
 		// turn end without a policy population re-blocks". A read-only turn takes
-		// `handleTurnEnd`'s no-file early return and judges nothing — but the
-		// bytes the verdict was computed against are still on disk, so the
-		// verdict still describes them and the gate must stay open.
+		// `handleTurnEnd`'s no-file early return (#4698 re-judges the latch there,
+		// but only while the gate is CLOSED), and this gate is already open, so
+		// the quiet turn judges nothing: the bytes the verdict was computed
+		// against are still on disk, and the gate stays open.
 		const env = setupTestEnvironment("pi-lens-3248-unjudged-turn-");
 		try {
 			const cwd = env.tmpDir;
@@ -614,14 +697,197 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 			turnEndText(cacheManager, cwd, runtime);
 
-			// A turn that touched no file at all: the early return, no policy pass.
+			// A turn that touched no file at all: the early return, no fresh
+			// population, and no work to do — this latch cannot be opened.
+			logLatency.mockClear();
 			runtime.beginTurn();
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 
+			expect(inlinePolicyRows()).toHaveLength(0);
 			expect(runtime.gitGuardHasBlockers).toBe(false);
 			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
 				block: false,
 			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("judges nothing on a quiet turn when --lens-guard is off", async () => {
+		// The read-only re-judge (#4698) exists for ONE reader: `evaluateGitGuard`.
+		// With the flag off nothing consults the latch, so a quiet turn must not
+		// pay for a policy pass whose verdict nobody reads — the state of a
+		// project that never enabled the gate.
+		const env = setupTestEnvironment("pi-lens-4698-flag-off-");
+		try {
+			const cwd = env.tmpDir;
+			const filePath = path.join(cwd, "app.ts");
+			fs.writeFileSync(filePath, "alpha();\n");
+
+			const runtime = newRuntime();
+			runtime.projectRoot = cwd;
+			const cacheManager = new CacheManager(false);
+			editDispatch(runtime, cacheManager, cwd, filePath, [
+				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
+			]);
+			// Marked, so the store is non-empty and only the FLAG can stop the pass.
+			markFalsePositive(
+				cwd,
+				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
+			);
+
+			logLatency.mockClear();
+			runtime.beginTurn();
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, cwd, { getFlag: () => false }),
+			);
+
+			expect(inlinePolicyRows()).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("judges nothing on a closed gate with no mark in the project", async () => {
+		// #4698's pass reacts to a MARK: a file-less turn can change a survivor
+		// only through one. The guard is load-bearing on cost as well as on
+		// meaning — `applyInlineBlockerPolicy` pays `loadProjectRulePolicy` per
+		// record — so a blocked but unmarked session must re-read nothing on a
+		// quiet turn. Without it, every reply in that state runs the whole policy
+		// pass over every live blocker.
+		const env = setupTestEnvironment("pi-lens-4698-unmarked-");
+		try {
+			const cwd = env.tmpDir;
+			const filePath = path.join(cwd, "app.ts");
+			fs.writeFileSync(filePath, "alpha();\n");
+
+			const runtime = newRuntime();
+			runtime.projectRoot = cwd;
+			const cacheManager = new CacheManager(false);
+			editDispatch(runtime, cacheManager, cwd, filePath, [
+				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
+			]);
+
+			// No mark: the empty store is the population.
+			logLatency.mockClear();
+			runtime.beginTurn();
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+
+			expect(inlinePolicyRows()).toHaveLength(0);
+			expect(runtime.gitGuardHasBlockers).toBe(true);
+			// The next commit is still refused: the pass judged nothing.
+			expect(evaluateGitGuard(runtime, cacheManager, cwd).block).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("judges nothing on a quiet turn when ANOTHER project holds the session defer", async () => {
+		// #4701 review F1: the marks guard must answer for the PROJECT. Its defer
+		// half read the process-wide anchor Set, so one `defer` recorded in any
+		// project — in any session of the process's life — made every project
+		// look marked, and a quiet turn here ran the whole policy pass for state
+		// this project cannot act on. Measured through this seam as probe P4: p50
+		// 11,976 µs and 17,520 µs over two runs, 1.00 `inline_blocker_policy` row
+		// per turn, against 85.6 µs and 0 rows in the same shape with no defer
+		// anywhere.
+		const env = setupTestEnvironment("pi-lens-4698-project-marked-");
+		const other = setupTestEnvironment("pi-lens-4698-foreign-mark-");
+		try {
+			const cwd = env.tmpDir;
+			const filePath = path.join(cwd, "app.ts");
+			fs.writeFileSync(filePath, "alpha();\n");
+
+			const runtime = newRuntime();
+			runtime.projectRoot = cwd;
+			const cacheManager = new CacheManager(false);
+			editDispatch(runtime, cacheManager, cwd, filePath, [
+				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
+			]);
+
+			// A SECOND project root (its own marker, its own disposition store)
+			// defers a finding of its own. A defer writes no store entry, so this
+			// project still holds no mark of any kind.
+			const otherFile = path.join(other.tmpDir, "app.ts");
+			fs.writeFileSync(otherFile, "alpha();\n");
+			markDefer(
+				other.tmpDir,
+				blockingDiagnostic(otherFile, 1, "alpha is unsafe"),
+			);
+
+			logLatency.mockClear();
+			runtime.beginTurn();
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+
+			expect(inlinePolicyRows()).toHaveLength(0);
+			// The population is untouched here, so the gate stays shut: only the
+			// READ was wrong, never the verdict.
+			expect(runtime.gitGuardHasBlockers).toBe(true);
+			expect(evaluateGitGuard(runtime, cacheManager, cwd).block).toBe(true);
+		} finally {
+			env.cleanup();
+			other.cleanup();
+		}
+	});
+
+	it("opens the gate for a DEMOTED blocker whose every finding is marked on a quiet turn", async () => {
+		// #4990 reverses #4698's rule for the demoted arm: the same policy stack
+		// judges a demoted record on BOTH turn shapes, so a fully marked one
+		// leaves the gate. #4698's invariant still holds — the two shapes must
+		// agree on one state — but the shared rule now includes the demoted arm.
+		const env = setupTestEnvironment("pi-lens-4698-demoted-mark-only-");
+		try {
+			const cwd = env.tmpDir;
+			const filePath = path.join(cwd, "drifted.ts");
+			fs.writeFileSync(filePath, "alpha();\n");
+
+			const runtime = newRuntime();
+			runtime.projectRoot = cwd;
+			const cacheManager = new CacheManager(false);
+			const diagnostic = blockingDiagnostic(filePath, 1, "alpha is unsafe");
+			editDispatch(runtime, cacheManager, cwd, filePath, [diagnostic]);
+			expect(runtime.markInlineBlockerStale(filePath, "dependency-drift")).toBe(
+				true,
+			);
+			markFalsePositive(cwd, diagnostic);
+
+			// A turn that writes nothing at all: the mark-only shape.
+			runtime.beginTurn();
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+
+			expect(runtime.gitGuardHasBlockers).toBe(false);
+			expect(evaluateGitGuard(runtime, cacheManager, cwd).block).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps the gate closed when a quiet turn marks only one of two blockers", async () => {
+		// The read-only sibling of the "two of four" case above: the pass may open
+		// the gate only for a file whose WHOLE blocker set the policy suppressed.
+		// A survivor is still gating, and this is also the shape a quiet turn pays
+		// the policy cost for — marks exist, so the store probe cannot skip it.
+		const env = setupTestEnvironment("pi-lens-4698-partial-mark-");
+		try {
+			const cwd = env.tmpDir;
+			const filePath = path.join(cwd, "app.ts");
+			fs.writeFileSync(filePath, "alpha();\nbeta();\n");
+
+			const runtime = newRuntime();
+			runtime.projectRoot = cwd;
+			const cacheManager = new CacheManager(false);
+			const pair = [
+				blockingDiagnostic(filePath, 1, "alpha is unsafe"),
+				blockingDiagnostic(filePath, 2, "beta is unsafe"),
+			];
+			editDispatch(runtime, cacheManager, cwd, filePath, pair);
+			markFalsePositive(cwd, pair[0]);
+
+			runtime.beginTurn();
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+
+			expect(runtime.gitGuardHasBlockers).toBe(true);
+			expect(evaluateGitGuard(runtime, cacheManager, cwd).block).toBe(true);
 		} finally {
 			env.cleanup();
 		}
@@ -704,7 +970,7 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			fs.writeFileSync(filePath, "safeAlpha();\n");
 			editDispatch(runtime, cacheManager, cwd, filePath, []);
 
-			expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
+			expect(runtime.gitGuardCacheUnknownFor()).toBeUndefined();
 			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
 				block: false,
 			});
@@ -748,7 +1014,7 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			fs.writeFileSync(blocking, "safeAlpha();\n");
 			editDispatch(runtime, cacheManager, cwd, blocking, []);
 
-			expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
+			expect(runtime.gitGuardCacheUnknownFor()).toBeUndefined();
 			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
 				block: false,
 			});
@@ -788,7 +1054,7 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			fs.writeFileSync(filePath, "safeAlpha();\nsafeBeta();\n");
 			editDispatch(runtime, cacheManager, cwd, filePath, []);
 
-			expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
+			expect(runtime.gitGuardCacheUnknownFor()).toBeUndefined();
 			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
 				block: false,
 			});
@@ -872,8 +1138,20 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 				"blockerContent",
 				"provenance",
 			];
+			// #4750 adds one: the owner's write stamp. The 4.2.1 reader
+			// (`isTurnEndFindingsCache` at v4.2.1) checks named fields only, so an
+			// extra key leaves the record a record to it.
+			const V4750_KEYS = ["blockerWrittenAt"];
+			// #4943 adds one: the session the composer addressed `content` to.
+			// The same reader rule holds, and the gate never reads it.
+			const V4943_KEYS = ["deliverTo"];
 			expect(
-				Object.keys(after).filter((key) => !V4_2_1_KEYS.includes(key)),
+				Object.keys(after).filter(
+					(key) =>
+						!V4_2_1_KEYS.includes(key) &&
+						!V4750_KEYS.includes(key) &&
+						!V4943_KEYS.includes(key),
+				),
 			).toEqual([]);
 		} finally {
 			env.cleanup();

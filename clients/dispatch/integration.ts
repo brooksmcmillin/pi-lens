@@ -31,9 +31,13 @@ import {
 	type RunnerResultSink,
 } from "./dispatcher.js";
 import { spawnAbortScope } from "../safe-spawn.js";
-import { recordDegradationOnce } from "../degradation-ledger.js";
+import { emitBounded } from "../bounded-telemetry.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import { FactStore, setFactStoreEvictionReporter } from "./fact-store.js";
-import { resolveAnalysisRoot } from "../analysis-root.js";
+import { canWriteAnalysisRoot, resolveAnalysisRoot } from "../analysis-root.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { classifyObservedRunner } from "./collect-later-tier.js";
 import {
@@ -80,6 +84,7 @@ import type {
 	CascadeSectionLayout,
 	CascadeSkipReason,
 	CascadeUnconfirmed,
+	CascadeUnconfirmedReason,
 } from "../cascade-types.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
 import type { GenerationHandle } from "../generation-guard.js";
@@ -92,9 +97,11 @@ import {
 	type BoundToCurrentDisk,
 	type TouchFileResult,
 	bindingStateLabel,
+	readBoundToCurrentDisk,
 	touchCoverageGap,
 } from "../lsp/diagnostic-binding.js";
 import { getServersForFileWithConfig } from "../lsp/config.js";
+import { demoteEnvironmentGapDiagnostics } from "../lsp/environment-gap.js";
 import {
 	classifyJsTsGlobalScope,
 	goPackageFiles,
@@ -103,7 +110,11 @@ import {
 	isGoSourceFile,
 } from "../lsp/implicit-scope.js";
 import { getLSPService } from "../lsp/capabilities.js";
-import { isExternalOrVendorFile, normalizeMapKey } from "../path-utils.js";
+import {
+	isExternalOrVendorFile,
+	normalizeMapKey,
+	toPosix,
+} from "../path-utils.js";
 import { getProjectIgnoreMatcher } from "../file-utils.js";
 import {
 	resetAstGrepNapiLoadState,
@@ -366,7 +377,7 @@ export async function runAstGrepWarningScan(
 		// Single-runner group: ast-grep only, warning mode (blockingOnly=false)
 		const group: RunnerGroup = {
 			mode: "all",
-			runnerIds: ["ast-grep"],
+			runnerIds: ["ast-grep-napi"],
 			filterKinds: ["jsts"],
 		};
 		await runProviders(ctx);
@@ -643,21 +654,20 @@ function ensureCascadeTurnScope(turnSeq: number): void {
 }
 
 /**
- * #4486: a cached diagnostics entry is an observation of the state this
- * compute is asked about only when it was published after the compute
- * started. The pipeline starts the compute after the primary's dispatch
- * returned, and that dispatch awaited the primary's didChange, so anything
- * stamped later was computed against the edit. Erring late costs a touch;
- * erring early served a pre-edit clean as current (a 4 s old snapshot of a
- * neighbour the edit had broken). Replaces the 240 s TTL at all three
- * readers: the passive snapshot, the touch-error fallback and the degraded
- * fallback.
+ * #4486: an answer is an observation of the state this compute is asked about
+ * only when it was published after the compute started. The pipeline starts
+ * the compute after the primary's dispatch returned, and that dispatch awaited
+ * the primary's didChange, so anything stamped later was computed against the
+ * edit. Erring late costs a touch; erring early served a pre-edit clean as
+ * current (a 4 s old snapshot of a neighbour the edit had broken). Replaces the
+ * 240 s TTL at every reader: the passive snapshot, the touch-error fallback,
+ * the degraded fallback, and — #5040 — a touch's own reused answer.
  */
 function isPostEditObservation(
-	entry: { ts: number },
+	publishedAt: number,
 	cascadeStart: number,
 ): boolean {
-	return entry.ts > cascadeStart;
+	return publishedAt > cascadeStart;
 }
 
 /**
@@ -724,34 +734,20 @@ function cascadeReconcilableLspErrors(
 	rawDiags: readonly import("../lsp/client.js").LSPDiagnostic[],
 	neighborPath: string,
 ): ReturnType<typeof convertLspDiagnostics> {
+	// #4532 round 6 (review NEW-2; AGENTS.md shape 71): the environment-gap
+	// rule the cascade display runs (`applyCascadeDisplayPolicy`), applied before
+	// the ERROR filter, so a gap the agent no longer sees is not persisted as a
+	// blocking footer entry either. A demoted row is a warning and leaves here
+	// as every LSP warning does. The rule reads TypeScript rows only, so an
+	// auxiliary row passes through it untouched and is dropped below.
 	return convertLspDiagnostics(
-		rawDiags
+		demoteEnvironmentGapDiagnostics([...rawDiags], { filePath: neighborPath })
 			.filter(
 				(d) => d.severity === 1 && !findAuxiliaryProfileForSource(d.source),
 			)
 			.slice(0, MAX_PER_FILE),
 		neighborPath,
 	);
-}
-
-/**
- * Read the content `binding` verdict off a diagnostics result (#1095).
- *
- * `touchFile` carries `binding` as an EXPLICIT enumerable field on its
- * `TouchFileResult` wrapper (#1179), so it survives any copy of `.diags`.
- * `getAllDiagnostics` still attaches `binding` as a lazy, disk-verifying
- * NON-enumerable getter on each Map entry — reading it directly off the
- * producer's own entry (never a spread/clone, which drops non-enumerables)
- * triggers the disk verify exactly once (memoized per entry). Accepts either
- * shape; returns `undefined` when no binding was attached at all (a partially-
- * mocked client, a non-collecting touch) — indistinguishable from "unknown" at
- * every call site, which is the intended pre-#1095 fall-through.
- */
-function readBoundToCurrentDisk(
-	rawDiags: unknown,
-): BoundToCurrentDisk | undefined {
-	return (rawDiags as { binding?: { boundToCurrentDisk?: BoundToCurrentDisk } })
-		?.binding?.boundToCurrentDisk;
 }
 
 /**
@@ -819,6 +815,52 @@ function isConfirmedTouch(rawDiags: TouchFileResult): boolean {
 		!readInconclusive(rawDiags) &&
 		touchCoverageGap(rawDiags).length === 0 &&
 		readBoundToCurrentDisk(rawDiags) !== false
+	);
+}
+
+/**
+ * #5040: the cached answer this touch reused instead of producing its own
+ * (`TouchFileResult.reusedAnswer` — a notify-skipped push server whose entry
+ * stood unchanged through the touch). Read off the wrapper, like every other
+ * flag here (#1179).
+ */
+function readReusedAnswer(
+	rawDiags: unknown,
+): { serverId: string; publishedAt: number } | undefined {
+	const reused = (
+		rawDiags as { reusedAnswer?: { serverId?: unknown; publishedAt?: unknown } }
+	)?.reusedAnswer;
+	return typeof reused?.serverId === "string" &&
+		typeof reused.publishedAt === "number"
+		? { serverId: reused.serverId, publishedAt: reused.publishedAt }
+		: undefined;
+}
+
+/**
+ * #5040: is this touch's answer older than the edit this cascade is about?
+ *
+ * A push-only server publishes for a dependent when ITS project model changes,
+ * not when we ask (jdtls republishes one importer of a broken exporter and
+ * never the other — PR #5035's wire capture). The touch of a neighbour sends
+ * nothing for unchanged content, so the only answer it can report is the entry
+ * the server already held; when that entry predates this run, nothing has
+ * re-asked the server since the exporter changed, and a clean verdict for it
+ * would be an all-clear for a dependent nobody re-checked. It is unconfirmed,
+ * by the same rule `isPostEditObservation` (#4486) already applies to the
+ * passive snapshot, the touch-error fallback and the degraded fallback.
+ *
+ * Not a disqualifier when the answer postdates the run: the server DID publish
+ * for this neighbour after the edit (rows 1-4 of the PR's state table), and the
+ * neighbour keeps whatever verdict it earned.
+ */
+function isPreEditAnswer(
+	rawDiags: TouchFileResult,
+	cascadeStart: number,
+): boolean {
+	const reused = readReusedAnswer(rawDiags);
+	return (
+		reused !== undefined &&
+		!isPostEditObservation(reused.publishedAt, cascadeStart)
 	);
 }
 
@@ -924,6 +966,9 @@ export function _seedReverseDepsIndexCacheForTests(
 	setReverseDepsEntry(key, { index, savedToSnapshot: false, generation });
 }
 
+// #5055: how many unplaced referrers the advisory names; the rest are counted.
+const UNPLACED_REFERRER_NAMED = 3;
+
 // Bounded transitive cascade (#162): expand neighbour derivation beyond the
 // one-hop importers/callers to depth-2 dependents, so an edit's blast radius
 // reaches indirect dependents — capped so the per-edit cost stays bounded. The
@@ -947,6 +992,7 @@ export const CASCADE_GRAPH_KINDS = new Set([
 	"rust",
 	"ruby",
 	"cxx",
+	"java",
 ]);
 
 /**
@@ -956,9 +1002,9 @@ export const CASCADE_GRAPH_KINDS = new Set([
  * autoPropagate (jsts): tsserver pushes diagnostics automatically, so we
  * read from the passive snapshot instead of touching neighbors actively.
  *
- * Degraded fallback: when the graph produces no neighbors (ungraphed languages
- * like Java/Kotlin/C#), fall back to the passive LSP snapshot from getAllDiagnostics
- * to preserve cascade coverage.
+ * Degraded fallback: when the graph yields no neighbours for a graphed kind,
+ * fall back to the passive LSP snapshot from getAllDiagnostics to preserve
+ * cascade coverage. A kind outside this set skips as `non_code` first.
  */
 /**
  * Whether a cascade neighbour is suppressed by the project's ignore config
@@ -1003,6 +1049,13 @@ function isIgnoredCascadeNeighbor(filePath: string, cwd: string): boolean {
  *  - File over the shared `WORD_INDEX_MAX_BYTES` cap ⇒ removed/absent from
  *    the index (never partially indexed) — same cap phase 1's build path
  *    enforces via `collectWordIndexDocs`.
+ *  - The file's analysis root is not writable by this session (`adopted`, or
+ *    `none`) ⇒ no-op. The index is SESSION state, and an adopted root is a
+ *    foreign project the session serves read-only: it gets LSP and the
+ *    allowlisted per-file linters, never a session-keyed record (#4242). This
+ *    is `canWriteAnalysisRoot`'s rule, the same one the formatter and the
+ *    autofix writer ask, resolved against the authoritative workspace root
+ *    rather than the language root this cascade runs in.
  *  - On a successful update, `onUpdated` fires so the caller can schedule a
  *    debounced persist (never a synchronous write per edit — same #260
  *    discipline as the graph).
@@ -1032,12 +1085,35 @@ async function updateWordIndexForCascade(args: {
 	wordIndex?: WordIndex | null;
 	filePath: string;
 	content?: string;
+	/**
+	 * Authoritative workspace root (`PipelineContext.projectRoot`), against which
+	 * the file's analysis-root class is resolved. `cwd` at the call site is the
+	 * LANGUAGE root, which in an adopted project is a directory the session does
+	 * not own — resolving against it would call a foreign file a `session` one.
+	 */
+	sessionRoot: string;
 	onUpdated?: (index: WordIndex) => void;
 	dbg?: (msg: string) => void;
 }): Promise<void> {
-	const { wordIndex, filePath, content, onUpdated, dbg } = args;
+	const { wordIndex, filePath, content, onUpdated, dbg, sessionRoot } = args;
 	if (!wordIndex || !wordIndex.forward) return;
 	if (content === undefined) return;
+	// #4242: the index is session state, so only a file the session owns may
+	// enter it. Asked only once a write was otherwise going to happen, so the
+	// record below names a real refusal rather than a cold-index no-op.
+	if (!canWriteAnalysisRoot(resolveAnalysisRoot(filePath, sessionRoot))) {
+		emitBounded(
+			"adopted_root_writer_skipped",
+			`${filePath}:word-index`,
+			{
+				filePath,
+				durationMs: 0,
+				metadata: { writer: "word-index" },
+			},
+			{ ledgerKind: "adopted-root-writer-skipped", risingEdgePer: "identity" },
+		);
+		return;
+	}
 
 	const byteLength = Buffer.byteLength(content, "utf-8");
 	if (byteLength > WORD_INDEX_MAX_BYTES) {
@@ -1258,6 +1334,7 @@ export async function computeCascadeForFile(
 			wordIndex,
 			filePath: nodePath.resolve(filePath),
 			content: fileContent,
+			sessionRoot: projectRoot ?? cwd,
 			onUpdated: onWordIndexUpdated,
 			dbg,
 		});
@@ -1766,6 +1843,41 @@ export async function computeCascadeForFile(
 						importerSet.has(p) ? 0 : callerSet.has(p) ? 1 : 2;
 					return rank(a) - rank(b);
 				});
+			// #5055: a file whose reference to a changed symbol stayed on its
+			// name-only placeholder is a dependent the graph could not see. When the
+			// run has no neighbor to check, that file is the difference between a
+			// leaf and an unproven dependent set, so it leaves the run indeterminate
+			// instead of `no_neighbors`. Only a file edited this turn is accounted
+			// for (B10: its own pipeline run answers for it), and a file removed
+			// outside pi is gone, which the seq fast path's cached graph does not
+			// know until its periodic re-verify (the neighbour chain above filters
+			// the same way). The graph holds no test, vendor or ignored file, so no
+			// other state clears a referrer.
+			// Gated on the empty run on purpose: a run that has neighbors already
+			// speaks, and flagging every unplaced common-name call there marked 185
+			// of 515 files of this repo's own graph.
+			if (eligibleNeighbors.length === 0 && !impact.indeterminate) {
+				const unplaced = (impact.nameOnlyReferrers ?? []).filter(
+					(f) =>
+						!primaryFilesThisTurn.has(normalizeMapKey(f)) &&
+						nodeFs.existsSync(f),
+				);
+				if (unplaced.length > 0) {
+					const shown = unplaced
+						.slice(0, UNPLACED_REFERRER_NAMED)
+						.map((f) => toPosix(nodePath.relative(cwd, f)))
+						.join(", ");
+					const more =
+						unplaced.length > UNPLACED_REFERRER_NAMED
+							? ` (+${unplaced.length - UNPLACED_REFERRER_NAMED} more)`
+							: "";
+					impact.indeterminate = {
+						reason: "unresolved_reference",
+						detail: `${unplaced.length} file(s) reference a changed symbol by name alone, and several definitions share the name: ${shown}${more}`,
+						unplacedReferrerCount: unplaced.length,
+					};
+				}
+			}
 			cascadeEligibleCount = eligibleNeighbors.length;
 			cascadeFilterDroppedCount = Math.max(
 				0,
@@ -1902,7 +2014,7 @@ export async function computeCascadeForFile(
 		// the four display sites below rendered. Aggregate, not per neighbour: a
 		// cascade walks up to `CASCADE_NEIGHBOUR_BUDGET` (40) neighbours per edit,
 		// so a record inside the loop would be per-occurrence logging on a per-edit
-		// path — one bounded row per RUN instead (AGENTS.md "bounded observability").
+		// path — one bounded row per RUN instead (docs/engineering-principles.md "Every new failure path gets bounded observability").
 		// `policyElapsedMs` accumulates ONLY the stack's own time (round 2, F2): a
 		// clock started here would have spanned the whole `touchFile` fan-out and
 		// reported the neighbour WALK as the policy phase — hundreds of ms against
@@ -1916,21 +2028,36 @@ export async function computeCascadeForFile(
 		// #4487: the selected neighbours freshly observed by this run, clean
 		// or not (`CascadeRun.observedNeighborPaths`).
 		const observedPaths: string[] = [];
-		// #4485: selected neighbours that got no answer within their bound,
-		// by the server asked (`CascadeRun.unconfirmed`).
+		// #4485: selected neighbours the run does not cover, by the server asked
+		// and by WHY (`CascadeRun.unconfirmed`).
 		const unconfirmedByServer = new Map<
 			string,
-			{ waitMs: number; paths: string[] }
+			{
+				serverId: string;
+				reason: CascadeUnconfirmedReason;
+				waitMs: number;
+				paths: string[];
+			}
 		>();
 		const noteUnconfirmed = (
 			serverId: string,
+			reason: CascadeUnconfirmedReason,
 			waitMs: number,
 			neighborPath: string,
 		): void => {
-			const group = unconfirmedByServer.get(serverId) ?? { waitMs, paths: [] };
+			// The key carries the reason: one server can hold BOTH shapes for
+			// different neighbours in one run, and merging them would attribute one
+			// cause's paths to the other's sentence (#5040, defect shape 24).
+			const key = `${reason}:${serverId}`;
+			const group = unconfirmedByServer.get(key) ?? {
+				serverId,
+				reason,
+				waitMs,
+				paths: [],
+			};
 			group.waitMs = Math.max(group.waitMs, waitMs);
 			group.paths.push(neighborPath);
-			unconfirmedByServer.set(serverId, group);
+			unconfirmedByServer.set(key, group);
 		};
 		const policyCounts = {
 			suppressed: 0,
@@ -2008,7 +2135,7 @@ export async function computeCascadeForFile(
 				// observation of the edited state; an older one, whatever its age,
 				// falls through to the touch below.
 				const postEdit =
-					entry != null && isPostEditObservation(entry, cascadeStart);
+					entry != null && isPostEditObservation(entry.ts, cascadeStart);
 				// #1095: content binding is the INNER gate; post-edit stays the outer bound.
 				//   false     → the server's diagnostics were computed against a DIFFERENT
 				//               disk state (e.g. the PRE-fix content) — don't trust or
@@ -2291,6 +2418,7 @@ export async function computeCascadeForFile(
 									else recordTouch();
 									noteUnconfirmed(
 										touchedClient.serverId,
+										"no-answer",
 										SILENT_PUSH_WAIT_MS,
 										neighborPath,
 									);
@@ -2400,7 +2528,87 @@ export async function computeCascadeForFile(
 					if (rawDiags.inconclusiveReason === "primary-unavailable") {
 						const serverIds = rawDiags.inconclusiveServerIds ?? [];
 						const cause = rawDiags.primaryUnavailableCause ?? "unstarted";
+						// #5014 r2 (F2): a `fallbackFor` alternate can answer while its
+						// owner is named here. Its findings are delivered beside the
+						// line; they never confirm the neighbour (no reconcile, no
+						// observation).
+						// #5034 r7: and only when they describe this run's bytes. An
+						// answer from before the edit (#5040, the rule the branch below
+						// applies) or one computed for other bytes than disk (#1095, the
+						// rule the runner applies to this touch shape, #5034 r3 F7) is
+						// withheld; the line stays, so the neighbour never reads clean.
+						const preEditAnswer = isPreEditAnswer(rawDiags, cascadeStart)
+							? readReusedAnswer(rawDiags)
+							: undefined;
+						const bindingRejected = readBoundToCurrentDisk(rawDiags) === false;
+						const diags =
+							preEditAnswer || bindingRejected
+								? []
+								: cascadeDisplay(rawDiags.diags, neighborPath, content);
 						const durationMs = Date.now() - neighborStart;
+						logCascade({
+							phase: "neighbor_touch",
+							filePath,
+							neighborFile: neighborPath,
+							diagnosticCount: diags.length,
+							durationMs,
+							lspTouched: true,
+							lspServerCount: configuredServerCount,
+							coldSnapshot: isColdSnapshot,
+							metadata: {
+								inconclusive: true,
+								...readInconclusiveAttribution(rawDiags),
+								primaryUnavailableCause: cause,
+								...(preEditAnswer && {
+									preEditAnswer: true,
+									answerServerId: preEditAnswer.serverId,
+									answerPublishedAt: preEditAnswer.publishedAt,
+									cascadeStart,
+								}),
+								...(bindingRejected && {
+									bindingState: bindingStateLabel(false),
+								}),
+							},
+						});
+						return {
+							filePath: neighborPath,
+							reason: neighborReason(importerSet, callerSet, neighborPath),
+							diagnostics: diags,
+							lspTouched: true as const,
+							primaryUnavailable: { serverIds: [...serverIds], cause },
+							durationMs,
+						} satisfies CascadeResult["neighbors"][number];
+					}
+					// #5040: the answer exists, but it predates this run's edit. A
+					// push-only server (jdtls) publishes for a dependent when ITS model
+					// changes, not when we ask, so a notify-skipped touch of unchanged
+					// content reports whatever the server last published — possibly from
+					// before the exporter changed. That is not an observation of the
+					// post-edit state, so it is neither an answer to display nor a
+					// confirmed clean: the neighbour is named unconfirmed and the run
+					// never reads `clean` for it (the same refusal the passive snapshot
+					// and both fallbacks already make, #4486).
+					const reusedAnswer = readReusedAnswer(rawDiags);
+					if (
+						isPreEditAnswer(rawDiags, cascadeStart) &&
+						reusedAnswer !== undefined
+					) {
+						const durationMs = Date.now() - neighborStart;
+						noteUnconfirmed(
+							reusedAnswer.serverId,
+							"pre-edit-answer",
+							0,
+							neighborPath,
+						);
+						// One counted record per server and path: the reason a run cannot
+						// answer for this neighbour is field evidence (is this server ever
+						// re-publishing its dependents?), so it is a count, not a
+						// once-per-session flag.
+						incrementDegradationCount({
+							kind: "cascade-pre-edit-answer",
+							subject: `${reusedAnswer.serverId}:${normalizeMapKey(neighborPath)}`,
+							reason: `no publication for this dependent since the edit, so the cached answer is ${Math.max(0, cascadeStart - reusedAnswer.publishedAt)} ms older than this run`,
+						});
 						logCascade({
 							phase: "neighbor_touch",
 							filePath,
@@ -2411,19 +2619,16 @@ export async function computeCascadeForFile(
 							lspServerCount: configuredServerCount,
 							coldSnapshot: isColdSnapshot,
 							metadata: {
-								inconclusive: true,
-								...readInconclusiveAttribution(rawDiags),
-								primaryUnavailableCause: cause,
+								preEditAnswer: true,
+								answerServerId: reusedAnswer.serverId,
+								answerPublishedAt: reusedAnswer.publishedAt,
+								cascadeStart,
+								answerAgeMs: cascadeStart - reusedAnswer.publishedAt,
 							},
 						});
-						return {
-							filePath: neighborPath,
-							reason: neighborReason(importerSet, callerSet, neighborPath),
-							diagnostics: [],
-							lspTouched: true as const,
-							primaryUnavailable: { serverIds: [...serverIds], cause },
-							durationMs,
-						} satisfies CascadeResult["neighbors"][number];
+						// Not an answer (#240 doctrine): the degraded-fallback path below
+						// still has a chance to surface a post-edit passive snapshot.
+						return undefined;
 					}
 					// #1093/#571/#1095: a touch result is only a CONFIRMED observation of the
 					// neighbor's current on-disk state when it is neither `inconclusive` (the
@@ -2436,6 +2641,9 @@ export async function computeCascadeForFile(
 					// are folded into `isConfirmedTouch` so no gate below can miss one. A
 					// confirmed result reconciles and counts as this run's observation of
 					// the neighbour (#4487); an unconfirmed one does neither.
+					// #5040: the age axis is NOT folded in: it is refused above, in the
+					// branch that also records the ledger row, because it applies to the
+					// CLEAN claim and to the findings alike and returns before this read.
 					const confirmed = isConfirmedTouch(rawDiags);
 					const bindingRejected = readBoundToCurrentDisk(rawDiags) === false;
 					const inconclusive = readInconclusive(rawDiags);
@@ -2453,7 +2661,16 @@ export async function computeCascadeForFile(
 					// stay on the `rawDiags` wrapper and are unaffected (the shape-5 fix).
 					// #3157 site 2 of 4: the fresh in-lane touch. `content` is the copy
 					// this touch was computed against — no second read.
-					const diags = cascadeDisplay(rawDiags.diags, neighborPath, content);
+					// #5051: bound-false answers are not displayed either. Rows computed
+					// for bytes the neighbour no longer holds are not this edit's
+					// cascade error; the runner withholds the same rows (#5017 L, one
+					// reader: `readBoundToCurrentDisk`), as the primary-unavailable
+					// branch above does (#5034 r7). The neighbour stays in the result,
+					// flagged `inconclusive` below, so the run owes it its line and
+					// never reads clean.
+					const diags = bindingRejected
+						? []
+						: cascadeDisplay(rawDiags.diags, neighborPath, content);
 					const durationMs = Date.now() - neighborStart;
 
 					// #1899: the A5 same-write cache write stood here.
@@ -2518,7 +2735,9 @@ export async function computeCascadeForFile(
 						reason: neighborReason(importerSet, callerSet, neighborPath),
 						diagnostics: diags,
 						lspTouched: true as const,
-						...(inconclusive && { inconclusive: true as const }),
+						...((inconclusive || bindingRejected) && {
+							inconclusive: true as const,
+						}),
 						// #1459: carry the coverage gap to the agent-facing surface. A
 						// scanner whose breaker was open, whose resync the fan-out gate
 						// deferred, or whom the aux grace timer cut off never looked at this
@@ -2549,7 +2768,7 @@ export async function computeCascadeForFile(
 					// #4486: the same post-edit gate as the passive snapshot; a
 					// pre-edit entry is not this neighbour's current state.
 					const postEdit =
-						entry != null && isPostEditObservation(entry, cascadeStart);
+						entry != null && isPostEditObservation(entry.ts, cascadeStart);
 					// #1104: consult binding before trusting a post-edit fallback snapshot —
 					// MATCH #1100/#1095 semantics (false → skip, "unknown" → use, true →
 					// use). Without this, a failed active touch could still re-display a
@@ -2707,9 +2926,7 @@ export async function computeCascadeForFile(
 			passiveSnapshotHits + silentWaitTouches + coldTouches + noLspConfigured;
 		// #4485: the unanswered neighbours, by server (bounded by the selected
 		// slice). Any of them keeps the run from reading `no_neighbors`/`clean`.
-		const unconfirmedServers = [...unconfirmedByServer].map(
-			([serverId, group]) => ({ serverId, ...group }),
-		);
+		const unconfirmedServers = [...unconfirmedByServer.values()];
 		const unconfirmedCount = unconfirmedServers.reduce(
 			(sum, group) => sum + group.paths.length,
 			0,
@@ -2800,7 +3017,7 @@ export async function computeCascadeForFile(
 						? "no-rescue-window"
 						: undefined,
 				neighbors: visibleNeighbors.slice(0, 10).map((n) => ({
-					file: n.filePath.replace(/\\/g, "/").split("/").slice(-2).join("/"),
+					file: toPosix(n.filePath).split("/").slice(-2).join("/"),
 					diagnostics: n.diagnostics.length,
 					rawErrors: rawErrorsByPath.get(n.filePath) ?? 0,
 				})),
@@ -2944,7 +3161,7 @@ function appendFallbackNeighbors(
 		// #4486: a cached entry from before the compute started describes the
 		// tree before the edit. Both injected runs of the forensic window came
 		// from here, under the 240 s TTL this replaced.
-		if (!isPostEditObservation(entry, cascadeStart)) continue;
+		if (!isPostEditObservation(entry.ts, cascadeStart)) continue;
 		// #1104: a post-edit entry is not automatically trustworthy — consult
 		// binding the same way the reconcile path (#1100) and the touch-error
 		// fallback above do. `false` → skip (a stale/pre-fix-edit snapshot whose
@@ -3472,7 +3689,7 @@ export async function getAvailableRunners(filePath: string): Promise<string[]> {
 	const kind = detectFileKind(filePath);
 	if (!kind) return [];
 
-	const normalizedPath = filePath.replace(/\\/g, "/");
+	const normalizedPath = toPosix(filePath);
 	const pathForFilter = normalizedPath.startsWith("/")
 		? normalizedPath
 		: `/${normalizedPath}`;

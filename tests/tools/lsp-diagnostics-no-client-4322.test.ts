@@ -296,6 +296,6 @@ describe("a JSON file with no language server and no auxiliary (#4322)", () => {
 		expect(outcomes.map((outcome) => outcome.outcome)).toEqual(["unavailable"]);
 		expect(outcomes[0]?.primaryDiagnosticsCount).toBe(1);
 		expect(result.text).toContain("Showing stale last-known diagnostics");
-		expect(result.text).not.toContain("auxiliary findings only");
+		expect(result.text).not.toContain("auxiliary or fallback findings only");
 	}, 30_000);
 });

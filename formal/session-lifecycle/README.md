@@ -29,10 +29,10 @@ Four kinds of config:
   `H3StaleNoteResume`, `H3NoteEvicted`, `H3InMemoryNewGapReload`,
   `H3SdkBind`, `H3SdkBindFileBacked`, with `namedSuccessor`; `Merged`,
   `MergedStores`, `H3Interrupted*` and `H3FileLessCarry` carry it too, with
-  `HasPrimary`), and so must #3613's turn half (`MergedTurns`). The rest
+  `HasPrimary`), and so must #3613's turn half (`MergedTurns`) and its
+  read-guard half (`Current`, F4, since #4942). The rest
   register a known violation of merged master until its fix flips the
-  config to `pass`: `Current` violates `NoCrossSessionState` through F4
-  (the read-guard half of #3613), and
+  config to `pass`:
   `AcceptedSecondaryForkActivation` pins the answer #3855 gives for a
   subagent's own `/fork` (finding F6), and `AcceptedR3InMemoryNew` pins
   #3855's residual R3 (finding F7).
@@ -158,7 +158,7 @@ or `LegacyFence`, and `TargetSec` (the design, S4 included), `MergedSec`
 
 | Store | startup | /new | resume | /fork, /clone, pi --fork | /tree | /reload | shutdown | idle | Secondary: target / merged | Fence |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `RG` target | rehydrate | reset | rehydrate | import-parent | filter-by-branch (D8) | filter-by-branch (D5) | none | none | own / shared (#3613) | branch |
+| `RG` target | rehydrate | reset | rehydrate | import-parent | filter-by-branch (D8) | filter-by-branch (D5) | none | none | own / own (#4942; before it shared, F4, #3613) | branch |
 | `RG` legacy | rehydrate | reset | rehydrate | reset | none | reset (N1) | none | none | shared | session |
 | `TC` | reset | reset | reset | reset | none | reset | none | none | own / own (#3613; before it shared, N2; durable project worklists are partitioned by live session in R2) | session |
 | `WG` guards | reset | reset | reset | carry (legacy: reset, #3589) | carry | carry | none | none | shared | none |
@@ -393,7 +393,17 @@ without it `DrainDefer` sees every generation's. `debounceEntryCapture`
 (#3759 row 16); `stateWBranchFence`, a rejected alternative that fences the
 writers at branch level. `parkSessionKey` (#4112 round 2), `parkResetClear`,
 `parkFence` (`isCurrentSession`). `turnEndScoped` is the shipped #3613 R2
-shape: a `turn_end` drains only its own scope's work.
+shape: a `turn_end` drains only its own scope's work. `blockerStore` (#4921)
+lets a tool_result also leave an inline-blocker record (work kind `blocker`),
+which a `turn_end` re-serves rather than drains; `blockerScoped` is the shipped
+#4921 shape: a `turn_end` delivers only its own session's blocker records
+(`InlineBlockerRecord.session`, `getInlineBlockersSnapshot({ sessionId })`).
+`slotAddressed` is the shipped #4943 shape: a request takes the per-project
+turn-end message (`Stage`, `TakeSlot`) only when its own session's `turn_end`
+staged it (`deliverTo`, `consumeTurnEndFindings(..., sessionId)`).
+`slotHostAddressed` is the shipped #4943 R2 shape: the MCP host (`McpStage`,
+`McpTake`) stages to one address for every server process
+(`MCP_DELIVERY_ADDRESS`) and takes only a message so addressed.
 
 ### #3705's rows, by column
 
@@ -433,6 +443,41 @@ it is an `expect: violated` witness, not a new finding.
 entry carries its producing activation, and a `turn_end` drains only its own.
 The coordinator scope remains the owner of shared cascade settlement and late
 auxiliary stores, so secondary cleanup does not discard primary work.
+`Pre4921BlockerUnscoped` adds the inline-blocker map under `turnEndScoped`
+alone, master before #4921: a subagent's `turn_end` delivers the primary's
+blocker. `Fix4921BlockerScoped` adds `blockerScoped` and passes. Both run at
+`SecondaryTurnEnd`'s bound: the blocker kind added to `SecondaryTurnEndScoped`
+(with `/new` and `/reload`) passed 6.4M distinct states unfinished in 4 min,
+against 398,844 without it, so that config keeps its three kinds.
+
+The composer's message itself is staged in one per-project slot (the
+`turn-end-findings` record) that the next request takes, not the `turn_end`.
+`Stage` replaces the slot's message with the staging session's,
+unconditionally, as the cache write does: a session may stage again after its
+message was taken, and over its own staged message. `TakeSlot` is a live
+session's request taking it. `Pre4943SlotUnaddressed` is master before #4943:
+the slot names no reader, so the subagent's request takes the message the
+primary's `turn_end` staged. `Fix4943SlotAddressed` adds `slotAddressed` and
+passes. The slot lives in one coordinator generation here, since neither
+config takes a replacement transition. An overwrite drops the earlier
+message; a blocker comes back, because its session's next `turn_end`
+re-composes it, but a one-shot advisory does not. `Current` does not take
+`Stage` or `TakeSlot`, so its verdict says nothing about the slot; the
+#4943 configs are the slot's only evidence.
+
+The MCP host is another process on the same project cache, so it is not a
+ticket: `Mcp` (0) names it as a stager and a reader. `McpStage` is an MCP
+server's turn end replacing the slot's message with the host's; `McpTake` is
+an MCP reader taking it (`lens_turn_end`'s consume, or the Stop pass's peek
+with the acknowledge that commits it, as one step). `Pre4943R2McpUnaddressed`
+is master before #4943 R2: the MCP reader names no reader identity, so it
+takes the message a pi session's `turn_end` staged. `Fix4943R2McpAddressed`
+adds `slotHostAddressed` and passes `SecondaryIsolation` and
+`NoCrossSessionState`. One host address stands for every server process, so
+the model has no server restart to tell apart: that a restarted server still
+reads the last one's message, and that an acknowledge leaves a pi message
+staged between the peek and the ack, are pinned by
+`tests/clients/mcp/session-test-findings-retire.test.ts`.
 
 ### Overlap with `formal/turn-end-delivery-holds`
 
@@ -551,7 +596,7 @@ counterexample.
 | `Mut3855r1DemotedReplaces` | #3855 r1 (F2): the demoted user conversation's own `/reload` finds its note and is declined | violated `UserNotDeclined` | 212 |
 | `Mut3855r1StaleNote` | #3855 r1 (F3): a stale note declines the primary's resume successor; no primary | violated `HasPrimary` | 6 |
 | `Mut3855r1Evicted` | #3855 r1: an evicted note lets a gap subagent's start demote the real successor | violated `NoLostCarry` | 225 |
-| `Current` | merged master, every transition: F4, #3613 | violated `NoCrossSessionState` | 257 |
+| `Current` | merged master, every transition: F4, #3613, closed by #4942 (violated `NoCrossSessionState`, 257 states, before it) | pass | 6797 |
 | `Fix` | adopted design: every transition, a primary and a subagent reader, one turn | pass | 71419 |
 | `FixProcess` | adopted design: heartbeat and LSP work across `/new`, resume, `/reload`, idle reset, quit, `pi --fork` | pass | 24771 |
 | `FixOrder` | adopted design: widget tokens over three turns across `/new`, `/reload`, quit, `pi --fork` | pass | 319 |
@@ -609,6 +654,12 @@ counterexample.
 | `MutParkNoFence` | the hold settle without `isCurrentSession`: a turn that began before `/reload` parks into the successor's map | `violated ParkedStaysInScope` | 128 |
 | `SecondaryTurnEnd` | #3613 R2 and #3758, open on master: a subagent's `turn_end` drains the primary's worklist, cascade runs and runner findings, and the primary's takes the subagent's | `violated SecondaryIsolation` | 24 |
 | `SecondaryTurnEndScoped` | the proposed fix, NOT shipped: a `turn_end` drains its own scope's work, across `/new` and `/reload` | pass | 398844 |
+| `Pre4921BlockerUnscoped` | #4921, master before the fix: the worklist, cascade and runner records are scoped, the inline-blocker map is not; a subagent's `turn_end` delivers the primary's blocker | `violated SecondaryIsolation` | 60 |
+| `Fix4921BlockerScoped` | #4921, shipped: a `turn_end` delivers only its own session's inline-blocker records | pass | 6642 |
+| `Pre4943SlotUnaddressed` | #4943, master before the fix: the per-project turn-end slot names no reader; a subagent's request takes the message the primary's `turn_end` staged | `violated SecondaryIsolation` | 8 |
+| `Fix4943SlotAddressed` | #4943, shipped: a request takes the staged message only when its own session staged it | pass | 16 |
+| `Pre4943R2McpUnaddressed` | #4943 R2, master before the fix: the MCP host reads the slot with no reader identity and takes a pi session's staged message | `violated SecondaryIsolation` | 9 |
+| `Fix4943R2McpAddressed` | #4943 R2, shipped: the MCP host stages to its one address and takes only a message so addressed | pass | 44 |
 
 ## Pre-fix and Mut configs and their issues
 
@@ -634,7 +685,7 @@ alternative" is a shape the adopted design rejects, never shipped.
 | `Pre3855SdkBind` | #3855 verify r2 PR8 | pre-#3855 (b9eda404c): #3668 row 17 | As above, with any non-`startup` gap start admitted. |
 | `AcceptedR3InMemoryNew` | #3855 residual R3 | master, accepted | The primary's in-memory `/new`; a subagent's own in-memory `/new` starts first in the gap with the same pair. |
 | `AcceptedSecondaryForkActivation` | #3855 (the #3835 r2 question) | master, accepted: a secondary's scope never stashes, saves a sidecar or adopts, and `adoptHandoff` runs only for a primary start | The subagent activates a tool, and its own `/fork` starts without it. |
-| `Current` | F4, #3613 | master: a subagent's handlers reach the module-level `runtime.readGuard` | The subagent's read lands in the primary's cell. |
+| `Current` | F4, #3613 | pre-#4942 master: a subagent's handlers reach the module-level `runtime.readGuard`; `MergedSec` now owns `RG`, so the config passes | The subagent's read lands in its own cell. |
 | `PreS1OrderTurn` | N3; #3540 case A | pre-S1 (b456ff89c): `_writeOrderTurn += 1`, a coordinator field | A turn draws token 1, `/reload` re-evaluates the entry, and the next turn draws token 1 again. |
 | `MutWidgetDropAfterReEval` | N3's harm; #3540 | pre-S1 (b456ff89c), as above | Two turns and a widget write at token 2; after `/reload` with re-evaluation, a turn draws token 1, and the widget guard drops the live session's own write as older. |
 | `PreS2ReloadReset` | N1, under D5 | pre-S2 (ae5396e46): `resetForSession` on every primary start, no reload hand-off | A read lands, and `/reload` starts clean. |
@@ -656,8 +707,8 @@ alternative" is a shape the adopted design rejects, never shipped.
 | `MutSecondaryTurnStart` | N2, #3613 | pre-#3613 (17b10c027): `onTurnStart` called `runtime.beginTurn()` with no session id (`index.ts`) | The subagent starts, and its `turn_start` moves the primary's turn. |
 | `MutSecondaryTurnReset` | #3613 | pre-#3613 (17b10c027): one per-turn warning map on the coordinator, cleared by every `beginTurn` and by `resetForSession` | The primary's turn starts while a subagent is live, so the subagent's per-turn records move (the same for the primary's `/new`). |
 | `MutStartThrowsLatePin` | #3613 F1 (review r1 on #4118) | #4118 r1 (c4c4564b6): `setSessionLifecycle` after `await bounded(handleSessionStart …)` | The startup's handler throws after its reset, the pin is skipped, and the primary's first turn takes the other-session path. |
-| `MutSecondaryReadShared` | F4, #3613 | master: a subagent's handlers reach the module-level `runtime.readGuard` | The subagent's read lands in the primary's cell. |
-| `MutTreeWipesSecondary` | #3607 | master, the accepted residual #3521 F2 (the comment on the `session_tree` handler, `index.ts`) | The subagent's read lands, and the primary's `/tree` filters it away. |
+| `MutSecondaryReadShared` | F4, #3613, #4942 | pre-#4942 master: a subagent's handlers reach the module-level `runtime.readGuard` (`RuntimeCoordinator.readGuardFor` partitions it) | The subagent's read lands in the primary's cell. |
+| `MutTreeWipesSecondary` | #3607, #4942 | pre-#4942 master, the accepted residual #3521 F2 (the comment on the `session_tree` handler, `index.ts`; closed by `readGuardFor`) | The subagent's read lands, and the primary's `/tree` filters it away. |
 | `MutSettleDuringTree` | #3521 (the G10 F1 review race) | design alternative: fenced at session level with no branch epoch | A read of entry 2 begins, `/tree` drops entry 2, and the read lands. |
 | `MutSecondaryTakesHandoff` | design finding F2 | design alternative: section 3.4 as written | `/reload`'s shutdown fills the slot, and a subagent's `session_start` takes it. |
 | `MutDuplicateStart` | #2890 | pre-#2895 (745020083): no duplicate-start gate | A duplicate start re-runs the reset. |
@@ -674,10 +725,13 @@ alternative" is a shape the adopted design rejects, never shipped.
 | `Mut4112ParkNoResetClear` | #4112 | design alternative: `resetForSession` without `_cutAdvisoryItems.clear()` (shipped with #4112, ee50e47b6) | The primary parks; `/reload` (the stable id and so the key survive); the successor shows the item. |
 | `MutParkNoFence` | #4161, #4168 | design alternative: `settle` without `isCurrentSession` (since 9c8a6f530, owner-fenced by dac19f046) | A turn begins in session 1; `/reload`; its settle parks into session 2's map under the same key; session 2 shows it. |
 | `SecondaryTurnEnd` | #3613 R2, #3758 | master, open: `handleTurnEnd` takes the process runtime for every activation (`onTurnEnd`, `index.ts`) | The primary's tool_result leaves a worklist record; a subagent starts; its `turn_end` drains it. |
+| `Pre4921BlockerUnscoped` | #4921 | pre-#4921 (a6c5c380d): `InlineBlockerRecord` carried no owner and `handleTurnEnd` read `getInlineBlockersSnapshot()` whole | The primary's tool_result records a blocker; a subagent starts; its `turn_end` delivers it. |
+| `Pre4943SlotUnaddressed` | #4943 | pre-#4943 (2af695cd8): `consumeTurnEndFindings` took the `turn-end-findings` record for any reader | A subagent starts; the primary's `turn_end` stages its message; the subagent's request takes it. |
+| `Pre4943R2McpUnaddressed` | #4943 R2 | pre-R2 (23aebcc2c): the MCP host called `peekTurnEndFindings`, `consumeTurnEndFindings` and `acknowledgeTurnEndFindings` with no reader identity | The primary's `turn_end` stages its message; the MCP host's Stop pass takes it. |
 
-Since #3613's turn half, `Current` holds `SecondaryIsolation` and violates
-`NoCrossSessionState` (257 states): F4, the read-guard half of #3613, still
-open. `MergedTurns` checked under `PreS4TurnSec` violates
+Since #3613's turn half, `Current` holds `SecondaryIsolation`, and since
+#4942 `NoCrossSessionState` too (6797 states; it was violated, 257 states, while
+F4, the read-guard half of #3613, stayed open). `MergedTurns` checked under `PreS4TurnSec` violates
 `SecondaryIsolation` (26 states), and `MutSecondaryTurnReset` passes under
 the invariant before #3613 (19 states): the turn clause for live subagents
 is what sees the primary's turn and reset moving their records.
@@ -953,9 +1007,11 @@ marker's 60 s bound, behind a later `startup` (not modelled: no time).
 #3819's `demotedDiscard` guards the second, and its `ticketKey` is what lets
 a file-less successor find its slot at all (`H3FileLessCarry`).
 
-**F4. Today, a subagent's read authorises the primary's edit** (#3613). The
-shared read guard puts a subagent's read in the primary's cell
-(`MutSecondaryReadShared` and `Current`).
+**F4. Before #4942, a subagent's read authorised the primary's edit**
+(#3613). The shared read guard put a subagent's read in the primary's cell
+(`MutSecondaryReadShared`, and `Current` until `MergedSec` owned `RG`).
+`RuntimeCoordinator.readGuardFor` gives each concurrent session its own
+guard, keyed by the owner the inline blockers use (#4921).
 
 **F5. An interrupted start's shutdown re-keys the slot; skipping the stash
 is not enough (#3881).** The interrupted start never adopted, so the slot
@@ -1110,8 +1166,9 @@ Not modelled:
   told apart there; `SessionLifecycleF1`'s two-verb pipeline run (F1 section)
   tells them apart, and the fork row's `carry` from `reset` through the widget's
   rows.
-- **Time**, the cwd-changing resume's re-evaluation, the MCP host, the
-  advisory cap, and more than one subagent.
+- **Time**, the cwd-changing resume's re-evaluation, the MCP host (except
+  as a stager and reader of the turn-end slot, #4943 R2), the advisory cap,
+  and more than one subagent.
 
 ### LastMemberOwnership (#4554 review round 5)
 
@@ -1137,3 +1194,107 @@ live member remains); `= TRUE` is the pre-fix reading, and
 `Mut4554r6UnmatchedLeaveLast` registers its violation of `NoEarlyTeardown`.
 The round-5 handoff save already keys `saved` by the departing context, which
 is the as-built identity Greptile F2 restored in `index.ts`.
+
+#4704 adds the topology pi 1.3.0 actually produces for an in-process
+subagent: pi runs the factory once per session load, so M's subagent T is
+its own activation C, a declined start that admits nothing. Two constants:
+
+- `ProcessWideLast` (as-built `TRUE`): "last" is read across every
+  activation, and only the process's last live leave tears the shared infra
+  down. `= FALSE` is the pre-fix reading, and
+  `Mut4704ActivationLast` registers its `NoEarlyTeardown` violation: M's
+  leave finds A empty and tears the shared infra down while T is live.
+- `StaleMemberHolds` (as-built `FALSE`): `DisposeT` is T's runner calling
+  `AgentSession.dispose()`, which invalidates T and emits no shutdown, so T
+  never leaves. A member pi invalidated does not count as live.
+  `Mut4704StaleSiblingHolds` sets it `TRUE` and violates `NoMissedTeardown`:
+  M's leave after T's disposal keeps the registration with nothing live.
+
+`NoStrandedOwner` now reads "a held registration implies a truly live
+session", with one accepted exception: every recorded member was disposed
+without a shutdown, so no pi-lens callback can run. `NoForeignTeardown` now
+reads "no leave releases a registration whose own session is still live".
+
+Review F1 on #4708 splits the two facts round 1 released at one boundary.
+`StartR(a, r)` now picks R's root: the registered primary's (`same`) or
+another (`other`, a cross-root `/resume`). It declines R as the classifier
+does, when a registration is still held and the roots differ (#2129). The
+`declinedSuccessor` ghost flags a decline only once M really left, and
+`NoDeclinedSuccessor` forbids it. Two constants:
+
+- `SplitRelease` (as-built `TRUE`): the registration is per primary, so the
+  holder's own leave releases it, whatever else is live. The process's last
+  live leave tears the infra down and releases a registration still held
+  then. `= FALSE` is round 1, one boundary for both, and
+  `Mut4704RegistrationHeld` registers its `NoDeclinedSuccessor` violation:
+  M leaves while T lives, then R starts in another root and is declined.
+- `StartKeepsLiveFleet` (as-built `TRUE`): a full start keeps the shared LSP
+  fleet while another session is truly live (`keepSharedLsp`).
+  `Mut4704StartResetsFleet` sets it `FALSE` and violates `NoEarlyTeardown`:
+  R's start resets the fleet that S and T still drive.
+
+The model has no disposed holder: only T can be disposed, and T never holds
+the registration. The last leave's release of a held registration whose
+holder pi disposed is pinned by the tier-2 witness instead.
+
+#4965 (verify V1 on #4972) adds the session-id lookup: a process-wide index
+from a session's key to its scope (`clients/session-scope.ts`), so a key
+nobody gives back holds an ended session's scope and cells for the life of
+the process. `bound` is the set of contexts whose key the index names (R's
+bind takes M's shared key), and the `leaked` ghost flags a start or a leave
+after which a context that left and is listed nowhere, or that pi disposed,
+is still bound. `NoLeakedBinding` forbids it. `DisposeT` stays lazy: T's key
+goes at the next process read. Three constants, each as-built `TRUE`, and
+`Pre4965KeysKept` sets all three `FALSE` (#4972 r1) and violates
+`NoLeakedBinding` (S leaves A before M):
+
+- `UnbindAtLeave`: every leave gives its key back. `= FALSE` is r1, where
+  only the activation's last leave did (through its retire); alone it is
+  violated by S leaving A before M.
+- `DisposalUnbinds`: a process read that finds a member pi disposed gives
+  its key back. `= FALSE` only counted it; alone it is violated when T is
+  disposed and M's subagent S starts.
+- `SweepAtStart`: every start reads the process. `= FALSE` read it only at a
+  full start and a leave; alone it is violated on the same schedule: a run
+  of subagent starts never finds the disposed ones.
+
+### TurnStateOwner (#4751)
+
+`TurnStateOwner` models who owns the turn-state worklist inside one process.
+Two classifiers read one record: the writer (`addModifiedRange` through
+`resolveTurnStatePartition`) takes a session's role from the persisted
+envelope owner, and the reader (`handleTurnEnd`) takes it from the live role.
+A departing primary keeps the envelope, owner field included, for successor
+replay. Three sessions: P1, its in-process successor P2 (pi's newSession,
+fork, clone or a resume of another session) and a subagent S, each with at
+most two turns. `NoStrandedWrite` says every write lands in the store its
+writer's own turn end reads; `NoForeignWipe` says no clear keyed by one
+session empties another session's work.
+
+- `PrimaryClaims` (as-built `TRUE`): a primary's turn_start takes the
+  envelope from an in-process predecessor. `Pre4751NoClaim` (no subagent)
+  registers the pre-fix violation: P2's write resolves as a secondary's.
+- `ClaimEmpty` (as-built `TRUE`): the claim also takes an envelope with no
+  owner and no files. `Mut4751NoEmptyClaim` registers the window it closes: S
+  leaves before any turn, clears the ownerless envelope as its own, and P's
+  next write in that turn resolves as a secondary's.
+- `SecondaryClaims` (as-built `FALSE`): the turn_start guard admits only the
+  primary. `Mut4751SecondaryClaims` registers a subagent turn inside the
+  primary's turn taking the envelope from it.
+- `WithSubagent` bounds the actors (a scenario bound, not a code choice).
+
+Not modelled: owners in another process (the claim refuses them, and
+`getTurnStateAccess`'s liveness rule judges them as before), the MCP writer
+(kind `mcp`, envelope only), and the predecessor's late writes after its
+leave (the `tool_result` writer adds a range only while its entry is live, #3596).
+The owner's age is not modelled either: a predecessor past
+`TURN_OWNER_STALE_MS` is claimed with its files evicted (arm `evicted`), which
+leaves the ownership outcome the model checks unchanged.
+
+Assumption: pi delivers a session's `turn_end` before any session replacement.
+`LeavePrimary` sets `inTurn` to `FALSE`, so the model has no turn end of a
+departed primary. One ordering therefore sits outside it:
+
+| Unmodelled ordering | What the code does | Why it is outside the model |
+|---|---|---|
+| A departed primary's `turn_end` clear lands after its successor's claim | `clearTurnState` falls through its owner check for a same-pid owner (`clients/cache-manager.ts:806`), clears the envelope the successor claimed and stamps the old id, so the successor's next turn end finds no files | review r1 of #4753 drove a real pi `AgentSession` through `restart({ reason: "new" })` while a prompt was in flight: pi settled the first session's `turn_end` (its row 56) and shutdown fence (row 72) before the successor's claim (row 115); the ordering appeared only when the seam was called directly |

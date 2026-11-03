@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { writeFileAtomic } from "./atomic-write.js";
+import { registerBackgroundWriteDrain } from "./background-write-drains.js";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
@@ -2287,6 +2288,30 @@ export async function waitForProjectSnapshotPersistsForTests(): Promise<void> {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
+
+/**
+ * Test-only strict form of {@link waitForProjectSnapshotPersistsForTests}: that
+ * wait is a bounded poll (200 x 10 ms) and resolves with work outstanding, so a
+ * persist slower than the bound would land after a fixture root was removed.
+ * This one reports what remains (any request, active persist or queued persist).
+ */
+async function settleProjectSnapshotPersistsForTests(): Promise<
+	string | undefined
+> {
+	await waitForProjectSnapshotPersistsForTests();
+	const pending =
+		_snapshotWorkerRequests.size +
+		_activeSnapshotPersists.size +
+		_queuedSnapshotPersists.size;
+	return pending > 0
+		? "project-snapshot persists still pending after the bounded wait"
+		: undefined;
+}
+
+// #4937: the loaded extension copy's in-flight worker write is invisible to a
+// test's own import of this module; the tier-2 harness joins it through the
+// registry (`clients/background-write-drains.ts`).
+registerBackgroundWriteDrain(settleProjectSnapshotPersistsForTests);
 
 /** Test-only: force any in-flight worker body write to the sync main-thread path. */
 export function flushProjectSnapshotPersistsForTests(): void {

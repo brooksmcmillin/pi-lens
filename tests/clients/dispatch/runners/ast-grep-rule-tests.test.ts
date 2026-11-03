@@ -27,6 +27,14 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { safeSpawn } from "../../../../clients/safe-spawn.js";
+import { setProjectTrustState } from "../../../../clients/project-trust.js";
+
+// #4530: the ast-grep CLI under test is this checkout's own devDependency, found
+// through the test runner's `node_modules/.bin` PATH entry. That entry is the
+// session repository's own bytes, which a bare lookup refuses until pi trusts
+// the project. This file tests the tool, not trust, so it adopts trust the way
+// the maintenance hosts do; the trust rule has its own suite.
+setProjectTrustState("trusted");
 
 const RULES_ROOT = path.join(process.cwd(), "rules", "ast-grep-rules");
 const SGCONFIG_PATH = path.join(RULES_ROOT, ".sgconfig.yml");

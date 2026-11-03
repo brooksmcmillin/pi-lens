@@ -8,7 +8,7 @@
  * attach (#2007) and the shared-checkout guard (#2107) — then compared against
  * that one clobbered value and could not see a peer under any other root.
  *
- * `getGlobalPiLensDir` is mocked to a per-test temp dir, so nothing here
+ * `PI_LENS_HOME` is pinned to a per-test temp dir, so nothing here
  * touches the real `~/.pi-lens/instances.json`.
  */
 
@@ -19,13 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "./test-utils.js";
 
 let dir: string;
-
-vi.mock("../../clients/file-utils.js", () => ({
-	// #2506: both resolvers, same dir. Under the vitest PI_LENS_HOME pin
-	// production returns one value for both, so a double that split them
-	// would diverge from production on the axis these tests measure.
-	getGlobalPiLensDir: () => dir,
-}));
+let previousHome: string | undefined;
 
 describe("instance-registry multi-root (#2130)", () => {
 	let realRoot: string;
@@ -33,6 +27,10 @@ describe("instance-registry multi-root (#2130)", () => {
 
 	beforeEach(() => {
 		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-instreg-mr-"));
+		// #2506: `PI_LENS_HOME` is the one knob both the data and the log
+		// resolvers read, so the registry file lands in `dir` as in production.
+		previousHome = process.env.PI_LENS_HOME;
+		process.env.PI_LENS_HOME = dir;
 		// Real directories: `normalizeFilePath` canonicalizes an EXISTING path
 		// via realpath, so comparing against a made-up path would compare two
 		// differently-derived spellings and prove nothing.
@@ -43,6 +41,8 @@ describe("instance-registry multi-root (#2130)", () => {
 
 	afterEach(() => {
 		vi.unstubAllEnvs();
+		if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+		else process.env.PI_LENS_HOME = previousHome;
 		removeTempDirSync(dir);
 		removeTempDirSync(realRoot);
 		removeTempDirSync(tempRoot);

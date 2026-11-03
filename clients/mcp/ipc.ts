@@ -23,6 +23,8 @@ import { writeFileAtomic } from "../atomic-write.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
 import { DEFAULT_MAX_OUTPUT_BYTES } from "../spawn-output-cap.js";
 import type { LSPCodeAction, LSPDiagnostic } from "../lsp/client.js";
+import type { DiagnosticBinding } from "../lsp/diagnostic-binding.js";
+import type { TsserverProjectIdentity } from "../lsp/tsserver-sync.js";
 import type { McpAnalyzeResult } from "./analyze.js";
 
 export const WARM_DIAGNOSTICS_SCHEMA_VERSION = 1;
@@ -253,6 +255,29 @@ export interface WarmDiagnosticsResponse {
 	 * diagnostics array.
 	 */
 	unconfirmedServerIds?: string[];
+	/**
+	 * #4645: the incumbent's own tsserver answer to "which project owns this
+	 * file", asked only when a row could be demoted by it. `diagnostics` stay the
+	 * server's raw rows: the reader runs the one demotion pipeline itself with
+	 * this answer standing in for the probe it cannot send without spawning, so
+	 * its rendered rows and the form its cache stores are a local read's. Absent
+	 * when nothing was asked, the probe did not answer, or the probe did not
+	 * settle before the reply's send reserve; an incumbent built before this
+	 * omits it, and an older reader ignores it and renders the raw rows.
+	 */
+	projectIdentity?: TsserverProjectIdentity;
+	/**
+	 * #5030: the incumbent touch's content binding, the verdict on whether
+	 * `diagnostics` describe the bytes on disk (`boundToCurrentDisk`) and the
+	 * fingerprint of the bytes they describe. Always present on an incumbent that
+	 * knows the field (`"unknown"` when its touch composed none), so ABSENCE can
+	 * only mean an incumbent built before it. A reader takes the field through
+	 * `warmAnswerBinding` (`clients/lsp/diagnostic-binding.ts`), which reads an
+	 * absent or unreadable one as `boundToCurrentDisk: false`: not current, never
+	 * current. An older reader ignores the field (nothing here validates keys), so
+	 * the schema version stays 1.
+	 */
+	binding?: DiagnosticBinding;
 }
 
 export interface WarmCodeActionRange {

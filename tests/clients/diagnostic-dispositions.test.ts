@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCaseAliasFixture, removeTempDirSync } from "./test-utils.js";
 
@@ -32,6 +34,7 @@ import {
 	applyWeakDispositions,
 	computeStrictAnchor,
 	getDisposition,
+	hasAnyDispositionMarks,
 	isDeferredThisSession,
 	markDisposition,
 	_setMultiFileReadForTests,
@@ -523,6 +526,47 @@ describe("applyDispositionsMultiFile (#1617 — cross-file lanes: gitleaks/trivy
 		}
 	});
 
+	it("F1 (#4701 review): a defer in ANOTHER project reads no file group here", () => {
+		// The empty-store hoist above is project-scoped on both halves. Its defer
+		// half used to be the process-wide `deferredThisSession.size`, so one
+		// `defer` recorded in any project sent this project's cross-file scan
+		// through the per-group read path (the ~270 ms/analyzer cost the hoist
+		// exists to prevent) to discover there was nothing to filter.
+		const projectDir = cwd();
+		const otherProject = `${projectDir}-other`;
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(otherProject, { recursive: true });
+		const fileA = path.join(projectDir, "a.ts");
+		fs.writeFileSync(fileA, "const secretA = 'aaa';\n");
+		const diagA = { filePath: fileA, tool: "gitleaks", message: "m", line: 1 };
+		markDisposition(
+			otherProject,
+			{
+				cwd: otherProject,
+				filePath: path.join(otherProject, "a.ts"),
+				tool: "eslint",
+				rule: "no-bad",
+				message: "bad call",
+				line: 1,
+			},
+			"defer",
+		);
+
+		const readSpy = vi.fn(fs.readFileSync);
+		_setMultiFileReadForTests(readSpy as unknown as typeof fs.readFileSync);
+		try {
+			const kept = applyDispositionsMultiFile(
+				[diagA],
+				projectDir,
+				(d) => d.filePath,
+			);
+			expect(kept).toEqual([diagA]);
+			expect(readSpy).not.toHaveBeenCalled();
+		} finally {
+			_setMultiFileReadForTests(null);
+		}
+	});
+
 	it("preserves the caller's original element order across file groups", () => {
 		const projectDir = cwd();
 		fs.mkdirSync(projectDir, { recursive: true });
@@ -725,6 +769,22 @@ describe("F3 (#1625 review round): deferredThisSession is scoped per-project, no
 
 		expect(isDeferredThisSession(projectA, anchor)).toBe(true);
 		expect(isDeferredThisSession(projectB, anchor)).toBe(false);
+	});
+
+	it("hasAnyDispositionMarks answers for its OWN project (#4701 F1)", () => {
+		// #4701 review F1: the probe is the read-only turn's cost guard
+		// (`resyncCommitGateForReadOnlyTurn`, clients/runtime-turn.ts). Its defer
+		// half read the process-wide anchor Set, so one `defer` in ANY project —
+		// in any session of the process's life — made every project look marked
+		// and every quiet turn in that project paid the whole policy pass. The
+		// mark a file-less turn can act on is this project's own.
+		const { projectA, projectB } = projectDirs();
+		markDisposition(projectA, { ...finding(projectA), content }, "defer");
+
+		// A defer writes no store entry, so project A's `true` is the defer half.
+		expect(hasAnyDispositionMarks(projectA)).toBe(true);
+		// Project B holds no mark of any kind and can act on none of A's.
+		expect(hasAnyDispositionMarks(projectB)).toBe(false);
 	});
 });
 
@@ -1037,5 +1097,349 @@ describe("applyWeakDispositions (#755 — instant cache-only filter)", () => {
 		const input = [diag, other];
 		const kept = applyWeakDispositions(input, cwd(), filePath());
 		expect(kept).toBe(input);
+	});
+});
+
+/**
+ * Property (#4928): the `dd:` and `ddw:` anchors over arbitrary content,
+ * line positions and spellings.
+ *
+ * Recurrence this prevents: a mark that stops matching its own finding with no
+ * error, or starts matching another one. Either an edit around the finding
+ * moves its anchor (the strict span, #3183), or the id formula changes and
+ * every mark stored by a released writer is orphaned (the #1816 re-key, the
+ * #1024 path form), or two findings share an id and one mark silences both
+ * (#1625 F1: two secrets with one rule and message shared a weak anchor).
+ *
+ * Relations, not a reimplemented oracle: the weak anchor ignores content and
+ * line; the strict anchor follows only the finding's own line, ignoring the
+ * lines around it and the whitespace in it; an anchor does not move under a
+ * message spelling that `normalizeMessage` folds; two findings that differ in
+ * tool, rule or folded message get different anchors. One pin does restate a
+ * formula: the released writers' `sha256(file|tool|rule|message[|lineHash])`
+ * with their FNV-1a line hash, so a stored `dd:`/`ddw:` key keeps matching
+ * (shape 57). It runs last, so a relation that breaks is the one reported.
+ *
+ * numRuns 300, seed 492801: each run does the realpath work of two anchors.
+ *
+ * Not modelled: path forms (one real fixture file, #4689 owns those), a
+ * line-hash collision (32 bits; edits are covered in read-guard.test.ts), and the
+ * stored rows (the store property below). Tool and rule are drawn without
+ * "|": the parts are joined with it, so tool "|" with message "" and tool ""
+ * with message "|" share one id. Reachable producers of "|" in a rule, tool or
+ * code: a user or project ast-grep rule `id:`, parsed without validation
+ * (clients/ast-grep-rule-manager.ts:139), read as `rule` at
+ * clients/dispatch/runners/ast-grep-napi.ts:900 and :1337; an LSP server's
+ * `<source>:<code>` rule (clients/dispatch/utils/lsp-diagnostics.ts:57); and
+ * the rule, code and source parts of the `cq:` and `aw:` ids
+ * (clients/code-quality-warnings.ts:118, clients/actionable-warnings.ts:263).
+ * That is a defect on master, reported in the PR body and not fixed here: a
+ * fix re-keys every stored mark (shape 57).
+ */
+describe("anchor properties (#4928)", () => {
+	const NON_WS = "abcdeXYZ019_(){};=.,'+-*/<>!&:[]".split("");
+	const lineArb = fc
+		.array(
+			fc.string({
+				unit: fc.constantFrom(...NON_WS),
+				minLength: 1,
+				maxLength: 6,
+			}),
+			{ maxLength: 5 },
+		)
+		.map((tokens) => tokens.join(" "));
+	// Includes NBSP, EM SPACE and BOM: JS `\s`, but not typeable.
+	const wsArb = fc.constantFrom(
+		" ",
+		"\t",
+		"  ",
+		" \t ",
+		String.fromCodePoint(0xa0),
+		String.fromCodePoint(0x2003),
+		String.fromCodePoint(0xfeff),
+	);
+	// No "|": the anchors join their parts with it (see "Not modelled").
+	const textArb = fc.string({
+		unit: fc.constantFrom(..."abcxyzXYZ09_.-:/@".split("")),
+		maxLength: 8,
+	});
+	const messageArb = fc
+		.array(
+			fc.oneof(
+				fc.string({
+					unit: fc.constantFrom(..."abcXYZ09.:'".split("")),
+					maxLength: 5,
+				}),
+				wsArb,
+			),
+			{ maxLength: 6 },
+		)
+		.map((parts) => parts.join(""));
+
+	// FNV-1a over the whitespace-stripped line, unchanged since f74495f13.
+	const releasedLineHash = (line: string): string => {
+		const stripped = line.replace(/\s+/g, "");
+		let hash = 2166136261;
+		for (let i = 0; i < stripped.length; i++) {
+			hash = Math.imul(hash ^ stripped.charCodeAt(i), 16777619);
+		}
+		return (hash >>> 0).toString(16).padStart(8, "0");
+	};
+	const releasedWriter = (
+		d: { tool: string; rule: string; message: string },
+		lineText: string,
+	) => {
+		const parts = [
+			"a.ts",
+			d.tool,
+			d.rule,
+			d.message.replace(/\s+/g, " ").trim().toLowerCase(),
+		];
+		const id = (extra: string[]) =>
+			createHash("sha256")
+				.update([...parts, ...extra].join("|"))
+				.digest("hex")
+				.slice(0, 12);
+		return {
+			strict: `dd:${id([releasedLineHash(lineText)])}`,
+			weak: `ddw:${id([])}`,
+		};
+	};
+
+	it("keeps a mark on its finding and off every other, over arbitrary spellings", () => {
+		const project = cwd();
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(filePath(), "");
+		const anchors = (
+			d: { tool: string; rule: string; message: string },
+			content: string,
+			line: number | undefined,
+		) => anchorsForDiagnostic(project, filePath(), { ...d, line }, content);
+		fc.assert(
+			fc.property(
+				fc.record({
+					above: fc.array(lineArb, { maxLength: 4 }),
+					own: lineArb,
+					below: fc.array(lineArb, { maxLength: 4 }),
+					otherAbove: fc.array(lineArb, { maxLength: 4 }),
+					otherBelow: fc.array(lineArb, { maxLength: 4 }),
+					joiners: fc.array(wsArb, { minLength: 8, maxLength: 8 }),
+					eol: fc.constantFrom("\n", "\r\n"),
+					tool: textArb,
+					rule: textArb,
+					message: messageArb,
+					field: fc.constantFrom("tool", "rule", "message"),
+					replacement: fc.oneof(textArb, messageArb),
+				}),
+				(s) => {
+					const finding = { tool: s.tool, rule: s.rule, message: s.message };
+					const build = (above: string[], own: string, below = s.below) =>
+						[...above, own, ...below].join(s.eol);
+					const at = s.above.length + 1;
+					const base = anchors(finding, build(s.above, s.own), at);
+
+					const moved = anchors(
+						finding,
+						build(s.otherAbove, s.own, s.otherBelow),
+						s.otherAbove.length + 1,
+					);
+					expect(moved, "lines around the finding changed").toEqual(base);
+
+					const respaced = `${s.own
+						.split(/\s+/)
+						.filter(Boolean)
+						.map((t, i) => `${s.joiners[i % 8]}${t}`)
+						.join("")}${s.joiners[7]}`;
+					expect(
+						anchors(finding, build(s.above, respaced), at).strict,
+						"whitespace inside the finding's own line",
+					).toBe(base.strict);
+
+					const folded = anchors(
+						{
+							...finding,
+							message: ` ${s.message.replace(/\s+/g, "\t").toUpperCase()}\n`,
+						},
+						build(s.above, s.own),
+						at,
+					);
+					expect(folded, "message spelling normalizeMessage folds").toEqual(
+						base,
+					);
+
+					for (const content of [
+						"",
+						build(s.above, "changed(own)"),
+						build([], ""),
+					]) {
+						expect(
+							anchors(finding, content, at + 99).weak,
+							"the weak anchor reads no content and no line",
+						).toBe(base.weak);
+					}
+					expect(anchors(finding, "", undefined).weak).toBe(base.weak);
+
+					expect(base, "the released writers' ids").toEqual(
+						releasedWriter(finding, s.own),
+					);
+
+					const folds = (d: { message: string }) =>
+						d.message.replace(/\s+/g, " ").trim().toLowerCase();
+					const changed = { ...finding, [s.field]: s.replacement };
+					fc.pre(
+						changed.tool !== s.tool ||
+							changed.rule !== s.rule ||
+							folds(changed) !== folds(finding),
+					);
+					const other = anchors(changed, build(s.above, s.own), at);
+					expect(other.weak, "a different finding").not.toBe(base.weak);
+					expect(other.strict, "a different finding").not.toBe(base.strict);
+				},
+			),
+			{ numRuns: 300, seed: 492801 },
+		);
+	});
+});
+
+/**
+ * Property (#4928): what the disposition filters do with the rows a store file
+ * holds, including the shapes older writers and damage left behind.
+ *
+ * Recurrence this prevents: a stored row dropping a finding it does not name.
+ * `false-positive` drops through its strict key only, `suppress` through its
+ * weak key and never a blocking finding (#1625 F1), and every other row (a
+ * `flagged` mark, a legacy or unknown disposition, a damaged row) drops
+ * nothing. A store file that is not a map of rows (an empty file, `null`, an
+ * array, text) must read as no marks, never throw into the dispatch path.
+ *
+ * Shapes come from `git show cd954efea:clients/diagnostic-dispositions.ts`
+ * (the first released writer) and the current writer: a row with and without
+ * `reason`, `line` and `lineText`, a bare `{ disposition }`, and a state file
+ * with no `dispositions` key (shape 57). The expected drops are the filter's
+ * documented contract, keyed through `anchorsForDiagnostic`.
+ *
+ * numRuns 150, seed 492802: every run writes the store file and resets the
+ * mtime-and-size read cache, which would serve a same-size rewrite stale.
+ *
+ * Not modelled: session `defer` (the F3 cases), the multi-file lane's file
+ * reads, and a store rewritten while the process runs.
+ */
+describe("stored disposition rows property (#4928)", () => {
+	const dispositionArb = fc.constantFrom(
+		"false-positive",
+		"suppress",
+		"flagged",
+		"defer",
+		"ignore",
+		"",
+	);
+	const rowArb = fc.oneof(
+		fc.record({
+			disposition: dispositionArb,
+			createdAt: fc.constant("2026-01-01T00:00:00.000Z"),
+			lastSeenAt: fc.constant("2026-01-01T00:00:00.000Z"),
+		}),
+		fc.record({
+			disposition: dispositionArb,
+			reason: fc.string({ maxLength: 8 }),
+			createdAt: fc.constant("2026-01-01T00:00:00.000Z"),
+			lastSeenAt: fc.constant("2026-01-01T00:00:00.000Z"),
+			line: fc.nat({ max: 9 }),
+			lineText: fc.string({ maxLength: 8 }),
+		}),
+		fc.record({ disposition: dispositionArb }),
+		fc.constantFrom(null, "false-positive", "suppress", 1, [], {}),
+	);
+	const notAMapArb = fc.constantFrom(
+		"",
+		"{}",
+		"[]",
+		"null",
+		"7",
+		"not json",
+		'{"dispositions":null}',
+		'{"dispositions":[]}',
+		'{"dispositions":"suppress"}',
+		'{"dispositions":5}',
+	);
+	const dropsAs = (row: unknown, disposition: string): boolean =>
+		typeof row === "object" &&
+		row !== null &&
+		(row as { disposition?: unknown }).disposition === disposition;
+
+	it("drops only the finding a false-positive or suppress row names", () => {
+		const project = cwd();
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(filePath(), "");
+		fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+		const content = ["line 0", "line 1", "line 2", "line 3"].join("\n");
+		fc.assert(
+			fc.property(
+				fc.oneof(
+					fc.record({ raw: notAMapArb }),
+					fc.record({
+						findings: fc.array(
+							fc.record({
+								blocking: fc.boolean(),
+								strict: fc.option(rowArb, { nil: undefined }),
+								weak: fc.option(rowArb, { nil: undefined }),
+							}),
+							{ minLength: 1, maxLength: 4 },
+						),
+						foreign: fc.dictionary(
+							fc.constantFrom(
+								"dd:000000000000",
+								"ddw:ffffffffffff",
+								"aw:0123456789",
+							),
+							rowArb,
+						),
+					}),
+				),
+				(scenario) => {
+					const diags = (
+						"findings" in scenario ? scenario.findings : [{ blocking: false }]
+					).map((f, i) => ({
+						tool: "eslint",
+						rule: `rule-${i}`,
+						message: `message ${i}`,
+						line: i + 1,
+						semantic: f.blocking ? "blocking" : "warning",
+					}));
+					const expected = diags.map(() => true);
+					let text: string;
+					if ("raw" in scenario) {
+						text = scenario.raw;
+					} else {
+						const rows: Record<string, unknown> = { ...scenario.foreign };
+						scenario.findings.forEach((f, i) => {
+							const keys = anchorsForDiagnostic(
+								project,
+								filePath(),
+								diags[i]!,
+								content,
+							);
+							if (f.strict !== undefined) rows[keys.strict] = f.strict;
+							if (f.weak !== undefined) rows[keys.weak] = f.weak;
+							expected[i] =
+								!dropsAs(f.strict, "false-positive") &&
+								!(!f.blocking && dropsAs(f.weak, "suppress"));
+						});
+						text = JSON.stringify({ dispositions: rows });
+					}
+					fs.writeFileSync(statePath(), text);
+					_resetStateCacheForTests();
+					_resetDeferredForTests();
+
+					expect(
+						applyDispositions(diags, project, filePath(), content).map(
+							(d) => d.rule,
+						),
+						text,
+					).toEqual(diags.filter((_, i) => expected[i]).map((d) => d.rule));
+				},
+			),
+			{ numRuns: 150, seed: 492802 },
+		);
 	});
 });

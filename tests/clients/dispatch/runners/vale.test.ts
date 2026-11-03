@@ -23,9 +23,30 @@
  * the shipped parser (the #1791 biome-check.test.ts precedent).
  */
 
-import { describe, expect, it } from "vitest";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { FactStore } from "../../../../clients/dispatch/fact-store.js";
 import { parseValeOutput } from "../../../../clients/dispatch/runners/vale.js";
+import valeRunner from "../../../../clients/dispatch/runners/vale.js";
+import { setupTestEnvironment } from "../../test-utils.js";
 
+// Process boundary only: `vale` is not on the CI image, so every spawn
+// (the availability probe and the run) answers a clean exit.
+const safeSpawnAsync = vi.hoisted(() =>
+	vi.fn(async (..._args: unknown[]) => ({
+		error: null,
+		status: 0,
+		stdout: "{}",
+		stderr: "",
+	})),
+);
+vi.mock("../../../../clients/safe-spawn.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../../../clients/safe-spawn.js")
+	>()),
+	safeSpawnAsync,
+}));
 // Captured from: vale --output=JSON AGENTS.md (v3.9.6, this repo's own
 // .vale.ini), trimmed to one warning-severity and one suggestion-severity
 // alert.
@@ -129,5 +150,43 @@ describe("vale parseValeOutput (real binary shape, #1933 review F1)", () => {
 		expect(parseValeOutput("not json", "AGENTS.md", ".")).toEqual([]);
 		// An empty flat map (vale ran, found nothing) is a real, valid shape.
 		expect(parseValeOutput("{}", "AGENTS.md", ".")).toEqual([]);
+	});
+});
+
+describe("vale config lookup (#4689 item 6)", () => {
+	it("runs when .vale.ini sits at the runner's own cwd", async () => {
+		// RECURRENCE GUARDED: `findValeConfig` lost its explicit `cwd/.vale.ini`
+		// pre-check when it folded onto `findLocalToolConfig`; a lookup that
+		// started at the cwd's parent would skip every project whose config is
+		// in the project root, silently turning Vale off.
+		const env = setupTestEnvironment("pi-lens-vale-config-");
+		try {
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".vale.ini"),
+				"MinAlertLevel = suggestion\n",
+			);
+			const filePath = path.join(env.tmpDir, "doc.md");
+			fs.writeFileSync(filePath, "# Doc\n");
+			safeSpawnAsync.mockClear();
+			const result = await valeRunner.run({
+				filePath,
+				cwd: env.tmpDir,
+				kind: "markdown",
+				pi: { getFlag: () => false },
+				autofix: false,
+				deltaMode: true,
+				facts: new FactStore(),
+				hasTool: async () => true,
+				log: () => {},
+			} as never);
+			expect({
+				skipped: result.status === "skipped",
+				ranVale: safeSpawnAsync.mock.calls.some((call) =>
+					(call[1] as string[]).includes("JSON"),
+				),
+			}).toEqual({ skipped: false, ranVale: true });
+		} finally {
+			env.cleanup();
+		}
 	});
 });

@@ -1173,7 +1173,7 @@
 		".tfvars": {
 			"kind": "terraform",
 			"kindLanguageId": "terraform",
-			"lspId": "terraform",
+			"lspId": "terraform-vars",
 			"treeSitterGrammar": null,
 			"scannerGrammar": null,
 			"readExpansionLang": null,

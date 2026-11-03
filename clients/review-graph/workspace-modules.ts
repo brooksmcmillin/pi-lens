@@ -18,7 +18,7 @@ import {
 	isExcludedDirName,
 	type ProjectIgnoreMatcher,
 } from "../file-utils.js";
-import { normalizeMapKey } from "../path-utils.js";
+import { normalizeMapKey, toPosix } from "../path-utils.js";
 import { getWorkspaceManifestMarkers } from "../workspace-topology.js";
 
 export interface WorkspaceModule {
@@ -122,7 +122,7 @@ function normalizeWorkspacePatterns(
 }
 
 function expandWorkspacePattern(cwd: string, pattern: string): string[] {
-	const normalized = stripQuotes(pattern.trim()).replace(/\\/g, "/");
+	const normalized = toPosix(stripQuotes(pattern.trim()));
 	if (!normalized || normalized.startsWith("!")) return [];
 
 	const starIndex = normalized.indexOf("*");
@@ -208,7 +208,7 @@ function moduleFromPackageJson(
 	return {
 		name: pkgJson.name,
 		root: normalizeMapKey(pkgRoot),
-		relativePath: path.relative(cwd, pkgRoot).replace(/\\/g, "/"),
+		relativePath: toPosix(path.relative(cwd, pkgRoot)),
 		entrypoints: pkgJson.main ? [pkgJson.main] : ["index.js"],
 		internalDeps: [],
 		externalDeps: depsFromPackageJson(pkgJson),
@@ -270,7 +270,7 @@ function scanCargoModules(cwd: string): WorkspaceModule[] {
 		modules.push({
 			name,
 			root: normalizeMapKey(pkgRoot),
-			relativePath: path.relative(cwd, pkgRoot).replace(/\\/g, "/"),
+			relativePath: toPosix(path.relative(cwd, pkgRoot)),
 			entrypoints: ["src/lib.rs", "src/main.rs"],
 			internalDeps: [],
 			externalDeps: deps,
@@ -303,7 +303,7 @@ function scanGoModules(cwd: string): WorkspaceModule[] {
 		modules.push({
 			name,
 			root: normalizeMapKey(pkgRoot),
-			relativePath: path.relative(cwd, pkgRoot).replace(/\\/g, "/"),
+			relativePath: toPosix(path.relative(cwd, pkgRoot)),
 			entrypoints: ["."],
 			internalDeps: [],
 			externalDeps: [],

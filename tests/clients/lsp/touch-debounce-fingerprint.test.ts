@@ -30,17 +30,13 @@ import { flushAllNdjsonWriters } from "../../../clients/ndjson-logger.js";
 import { getGlobalPiLensLogDir } from "../../../clients/probe-home-state.js";
 import { waitFor } from "../interleaving-kit.js";
 import { createMockState } from "./mock-client-state.js";
+import { _setServersForFileForTests } from "../../../clients/lsp/config.js";
 
 const { getServersForFileWithConfig, createLSPClient } = vi.hoisted(() => ({
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
 }));
 
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 // #3480 round 1: count the fingerprints `touchFile` computes. Wrapped, not
 // replaced: every other export is the real module.
 vi.mock("../../../clients/lsp/document-drift.js", async (importOriginal) => {
@@ -226,6 +222,16 @@ async function setup(
 			});
 	return { service, texts, state, client };
 }
+
+// #4709: the setter is module state. It is armed per case at file scope and
+// dropped after each case, so no describe reads a list an earlier describe
+// armed (a shuffled run orders the describes freely).
+beforeEach(() => {
+	_setServersForFileForTests(getServersForFileWithConfig);
+});
+afterEach(() => {
+	_setServersForFileForTests(undefined);
+});
 
 describe("#3480 — touch debounce fingerprint covers the whole document", () => {
 	beforeEach(() => {

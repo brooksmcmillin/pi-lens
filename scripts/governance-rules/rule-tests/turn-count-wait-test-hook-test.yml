@@ -1,0 +1,29 @@
+# The test-hook population (#4969: waitForProjectSnapshotPersistsForTests).
+id: turn-count-wait-test-hook
+valid:
+  # The same loop outside a *ForTests function is production code: out of scope.
+  - |
+    export async function retryWrite() {
+      for (let attempt = 0; attempt < 3 && !done; attempt++) await write();
+    }
+  # A test hook bounded by a real-clock deadline.
+  - |
+    export async function waitForPersistsForTests() {
+      const deadline = Date.now() + 2_000;
+      while (active.size > 0 && Date.now() < deadline) await sleep(10);
+    }
+invalid:
+  - |
+    export async function waitForProjectSnapshotPersistsForTests() {
+      for (let attempts = 0; attempts < 200 && active.size > 0; attempts++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+  - |
+    export const drainForTests = async () => {
+      let n = 0;
+      while (queue.length > 0) {
+        await Promise.resolve();
+        if (++n > 100) return;
+      }
+    };

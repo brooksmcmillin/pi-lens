@@ -278,6 +278,9 @@ describe("lookup() serve-time expiry (#1782)", () => {
 describe("expiry observability (#1782 AC4)", () => {
 	it("emits ONE bounded record per sweep carrying the count and the oldest age", async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		const logLatency = vi.fn();
 		vi.doMock("../../../clients/latency-logger.js", async (importOriginal) => ({
 			...(await importOriginal<Record<string, unknown>>()),
@@ -334,12 +337,18 @@ describe("expiry observability (#1782 AC4)", () => {
 		);
 		vi.doUnmock("../../../clients/latency-logger.js");
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 	});
 
 	// #4320: a finding dropped because a file was created is counted under its
 	// own reason, in the same single record, not folded into preSession.
 	it("counts a creation-dropped finding as fileCreated, not preSession", async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		const logLatency = vi.fn();
 		vi.doMock("../../../clients/latency-logger.js", async (importOriginal) => ({
 			...(await importOriginal<Record<string, unknown>>()),
@@ -386,6 +395,9 @@ describe("expiry observability (#1782 AC4)", () => {
 		expect(records[0].metadata.preSession).toBe(0);
 		vi.doUnmock("../../../clients/latency-logger.js");
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 	});
 });
 
@@ -532,8 +544,11 @@ describe("session clock re-arm (#1782)", () => {
 describe("runWorkspaceDiagnostics honors the expiry bound end to end (#1782 AC3)", () => {
 	let tmpSweep: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmpSweep = fs.mkdtempSync(
@@ -616,8 +631,4 @@ describe("runWorkspaceDiagnostics honors the expiry bound end to end (#1782 AC3)
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));

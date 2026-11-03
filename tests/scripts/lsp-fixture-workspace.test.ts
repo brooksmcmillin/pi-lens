@@ -266,6 +266,14 @@ describe("withScratchHome (#2670/#2506-shape)", () => {
 	};
 	let savedHome: string | undefined;
 	let savedData: string | undefined;
+	const HOME_PIN_KEYS = [
+		"HOME",
+		"USERPROFILE",
+		"XDG_CONFIG_HOME",
+		"XDG_CACHE_HOME",
+		"XDG_DATA_HOME",
+	];
+	const savedHomePin: Record<string, string | undefined> = {};
 
 	beforeEach(async () => {
 		({ withScratchHome } = await import(
@@ -275,6 +283,7 @@ describe("withScratchHome (#2670/#2506-shape)", () => {
 		));
 		savedHome = process.env.PI_LENS_HOME;
 		savedData = process.env.PILENS_DATA_DIR;
+		for (const key of HOME_PIN_KEYS) savedHomePin[key] = process.env[key];
 	});
 
 	afterEach(() => {
@@ -285,6 +294,11 @@ describe("withScratchHome (#2670/#2506-shape)", () => {
 		else process.env.PI_LENS_HOME = savedHome;
 		if (savedData === undefined) delete process.env.PILENS_DATA_DIR;
 		else process.env.PILENS_DATA_DIR = savedData;
+		// #4821 F1: withScratchHome also pins the home set; restore every key it writes.
+		for (const key of HOME_PIN_KEYS) {
+			if (savedHomePin[key] === undefined) delete process.env[key];
+			else process.env[key] = savedHomePin[key];
+		}
 	});
 
 	it("pins PI_LENS_HOME and PILENS_DATA_DIR to a fresh temp dir when neither is set", () => {
@@ -418,6 +432,7 @@ describe("withScratchHome (#2670/#2506-shape)", () => {
 	// prior mint) AND land its own fresh `dir` on disk afterward — explicitly
 	// asserted, not merely assumed because cleanup didn't throw.
 	it("(a) never removes a scratch home whose owner.pid names a live process (helper-minted, end-to-end)", () => {
+		const homeAtStart = process.env.HOME;
 		delete process.env.PI_LENS_HOME;
 		delete process.env.PILENS_DATA_DIR;
 		const first = withScratchHome({ tmpPrefix: SWEEP_TEST_PREFIX });
@@ -443,9 +458,12 @@ describe("withScratchHome (#2670/#2506-shape)", () => {
 			expect(second.dir).not.toBe(live);
 		} finally {
 			second.restore();
+			first.restore();
 			fs.rmSync(second.dir as string, { recursive: true, force: true });
 			fs.rmSync(live, { recursive: true, force: true });
 		}
+		// #4821 F1: both pins are restored, so HOME is the start value again.
+		expect(process.env.HOME).toBe(homeAtStart);
 	});
 
 	it("(b) removes a scratch home whose owner.pid names a dead process", () => {

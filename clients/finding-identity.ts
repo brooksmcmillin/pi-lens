@@ -27,7 +27,7 @@
 
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { normalizeMapKey } from "./path-utils.js";
+import { normalizeMapKey, toPosix } from "./path-utils.js";
 
 /** Every finding id in this codebase truncates its sha256 hex digest to this
  * many characters. Single source so the three call sites this module
@@ -175,10 +175,11 @@ export function hashText(
 }
 
 /**
- * Canonicalize BOTH `filePath` and `cwd` through `normalizeMapKey` (realpath
- * + case-fold on Windows) BEFORE computing the relative path, so two callers
- * holding different path FORMS of the same file (raw vs. already-normalized,
- * a Windows drive/segment case difference, a slash variant) converge on the
+ * Canonicalize BOTH `filePath` and `cwd` through `normalizeMapKey` (the path
+ * identity: realpath on every platform, #4689, plus the win32 case fold)
+ * BEFORE computing the relative path, so two callers holding different path
+ * FORMS of the same file (raw vs. already-normalized, a link spelling, a
+ * Windows drive/segment case difference, a slash variant) converge on the
  * identical relative-path component instead of silently diverging into two
  * different finding ids for the same file (the #533 orphaned-record class).
  * `normalizeMapKey` is idempotent, so an already-canonical caller pays no
@@ -188,7 +189,7 @@ export function hashText(
 export function relativeFile(filePath: string, cwd: string): string {
 	const canonicalCwd = normalizeMapKey(cwd);
 	const canonicalFile = normalizeMapKey(filePath);
-	const rel = path.relative(canonicalCwd, canonicalFile).replace(/\\/g, "/");
+	const rel = toPosix(path.relative(canonicalCwd, canonicalFile));
 	return rel && !rel.startsWith("..") ? rel : canonicalFile;
 }
 

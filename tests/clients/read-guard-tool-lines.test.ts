@@ -8,12 +8,9 @@ import {
 	relocateEditRange,
 	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
+	tryCorrectIndentationMismatchFromContent,
 } from "../../clients/read-guard-tool-lines.js";
-import {
-	applyPartiallyApplicableEdits,
-	PartialApplyRecordStore,
-	type PartiallyApplicableEdit,
-} from "../../clients/partial-edit-apply.js";
+import { PartialApplyRecordStore } from "../../clients/partial-edit-apply.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { ReadGuard } from "../../clients/read-guard.js";
 import {
@@ -598,17 +595,14 @@ describe("read-guard tool line helpers", () => {
 				newText: "ok",
 				originalIndex: 0,
 			});
-			// #1053: the carried span and snapshot identity point at the exact
-			// preflight-approved region.
+			// #1053: the carried span points at the exact preflight-approved
+			// region.
 			const lf = fs.readFileSync(filePath, "utf-8").replace(/\r\n/g, "\n");
 			const start = lf.indexOf("function bar() {\n  return 2;\n}");
 			expect(result.partiallyApplicable?.[0]).toMatchObject({
 				spanStart: start,
 				spanEnd: start + "function bar() {\n  return 2;\n}".length,
 			});
-			expect(result.partiallyApplicable?.[0].snapshot.hash).toMatch(
-				/^[0-9a-f]{64}$/,
-			);
 		} finally {
 			env.cleanup();
 		}
@@ -1166,6 +1160,97 @@ describe("tryCorrectIndentationMismatch — Unicode punctuation drift (Tier C)",
 	});
 });
 
+// Recurrence guarded: Tiers A, B and C were three hand-copied span matchers that
+// differed only in their line signature; a safety edit (unique-match, >=2
+// anchors, blank skipping) applied to one copy would leave the others behind.
+// They now share one matcher with the SAME safety contract. The tiers form a
+// ladder (A's matches are a subset of B's, B's of C's), so the A and B cells
+// also pass through coarser tiers: the necessity of the A and B rows is pinned
+// only by "a finer tier recovers its unique span where the coarser tiers would
+// collide", and only tier C's cells red when its row is removed.
+describe("tryCorrectIndentationMismatchFromContent — signature tiers share one matcher", () => {
+	// Each tier's drift is only bridged by its own signature (and the ones after it).
+	const TIERS = [
+		{
+			tier: "A (indentation)",
+			file: ["\tconst a = 1;", "", "", "\tconst b = 2;"],
+			old: ["const a = 1;", "const b = 2;"],
+		},
+		{
+			tier: "B (interior whitespace)",
+			file: ["\tconst a = 1 + 2;", "   ", "\tconst b = 3 + 4;"],
+			old: ["const a=1+2;", "const b=3+4;"],
+		},
+		{
+			tier: "C (unicode punctuation)",
+			file: ['\tconst a = "x";', "", "\tconst b = 3 - 4;"],
+			old: ["const a = \u201cx\u201d;", "const b = 3 \u2014 4;"],
+		},
+	];
+
+	it.each(TIERS)(
+		"tier $tier recovers the verbatim file span across interior blank lines",
+		({ file, old }) => {
+			const content = `${file.join("\n")}\n`;
+			expect(
+				tryCorrectIndentationMismatchFromContent(old.join("\n"), content),
+			).toBe(file.join("\n"));
+		},
+	);
+
+	it.each(TIERS)(
+		"tier $tier refuses a signature that occurs twice",
+		({ file, old }) => {
+			const content = `${[...file, "gap();", ...file].join("\n")}\n`;
+			expect(
+				tryCorrectIndentationMismatchFromContent(old.join("\n"), content),
+			).toBeUndefined();
+		},
+	);
+
+	it.each(TIERS)(
+		"tier $tier refuses an oldText with one non-blank line however many blanks pad it",
+		({ file, old }) => {
+			const content = `${file.join("\n")}\n`;
+			expect(
+				tryCorrectIndentationMismatchFromContent(`${old[0]}\n\n  \n`, content),
+			).toBeUndefined();
+		},
+	);
+	// Each tier is behaviour: a finer tier answers where a coarser signature would
+	// see two spans and refuse (drop a row and this cell reds; order is not
+	// observable, since every tier refuses an ambiguous signature).
+	it("a finer tier recovers its unique span where the coarser tiers would collide", () => {
+		const byIndent = [
+			"const a = 1;",
+			"const b = 2;",
+			"gap();",
+			"const a=1;",
+			"const b = 2;",
+		].join("\n");
+		expect(
+			tryCorrectIndentationMismatchFromContent(
+				"  const a = 1;\n\n  const b = 2;",
+				byIndent,
+			),
+		).toBe("const a = 1;\nconst b = 2;");
+
+		const byWhitespace = [
+			"const a = 1 - 2;",
+			"const b = 3;",
+			"gap();",
+			"const a = 1 \u2014 2;",
+			"const b = 3;",
+		].join("\n");
+		expect(
+			tryCorrectIndentationMismatchFromContent(
+				"const a = 1-2;\nconst b = 3;",
+				byWhitespace,
+			),
+		).toBe("const a = 1 - 2;\nconst b = 3;");
+	});
+});
+
 describe("getTouchedLinesForGuard — did-you-mean suggestions", () => {
 	it("suggests the closest current line when oldText nearly matches", () => {
 		const env = setupTestEnvironment("pi-lens-didyoumean-");
@@ -1676,7 +1761,6 @@ describe("getTouchedLinesForGuard — preflight spans and exact-retry recognitio
 			expect(edit!.spanStart).toBe(lf.indexOf("const b = 2;"));
 			expect(edit!.spanEnd).toBe(edit!.spanStart + "const b = 2;".length);
 			expect(edit!.appliedSpanText).toBe("const b = 2;");
-			expect(edit!.snapshot.hash).toMatch(/^[0-9a-f]{64}$/);
 		} finally {
 			env.cleanup();
 		}
@@ -1867,38 +1951,34 @@ describe("getTouchedLinesForGuard — preflight spans and exact-retry recognitio
 		}
 	});
 
-	it("recognizes an identical retry after a formatter rewrote the file post-commit", async () => {
+	it("recognizes an identical retry after a formatter rewrote the file post-commit", () => {
 		const env = setupTestEnvironment("rg-formatter-retry-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
 			const raw = "const a = 1;\nconst b = 2;\n";
 			fs.writeFileSync(filePath, raw);
-			const spanStart = raw.indexOf("const b = 2;");
-			const edit: PartiallyApplicableEdit = {
-				oldText: "const b = 2;",
-				appliedSpanText: "const b = 2;",
-				newText: "const b = 20;",
-				originalIndex: 0,
-				snapshot: {
-					hash: createHash("sha256").update(raw, "utf8").digest("hex"),
-				},
-				spanStart,
-				spanEnd: spanStart + "const b = 2;".length,
-			};
 			const records = new PartialApplyRecordStore();
-
-			await applyPartiallyApplicableEdits({
+			// The commit and its record, as a host edit's tool_result writes them
+			// (#5120), then a formatter's rewrite and its after-write stamp: it
+			// appends a trailing newline, changing the raw bytes (and thus the
+			// file hash) while leaving the applied line intact.
+			const committed = raw.replace("const b = 2;", "const b = 20;");
+			fs.writeFileSync(filePath, committed);
+			const hash = (text: string) =>
+				createHash("sha256").update(text, "utf8").digest("hex");
+			records.record(
 				filePath,
-				edits: [edit],
-				recordStore: records,
-				// A formatter rewrites the file after the commit: it appends a
-				// trailing newline, changing the raw bytes (and thus the file hash)
-				// while leaving the applied line intact.
-				afterWrite: async () => {
-					fs.writeFileSync(filePath, `${fs.readFileSync(filePath, "utf-8")}\n`);
-					return undefined;
-				},
-			});
+				"const b = 2;",
+				"const b = 20;",
+				hash(committed),
+			);
+			fs.writeFileSync(filePath, `${committed}\n`);
+			records.noteAfterWriteHash(
+				filePath,
+				"const b = 2;",
+				"const b = 20;",
+				hash(`${committed}\n`),
+			);
 
 			// The post-afterWrite state was recorded alongside the post-commit one.
 			expect(

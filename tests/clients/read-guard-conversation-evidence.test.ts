@@ -29,6 +29,7 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { computeHashlineAnchors } from "../../clients/hashline-anchor.js";
+import { createFileTime } from "../../clients/file-time.js";
 import { lineContentHash } from "../../clients/read-guard.js";
 import { recordIOEntry } from "../../clients/io-bridge.js";
 import {
@@ -48,13 +49,6 @@ vi.mock("../../clients/dispatch/integration.js", async (importOriginal) => ({
 	>()),
 	dispatchLintWithResult: vi.fn(),
 	computeCascadeForFile: vi.fn().mockResolvedValue(undefined),
-}));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(),
-	resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("../../clients/recent-touches.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/recent-touches.js")>()),
@@ -86,13 +80,12 @@ import {
 	formatFile as runFormatter,
 	getFormattersForFile,
 } from "../../clients/formatters.js";
-import { getLSPService } from "../../clients/lsp/capabilities.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { pathToFileURL } from "node:url";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { setHostFileMutationQueueLoader } from "../../clients/file-mutation-queue.js";
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const CLEAN_DISPATCH = {
 	diagnostics: [],
@@ -435,18 +428,16 @@ const WRITTEN = [
 	"const d = 4;",
 ].join("\n");
 
-beforeEach(() => {
+beforeEach(async () => {
 	resetDegradationLedger();
 	vi.mocked(logLatency).mockClear();
-	vi.mocked(getLSPService).mockReturnValue(
-		makeLspServiceDouble({
-			supportsLSP: () => false,
-			hasLSP: async () => false,
-			openFile: async () => {},
-			touchFile: async () => {},
-			getAllDiagnostics: async () => new Map(),
-		}) as never,
-	);
+	await installLspServiceDouble({
+		supportsLSP: () => false,
+		hasLSP: async () => false,
+		openFile: async () => {},
+		touchFile: async () => {},
+		getAllDiagnostics: async () => new Map(),
+	});
 	vi.mocked(dispatchLintWithResult).mockReset();
 	vi.mocked(dispatchLintWithResult).mockResolvedValue(CLEAN_DISPATCH as never);
 });
@@ -2896,8 +2887,9 @@ describe("#3525: FileTime moves only over bytes the conversation accounts for", 
 	});
 
 	/**
-	 * An oldText batch whose second edit does not resolve: pi-lens applies the
-	 * first itself and refuses the batch (#2402's partial apply).
+	 * An oldText batch whose second edit does not resolve (#2402's partial
+	 * apply): tool_call rewrites it to the first edit (#5120), the host applies
+	 * the executed input, and the edit's tool_result reports the partial apply.
 	 */
 	const partialApply = async (
 		runtime: RuntimeCoordinator,
@@ -2906,7 +2898,10 @@ describe("#3525: FileTime moves only over bytes the conversation accounts for", 
 		newText: string,
 	) => {
 		const toolCallId = `partial-${++seq}`;
-		const input = {
+		const input: {
+			path: string;
+			edits: Array<{ oldText: string; newText: string }>;
+		} = {
 			path: file,
 			edits: [
 				{ oldText, newText },
@@ -2918,8 +2913,19 @@ describe("#3525: FileTime moves only over bytes the conversation accounts for", 
 				callDeps(runtime, { toolName: "edit", toolCallId, input }),
 			),
 		)) as { block?: boolean; reason?: string } | undefined;
-		expect(verdict?.reason).toContain("PARTIAL APPLY — 1 edit committed");
-		expect(verdict?.reason).not.toContain("Post-edit analysis failed");
+		expect(verdict).toBeUndefined();
+		let text = fs.readFileSync(file, "utf8");
+		for (const edit of input.edits)
+			text = text.replace(edit.oldText, edit.newText);
+		writeNow(file, text);
+		const result = await handleToolResult(
+			resultDeps(runtime, { toolName: "edit", toolCallId, input, content: [] }),
+		);
+		const reported = (result?.content ?? [])
+			.map((part) => part.text)
+			.join("\n");
+		expect(reported).toContain("PARTIAL APPLY — 1 edit committed");
+		expect(reported).not.toContain("Post-edit analysis failed");
 	};
 
 	// #3785 review r1 F2: the partial apply reached tool_result with no
@@ -3002,25 +3008,23 @@ describe("#3525: FileTime moves only over bytes the conversation accounts for", 
 			const runtime = newRuntime(env.tmpDir);
 			await piWrite(runtime, file, BIG);
 			foreignWrite(file, 11, "EXTERNAL11");
-			vi.mocked(getLSPService).mockReturnValue(
-				makeLspServiceDouble({
-					supportsLSP: () => true,
-					hasLSP: async () => true,
-					rename: async () => ({
-						changes: {
-							[pathToFileURL(file).href]: [
-								{
-									range: {
-										start: { line: 2, character: 0 },
-										end: { line: 2, character: 4 },
-									},
-									newText: "renamed",
+			await installLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				rename: async () => ({
+					changes: {
+						[pathToFileURL(file).href]: [
+							{
+								range: {
+									start: { line: 2, character: 0 },
+									end: { line: 2, character: 4 },
 								},
-							],
-						},
-					}),
-				}) as never,
-			);
+								newText: "renamed",
+							},
+						],
+					},
+				}),
+			});
 			const tool = createLspNavigationTool((flag) => flag === "lens-lsp", {
 				runtime,
 				cacheManager: new CacheManager(false),
@@ -3266,6 +3270,83 @@ describe("#3962: a native re-read supersedes a stale bridge binding", () => {
 			expect(edit.blocked).toBe(true);
 			expect(edit.reason).toContain("content no longer matches");
 		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("#4942 r7: a primary reset keeps a live secondary's in-flight read stamp", () => {
+	it("blocks an edit on a line another writer changed while the secondary's read was in flight across the primary's reset", async () => {
+		// RECURRENCE GUARDED: #4955 review F13 (CodeRabbit PRRT_kwDORt8rec6xWL2f,
+		// AGENTS shape 46: a bound must not drop state a live reader still
+		// needs). resetForSession released every dropped secondary guard's
+		// FileTime bucket. A secondary's read whose tool_call stamped the file
+		// before the reset and whose tool_result came after it then found no
+		// stamp, so diskMovedSinceStamp read false after an external write and
+		// the result recorded the racer's bytes as read.
+		const env = setupTestEnvironment("rg-4942-r7-reset-inflight-");
+		try {
+			const file = fixture(env.tmpDir, "a.ts", `${lines(6).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			runtime.setSessionLifecycle({ sessionId: "primary-r7" });
+			const sub = "sub-r7";
+			const toolCallId = `read-${++seq}`;
+			const args = { path: file, offset: 1, limit: 6 };
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall({
+					...(callDeps(runtime, {
+						toolName: "read",
+						toolCallId,
+						input: args,
+					}) as object),
+					sessionId: sub,
+				} as never),
+			);
+			const result = await createReadToolDefinition(
+				runtime.projectRoot,
+			).execute(toolCallId, args, undefined, undefined, {
+				cwd: runtime.projectRoot,
+			} as never);
+			// The primary resets while the secondary's read is in flight, and
+			// another writer changes line 3 before the tool_result.
+			runtime.resetForSession();
+			const changed = lines(6);
+			changed[2] = "EXTERNAL3";
+			writeNow(file, `${changed.join("\n")}\n`);
+			await handleToolResult({
+				...(resultDeps(runtime, {
+					toolName: "read",
+					toolCallId,
+					input: args,
+					content: result.content,
+					details: result.details,
+				}) as object),
+				sessionId: sub,
+				readGuard: runtime.readGuardFor(sub),
+			} as never);
+
+			const editId = `edit-${++seq}`;
+			const verdict = (await runHandlerExpectingNoThrow(() =>
+				handleToolCall({
+					...(callDeps(runtime, {
+						toolName: "edit",
+						toolCallId: editId,
+						input: {
+							path: file,
+							edits: [
+								{
+									range: { start: { line: 3 }, end: { line: 3 } },
+									newText: "agent3",
+								},
+							],
+						},
+					}) as object),
+					sessionId: sub,
+				} as never),
+			)) as { block?: boolean } | undefined;
+			expect(verdict?.block).toBe(true);
+		} finally {
+			createFileTime("sub-r7").clear();
 			env.cleanup();
 		}
 	});

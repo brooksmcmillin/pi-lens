@@ -84,7 +84,10 @@ export function judgeDeferredRunnerFindings(
 	cwd: string,
 	options: { quiet?: boolean } = {},
 ): DeferredRunnerVerdict {
-	const findings = pending.result?.diagnostics ?? [];
+	// #4130: the run's fault reaches the agent once, as turn end's failure note.
+	const findings = (pending.result?.diagnostics ?? []).flatMap((d) =>
+		d.runnerFault === true ? [] : [d],
+	);
 	if (findings.length === 0) {
 		return { stale: 0, live: 0, kept: [], suppressed: 0, bytes: undefined };
 	}
@@ -165,6 +168,8 @@ export function recordDeferredRunnerBlockers(
 					}
 				: {}),
 		},
+		// #4943: the producing write's session, stamped by the dispatch.
+		pending.sessionId,
 	);
 	// Same recompute every recording seam does: the latch re-derives from the map.
 	if (recorded > 0) runtime.updateGitGuardStatus(false, "");
@@ -231,12 +236,11 @@ function withoutLaneCopies(
 	const lane = pending.result?.coveredBy;
 	if (lane === undefined) return findings;
 	const standsFor = laneCopyStandsFor(
-		(runtime.getInlineBlockerDiagnostics(pending.filePath) ?? []).flatMap(
-			(d) =>
-				d.runnerId === lane.runnerId &&
-				(lane.serverId === undefined || d.serverId === lane.serverId)
-					? [d]
-					: [],
+		(runtime.getInlineBlockerDiagnostics(pending.filePath) ?? []).flatMap((d) =>
+			d.runnerId === lane.runnerId &&
+			(lane.serverId === undefined || d.serverId === lane.serverId)
+				? [d]
+				: [],
 		),
 	);
 	return findings.flatMap((d) => (standsFor(d) ? [] : [d]));

@@ -77,8 +77,13 @@ column is the effective behavior when nothing is set.
 | `--lens-guard` | `guard.enabled` | global | **off** |
 | `--lens-checkout-guard` | `guard.sharedCheckout` | global | **off** |
 | `--no-opengrep` | `opengrep.enabled` | global | Opengrep scanner **on** |
+| `--no-ast-grep` | `astGrep.enabled` | global | ast-grep auxiliary server **on** |
+| `--no-zizmor` | `zizmor.enabled` | global | zizmor auxiliary server **on** |
+| `--no-typos` | `typos.enabled` | global | typos auxiliary server **on** |
+| `--lens-spotbugs` | `spotbugs.enabled` | global | SpotBugs **off** |
 | `--no-read-guard` | `readGuard.enabled` | global | read-before-edit monitor **on** |
 | `--no-lens-context` | `contextInjection.enabled` | global | context injection **on** |
+| `--lens-retain-injections` | `contextInjection.retain` | global | **off** |
 | `--lens-turn-summary` | `turnSummary.enabled` | global | **off** |
 | `--lens-actionable-warnings` | `actionableWarnings.enabled` | global | **off** |
 | `--lens-actionable-warning-actions` | `actionableWarnings.includeLspCodeActions` | global | **off** |
@@ -88,9 +93,10 @@ column is the effective behavior when nothing is set.
 | `--lens-compact-lsp-status` | `ui.compactLspStatus` | global | **off** (footer lists the active server names) |
 | `--lens-hide-lsp-status` | `ui.hideLspStatus` | global | **off** (footer publishes the `pi-lens-lsp` status; outranks `ui.compactLspStatus` when both are set) |
 | `--lens-compact-widget` | `ui.compactWidget` | global | **off** (widget stacks file rows, suppressed count and blocker details below its summary header; **on** renders only that header — languages + totals, plus the `LSP↑` chip while servers are spawning) |
-| `--no-lazy-tools` | `tools.lazy` | global | lazy tools **on** (five situational tools start inactive) |
+| `--no-lazy-tools` | `tools.lazy` | global | `true`: the five situational tools start inactive on every model (`"auto"` only on a model that keeps mid-conversation system messages, `false` never) |
 | `--no-tool=<name>` | `tools.<name>.enabled` | project | every lens tool **on** |
 | `--lens-turn-end-madge` | `turnEnd.madge.enabled` | global | **off** (madge runs at session start, not per turn) |
+| `--lens-fallow` | `fallow.enabled` | global | **off** (fallow-lsp advisory auxiliary on JS/TS files; nothing installed or launched while off) |
 | `--no-knip` | `knip.enabled` | project | knip analyzer **on** |
 | `--no-jscpd` | `jscpd.enabled` | project | jscpd analyzer **on** |
 | `--no-madge` | `madge.enabled` | project | madge analyzer **on** |
@@ -99,10 +105,13 @@ column is the effective behavior when nothing is set.
 | `--no-dead-code` | `deadCode.enabled` | project | dead-code analyzer **on** |
 | `--no-complexity` | `complexity.enabled` | project | complexity analyzer **on** |
 
-`--no-lazy-tools` keeps every pi-lens tool active for the whole session, so the
-advertised tool list never changes. The `pi_lens_activate_tools` loader stays
-registered and keeps its usual description; under this flag the tools it names
-are already active, so calling it is a no-op.
+`--no-lazy-tools` (or `tools.lazy: false`) keeps every pi-lens tool active for
+the whole session, so the advertised tool list never changes. The opt-in
+`"auto"` decides per model, at session start and on a model switch only; see
+[globalconfig.md](globalconfig.md#startup-controls) for the rule, why `true`
+stays the default, and the precedence over `tools.<name>.enabled`. The `pi_lens_activate_tools` loader
+stays registered and keeps its usual description; when the tools it names are
+already active, calling it is a no-op.
 
 The `tools.<name>.enabled` population covers every model-facing pi and MCP
 tool. The loader `pi_lens_activate_tools` and MCP lifecycle tools
@@ -141,13 +150,14 @@ field docs.
 | `ignore` | global + project | `[]` | Gitignore-style globs excluded from every scan |
 | `widget.visible` | global | `true` | Whether the diagnostics widget shows at session start |
 | `dispatch.runnerTimeoutFloorMs` | global | none (no floor) | Minimum wall-clock budget per dispatch runner |
+| `dispatch.disabledRunners` | global + project | `[]` | Dispatch runner ids that never run (for example `["dotnet-build"]`). A denial: the union of every tier, so a project can add but never re-enable. Unknown ids are dropped with a warning. See [configuration](configuration.md#dispatchdisabledrunners--turning-a-dispatch-runner-off) |
 | `format.mode` | global | `"deferred"` | `"deferred"` (at `agent_end`) or `"immediate"` |
 | `actionableWarnings.autoFix.maxFixes` | global | `5` | Cap on quickfixes applied per turn (`0` = report only) |
 | `rules.high-complexity.threshold` | project | `15` | Cyclomatic-complexity threshold |
 | `rules.high-fan-out.threshold` | project | `20` | Distinct-function-call threshold |
-| `rules.<id>.disable` | global + project | absent | Disable diagnostics for a rule (output-only filter, project-wide; same normalization as `pi-lens-ignore`) |
+| `rules.<id>.disable` | global + project | absent | Disable diagnostics for a rule (output-only filter, project-wide; same normalization as `pi-lens-ignore`). Read per file from its nearest `.pi-lens.json`, so a nested file governs the files under it. See [configuration](configuration.md#rulesid--read-from-each-files-own-config) |
 | `rules.<id>.select` | project | absent | Allowlist of rule ids (output-only filter, project-wide across every key; disable wins over select) |
-| `rules.<id>.ignorePaths` | global + project | `[]` | Experimental rule-scoped globs relative to the project root; matching files skip that rule's scan and output. Entries are monotonic across tiers. |
+| `rules.<id>.ignorePaths` | global + project | `[]` | Experimental rule-scoped path entries matched like the `ignore` field: gitignore rules, relative to the directory of the file that declares them (the project root for a global entry). A later entry beats an earlier one, `!` re-includes, a leading `/` roots the entry at that directory, a trailing `/` names a directory, and an entry with no slash matches at any depth below it. Matching files skip that rule's scan and output. Entries are monotonic across files: a `!` re-includes only against the entries of its own file, and a nearer file never lifts another file's carve-out. Changed from earlier releases, which matched each entry as a plain glob: a `!` entry used to hide every path its glob did not name, and a leading `/` or trailing `/` matched nothing; they now follow gitignore. An entry with a slash keeps its meaning, and a slashless entry such as `*.gen.ts` now also matches below the root. See the [configuration reference](./configuration.md#rulesid--read-from-each-files-own-config). |
 | `maxProjectFiles` | project | `2000` | Base scale knob; derives five subsystem size budgets |
 | `reviewGraph.maxFiles` | project | derived (clamped `100`–`20000`) | Explicit review-graph file budget |
 | `trivy.enabled` / `trivy.minSeverity` | project | off | Opt-in Trivy vulnerability scanning |
@@ -160,7 +170,7 @@ field docs.
 User-level. The file is selected by the [global-location table](configuration.md#global-config-location)
 and applies to **every** project. It honors **all** flag keys from the
 table above plus the non-flag global knobs (`ignore`, `widget.visible`,
-`dispatch.runnerTimeoutFloorMs`, `format.mode`,
+`dispatch.runnerTimeoutFloorMs`, `dispatch.disabledRunners`, `format.mode`,
 `actionableWarnings.autoFix.maxFixes`). On Windows the path is
 `%USERPROFILE%\.pi-lens\config.json`.
 
@@ -210,9 +220,12 @@ Most toggles are **global-only**. Putting a global-only key such as
 `"lsp": { "enabled": false }` in a `.pi-lens.json` is **not** honored at project
 scope — pi-lens logs a one-time warning saying so (rather than silently doing
 nothing) and you should set it in `~/.pi-lens/config.json` or pass the CLI flag
-instead. Foreign LSP-loader namespaces that a shared file legitimately carries
-(`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) and `$schema` are
-tolerated without warning; anything else is logged once as a likely typo.
+instead. `dispatch` is mixed-scope: `dispatch.disabledRunners` is honored in a
+project file, while `dispatch.runnerTimeoutFloorMs` stays global-only and is
+reported as such. Foreign LSP-loader namespaces that a shared file legitimately
+carries (`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) and
+`$schema` are tolerated without warning; anything else is logged once as a
+likely typo.
 
 ```json
 {

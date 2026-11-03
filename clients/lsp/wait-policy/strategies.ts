@@ -14,6 +14,10 @@
  */
 
 import { createRequire } from "node:module";
+import {
+	isTsgoLaunchVariant,
+	type LspLaunchVariant,
+} from "../server-traits.js";
 
 const _require = createRequire(import.meta.url);
 
@@ -101,6 +105,20 @@ export interface DiagnosticStrategy {
 	 *  `Notification_handler.on_notification`: `DidSaveTextDocument` ->
 	 *  `Scan_helpers.scan_file`). The client expects that publication. */
 	rescansOnSave?: boolean;
+	/** #4763: until this server sends `semgrep/rulesRefreshed`, an EMPTY publish
+	 *  is not an answer. Opengrep with `--config auto` loads its rules after
+	 *  `didOpen`; a scan before that logs "Rules not loaded yet, not scanning
+	 *  anything" and publishes `[]` (opengrep@60ed3b3 `Scan_helpers.run_semgrep`
+	 *  `when not session.cached_session.initialized`), then
+	 *  `Scan_helpers.refresh_rules` sends `semgrep/rulesRefreshed` and
+	 *  republishes every open document. Measured 3/3 on 1.30.0 and 2/2 on 1.32.0
+	 *  (docs/lsp-capability-matrix.md, opengrep): `[]` at +10..20 ms, the
+	 *  notification at +0.7..1.0 s, the findings 0.25..0.5 s later. The client
+	 *  holds that `[]` (not cached, no stamp, no emit), so it can neither end the
+	 *  wait nor read as "answered". With a local rule file the notification
+	 *  arrives before the first publish and nothing is held. A non-empty publish
+	 *  is a scan result and is never held. */
+	emptyUntilRulesRefreshed?: boolean;
 	/** #3548: `textDocument/didClose` makes this server publish once more, an
 	 *  empty, version-less set that answers no send (tekumara/typos-lsp
 	 *  `crates/typos-lsp/src/lsp.rs` `did_close`:
@@ -325,7 +343,10 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 		},
 		// Opengrep security scanner (cross-language LSP). It pushes an EMPTY result
 		// during the one-time rule-load window at startup, then the real scan after
-		// `semgrep/rulesRefreshed` — so never seed the first push. Push-only (no pull
+		// `semgrep/rulesRefreshed` — so never seed the first push, and hold that
+		// empty publish (`emptyUntilRulesRefreshed`, #4763): without the hold it
+		// ended the touch as "answered" and the findings arrived after the wait.
+		// Push-only (no pull
 		// diagnostics). Warm per-file scan ~1.3s; the first touch in a session may
 		// also pay rule-load (~3.5s cold). aggregateWaitMs is 3500: it's this
 		// server's OWN deadline, bounded by the per-edit caller cap as a ceiling
@@ -343,6 +364,7 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			// Opengrep re-scans only on a fresh didOpen — didChange is a no-op for it.
 			reopenOnResync: true,
 			rescansOnSave: true,
+			emptyUntilRulesRefreshed: true,
 		},
 		// ast-grep structural linter (sgconfig-gated auxiliary LSP). Push-only,
 		// compiles the project rules on the first scan of a session, and — like
@@ -510,25 +532,24 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			// #3484: the fence reply (+2..4 ms) precedes the publish (~+1 s).
 			diagnosticsFence: "reply-first",
 		},
-		// terraform-ls (#3310). The nightly tool-smoke measurement was identical
-		// on 2026-09-27, 2026-09-28, and 2026-09-29:
-		//
-		//   [terraform] clean-behavior=publishes-unversioned (tier 2*)
-		//   dirtyPubs=2(v:0) cleanPubs=2(v:0) first-publish=empty-first
-		//   provisional pre-index publish
-		//
-		// The first empty, unversioned publish is the cold-index artifact, so hold
-		// it once and let terraform-ls's next publish resolve the wait. A held
-		// clean-only trace therefore reaches the caller as unanswered/indeterminate
-		// at the wait ceiling rather than a false clean, by design (#3310). The
-		// marker is measured policy, not a blanket rule for Tier 2* push servers.
+		// terraform-ls: NO `emptyFirstPublish` marker (#4615). The earlier
+		// `empty-first` reading (2026-09-27..29, and the nightlies 2026-10-17..20)
+		// came from a probe that counted terraform-ls's EMPTY set for the
+		// WORKSPACE DIRECTORY URI. terraform-ls publishes that set in the same
+		// ~1 ms burst as the file's own finding, and the probe's drainer kept rows
+		// by server id only, so the directory row was read as the file's first
+		// publish. Scoped to the fixture's own document, the first publish carries
+		// the finding: `direct` (terraform-ls 0.39.0, 16/16 cold runs). The hold
+		// was also a no-op for a dirty file: the one-shot hold is spent on the
+		// directory row or an unrelated `.tf` file, never on the finding. On a
+		// clean `.tf` file it could swallow the file's own `[]`, which costs a
+		// wait to the ceiling (inferred from code, not probed).
 		terraform: {
 			seedFirstPush: false,
 			pullRetryBudgetMs: 0,
 			debounceMs: 150,
 			aggregateWaitMs: 1500,
 			expectSemanticSecondPush: false,
-			emptyFirstPublish: "indexing",
 		},
 		// yaml-language-server (#3484): the default strategy plus the measured
 		// fence order — reply +3..6 ms, publish +207..242 ms after didChange.
@@ -635,12 +656,130 @@ const DEFAULT_STRATEGY: DiagnosticStrategy = {
 	expectSemanticSecondPush: false,
 };
 
+/** One strategy field's treatment on a command-override launch (#4833). */
+interface OverrideStrategyDecision {
+	/**
+	 * `inherit` = the override keeps the row's value; `reset` = the default;
+	 * `longer` = the longer of the row's budget and the default.
+	 */
+	readonly keep: "inherit" | "reset" | "longer";
+	readonly why: string;
+}
+
+/**
+ * #4833: what a `serverOverrides.<id>.command` launch does with EVERY
+ * {@link DiagnosticStrategy} field of the row keyed by its catalog server id.
+ * The row was measured on the catalog binary, but `DEFAULT_STRATEGY` is the
+ * default for a server nobody measured, not the fail-safe value of each field:
+ * resetting a protocol workaround reads a file sooner (a false clean).
+ *
+ * Direction of the default, per field. FAIL-SAFE = it waits longer or reads
+ * unconfirmed; FAIL-OPEN = it reads clean sooner.
+ *   - `inherit` = the row's value is the restrictive direction (it adds work, a
+ *     hold or a drop whose worst case is a timeout); resetting would be
+ *     fail-open.
+ *   - `longer` = a wait budget: never shorter than the default.
+ *   - `reset` = an optimistic claim (skip a wait, trust a first push); the
+ *     default is fail-safe.
+ *
+ * Mapped over `keyof DiagnosticStrategy`, so a new field fails to compile until
+ * decided; `tests/config/lsp-override-copy-census.test.ts` reads the interface
+ * and checks the effect of each decision on every catalog row.
+ */
+export const OVERRIDE_STRATEGY_FIELDS: {
+	readonly [K in keyof DiagnosticStrategy]-?: OverrideStrategyDecision;
+} = {
+	seedFirstPush: {
+		keep: "reset",
+		why: "True takes the first push as complete (optimistic); the default waits for the settle.",
+	},
+	pullRetryBudgetMs: {
+		keep: "longer",
+		why: "A retry budget; zero skips the pull retry, so never shorter than the default.",
+	},
+	debounceMs: {
+		keep: "longer",
+		why: "A settle window; a shorter one reads sooner, so never shorter than the default.",
+	},
+	aggregateWaitMs: {
+		keep: "longer",
+		why: "A wait budget measured on the catalog binary (opengrep cold scan 3.5 s); never shorter than the default.",
+	},
+	expectSemanticSecondPush: {
+		keep: "inherit",
+		why: "Adds a second pull after an empty fast first pull; the default reads that empty answer.",
+	},
+	reopenOnResync: {
+		keep: "inherit",
+		why: "Re-opens an edited document for a scanner that ignores didChange; dropping it loses every later finding.",
+	},
+	rescansOnSave: {
+		keep: "inherit",
+		why: "Expects the publish a save triggers; at worst the wait times out as unconfirmed.",
+	},
+	emptyUntilRulesRefreshed: {
+		keep: "inherit",
+		why: "Holds the empty publish before the rules load; dropping it reads that empty as clean.",
+	},
+	publishesOnClose: {
+		keep: "inherit",
+		why: "Drops the version-less close-time empty publish; dropping it lets a stale empty overwrite a real answer.",
+	},
+	emptyFirstPublish: {
+		keep: "inherit",
+		why: "Holds the empty pre-index first publish (#3310); dropping it reads that empty as clean.",
+	},
+	diagnosticsFence: {
+		keep: "inherit",
+		why: "Drops version-less publishes that predate the edit; the worst case is a timeout, never a false clean.",
+	},
+	silentOnClean: {
+		keep: "reset",
+		why: "True skips the in-lane wait on a clean transition (optimistic); the default waits in full.",
+	},
+	workspaceIndexing: {
+		keep: "reset",
+		why: "True shortens later same-sweep waits (optimistic); the default pays the full budget every touch.",
+	},
+	workspaceIndexingWarmWaitMs: {
+		keep: "reset",
+		why: "Read only with workspaceIndexing, so it resets with it.",
+	},
+};
+
+/**
+ * The row for a command-override launch: the default strategy with the row's
+ * `inherit` fields and the longer of its `longer` budgets applied. A field the
+ * table does not name resets (fail closed); an id with no row is the default.
+ */
+function overrideStrategy(serverId: string): DiagnosticStrategy {
+	const row = SERVER_DIAGNOSTIC_STRATEGIES[serverId];
+	if (!row) return DEFAULT_STRATEGY;
+	const strategy: DiagnosticStrategy = { ...DEFAULT_STRATEGY };
+	for (const [field, value] of Object.entries(row)) {
+		if (!Object.hasOwn(OVERRIDE_STRATEGY_FIELDS, field)) continue;
+		const keep =
+			OVERRIDE_STRATEGY_FIELDS[field as keyof DiagnosticStrategy].keep;
+		if (keep === "inherit") Object.assign(strategy, { [field]: value });
+		else if (keep === "longer" && typeof value === "number") {
+			const floor = DEFAULT_STRATEGY[field as keyof DiagnosticStrategy];
+			if (typeof floor === "number") {
+				Object.assign(strategy, { [field]: Math.max(value, floor) });
+			}
+		}
+	}
+	return strategy;
+}
+
 export function getStrategy(
 	serverId: string,
-	launchVariant?: "classic" | "native-ts7",
+	launchVariant?: LspLaunchVariant,
 ): DiagnosticStrategy {
-	if (serverId === "typescript" && launchVariant === "native-ts7") {
+	if (serverId === "typescript" && isTsgoLaunchVariant(launchVariant)) {
 		return NATIVE_TS7_DIAGNOSTIC_STRATEGY;
 	}
+	// #4833: a `serverOverrides.<id>.command` launch runs another binary, so the
+	// catalog row's optimistic claims reset and its restrictive fields stay.
+	if (launchVariant === "override") return overrideStrategy(serverId);
 	return SERVER_DIAGNOSTIC_STRATEGIES[serverId] ?? DEFAULT_STRATEGY;
 }

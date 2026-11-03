@@ -17,12 +17,13 @@ import {
 	loadPiLensGlobalConfig,
 } from "../../clients/lens-config.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
+import { useConfigPath } from "../support/global-config.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 let tmpDir: string;
 let projectRoot: string;
 let globalConfigPath: string;
-let previousConfigPath: string | undefined;
+const setConfigPath = useConfigPath();
 
 function writeGlobalConfig(obj: unknown): void {
 	fs.writeFileSync(globalConfigPath, JSON.stringify(obj));
@@ -33,14 +34,11 @@ beforeEach(() => {
 	projectRoot = path.join(tmpDir, "project");
 	fs.mkdirSync(projectRoot, { recursive: true });
 	globalConfigPath = path.join(tmpDir, "global-config.json");
-	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
-	process.env.PI_LENS_CONFIG_PATH = globalConfigPath;
+	setConfigPath(globalConfigPath);
 	resetProjectLensConfigCache();
 });
 
 afterEach(() => {
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	removeTempDirSync(tmpDir);
 	resetProjectLensConfigCache();
 });

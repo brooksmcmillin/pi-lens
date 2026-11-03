@@ -445,32 +445,50 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 		}
 	});
 
-	it("running the script as a command exits 0 and writes a record", () => {
-		// Pins the `invokedDirectly` guard. If it stopped matching, the prepare
-		// step would silently do nothing and every install would stay cold.
-		const logFile = path.join(
-			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-warm-cli-")),
-			"install.log",
-		);
-		execFileSync(
-			process.execPath,
-			[path.join(root, "scripts", "warm-loader-cache.mjs")],
-			{
-				env: {
-					...process.env,
-					PI_LENS_INSTALL_LOG: logFile,
-					PI_LENS_SKIP_WARM_CACHE: "1",
-				},
-				stdio: "ignore",
-			},
-		);
-		const written = JSON.parse(
-			fs.readFileSync(logFile, "utf8").trim().split("\n").at(-1) as string,
-		);
-		expect(written.event).toBe("warm_loader_cache");
-		expect(written.status).toBe("skipped");
-		fs.rmSync(path.dirname(logFile), { recursive: true, force: true });
-	});
+	it.each(["canonical", "symlink", "preserve-symlinks-main"])(
+		"running the script via %s exits 0 and writes a record",
+		(entry) => {
+			// #4096: argv keeps the symlink spelling while import.meta.url normally
+			// holds the real path. Exit 0 alone used to conceal that no warm ran.
+			const logFile = path.join(
+				fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-warm-cli-")),
+				"install.log",
+			);
+			const linkedScripts = path.join(path.dirname(logFile), "scripts");
+			fs.symlinkSync(path.join(root, "scripts"), linkedScripts, "junction");
+			const script = path.join(
+				entry === "canonical" ? path.join(root, "scripts") : linkedScripts,
+				"warm-loader-cache.mjs",
+			);
+			try {
+				execFileSync(
+					process.execPath,
+					[
+						...(entry === "preserve-symlinks-main"
+							? ["--preserve-symlinks-main"]
+							: []),
+						script,
+					],
+					{
+						env: {
+							...process.env,
+							PI_LENS_INSTALL_LOG: logFile,
+							PI_LENS_SKIP_WARM_CACHE: "1",
+						},
+						stdio: "ignore",
+						timeout: 60_000,
+					},
+				);
+				const written = JSON.parse(
+					fs.readFileSync(logFile, "utf8").trim().split("\n").at(-1) as string,
+				);
+				expect(written.event).toBe("warm_loader_cache");
+				expect(written.status).toBe("skipped");
+			} finally {
+				fs.rmSync(path.dirname(logFile), { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("an inheriting child writes the worker's scratch install log, never the real one (#2651)", () => {
 		// vitest-setup pins PI_LENS_INSTALL_LOG under the per-worker home, so a
@@ -507,10 +525,12 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 		).toBe(realBefore);
 	});
 
-	it("ships both warm modules in the tarball", () => {
+	it("ships the warm modules and their entry helper in the tarball", () => {
+		// #4096: a helper available only in the checkout breaks installed CLIs.
 		const files = pkg.files ?? [];
 		expect(files).toContain("scripts/warm-loader-cache.mjs");
 		expect(files).toContain("scripts/lib/warm-loader-cache.mjs");
+		expect(files).toContain("scripts/lib/is-main-module.mjs");
 	});
 });
 

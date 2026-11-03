@@ -16,6 +16,7 @@ import {
 	listSourceFiles,
 	readWalkedFiles,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -102,48 +103,55 @@ function isTimingSensitive(source: string): boolean {
 }
 
 describe("timing-sensitive Vitest project coverage", () => {
-	it("phases every sync-block-sampler and process.cpuUsage budget test", () => {
-		const included = timingSensitiveInclude();
-		// readWalkedFiles: a path that vanished between the walk and the read is
-		// out of the population, not a finding (#3082).
-		const timingFiles = readWalkedFiles(testFiles(path.join(repoRoot, "tests")))
-			.filter(({ source }) => isTimingSensitive(source))
-			.map(({ file }) => toPosix(path.relative(repoRoot, file)));
-		// Calibration: 14 sampler/CPU-usage tests on 2026-08-26; half is 7.
-		assertNonEmptyScan("timing-sensitive detection", timingFiles.length, 7);
+	it(
+		"phases every sync-block-sampler and process.cpuUsage budget test",
+		() => {
+			const included = timingSensitiveInclude();
+			// readWalkedFiles: a path that vanished between the walk and the read is
+			// out of the population, not a finding (#3082).
+			const timingFiles = readWalkedFiles(
+				testFiles(path.join(repoRoot, "tests")),
+			)
+				.filter(({ source }) => isTimingSensitive(source))
+				.map(({ file }) => toPosix(path.relative(repoRoot, file)));
+			// Calibration: 14 sampler/CPU-usage tests on 2026-08-26; half is 7.
+			assertNonEmptyScan("timing-sensitive detection", timingFiles.length, 7);
 
-		// Reverse check: a renamed or deleted test must not leave a dead glob
-		// behind — a stale entry silently stops phasing anything at all.
-		const dead = [...included, ...timingMeasurementOnly].filter(
-			(file) => !fs.existsSync(path.join(repoRoot, file)),
-		);
-		expect(dead, "timing-sensitive include entries must exist on disk").toEqual(
-			[],
-		);
+			// Reverse check: a renamed or deleted test must not leave a dead glob
+			// behind — a stale entry silently stops phasing anything at all.
+			const dead = [...included, ...timingMeasurementOnly].filter(
+				(file) => !fs.existsSync(path.join(repoRoot, file)),
+			);
+			expect(
+				dead,
+				"timing-sensitive include entries must exist on disk",
+			).toEqual([]);
 
-		const unexpected = timingFiles.filter(
-			(file) =>
-				!included.includes(file) &&
-				!timingMeasurementOnly.includes(file) &&
-				// A sampler test phased in the fully serialized wall-clock-budget
-				// lane is quieter than this lane promises, not unphased
-				// (#2886 round 2: performance-report-occupancy keeps its sampler
-				// row there beside its deterministic yield-count row).
-				!wallClockBudgetInclude.includes(file),
-		);
-		expect(
-			unexpected,
-			"sampler/cpuUsage tests must be in timingSensitiveInclude",
-		).toEqual([]);
+			const unexpected = timingFiles.filter(
+				(file) =>
+					!included.includes(file) &&
+					!timingMeasurementOnly.includes(file) &&
+					// A sampler test phased in the fully serialized wall-clock-budget
+					// lane is quieter than this lane promises, not unphased
+					// (#2886 round 2: performance-report-occupancy keeps its sampler
+					// row there beside its deterministic yield-count row).
+					!wallClockBudgetInclude.includes(file),
+			);
+			expect(
+				unexpected,
+				"sampler/cpuUsage tests must be in timingSensitiveInclude",
+			).toEqual([]);
 
-		const staleExceptions = timingMeasurementOnly.filter(
-			(file) => !timingFiles.includes(file),
-		);
-		expect(
-			staleExceptions,
-			"escape-hatch entries must still be sampler/cpuUsage tests",
-		).toEqual([]);
-	});
+			const staleExceptions = timingMeasurementOnly.filter(
+				(file) => !timingFiles.includes(file),
+			);
+			expect(
+				staleExceptions,
+				"escape-hatch entries must still be sampler/cpuUsage tests",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// Reverse check (#2933 round 2, F2): every `included` entry must still be
 	// a sampler/cpuUsage test or a documented non-sampler member. Without

@@ -72,11 +72,6 @@ vi.mock("../../clients/bootstrap.js", async (importOriginal) => ({
 	...(await importOriginal()),
 	loadBootstrapClients: vi.fn().mockResolvedValue({}),
 }));
-vi.mock("../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal()),
 	createLSPClient,
@@ -90,6 +85,7 @@ import {
 	writeProjectDiagnosticsDeltaReport,
 } from "../../clients/project-diagnostics/cache.js";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
+import { _setServersForFileForTests } from "../../clients/lsp/config.js";
 
 const PREFIX = "pi-lens-lensdiag-read-stamp-";
 // The model's timeline, in ms: the sweep reads a.ts at T_READ, a parallel
@@ -192,6 +188,7 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 	}
 
 	beforeEach(() => {
+		_setServersForFileForTests(getServersForFileWithConfig);
 		clearWidgetState();
 		resetDegradationLedger();
 		getServersForFileWithConfig.mockReset();

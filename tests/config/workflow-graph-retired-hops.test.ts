@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
-import { CI_JOB_NAMES, REQUIRED_CHECKS } from "../../scripts/lib/ci-checks.mjs";
+import { BRANCH_PROTECTION_CONTEXTS } from "../../scripts/lib/ci-checks.mjs";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
 
 // Recurrence (#3837, #3838; CI-friction investigation 2026-09-30). Three
@@ -187,10 +187,11 @@ describe("PR metadata checks live in their own workflow (#3838)", () => {
 		expect(triggerNames(on)).toContain("push");
 	});
 
-	it("hosts the two fork metadata jobs only in pr-metadata.yml, with no hop", () => {
+	it("hosts the fork metadata job only in pr-metadata.yml, with no hop", () => {
 		const metadataNames = [
-			"PR title",
+			"PR metadata",
 			"PR body (advisory)",
+			"PR title",
 			"Close-keyword syntax",
 		];
 		const hosts = new Map<string, string[]>();
@@ -203,8 +204,7 @@ describe("PR metadata checks live in their own workflow (#3838)", () => {
 			}
 		}
 		expect(Object.fromEntries(hosts)).toEqual({
-			"PR title": ["pr-metadata.yml"],
-			"Close-keyword syntax": ["pr-metadata.yml"],
+			"PR metadata": ["pr-metadata.yml"],
 		});
 		for (const job of Object.values(byFile("pr-metadata.yml")?.jobs ?? {})) {
 			expect(needsOf(job)).toEqual([]);
@@ -221,15 +221,7 @@ describe("PR metadata checks live in their own workflow (#3838)", () => {
 				),
 			),
 		);
-		for (const required of [
-			...REQUIRED_CHECKS,
-			CI_JOB_NAMES.KNIP,
-			"oxfmt format check",
-			"Install test (ubuntu-latest)",
-			"Install test (windows-latest)",
-			"Install test (macos-latest)",
-			"TLA+ models",
-		]) {
+		for (const required of BRANCH_PROTECTION_CONTEXTS) {
 			expect(names.has(required), `job named ${required}`).toBe(true);
 		}
 	});

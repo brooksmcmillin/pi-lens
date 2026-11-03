@@ -1,0 +1,20 @@
+=== turn 1: the context message the model reads on its next turn ===
+--- what the model read at turn end ---
+names the gate's prefix: false
+names a blocker: true
+first blocker: L3: Debugger statement — remove before committing
+the command ran: false
+
+=== turn 1: the commit's tool result ===
+--- the commit's tool result ---
+names the gate's prefix: true
+names a blocker: true
+first blocker: L3: Debugger statement — remove before committing
+the command ran: false
+
+=== turn 2: the commit's tool result after the fix ===
+--- the commit's tool result ---
+names the gate's prefix: false
+names a blocker: false
+first blocker: (none)
+the command ran: true

@@ -32,6 +32,9 @@ afterEach(() => {
 describe("lazy-import seam eviction (#1570)", () => {
 	it("clients/lsp-lazy.ts retries loadLspService after a rejected import", async () => {
 		vi.resetModules();
+		// Stays a module mock (#4709): the subject is a REJECTED module import, and
+		// the singleton lifecycle seam observes service construction, not a failed
+		// module load (installing a double would never reject `import()`).
 		vi.doMock("../../clients/lsp/capabilities.js", async () => {
 			lspAttempts.count += 1;
 			if (lspAttempts.count === 1) {
