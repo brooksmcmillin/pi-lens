@@ -830,6 +830,7 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 			runtime.deferMutation(mainRs, tmpDir, "edit", tmpDir, "autofix");
 			let settled = false;
 			let holder: Promise<void> | undefined;
+			setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
 			const previousTestMode = process.env.PI_LENS_TEST_MODE;
 			await latencyLogger.flushLatencyLog();
 			const logPath = latencyLogger.getLatencyLogPath();
@@ -931,6 +932,7 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 				await holder;
 				await drain;
 				await restoreSettled();
+				setHostFileMutationQueueLoader(undefined);
 			}
 		},
 	);

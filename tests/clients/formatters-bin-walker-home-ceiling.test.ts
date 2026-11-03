@@ -175,7 +175,7 @@ describe.each(WALKERS)(
 			}
 		});
 
-		it("a re-spelled HOME still ceilings on win32 (drive-letter case) and stays case-sensitive on POSIX (#2544 F1)", () => {
+		it("a re-spelled HOME ceilings the walk when both spellings identify the planted home (#2544 F1)", () => {
 			const { fakeHome, nested } = makeFixture();
 			try {
 				plantBin(fakeHome, binSubpath("oxfmt"));
@@ -186,9 +186,9 @@ describe.each(WALKERS)(
 
 				const resolved = walk("oxfmt", nested, respelledHome);
 
-				if (isWin) {
-					// `c:\…` IS `C:\…`; the ceiling must hold, or a walk started from
-					// the lowercase-drive VS Code URI form climbs straight past HOME.
+				if (isWin || fs.existsSync(respelledHome)) {
+					// The only planted home is reachable under both spellings on
+					// case-insensitive filesystems, including macOS APFS.
 					expect(resolved).toBeNull();
 				} else {
 					// `<tmp>/HOME` is NOT `<tmp>/home` on a case-sensitive filesystem,
