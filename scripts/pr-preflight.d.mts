@@ -2,6 +2,8 @@ export declare const GATES: Array<[string, string[], string]>;
 export declare function parseArgs(argv: string[]): {
 	only?: string;
 	skip?: string;
+	upstream?: string;
+	preview?: boolean;
 };
 export declare function formatSummary(
 	rows: Array<{ gate: string; job: string; code: number; firstRed: string }>,
