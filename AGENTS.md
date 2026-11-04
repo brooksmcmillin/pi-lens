@@ -677,6 +677,13 @@ The build, packaging, and release rules live in
 
 ## Test requirements
 
+Before broad integration tests, record the verified Node/package-manager paths
+and versions, CI's Node major, supported worker limit, and permitted temporary
+root. Run representative runtime and fixture-isolation tests first. Follow
+[Paths, data, and operating systems](docs/invariants/paths-os.md) for the
+standalone-probe versus harness-owned storage boundary; a shared
+`PILENS_DATA_DIR` override is not test isolation.
+
 For upstream syncs, `stryker-diff.mjs --upstream <trusted-ref>` makes only
 PR-changed tests that differ from shared upstream ancestry mandatory. Related
 coverage and mutation source ranges remain fork-relative; ordinary runs without

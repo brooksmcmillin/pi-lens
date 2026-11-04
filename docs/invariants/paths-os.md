@@ -21,10 +21,14 @@
   inline separator or containment logic.
 - Data and log locations follow **Data directories and logs**; never hardcode
   `.pi-lens` paths in writes or user-facing text.
-- Probes and child processes pin `PI_LENS_HOME`, `PILENS_DATA_DIR`, `HOME`, and
-  install/log/cache directories to `.probe-home` under the worktree; never the
-  maintainer's real home, and never via `TMPDIR`/`TMP`/`TEMP`, which moves the
-  vitest harness home into the checkout (#3026).
+- Standalone production probes and their child processes pin `PI_LENS_HOME`,
+  `PILENS_DATA_DIR`, `HOME`, and install/log/cache directories to `.probe-home`
+  under the worktree; never the maintainer's real home, and never via
+  `TMPDIR`/`TMP`/`TEMP`, which moves the vitest harness home into the checkout
+  (#3026). Vitest runs instead retain the harness-owned worker homes and
+  fixture-owned project data below: do not export a shared `PILENS_DATA_DIR`
+  across fixtures. Explicit per-case relocation tests own their override and
+  restoration.
 - Scratch checkouts and `mktemp -d` never land under `/tmp` (tmpfs; #3526). Use
   `~/.local/share/pi-lens-orchestrator/tmp/<lane>` for orchestrator and
   reviewer scratch, `<worktree>/../probes-<pr>` for probes, and
