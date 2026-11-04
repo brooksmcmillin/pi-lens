@@ -1007,7 +1007,7 @@ function unionChanged(ranges) {
 
 export async function main() {
 	const preview = process.argv.includes("--preview");
-	const input = readStdin();
+	const input = preview && process.stdin.isTTY ? "" : readStdin();
 	const base = resolveBaseRef();
 	let ranges = resolveDiffRange(input, base);
 	if (ranges === null) {

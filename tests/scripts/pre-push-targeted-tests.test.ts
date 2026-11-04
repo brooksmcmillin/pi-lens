@@ -272,6 +272,55 @@ describe("resolveDiffRange — pre-push ref population (#3661)", () => {
 		return { git, base, commit, hook };
 	}
 
+	it.each([
+		[true, true],
+		[true, false],
+		[false, true],
+		[false, false],
+	])(
+		"reads stdin only outside terminal preview (preview=%s, tty=%s)",
+		(preview, tty) => {
+			// PR #32: standalone preview waited for terminal EOF. A deletion ref
+			// makes an unwanted fd-0 read observable without a real terminal or wait.
+			const { base, hook } = gitFixture();
+			write(
+				"stdin-probe.cjs",
+				`const fs = require("node:fs");
+Object.defineProperty(process.stdin, "isTTY", { value: ${tty} });
+const read = fs.readFileSync;
+fs.readFileSync = function (file, ...args) {
+	if (file === 0) process.stderr.write("stdin-read\\n");
+	return read.call(this, file, ...args);
+};
+require("node:module").syncBuiltinESMExports();
+`,
+			);
+			const result = hook(
+				`refs/heads/topic ${zero} refs/heads/topic ${base}\n`,
+				preview ? ["--preview"] : [],
+				{
+					NODE_OPTIONS: `--require ${JSON.stringify(path.join(fixtureDir!, "stdin-probe.cjs"))}`,
+				},
+			);
+			expect(result.status, result.stderr).toBe(0);
+			if (preview && tty) {
+				expect(result.stderr).not.toContain("stdin-read");
+				const line = result.stdout
+					.split("\n")
+					.find((value) => value.startsWith("[pre-push] preview: "));
+				expect(line).toBeDefined();
+				const summary = JSON.parse(line!.slice("[pre-push] preview: ".length));
+				expect(summary.ranges).toEqual(["origin/master...HEAD"]);
+				expect(summary.selectedCount).toBe(0);
+			} else {
+				expect(result.stderr).toContain("stdin-read");
+				expect(result.stdout).toContain(
+					"deletion-only push; skipping build and tests",
+				);
+			}
+		},
+	);
+
 	it("previews empty, dirty, deletion-only and unavailable selections without treating unknown coverage as zero", () => {
 		// Recurrence: a dry run must not turn a missing diff into known zero
 		// coverage, or silently omit uncommitted work requested by preflight.
