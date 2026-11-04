@@ -1006,10 +1006,15 @@ function unionChanged(ranges) {
 }
 
 export async function main() {
-	const input = readStdin();
+	const preview = process.argv.includes("--preview");
+	const input = preview && process.stdin.isTTY ? "" : readStdin();
 	const base = resolveBaseRef();
 	let ranges = resolveDiffRange(input, base);
 	if (ranges === null) {
+		if (preview)
+			console.log(
+				`[pre-push] preview: ${JSON.stringify({ status: "deletion-only", selectedCount: 0, countsByReason: {}, selected: [] })}`,
+			);
 		console.log("[pre-push] deletion-only push; skipping build and tests.");
 		return 0;
 	}
@@ -1093,6 +1098,31 @@ export async function main() {
 			console.warn(
 				`[pre-push] selection too broad (${totalBeforeCap} test files matched ${changed.length} changed file(s), over the ${MAX_SELECTED_TESTS}-file cap); ${describeCappedKeep(selectionReasons, selected)}; rely on CI for the rest.`,
 			);
+	}
+
+	// Preview shares the complete selector above, but never reaches pass-cache
+	// logging, result records, builds, locks, tests, or step-summary writes.
+	if (preview) {
+		const countsByReason = {};
+		for (const { reason } of selectedRecords)
+			countsByReason[reason] = (countsByReason[reason] ?? 0) + 1;
+		console.log(
+			`[pre-push] preview: ${JSON.stringify({
+				status: changed === null ? "unavailable" : "selected",
+				ranges,
+				changedCount: changed?.length ?? null,
+				selectedCount: selected.length,
+				countsByReason,
+				selected: selectedRecords,
+				totalBeforeCap,
+				capped,
+				excludedCiOnly,
+				history: history
+					? { status: history.status, detail: history.detail }
+					: null,
+			})}`,
+		);
+		return changed === null ? 1 : 0;
 	}
 
 	const priorPass = alreadyPassed(heads, selected);

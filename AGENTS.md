@@ -528,6 +528,9 @@ assertion lines after workflow edits; the assertions remain shrink-only pins.
 npm run test:unit                     serialized unit suite
 npm run test:integration              serialized integration suite
 npm run preflight                     local merge/preflight gates
+npm run preflight -- --preview         push-test selection including working-tree edits; no gates run
+node scripts/pre-push-targeted-tests.mjs --preview
+                                        committed push-test selection; accepts hook ref lines on stdin
 npm run check:lockfile                lockfile consistency, plus a libc field dropped against the lock a commit records (#5207)
 npm run check:allow-scripts           allowScripts policy vs the resolved lockfile (#1185)
 npm run changelog:check               rollup check; fragments use check-changelog-fragments.mjs
@@ -629,6 +632,14 @@ when that has commits `origin/master` lacks, and
 skips a head whose tree-bound record already passed the same selection. When
 that base range cannot be resolved it falls back to the remote-tip
 range, and to the loud build-only pass only when that cannot resolve either.
+`--preview` shares the execution selector and prints a JSON summary with selected
+files, counts by reason, cap and CI-only deferrals, and history availability. It
+never builds, runs tests, or writes pass records; an unavailable diff exits 1,
+not a successful zero-coverage preview. Add `--include-worktree` to the hook
+script to include local edits (preflight preview does this automatically).
+Preflight gates and push tests are separate: neither preview nor preflight
+success proves the push-test population passed. Recompute selection when the
+candidate, base, history, or environment changes.
 Pre-push fails
 when its bounded test-lock wait times out (#3717); `PI_LENS_PREPUSH_LOCK_SKIP=1`
 is the only lock opt-out and is logged to `pre-push.log`. CI stays the gate.

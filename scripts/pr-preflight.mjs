@@ -69,7 +69,8 @@ const HARD_GATE_SKIP_REASON =
 export function parseArgs(argv) {
 	const result = { only: undefined, skip: undefined, upstream: undefined };
 	for (let index = 0; index < argv.length; index++) {
-		if (argv[index] === "--only") result.only = argv[++index];
+		if (argv[index] === "--preview") result.preview = true;
+		else if (argv[index] === "--only") result.only = argv[++index];
 		else if (argv[index] === "--skip") result.skip = argv[++index];
 		else if (argv[index] === "--upstream") {
 			const ref = argv[++index];
@@ -192,7 +193,26 @@ export function runPreflight({
 	spawn = spawnSync,
 	env = process.env,
 } = {}) {
-	const { only, skip, upstream } = parseArgs(argv);
+	const { only, skip, upstream, preview } = parseArgs(argv);
+	if (preview) {
+		if (only || skip || upstream)
+			throw new Error(
+				"--preview cannot be combined with gate selectors or --upstream",
+			);
+		console.log(
+			"[preflight] Push-test selection including working-tree changes; not validation. No preflight gates or push tests run.",
+		);
+		const result = spawn(
+			process.execPath,
+			[
+				"scripts/pre-push-targeted-tests.mjs",
+				"--preview",
+				"--include-worktree",
+			],
+			{ cwd, env, stdio: ["ignore", "inherit", "inherit"] },
+		);
+		return result.status ?? 1;
+	}
 	const lensHome = env.PI_LENS_HOME ?? resolve(cwd, ".probe-home");
 	const childEnv = {
 		...env,

@@ -272,6 +272,96 @@ describe("resolveDiffRange — pre-push ref population (#3661)", () => {
 		return { git, base, commit, hook };
 	}
 
+	it.each([
+		[true, true],
+		[true, false],
+		[false, true],
+		[false, false],
+	])(
+		"reads stdin only outside terminal preview (preview=%s, tty=%s)",
+		(preview, tty) => {
+			// PR #32: standalone preview waited for terminal EOF. A deletion ref
+			// makes an unwanted fd-0 read observable without a real terminal or wait.
+			const { base, hook } = gitFixture();
+			write(
+				"stdin-probe.cjs",
+				`const fs = require("node:fs");
+Object.defineProperty(process.stdin, "isTTY", { value: ${tty} });
+const read = fs.readFileSync;
+fs.readFileSync = function (file, ...args) {
+	if (file === 0) process.stderr.write("stdin-read\\n");
+	return read.call(this, file, ...args);
+};
+require("node:module").syncBuiltinESMExports();
+`,
+			);
+			const result = hook(
+				`refs/heads/topic ${zero} refs/heads/topic ${base}\n`,
+				preview ? ["--preview"] : [],
+				{
+					NODE_OPTIONS: `--require ${JSON.stringify(path.join(fixtureDir!, "stdin-probe.cjs"))}`,
+				},
+			);
+			expect(result.status, result.stderr).toBe(0);
+			if (preview && tty) {
+				expect(result.stderr).not.toContain("stdin-read");
+				const line = result.stdout
+					.split("\n")
+					.find((value) => value.startsWith("[pre-push] preview: "));
+				expect(line).toBeDefined();
+				const summary = JSON.parse(line!.slice("[pre-push] preview: ".length));
+				expect(summary.ranges).toEqual(["origin/master...HEAD"]);
+				expect(summary.selectedCount).toBe(0);
+			} else {
+				expect(result.stderr).toContain("stdin-read");
+				expect(result.stdout).toContain(
+					"deletion-only push; skipping build and tests",
+				);
+			}
+		},
+	);
+
+	it("previews empty, dirty, deletion-only and unavailable selections without treating unknown coverage as zero", () => {
+		// Recurrence: a dry run must not turn a missing diff into known zero
+		// coverage, or silently omit uncommitted work requested by preflight.
+		const { base, hook } = gitFixture();
+		const preview = (input: string, extra: string[] = []) => {
+			const result = hook(input, ["--preview", ...extra]);
+			const line = result.stdout
+				.split("\n")
+				.find((value) => value.startsWith("[pre-push] preview: "));
+			expect(line, result.stderr).toBeDefined();
+			return {
+				result,
+				summary: JSON.parse(line!.slice("[pre-push] preview: ".length)),
+			};
+		};
+		expect(preview("").summary.selectedCount).toBe(0);
+		write("clients/first.ts", "export const first = false;\n");
+		const dirty = preview("", ["--include-worktree"]);
+		expect(dirty.result.status).toBe(0);
+		expect(dirty.summary.selected).toContainEqual({
+			file: "tests/clients/first.test.ts",
+			reason: "mirror",
+		});
+		expect(dirty.summary.countsByReason.mirror).toBe(1);
+		const deleted = preview(
+			`refs/heads/topic ${zero} refs/heads/topic ${base}\n`,
+		);
+		expect(deleted.summary).toEqual({
+			status: "deletion-only",
+			selectedCount: 0,
+			countsByReason: {},
+			selected: [],
+		});
+		const unknown = preview(
+			"refs/heads/topic missing refs/heads/topic absent\n",
+		);
+		expect(unknown.result.status).toBe(1);
+		expect(unknown.summary.status).toBe("unavailable");
+		expect(unknown.summary.changedCount).toBeNull();
+	});
+
 	it("passes changed files from both mixed-push ranges to selection", () => {
 		// F3664-1 witness: main must call changedFiles for both ranges; a
 		// ranges.slice(0, 1) mutation must leave one target out of this output.
@@ -1978,35 +2068,58 @@ describe("history pass through the real hook and real git (#3215 lane 3)", () =>
 			summaryPath: summary,
 		});
 		const stepSummary = path.join(cwd, ".step-summary.md");
-		const result = spawnSync(
-			process.execPath,
-			[
-				path.join(repoRoot, "scripts/pre-push-targeted-tests.mjs"),
-				"--skip-build",
-				"--history-summary",
-				summary,
-			],
-			{
-				cwd,
-				encoding: "utf8",
-				env: { ...process.env, GITHUB_STEP_SUMMARY: stepSummary },
-				input: `refs/heads/topic ${pushed} refs/heads/topic ${failingHead}\n`,
-			},
+		const runHook = (mode: string) =>
+			spawnSync(
+				process.execPath,
+				[
+					path.join(repoRoot, "scripts/pre-push-targeted-tests.mjs"),
+					mode,
+					"--history-summary",
+					summary,
+				],
+				{
+					cwd,
+					encoding: "utf8",
+					env: { ...process.env, GITHUB_STEP_SUMMARY: stepSummary },
+					input: `refs/heads/topic ${pushed} refs/heads/topic ${failingHead}\n`,
+				},
+			);
+		// Recurrence: planning a broad push must not run builds/tests or write
+		// pass evidence, and must select the exact population execution uses.
+		const previewResult = runHook("--preview");
+		expect(previewResult.status, previewResult.stderr).toBe(0);
+		const previewLine = previewResult.stdout
+			.split("\n")
+			.find((line) => line.startsWith("[pre-push] preview: "));
+		expect(previewLine).toBeDefined();
+		const preview = JSON.parse(
+			previewLine!.slice("[pre-push] preview: ".length),
 		);
+		expect(previewResult.stdout).not.toContain("building...");
+		expect(previewResult.stdout).not.toContain("targeted test file(s)");
+		expect(fs.existsSync(stepSummary)).toBe(false);
+		const commonDir = path.join(cwd, ".git");
+		expect(readPrePushRecord(commonDir, pushed)).toBeNull();
+		const result = runHook("--skip-build");
+		expect(readPrePushRecord(commonDir, pushed)?.selected).toEqual(
+			preview.selected,
+		);
+		expect(preview.selectedCount).toBe(preview.selected.length);
 		const stepText = fs.existsSync(stepSummary)
 			? fs.readFileSync(stepSummary, "utf8")
 			: "";
-		return { result, stepText };
+		return { result, stepText, preview };
 	}
 
 	it("adds the tests that failed on a past head touching the same directory, from a summary the real rollup wrote", () => {
 		// #3214 round 1: a rule YAML change reds only rule-catalogs.test.ts, which
 		// imports nothing the YAML is; the hook must select it from history.
-		const { result } = runHookWithHistory({
+		const { result, preview } = runHookWithHistory({
 			baseFiles: { "rules/x/seed.yml": "seed\n" },
 			failingChange: { "rules/x/a.yml": "a\n" },
 			pushedChange: { "rules/x/b.yml": "b\n" },
 		});
+		expect(preview.countsByReason).toEqual({ history: 2 });
 		expect(result.stdout).toContain("history selection selected");
 		expect(result.stdout).toContain(
 			"history added tests/scripts/rule-catalogs.test.ts",
@@ -2028,10 +2141,16 @@ describe("history pass through the real hook and real git (#3215 lane 3)", () =>
 				"import { hub } from '../clients/hub.js';\nimport { it } from 'vitest';\nvoid hub;\nit('ok', () => {});\n",
 			]),
 		);
-		const { result, stepText } = runHookWithHistory({
+		const { result, stepText, preview } = runHookWithHistory({
 			baseFiles: { "clients/hub.ts": "export const hub = 1;\n", ...importers },
 			failingChange: { "clients/other.ts": "a\n" },
 			pushedChange: { "clients/hub.ts": "export const hub = 2;\n" },
+		});
+		expect(preview.capped).toBe(true);
+		expect(preview.countsByReason).toEqual({
+			import: 25,
+			governance: 1,
+			history: 1,
 		});
 		// sweep-floor-coverage is an armed registry suite; rule-catalogs is the
 		// history pick; the 26 importers of the hub keep their best 25 (#4489).

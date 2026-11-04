@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,57 @@ const { formatSummary, parseArgs, runPreflight } =
 afterEach(() => spawnSync.mockReset());
 
 describe("pr preflight", () => {
+	it("previews push selection without running preflight gates or writing local event evidence", () => {
+		// Recurrence: a preflight pass is not a push-test pass; planning must
+		// use the hook's selector, never execute gates or create pass evidence.
+		const cwd = mkdtempSync(join(tmpdir(), "pi-lens-preflight-preview-"));
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			writeFileSync(join(cwd, "COMMIT_MSG.txt"), "feat: preview\n");
+			writeFileSync(join(cwd, "PR_BODY.md"), "Preview selection.\n");
+			spawnSync.mockReturnValue({ status: 0 });
+			expect(
+				runPreflight({ cwd, argv: ["--preview"], spawn: spawnSync, env: {} }),
+			).toBe(0);
+			expect(spawnSync).toHaveBeenCalledExactlyOnceWith(
+				process.execPath,
+				[
+					"scripts/pre-push-targeted-tests.mjs",
+					"--preview",
+					"--include-worktree",
+				],
+				expect.objectContaining({
+					cwd,
+					stdio: ["ignore", "inherit", "inherit"],
+				}),
+			);
+			expect(existsSync(join(cwd, ".probe-home", "preflight-event.json"))).toBe(
+				false,
+			);
+			expect(log.mock.calls.flat().join(" ")).toContain("not validation");
+			spawnSync.mockReturnValue({
+				status: null,
+				error: new Error("spawn failed"),
+			});
+			expect(
+				runPreflight({ cwd, argv: ["--preview"], spawn: spawnSync, env: {} }),
+			).toBe(1);
+		} finally {
+			log.mockRestore();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+	it.each([
+		["--only", "lint"],
+		["--skip", "lint"],
+		["--upstream", "upstream/master"],
+	])("rejects ambiguous preview options %j", (...args) => {
+		// Recurrence: gate selectors must not silently change meaning in preview.
+		expect(() =>
+			runPreflight({ argv: ["--preview", ...args], env: {} }),
+		).toThrow("--preview cannot be combined");
+		expect(spawnSync).not.toHaveBeenCalled();
+	});
 	it("formats one summary table with the CI job column", () => {
 		const table = formatSummary([
 			{ gate: "lint", job: "Lint & type-check", code: 0, firstRed: "" },
