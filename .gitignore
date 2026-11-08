@@ -90,6 +90,7 @@ migrate-*.js
 !SECURITY.md
 !docs/adr/*.md
 !docs/engineering-principles.md
+!docs/workspace-release.md
 !docs/pi-lens-subagent.md
 !docs/pi-lens-monitor.md
 !docs/pi-lens-fixer.md

@@ -1,5 +1,5 @@
 /**
- * A dependency-free mock of the host `ExtensionAPI` for testing pi-lens's
+ * A lifecycle mock of the host `ExtensionAPI` for testing pi-lens's
  * extension wiring (#171).
  *
  * pi-lens's entry (`index.ts` default export) registers flags, commands, tools,
@@ -8,8 +8,7 @@
  * (`emit`) or command (`runCommand`) through the *real* handler, so the glue is
  * verified end-to-end instead of each helper in isolation.
  *
- * Typed against the pinned `@earendil-works/pi-coding-agent` types only
- * (type-only import — no runtime dependency, per AGENTS.md install constraints).
+ * Uses the pinned host's real event bus for inter-extension handshakes.
  *
  * LAZY-TOOLS POSTURE (#4687, #4723 F5). Both harnesses start the situational
  * tools INACTIVE by default, because pi-lens's default `tools.lazy` is `true`
@@ -19,6 +18,7 @@
  * eager); a per-model case belongs on tier 2 (`pi-session.ts`, `modelCompat`).
  */
 
+import { createEventBus } from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -217,6 +217,7 @@ export interface PiMock {
 	readonly activeToolSetCalls: string[][];
 
 	// ── ExtensionAPI surface that index.ts uses ──────────────────────────────
+	events: ExtensionAPI["events"];
 	registerFlag(name: string, options: RecordedFlag): void;
 	registerCommand(name: string, options: RecordedCommand): void;
 	registerTool(tool: { name: string } & Record<string, unknown>): void;
@@ -301,6 +302,7 @@ export function createPiMock(options: PiMockOptions = {}): PiMock {
 	const activeToolSetCalls: string[][] = [];
 
 	const mock: PiMock = {
+		events: createEventBus(),
 		flags,
 		commands,
 		tools,

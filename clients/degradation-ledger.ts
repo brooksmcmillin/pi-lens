@@ -1165,6 +1165,7 @@ export type DegradationKind =
 	 * check.
 	 */
 	| "lsp-workspace-cache-migration"
+	| "lsp-workspace-released"
 	/** Scoped TypeScript cache repair hit its bounded dependency fan-out. */
 	| "lsp_dependency_touch_capped"
 	/**
@@ -2700,6 +2701,7 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// missing row, not as a warning here.
 	"lsp-idle-eviction",
 	"lsp-idle-eviction-declined",
+	"lsp-workspace-released",
 ]);
 
 export function renderDegradationLines(

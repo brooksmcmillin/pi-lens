@@ -85,6 +85,11 @@ root and states a run a language server answered that recorded no finding
 `PipelineResult.checkedClean`, never off `output` or the all-clear line), so
 the path is never silent.
 
+Worktree cleanup can await `pilens:workspace:release` through
+`clients/workspace-release.ts`; the registry fences that workspace until service
+reset and releases only its owned LSP clients. Normal OS liveness and Git checks
+still govern deletion; see [workspace release](docs/workspace-release.md).
+
 The repository ships compiled JavaScript. TypeScript sources are authoritative;
 compiled twins are generated and must not be edited by hand.
 

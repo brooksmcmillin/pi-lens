@@ -2018,7 +2018,7 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<
 		ownerKey:
 			"process-wide: the shared LSP client pool, kept warm across sessions by design",
 		reason:
-			"spawned clients, failure counts, leases and idle timers of the shared pool",
+			"spawned clients, failure counts, leases, idle timers and bounded release tombstones of the shared pool; tombstones end with the owning service generation",
 	},
 	"lsp/client.ts": {
 		ownerKey:
@@ -2566,7 +2566,7 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"lsp-budget.ts": 0,
 	"lsp/capabilities.ts": 1,
 	"lsp/cascade-tier.ts": 1,
-	"lsp/client-registry.ts": 20,
+	"lsp/client-registry.ts": 21,
 	// #2065 fix round 1: 2 -> 3 for activeLspClients (see
 	// EXEMPT_SESSION_STATE_FILES).
 	// #2130 round 2: 3 -> 2. The `activeLspClients` module-level `new Set` moved
