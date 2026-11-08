@@ -18,12 +18,11 @@
  * eager); a per-model case belongs on tier 2 (`pi-session.ts`, `modelCompat`).
  */
 
-import { createEventBus } from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach, expect } from "vitest";
+import { afterEach, expect, vi } from "vitest";
 import { withTimeout } from "../../clients/deadline-utils.js";
 import { runHandlerExpectingNoThrow } from "./handler-verdict.js";
 import {
@@ -40,6 +39,10 @@ import { piMockAdmission } from "./pi-mock-importers.js";
  */
 const admissionRefusal = piMockAdmission(expect.getState().testPath);
 if (admissionRefusal !== undefined) throw new Error(admissionRefusal);
+
+const { createEventBus } = await vi.importActual<
+	typeof import("@earendil-works/pi-coding-agent")
+>("@earendil-works/pi-coding-agent");
 
 /**
  * #3855: the session manager is pi's, not the ctx's. pi 1.0.4 hands a /reload

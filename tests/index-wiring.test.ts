@@ -342,11 +342,7 @@ describe("index.ts extension wiring", () => {
 		try {
 			const parent = createPiMock();
 			const parentApi = parent.asExtensionAPI();
-			(
-				parentApi as unknown as { events: { emit: ReturnType<typeof vi.fn> } }
-			).events = {
-				emit: vi.fn(),
-			};
+			parentApi.events.emit = vi.fn();
 			extension(parentApi);
 			await parent.emit(
 				"session_start",
@@ -393,11 +389,7 @@ describe("index.ts extension wiring", () => {
 			const recoveredEmit = vi.fn();
 			const subagent = createPiMock();
 			const subagentApi = subagent.asExtensionAPI();
-			(
-				subagentApi as unknown as { events: { emit: typeof recoveredEmit } }
-			).events = {
-				emit: recoveredEmit,
-			};
+			subagentApi.events.emit = recoveredEmit;
 			extension(subagentApi);
 			// Model another activation winning the module singleton after factory
 			// load. The guarded session_start itself must reclaim the wiring.
@@ -450,9 +442,7 @@ describe("index.ts extension wiring", () => {
 			const ownerEmit = vi.fn();
 			const owner = createPiMock();
 			const ownerApi = owner.asExtensionAPI();
-			(ownerApi as unknown as { events: { emit: typeof ownerEmit } }).events = {
-				emit: ownerEmit,
-			};
+			ownerApi.events.emit = ownerEmit;
 			extension(ownerApi);
 			await owner.emit("session_start", { reason: "startup" }, liveCtx);
 
@@ -499,9 +489,7 @@ describe("index.ts extension wiring", () => {
 			const ownerEmit = vi.fn();
 			const owner = createPiMock();
 			const ownerApi = owner.asExtensionAPI();
-			(ownerApi as unknown as { events: { emit: typeof ownerEmit } }).events = {
-				emit: ownerEmit,
-			};
+			ownerApi.events.emit = ownerEmit;
 			extension(ownerApi);
 			await owner.emit("session_start", { reason: "startup" }, staleOwnerCtx);
 
@@ -562,9 +550,7 @@ describe("index.ts extension wiring", () => {
 			const bootEmit = vi.fn();
 			const boot = createPiMock();
 			const bootApi = boot.asExtensionAPI();
-			(bootApi as unknown as { events: { emit: typeof bootEmit } }).events = {
-				emit: bootEmit,
-			};
+			bootApi.events.emit = bootEmit;
 			extension(bootApi);
 			// Boot activation never receives an event of its own -- its
 			// `ownEventCtx` closure variable stays unset.
