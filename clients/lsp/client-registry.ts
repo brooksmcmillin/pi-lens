@@ -815,8 +815,10 @@ export class ClientRegistry {
 	}
 
 	workspaceReleased(filePath: string): boolean {
+		if (this.releasedWorkspaces.size === 0) return false;
+		const identity = normalizeMapKey(filePath);
 		return [...this.releasedWorkspaces].some((root) =>
-			isSameOrWithin(root, filePath),
+			isSameOrWithin(root, identity),
 		);
 	}
 
@@ -833,31 +835,31 @@ export class ClientRegistry {
 		}
 		// Publish before any await: an acquisition already resolving its root must not reopen it.
 		this.releasedWorkspaces.add(rootKey);
-		return this.withClientSpawnGate(async () => {
-			const belongs = (key: string) =>
-				isSameOrWithin(rootKey, parseClientKey(key).root);
-			const pending: Promise<SpawnedServer | undefined>[] = [];
-			for (const [key, spawn] of this.inFlight)
-				if (belongs(key)) pending.push(spawn);
-			await Promise.allSettled(pending);
-			const victims: Array<[string, LSPClientInfo]> = [];
-			for (const entry of this.clients)
-				if (belongs(entry[0])) victims.push(entry);
-			for (const [key] of victims) this.clearIdleEvictionTimer(key);
-			const settled = await Promise.allSettled(
-				victims.map(async ([key, client]) => {
-					await client.shutdown({ reason: "workspace_release" });
-					this.retireClient(key);
-				}),
-			);
-			for (const result of settled) if ("reason" in result) throw result.reason;
-			recordDegradationOnce({
-				kind: "lsp-workspace-released",
-				subject: rootKey,
-				reason: `released ${victims.length} owned LSP clients for worktree cleanup`,
-			});
-			return victims.map(([key]) => key);
+		// The fence blocks later target spawns, including after capacity eviction.
+		// Drain outside the global gate so a stuck target cannot stall its siblings.
+		const belongs = (key: string) =>
+			isSameOrWithin(rootKey, parseClientKey(key).root);
+		const pending: Promise<SpawnedServer | undefined>[] = [];
+		for (const [key, spawn] of this.inFlight)
+			if (belongs(key)) pending.push(spawn);
+		await Promise.allSettled(pending);
+		const victims: Array<[string, LSPClientInfo]> = [];
+		for (const entry of this.clients)
+			if (belongs(entry[0])) victims.push(entry);
+		for (const [key] of victims) this.clearIdleEvictionTimer(key);
+		const settled = await Promise.allSettled(
+			victims.map(async ([key, client]) => {
+				await client.shutdown({ reason: "workspace_release" });
+				this.retireClient(key);
+			}),
+		);
+		for (const result of settled) if ("reason" in result) throw result.reason;
+		recordDegradationOnce({
+			kind: "lsp-workspace-released",
+			subject: rootKey,
+			reason: `released ${victims.length} owned LSP clients for worktree cleanup`,
 		});
+		return victims.map(([key]) => key);
 	}
 
 	/**

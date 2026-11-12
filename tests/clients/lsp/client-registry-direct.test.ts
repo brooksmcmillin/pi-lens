@@ -2860,6 +2860,42 @@ describe("live primary client roots (#4532)", () => {
 });
 
 describe("workspace release before worktree cleanup", () => {
+	it.each(["warm", "ordinary"])(
+		"refuses a symlink into a released descendant while preserving its ancestor: %s",
+		async (route) => {
+			const f = ensureFixture("json");
+			const nested = path.join(f.root, "nested");
+			const alias = path.join(f.root, "alias");
+			fs.mkdirSync(nested);
+			fs.writeFileSync(path.join(nested, "a.fake"), "{}\n");
+			fs.symlinkSync(
+				nested,
+				alias,
+				process.platform === "win32" ? "junction" : "dir",
+			);
+			registerSessionRoot(f.root);
+			_setServersForFileForTests(() => [f.info]);
+			const service = new LSPService(undefined, f.root);
+			const registry = (
+				service as unknown as { clientRegistry: ClientRegistry }
+			).clientRegistry;
+			const client = fakeClient("json", f.root);
+			registry.clients.set(f.key, client);
+			try {
+				await service.releaseWorkspace(nested);
+				const lookup = (file: string) =>
+					route === "warm"
+						? service.getWarmClientForFile(file)
+						: service.getClientForFile(file);
+				expect(await lookup(path.join(alias, "a.fake"))).toBeUndefined();
+				expect(await lookup(f.file)).toBeDefined();
+				expect(registry.clients.get(f.key)).toBe(client);
+			} finally {
+				await service.shutdown();
+			}
+		},
+	);
+
 	it("refuses a known-slow shortcut published after release during candidate partition", async () => {
 		setProjectTrustState("trusted");
 		const f = ensureFixture("json");
@@ -3170,6 +3206,31 @@ describe("workspace release before worktree cleanup", () => {
 		expect(await acquisition).toBeUndefined();
 		await release;
 		expect(f.spawn).not.toHaveBeenCalled();
+	});
+
+	it("keeps sibling cold acquisition independent of a pending target release", async () => {
+		vi.useFakeTimers();
+		setProjectTrustState("trusted");
+		const f = ensureFixture();
+		const target = path.join(f.root, "target");
+		let finish!: (result: undefined) => void;
+		f.registry.inFlight.set(
+			keyFor("ts", target),
+			new Promise<undefined>((resolve) => {
+				finish = resolve;
+			}),
+		);
+		const release = f.registry.releaseWorkspace(target);
+		const acquisition = f.ensure();
+		try {
+			await vi.advanceTimersByTimeAsync(0);
+			expect(f.spawn).toHaveBeenCalledTimes(1);
+		} finally {
+			finish(undefined);
+			await release;
+			await acquisition;
+			await f.registry.shutdownClients({ fast: true });
+		}
 	});
 
 	it("bounds tombstones without evicting an earlier cleanup fence", async () => {

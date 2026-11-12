@@ -24,6 +24,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { makeHost } from "../../scripts/hot-path-sample.mjs";
+import { registerWorkspaceRelease } from "../../clients/workspace-release.js";
 import {
 	collectSamples,
 	evaluate,
@@ -51,6 +53,26 @@ function noisy(centre: number, spread: number, n: number, seed: number) {
 
 const verdict = (base: number[], head: number[]) =>
 	judge(bootstrapCompare(base, head, { iterations: 500 }));
+
+describe("sampler host", () => {
+	// PR33's advisory crashed at session_start because this recording host
+	// omitted the event bus that the workspace-release listener registers on.
+	it("supports the release handshake and listener disposal without running a sample", async () => {
+		const { pi } = makeHost();
+		const unregister = registerWorkspaceRelease(pi);
+		const request = {
+			root: join(tmpdir(), "hot-path-release-target"),
+			pending: [] as Promise<string[]>[],
+		};
+		pi.events.emit("pilens:workspace:release", request);
+		expect(request.pending).toHaveLength(1);
+		await expect(Promise.all(request.pending)).resolves.toEqual([[]]);
+		unregister();
+		const after = { ...request, pending: [] as Promise<string[]>[] };
+		pi.events.emit("pilens:workspace:release", after);
+		expect(after.pending).toEqual([]);
+	});
+});
 
 describe("bootstrapCompare", () => {
 	it("returns the same interval for the same samples (seeded)", () => {
