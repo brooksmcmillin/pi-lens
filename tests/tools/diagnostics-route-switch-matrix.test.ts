@@ -113,6 +113,7 @@ const STATUS =
 const NON_ENTRY_MEMBERS: Record<string, string> = {
 	constructor: "builds the service",
 	shutdown: "stops every server",
+	releaseWorkspace: "stops owned workspace clients without reading diagnostics",
 	restartPrimaryClientsUnder:
 		"stops the primary servers under a root after a dependency install; the next touch spawns fresh ones, and it returns a count, never diagnostics",
 	checkDestroyed: STATUS,

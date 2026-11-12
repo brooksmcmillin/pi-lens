@@ -31,6 +31,7 @@ export type LspClientLifecycleCapabilities = CapabilityMethods<
 	| "getBrokenStatus"
 	| "getStatus"
 	| "isSpawnInFlight"
+	| "releaseWorkspace"
 	| "shutdown"
 >;
 
@@ -108,6 +109,7 @@ export function adaptLspService(service: LSPService): LspCapabilities {
 			"getBrokenStatus",
 			"getStatus",
 			"isSpawnInFlight",
+			"releaseWorkspace",
 			"shutdown",
 		]),
 		documents: bindGroup<LspDocumentCapabilities>(service, [

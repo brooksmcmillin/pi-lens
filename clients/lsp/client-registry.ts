@@ -400,6 +400,8 @@ export class ClientRegistry {
 	private clientSpawnGate: Promise<void> = Promise.resolve();
 	/** True after shutdown() has been called; blocks new operations */
 	private isDestroyed = false;
+	/** Cleanup tombstones last for this service generation; never evict a live fence. */
+	private readonly releasedWorkspaces = new Set<string>();
 	/**
 	 * #850: teardown completion for every singleton generation retired before
 	 * this service was published. Only replacement services receive one; direct
@@ -803,6 +805,63 @@ export class ClientRegistry {
 		this.idleEvictionTimers.set(key, timer);
 	}
 
+	/** The acquisition verdict is checked after the caller's final await, before publication. */
+	canAcquire(filePath: string, root: string): boolean {
+		return (
+			!this.isDestroyed &&
+			!this.workspaceReleased(filePath) &&
+			!this.workspaceReleased(root)
+		);
+	}
+
+	workspaceReleased(filePath: string): boolean {
+		if (this.releasedWorkspaces.size === 0) return false;
+		const identity = normalizeMapKey(filePath);
+		return [...this.releasedWorkspaces].some((root) =>
+			isSameOrWithin(root, identity),
+		);
+	}
+
+	/** Release only this workspace's owned children, without resetting other roots. */
+	async releaseWorkspace(root: string): Promise<string[]> {
+		const rootKey = normalizeMapKey(root);
+		if (
+			!this.releasedWorkspaces.has(rootKey) &&
+			this.releasedWorkspaces.size >= 128
+		) {
+			throw new Error(
+				"Workspace release limit reached; reload pi-lens before further cleanup",
+			);
+		}
+		// Publish before any await: an acquisition already resolving its root must not reopen it.
+		this.releasedWorkspaces.add(rootKey);
+		// The fence blocks later target spawns, including after capacity eviction.
+		// Drain outside the global gate so a stuck target cannot stall its siblings.
+		const belongs = (key: string) =>
+			isSameOrWithin(rootKey, parseClientKey(key).root);
+		const pending: Promise<SpawnedServer | undefined>[] = [];
+		for (const [key, spawn] of this.inFlight)
+			if (belongs(key)) pending.push(spawn);
+		await Promise.allSettled(pending);
+		const victims: Array<[string, LSPClientInfo]> = [];
+		for (const entry of this.clients)
+			if (belongs(entry[0])) victims.push(entry);
+		for (const [key] of victims) this.clearIdleEvictionTimer(key);
+		const settled = await Promise.allSettled(
+			victims.map(async ([key, client]) => {
+				await client.shutdown({ reason: "workspace_release" });
+				this.retireClient(key);
+			}),
+		);
+		for (const result of settled) if ("reason" in result) throw result.reason;
+		recordDegradationOnce({
+			kind: "lsp-workspace-released",
+			subject: rootKey,
+			reason: `released ${victims.length} owned LSP clients for worktree cleanup`,
+		});
+		return victims.map(([key]) => key);
+	}
+
 	/**
 	 * #4476: retire and shut down the live primary clients whose root contains
 	 * `root` or lies under it, after a dependency install there. The install
@@ -941,7 +1000,7 @@ export class ClientRegistry {
 		}
 
 		const root = await this.resolveServerRootOnce(server, filePath, rootMemo);
-		if (!root || this.checkDestroyed()) return undefined;
+		if (!root || !this.canAcquire(filePath, root)) return undefined;
 		if (!isAuxiliary(server)) {
 			resolvedRoots?.set(server.id, normalizeMapKey(root));
 		}
@@ -1290,6 +1349,7 @@ export class ClientRegistry {
 				// either gap must not let this retired generation start a late spawn.
 				if (this.checkDestroyed()) return undefined;
 				if (!(await this.makeCapacityForClient(key))) return undefined;
+				if (!this.canAcquire(filePath, root)) return undefined;
 				const promise = this.spawnClient(
 					server,
 					root,
@@ -1341,7 +1401,7 @@ export class ClientRegistry {
 							: "spawn-failure-joined"
 						: "declined",
 			);
-			return spawned;
+			return this.canAcquire(filePath, root) ? spawned : undefined;
 		} catch (err) {
 			// A throwing spawn promise is an errored acquisition by definition.
 			//

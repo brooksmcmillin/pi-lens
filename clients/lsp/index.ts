@@ -2938,6 +2938,16 @@ export class LSPService {
 		return undefined;
 	}
 
+	/** Admit at publication, after every discovery/wait path has settled. */
+	private admittedClient(
+		filePath: string,
+		entry: SpawnedServer | undefined,
+	): SpawnedServer | undefined {
+		return entry && this.clientRegistry.canAcquire(filePath, entry.client.root)
+			? entry
+			: undefined;
+	}
+
 	/**
 	 * Get or create LSP client for a file
 	 * Prevents duplicate client creation via in-flight promise tracking
@@ -3192,7 +3202,7 @@ export class LSPService {
 		};
 
 		if (!effectiveMaxWaitMs || effectiveMaxWaitMs <= 0) {
-			return withBudget();
+			return this.admittedClient(filePath, await withBudget());
 		}
 
 		const timeoutSentinel = Symbol("lsp-client-wait-timeout");
@@ -3247,7 +3257,8 @@ export class LSPService {
 				const client = this.state.clients.get(
 					`${server.id}:${normalizeMapKey(root)}`,
 				);
-				if (client?.isAlive()) return { client, info: server };
+				if (client?.isAlive())
+					return this.admittedClient(filePath, { client, info: server });
 			}
 			waitSkipReasons?.add("budget_skipped_known_slow");
 			logLatency({
@@ -3335,7 +3346,7 @@ export class LSPService {
 			return undefined;
 		}
 
-		return waitResult;
+		return this.admittedClient(filePath, waitResult);
 	}
 
 	/**
@@ -3424,7 +3435,8 @@ export class LSPService {
 
 		const results = await Promise.all(acquisitions.values());
 		const clients = results.filter(
-			(entry): entry is SpawnedServer => entry !== undefined,
+			(entry): entry is SpawnedServer =>
+				this.admittedClient(filePath, entry) !== undefined,
 		);
 		return { clients, serverCountAttempted };
 	}
@@ -3474,7 +3486,10 @@ export class LSPService {
 				});
 			}),
 		);
-		return spawned.filter((entry): entry is SpawnedServer => Boolean(entry));
+		return spawned.filter(
+			(entry): entry is SpawnedServer =>
+				this.admittedClient(filePath, entry) !== undefined,
+		);
 	}
 
 	/**
@@ -3499,7 +3514,10 @@ export class LSPService {
 			const key = `${server.id}:${normalizeMapKey(root)}`;
 			const existing = this.state.clients.get(key);
 			if (existing?.isAlive()) {
-				return { client: existing, info: server };
+				return this.admittedClient(filePath, {
+					client: existing,
+					info: server,
+				});
 			}
 			missed.push(key);
 		}
@@ -10388,6 +10406,11 @@ export class LSPService {
 	async hasLSP(filePath: string): Promise<boolean> {
 		const spawned = await this.getClientForFile(filePath);
 		return Boolean(spawned);
+	}
+
+	/** Fence and release one worktree's clients; the rest of the service stays live. */
+	releaseWorkspace(root: string): Promise<string[]> {
+		return this.clientRegistry.releaseWorkspace(root);
 	}
 
 	/**

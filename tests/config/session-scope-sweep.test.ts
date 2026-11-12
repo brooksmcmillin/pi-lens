@@ -143,6 +143,8 @@ const ACTIVATION_STATE: Readonly<Record<string, string>> = {
 		"this activation's primary session_start until it returns, so a shutdown that lands before the start adopted hands on the slot left for it (#3881)",
 	turnStartScope:
 		"the session scope captured at turn_start so a sibling session cannot change the identity used by this turn's delayed delivery (#3613)",
+	unregisterWorkspaceRelease:
+		"this activation's event listener disposer, replaced on its session_start and invoked on its session_shutdown; it holds no conversation facts",
 	widgetMountFailureLogged: "a once-per-activation log latch for the mount",
 };
 

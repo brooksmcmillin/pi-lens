@@ -52,11 +52,13 @@
  * `PI_LENS_HOME` and `PILENS_DATA_DIR` are pinned under `--scratch` before the
  * first import, so nothing reaches the real home.
  */
+import { createEventBus } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import { scratchHomeEnv } from "./lib/scratch-home-env.mjs";
+import { isMainModule } from "./lib/is-main-module.mjs";
 
 const SMALL_LINES = 40;
 const LARGE_LINES = 4000;
@@ -88,10 +90,11 @@ function fixtureSource(lines) {
 }
 
 /** A recording stand-in for pi's ExtensionAPI: the host boundary. */
-function makeHost() {
+export function makeHost() {
 	const handlers = new Map();
 	const flags = new Map();
 	const pi = {
+		events: createEventBus(),
 		registerFlag: (name, o) => flags.set(name, o?.default),
 		registerCommand: () => {},
 		registerTool: () => {},
@@ -321,18 +324,20 @@ async function timeToolCallsAtOvercapHome(imp, handlers, scratch) {
 	return elapsed;
 }
 
-const tree = argValue("tree");
-const scratch = argValue("scratch");
-if (!tree || !scratch) {
-	console.error("usage: hot-path-sample.mjs --tree <dir> --scratch <dir>");
-	process.exit(2);
+if (isMainModule(import.meta.url)) {
+	const tree = argValue("tree");
+	const scratch = argValue("scratch");
+	if (!tree || !scratch) {
+		console.error("usage: hot-path-sample.mjs --tree <dir> --scratch <dir>");
+		process.exit(2);
+	}
+	const home = path.join(path.resolve(scratch), "home");
+	fs.mkdirSync(home, { recursive: true });
+	Object.assign(process.env, scratchHomeEnv(home));
+	process.env.PILENS_DATA_DIR = home;
+	process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
+	const result = await sample(path.resolve(tree), path.resolve(scratch));
+	process.stdout.write(`${JSON.stringify(result)}\n`);
+	// The extension leaves timers and watchers behind; this process is one sample.
+	process.exit(0);
 }
-const home = path.join(path.resolve(scratch), "home");
-fs.mkdirSync(home, { recursive: true });
-Object.assign(process.env, scratchHomeEnv(home));
-process.env.PILENS_DATA_DIR = home;
-process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
-const result = await sample(path.resolve(tree), path.resolve(scratch));
-process.stdout.write(`${JSON.stringify(result)}\n`);
-// The extension leaves timers and watchers behind; this process is one sample.
-process.exit(0);

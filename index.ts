@@ -1,5 +1,6 @@
 import "./clients/console-guard-install.js";
 import { BoundedSet } from "./clients/bounded-cache.js";
+import { registerWorkspaceRelease } from "./clients/workspace-release.js";
 import { bounded, withDeadline } from "./clients/deadline-utils.js";
 import { HOOK_WALL_BUDGET_MS } from "./clients/hook-budgets.js";
 import {
@@ -1489,6 +1490,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 			dbg(`turn-summary renderer registration failed: ${registerRendererErr}`);
 		}
 	}
+	let unregisterWorkspaceRelease = () => {};
+
 	// --- Commands ---
 
 	pi.registerCommand("lens-toggle", {
@@ -2501,6 +2504,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 		wrapSessionEventHandler(
 			"session_start",
 			async (event, ctx) => {
+				unregisterWorkspaceRelease();
+				unregisterWorkspaceRelease = registerWorkspaceRelease({
+					events: pi.events,
+				});
 				const sessionStartEvent = event as {
 					reason?: string;
 					previousSessionFile?: string;
@@ -4405,6 +4412,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// The LSP idle-reset timer (240s) is unref'd but we cancel it explicitly here
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
 	(pi as any).on("session_shutdown", (event: unknown, ctx: unknown) => {
+		unregisterWorkspaceRelease();
 		// #473: a concurrently-live in-process subagent session shutting down
 		// (its sibling primary — the real parent — still active) must NOT run
 		// the shared-infra teardown below: no LSP fleet shutdown, no idle-timer

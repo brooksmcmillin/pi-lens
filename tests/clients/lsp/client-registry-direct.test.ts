@@ -24,7 +24,10 @@ import {
 } from "../../../clients/degradation-ledger.js";
 import type { LSPClientInfo } from "../../../clients/lsp/client.js";
 import { LSPService } from "../../../clients/lsp/index.js";
-import { initLSPConfig } from "../../../clients/lsp/config.js";
+import {
+	initLSPConfig,
+	_setServersForFileForTests,
+} from "../../../clients/lsp/config.js";
 import {
 	ClientRegistry,
 	getLspClientCeiling,
@@ -51,6 +54,7 @@ import { normalizeMapKey } from "../../../clients/path-utils.js";
 import {
 	_clearSuccessfulLspSpawnHistoryForTests,
 	getSuccessfulLspSpawnDurationMs,
+	recordSuccessfulLspSpawn,
 } from "../../../clients/lsp/spawn-history.js";
 import {
 	clearWidgetState,
@@ -192,6 +196,7 @@ afterEach(() => {
 	delete process.env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS;
 	delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
 	resetProjectTrust();
+	_setServersForFileForTests(undefined);
 	resetSessionRootsForTests();
 	for (const dir of dirs.splice(0)) removeTempDirSync(dir);
 });
@@ -2851,6 +2856,409 @@ describe("live primary client roots (#4532)", () => {
 
 		register(registry, "rust", "/w/b", { spawnedAt: 7 });
 		expect(service.livePrimaryClientRoots()).toEqual([]);
+	});
+});
+
+describe("workspace release before worktree cleanup", () => {
+	it.each(["warm", "ordinary"])(
+		"refuses a symlink into a released descendant while preserving its ancestor: %s",
+		async (route) => {
+			const f = ensureFixture("json");
+			const nested = path.join(f.root, "nested");
+			const alias = path.join(f.root, "alias");
+			fs.mkdirSync(nested);
+			fs.writeFileSync(path.join(nested, "a.fake"), "{}\n");
+			fs.symlinkSync(
+				nested,
+				alias,
+				process.platform === "win32" ? "junction" : "dir",
+			);
+			registerSessionRoot(f.root);
+			_setServersForFileForTests(() => [f.info]);
+			const service = new LSPService(undefined, f.root);
+			const registry = (
+				service as unknown as { clientRegistry: ClientRegistry }
+			).clientRegistry;
+			const client = fakeClient("json", f.root);
+			registry.clients.set(f.key, client);
+			try {
+				await service.releaseWorkspace(nested);
+				const lookup = (file: string) =>
+					route === "warm"
+						? service.getWarmClientForFile(file)
+						: service.getClientForFile(file);
+				expect(await lookup(path.join(alias, "a.fake"))).toBeUndefined();
+				expect(await lookup(f.file)).toBeDefined();
+				expect(registry.clients.get(f.key)).toBe(client);
+			} finally {
+				await service.shutdown();
+			}
+		},
+	);
+
+	it("refuses a known-slow shortcut published after release during candidate partition", async () => {
+		setProjectTrustState("trusted");
+		const f = ensureFixture("json");
+		const nested = path.join(f.root, "nested");
+		fs.mkdirSync(nested);
+		registerSessionRoot(f.root);
+		_setServersForFileForTests(() => [f.info]);
+		recordSuccessfulLspSpawn("json", 2_000);
+		const service = new LSPService(undefined, f.root);
+		const registry = (service as unknown as { clientRegistry: ClientRegistry })
+			.clientRegistry;
+		let initialize!: () => void;
+		let partition!: () => void;
+		let entered!: () => void;
+		let ensured!: () => void;
+		const initGate = new Promise<void>((resolve) => {
+			initialize = resolve;
+		});
+		const partitionGate = new Promise<void>((resolve) => {
+			partition = resolve;
+		});
+		const partitionStarted = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const acquisitionDone = new Promise<void>((resolve) => {
+			ensured = resolve;
+		});
+		createLSPClient.mockImplementation(async () => {
+			await initGate;
+			return fakeClient("json", f.root);
+		});
+		const acquire = registry.ensureClientForServer.bind(registry);
+		vi.spyOn(registry, "ensureClientForServer").mockImplementation(
+			async (...args) => {
+				const entry = await acquire(...args);
+				ensured();
+				return entry;
+			},
+		);
+		const discover = registry.resolveServerRootOnce.bind(registry);
+		let resolutions = 0;
+		// Delay the real memoized root result used by the shortcut's partition.
+		vi.spyOn(registry, "resolveServerRootOnce").mockImplementation(
+			async (...args) => {
+				const root = await discover(...args);
+				if (++resolutions === 2) {
+					entered();
+					await partitionGate;
+				}
+				return root;
+			},
+		);
+		try {
+			const lookup = service.getClientForFile(
+				path.join(nested, "a.fake"),
+				750,
+				750,
+			);
+			await partitionStarted;
+			initialize();
+			await acquisitionDone;
+			await service.releaseWorkspace(nested);
+			partition();
+			expect(await lookup).toBeUndefined();
+			expect(registry.clients.has(`json:${normalizeMapKey(f.root)}`)).toBe(
+				true,
+			);
+		} finally {
+			initialize();
+			partition();
+			await service.shutdown();
+		}
+	});
+
+	it.each(["bounded-primary", "unbounded-primary", "all", "auxiliary"])(
+		"checks final publication after a real acquisition settles: %s",
+		async (kind) => {
+			const f = ensureFixture(kind === "auxiliary" ? "typos" : "json");
+			const nested = path.join(f.root, "nested");
+			fs.mkdirSync(nested);
+			registerSessionRoot(f.root);
+			f.info.role = kind === "auxiliary" ? "auxiliary" : "language";
+			_setServersForFileForTests(() => [f.info]);
+			const service = new LSPService(undefined, f.root);
+			const registry = (
+				service as unknown as { clientRegistry: ClientRegistry }
+			).clientRegistry;
+			registry.clients.set(
+				keyFor(f.info.id, f.root),
+				fakeClient(f.info.id, f.root),
+			);
+			let entered!: () => void;
+			let finish!: () => void;
+			const ready = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				finish = resolve;
+			});
+			const acquire = registry.ensureClientForServer.bind(registry);
+			// Observe and delay a real acquisition result at the caller's await boundary.
+			vi.spyOn(registry, "ensureClientForServer").mockImplementation(
+				async (...args) => {
+					const entry = await acquire(...args);
+					entered();
+					await gate;
+					return entry;
+				},
+			);
+			const file = path.join(nested, "a.fake");
+			let acquisition: Promise<SpawnedServer[]>;
+			if (kind === "all")
+				acquisition = service
+					.getClientsForFile(file)
+					.then((result) => result.clients);
+			else if (kind === "auxiliary")
+				acquisition = service.getAuxiliaryClientsForFile(
+					file,
+					new Set([f.info.id]),
+				);
+			else
+				acquisition = service
+					.getClientForFile(file, 750, kind === "unbounded-primary" ? 0 : 750)
+					.then((entry) => (entry ? [entry] : []));
+			try {
+				await ready;
+				await service.releaseWorkspace(nested);
+				finish();
+				expect(await acquisition).toEqual([]);
+				expect(registry.clients.has(keyFor(f.info.id, f.root))).toBe(true);
+			} finally {
+				finish();
+				await service.shutdown();
+			}
+		},
+	);
+
+	// Review recurrence: a preserved ancestor must not be a warm bypass into a released descendant.
+	it.each([false, true])(
+		"fences ancestor warm lookups including delayed discovery: %s",
+		async (delayed) => {
+			const root = tempProject("warm-release");
+			const nested = path.join(root, "nested");
+			fs.mkdirSync(nested);
+			registerSessionRoot(root);
+			await initLSPConfig(root);
+			const service = new LSPService(undefined, root);
+			const registry = (
+				service as unknown as { clientRegistry: ClientRegistry }
+			).clientRegistry;
+			registry.clients.set(
+				`json:${normalizeMapKey(root)}`,
+				fakeClient("json", root),
+			);
+			const file = path.join(nested, "config.json");
+			expect(await service.getWarmClientForFile(file)).toBeDefined();
+			if (delayed) {
+				// Fault injection delays the real discovery result, never fabricates a root or client.
+				const discover = registry.resolveServerRoot.bind(registry);
+				let entered!: () => void;
+				let finish!: () => void;
+				const started = new Promise<void>((resolve) => {
+					entered = resolve;
+				});
+				const gate = new Promise<void>((resolve) => {
+					finish = resolve;
+				});
+				const spy = vi
+					.spyOn(registry, "resolveServerRoot")
+					.mockImplementation(async (...args) => {
+						const resolved = await discover(...args);
+						entered();
+						await gate;
+						return resolved;
+					});
+				const lookup = service.getWarmClientForFile(file);
+				await started;
+				await service.releaseWorkspace(nested);
+				finish();
+				expect(await lookup).toBeUndefined();
+				spy.mockRestore();
+			} else {
+				await service.releaseWorkspace(nested);
+				expect(await service.getWarmClientForFile(file)).toBeUndefined();
+			}
+			expect(
+				await service.getWarmClientForFile(path.join(root, "package.json")),
+			).toBeDefined();
+			await service.shutdown();
+		},
+	);
+
+	// Recurrence: Pi runs from main while auxiliary LSP cwd pins a merged worktree.
+	it("releases primary and auxiliary clients only inside the target workspace", async () => {
+		vi.useFakeTimers();
+		const service = new LSPService();
+		const registry = (service as unknown as { clientRegistry: ClientRegistry })
+			.clientRegistry;
+		const roots = ["/work/task", "/work/task/pkg", "/work/task-other", "/work"];
+		const clients = roots.map((root) => fakeClient("json", root));
+		for (const [index, root] of roots.entries()) {
+			const key = `json:${root}`;
+			registry.clients.set(key, clients[index]!);
+			registry.scheduleIdleEviction(
+				key,
+				server("json", { idleEviction: "transparent" }),
+			);
+		}
+		const aux = fakeClient("typos", roots[0]!);
+		registry.clients.set("typos:/work/task", aux);
+		await expect(service.releaseWorkspace("/work/task")).resolves.toEqual([
+			"json:/work/task",
+			"json:/work/task/pkg",
+			"typos:/work/task",
+		]);
+		expect(clients[0]!.shutdown).toHaveBeenCalledWith({
+			reason: "workspace_release",
+		});
+		expect(clients[1]!.shutdown).toHaveBeenCalledTimes(1);
+		expect(aux.shutdown).toHaveBeenCalledTimes(1);
+		expect(clients[2]!.shutdown).not.toHaveBeenCalled();
+		expect(clients[3]!.shutdown).not.toHaveBeenCalled();
+		expect(vi.getTimerCount()).toBe(2);
+		expect(service.checkDestroyed()).toBe(false);
+		await expect(service.releaseWorkspace("/work/task")).resolves.toEqual([]);
+		expect(ledger("lsp-workspace-released")?.latestReasons).toEqual([
+			{
+				subject: "/work/task",
+				reason: "released 3 owned LSP clients for worktree cleanup",
+			},
+		]);
+		await service.shutdown();
+	});
+
+	// Recurrence: late file analysis recreates an LSP immediately after release.
+	it("fences later acquisitions including a root resolver already in flight", async () => {
+		const root = tempProject("released");
+		const registry = new ClientRegistry(makeHooks().hooks);
+		let resolve!: (root: string) => void;
+		const pending = new Promise<string>((done) => {
+			resolve = done;
+		});
+		const info = server("json", { root: () => pending });
+		const acquisition = registry.ensureClientForServer(
+			path.join(root, "a.json"),
+			info,
+		);
+		await registry.releaseWorkspace(root);
+		resolve(root);
+		expect(await acquisition).toBeUndefined();
+		expect(
+			await registry.ensureClientForServer(path.join(root, "b.json"), info),
+		).toBeUndefined();
+		expect(registry.inFlight.size).toBe(0);
+	});
+
+	// Recurrence: a spawn that initializes during cleanup must be joined, not orphaned.
+	it("waits for a pending initialize and closes its late client before returning", async () => {
+		setProjectTrustState("trusted");
+		const f = ensureFixture();
+		let entered!: () => void;
+		let finish!: () => void;
+		const initializing = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			finish = resolve;
+		});
+		const client = fakeClient("ts", f.root);
+		createLSPClient.mockImplementation(async () => {
+			entered();
+			await gate;
+			return client;
+		});
+		const acquisition = f.ensure();
+		await initializing;
+		const release = f.registry.releaseWorkspace(f.root);
+		finish();
+		expect(await acquisition).toBeUndefined();
+		expect(await release).toEqual([f.key]);
+		expect(client.shutdown).toHaveBeenCalledTimes(1);
+		expect(f.registry.clients.size).toBe(0);
+		expect(await f.ensure()).toBeUndefined();
+	});
+
+	it("does not start a spawn when release arrives during capacity eviction", async () => {
+		setProjectTrustState("trusted");
+		process.env.PI_LENS_LSP_CLIENT_CEILING = "1";
+		const f = ensureFixture();
+		let entered!: () => void;
+		let finish!: () => void;
+		const evicting = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			finish = resolve;
+		});
+		const victim = fakeClient("json", "/other");
+		victim.shutdown.mockImplementation(async () => {
+			entered();
+			await gate;
+		});
+		f.registry.clients.set("json:/other", victim);
+		const acquisition = f.ensure();
+		await evicting;
+		const release = f.registry.releaseWorkspace(f.root);
+		finish();
+		expect(await acquisition).toBeUndefined();
+		await release;
+		expect(f.spawn).not.toHaveBeenCalled();
+	});
+
+	it("keeps sibling cold acquisition independent of a pending target release", async () => {
+		vi.useFakeTimers();
+		setProjectTrustState("trusted");
+		const f = ensureFixture();
+		const target = path.join(f.root, "target");
+		let finish!: (result: undefined) => void;
+		f.registry.inFlight.set(
+			keyFor("ts", target),
+			new Promise<undefined>((resolve) => {
+				finish = resolve;
+			}),
+		);
+		const release = f.registry.releaseWorkspace(target);
+		const acquisition = f.ensure();
+		try {
+			await vi.advanceTimersByTimeAsync(0);
+			expect(f.spawn).toHaveBeenCalledTimes(1);
+		} finally {
+			finish(undefined);
+			await release;
+			await acquisition;
+			await f.registry.shutdownClients({ fast: true });
+		}
+	});
+
+	it("bounds tombstones without evicting an earlier cleanup fence", async () => {
+		const registry = new ClientRegistry(makeHooks().hooks);
+		for (let index = 0; index < 128; index++)
+			await registry.releaseWorkspace(`/released/${index}`);
+		await expect(
+			registry.releaseWorkspace("/released/overflow"),
+		).rejects.toThrow("release limit");
+		await expect(registry.releaseWorkspace("/released/0")).resolves.toEqual([]);
+		expect(registry.workspaceReleased("/released/0/file.json")).toBe(true);
+		expect(registry.workspaceReleased("/released/overflow/file.json")).toBe(
+			false,
+		);
+	});
+
+	// Release is not a best-effort success when a child refuses teardown.
+	it("reports teardown failure and keeps the client available for a retry", async () => {
+		const registry = new ClientRegistry(makeHooks().hooks);
+		const client = fakeClient("json", "/work/task");
+		client.shutdown.mockRejectedValueOnce(new Error("teardown failed"));
+		registry.clients.set("json:/work/task", client);
+		await expect(registry.releaseWorkspace("/work/task")).rejects.toThrow(
+			"teardown failed",
+		);
+		await expect(registry.releaseWorkspace("/work/task")).resolves.toEqual([
+			"json:/work/task",
+		]);
 	});
 });
 
