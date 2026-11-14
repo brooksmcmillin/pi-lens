@@ -975,7 +975,7 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 	// #4776 review G2 (and the Java thread): a verdict written after a trust
 	// change by a probe that started before it answered for the OLD trust, and
 	// stamping it current kept a tool missing (or found) under the new trust.
-	it("F10/A11: a Java probe joined after a trust flip is not shared across it", async () => {
+	it("F10/A11: a Java probe that a trust flip crosses is discarded, not served", async () => {
 		const jdk = path.join(layout.outside, "jdk");
 		writeStandIn(path.join(jdk, "bin"), "java", "exit 0");
 		writeStandIn(path.join(layout.main, "bin"), "java", "exit 0");
@@ -995,8 +995,11 @@ describe.skipIf(!POSIX)("package-manager global lookups (#4530)", () => {
 		_resetJvmRuntimeCacheForTests();
 		resetDispatchAvailabilityState();
 
-		// The untrusted probe is in flight (its search path is already scoped)
-		// when pi trusts the project and a second caller asks.
+		// The untrusted probe is in flight when pi trusts the project: it awaits
+		// fs.promises.stat and findCommand and reads trust at spawn, so its
+		// answer is the one toolOnPath discards. The held-probe join itself is
+		// pinned by availability-fold-5410 ("starts its own probe when trust
+		// changed under an in-flight one").
 		const untrusted = resolveJavaRuntimeEnv();
 		setProjectTrustState("trusted");
 		const trusted = resolveJavaRuntimeEnv();
