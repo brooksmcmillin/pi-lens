@@ -65,6 +65,15 @@ interface Layout {
 	stage: string;
 }
 
+/** Stage everything under `dir` and commit it. */
+function commitAll(dir: string, message: string): void {
+	for (const args of [
+		["add", "-A"],
+		["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message],
+	])
+		execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+}
+
 /**
  * A committed repository whose `src/a.ts` is clean, and, outside it, `stage/`
  * holding `a.ts` (the blocking bytes, mtime a minute old), `x.tar` (that file)
@@ -82,11 +91,9 @@ function layout(name: string): Layout {
 	fs.writeFileSync(target, CLEAN);
 	fs.mkdirSync(path.join(proj, "vendor"));
 	fs.writeFileSync(path.join(proj, "vendor", "a.ts"), CLEAN);
-	const git = (...args: string[]) =>
-		execFileSync("git", args, { cwd: proj, stdio: "ignore" });
-	git("init", "-q");
-	git("add", "-A");
-	git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base");
+	execFileSync("git", ["init", "-q"], { cwd: proj, stdio: "ignore" });
+	execFileSync("git", ["init", "-q"], { cwd: proj, stdio: "ignore" });
+	commitAll(proj, "base");
 	const old = new Date(Date.now() - 60_000);
 	for (const file of [
 		path.join(stage, "a.ts"),
@@ -385,18 +392,7 @@ describe("a bash write into a directory keeps its old mtime (#5552)", () => {
 					for (let i = 0; i < 600; i += 1)
 						fs.writeFileSync(path.join(users, `u${i}.ts`), CLEAN);
 					fs.writeFileSync(path.join(l.proj, "zz.ts"), CLEAN);
-					const git = (...args: string[]) =>
-						execFileSync("git", args, { cwd: l.proj, stdio: "ignore" });
-					git("add", "-A");
-					git(
-						"-c",
-						"user.name=t",
-						"-c",
-						"user.email=t@t",
-						"commit",
-						"-qm",
-						"u",
-					);
+					commitAll(l.proj, "u");
 					const old = new Date(Date.now() - 3 * 86_400_000);
 					for (const file of [
 						path.join(l.proj, "zz.ts"),

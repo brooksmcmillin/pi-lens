@@ -546,6 +546,20 @@ export function resolveOpaqueRecoveryRoots(
 	};
 }
 
+/**
+ * One record per root per session that a bash command filled a directory the
+ * scan could not read, so the working directory stood in for it and what git
+ * lists as changed there is credited as the command's write (#5552).
+ */
+export function recordGuessedWriteScope(root: string): void {
+	recordDegradationOnce({
+		kind: "bash-write-scope-guessed",
+		subject: normalizeMapKey(root),
+		reason:
+			"a bash command filled a directory the scan could not read (an unresolved variable or substitution), so the working directory stood in for it; files that changed there are credited as its writes",
+	});
+}
+
 const ROOT_REFUSAL_REASONS: Record<OpaqueRootRefusal, string> = {
 	"different-repository":
 		"a bash command named a git checkout in another repository; its writes were not observed (only a linked worktree of the session's own repository is recovered, #2050)",
@@ -1319,7 +1333,7 @@ export async function recoverOpaqueChangesViaGit(
 	if (dirtySetCut && namedPaths.size > 0)
 		recordDegradationOnce({
 			kind: "named-write-credit-withheld",
-			subject: normalizeMapKey(path.resolve(root)),
+			subject: normalizeMapKey(root),
 			reason: `${SAME_HEAD_DIRTY_SET_CAP} or more working-tree paths were dirty before a bash call, so no file can be shown clean before it; a write that keeps an old mtime (mv, cp -p, rsync -a, tar x) is not recovered by name for this call`,
 		});
 	const cleanBefore =
