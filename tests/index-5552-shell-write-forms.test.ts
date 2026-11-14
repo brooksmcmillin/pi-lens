@@ -110,8 +110,10 @@ function layout(name: string): Layout {
 async function runThenCommit(
 	name: string,
 	command: (l: Layout) => string,
+	prepare?: (l: Layout) => void,
 ): Promise<{ l: Layout; session: PiSession; scope: string; commit: string }> {
 	const l = layout(name);
+	prepare?.(l);
 	const session = await startPiSession({
 		root: fixture.root,
 		cwd: l.proj,
@@ -364,4 +366,68 @@ describe("a bash write into a directory keeps its old mtime (#5552)", () => {
 		).toEqual([]);
 		expect(run.commit).toContain(RAN_MARKER);
 	});
+
+	// Recurrence prevented (#5552 review r1 F1): the baseline's dirty set stops
+	// at 512 paths, so a user-dirty file past the cut read as clean before and a
+	// bare `tar x` credited it as the command's write: the user's 3-day-old
+	// `debugger;` was dispatched and the commit blocked as the agent's. With the
+	// set cut, nothing is credited by scope and the file stays the user's.
+	it(
+		"does not credit a user's old dirty file once the dirty set is cut",
+		LANE,
+		async () => {
+			const run = await runThenCommit(
+				"tar-dirty-cap",
+				(l) => `tar xf ${l.stage}/note.tar`,
+				(l) => {
+					const users = path.join(l.proj, "users");
+					fs.mkdirSync(users);
+					for (let i = 0; i < 600; i += 1)
+						fs.writeFileSync(path.join(users, `u${i}.ts`), CLEAN);
+					fs.writeFileSync(path.join(l.proj, "zz.ts"), CLEAN);
+					const git = (...args: string[]) =>
+						execFileSync("git", args, { cwd: l.proj, stdio: "ignore" });
+					git("add", "-A");
+					git(
+						"-c",
+						"user.name=t",
+						"-c",
+						"user.email=t@t",
+						"commit",
+						"-qm",
+						"u",
+					);
+					const old = new Date(Date.now() - 3 * 86_400_000);
+					for (const file of [
+						path.join(l.proj, "zz.ts"),
+						...Array.from({ length: 600 }, (_, i) =>
+							path.join(users, `u${i}.ts`),
+						),
+					]) {
+						fs.writeFileSync(file, BLOCKING);
+						fs.utimesSync(file, old, old);
+					}
+					fs.mkdirSync(path.join(l.stage, "doc"));
+					fs.writeFileSync(path.join(l.stage, "doc", "note.txt"), "note\n");
+					execFileSync("tar", [
+						"-cf",
+						path.join(l.stage, "note.tar"),
+						"-C",
+						l.stage,
+						"doc/note.txt",
+					]);
+				},
+			);
+			const read = await rows(run.session, run.scope);
+			expect(dispatchedRules(read, path.join(run.l.proj, "zz.ts"))).toEqual([]);
+			expect(
+				read.filter(
+					(row) =>
+						row.phase === "disk_change_published" &&
+						row.metadata?.sources === "bash-write",
+				),
+			).toEqual([]);
+			expect(run.commit).toContain(RAN_MARKER);
+		},
+	);
 });

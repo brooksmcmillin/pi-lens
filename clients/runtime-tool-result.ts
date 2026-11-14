@@ -2823,6 +2823,16 @@ export async function handleToolResult(
 			// empty array that the tree was clean. Only the second says "no discard".
 			dirtyBefore = baselines.find((entry) => entry.root === scanRoot)?.pending
 				?.dirtyPaths;
+			// #5552: a scope the scan could not read (`"$D"`) is the working
+			// directory, and what it credits rests on that guess. A failed command
+			// credits no scope, so it has nothing to say.
+			if (recoveryScopes.scopeGuessed && event.isError !== true)
+				recordDegradationOnce({
+					kind: "bash-write-scope-guessed",
+					subject: normalizeMapKey(path.resolve(scanRoot)),
+					reason:
+						"a bash command filled a directory the scan could not read (an unresolved variable or substitution), so the working directory stood in for it; files that changed there are credited as its writes",
+				});
 			// The roots recover in PARALLEL. Each is an independent `git status`
 			// (or stat capture), and a bash result the host classed READ-ONLY has a
 			// 500 ms bound, so summing two spawns would spend the budget the

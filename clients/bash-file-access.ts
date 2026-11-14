@@ -1064,6 +1064,8 @@ interface ShellWrites {
 	files: ShellOperand[];
 	/** Absolute directories whose contents the command may have changed. */
 	dirs: string[];
+	/** A directory is the working directory standing in for one the scan could not read. */
+	guessed?: true;
 }
 
 /**
@@ -1090,17 +1092,19 @@ function copyWrites(move: MoveOperands, cwd: string): ShellWrites {
 		destination: null,
 		destinationDir: dir,
 	});
+	if (!files.some((file) => !isFileOperand(file, cwd)))
+		return { files, dirs: [] };
 	return {
 		files,
-		dirs: files.some((file) => !isFileOperand(file, cwd))
-			? [scopeDirectory(dir, cwd)]
-			: [],
+		dirs: [scopeDirectory(dir, cwd)],
+		...(isUnreadableOperand(dir) ? { guessed: true as const } : {}),
 	};
 }
 
 /**
  * The long `rsync` options that take their value as the NEXT word (`--opt=V`
- * carries its own), read from `rsync --help` of 3.4.1. An option this list does
+ * carries its own), read from `rsync --help` of 3.4.1, with its `(aka ...)`
+ * spellings (`--cc`, `--zc`, `--zl`) and the obsolete `--log-format`. An option this list does
  * not know is read as valueless: placed after the operands with a separate
  * value it would be read as the destination, which then names a path no
  * recovery lists, and the mtime rule stays.
@@ -1110,6 +1114,7 @@ const RSYNC_VALUE_OPTIONS: ReadonlySet<string> = new Set([
 	"backup-dir",
 	"block-size",
 	"bwlimit",
+	"cc",
 	"checksum-choice",
 	"checksum-seed",
 	"chmod",
@@ -1134,6 +1139,7 @@ const RSYNC_VALUE_OPTIONS: ReadonlySet<string> = new Set([
 	"link-dest",
 	"log-file",
 	"log-file-format",
+	"log-format",
 	"max-alloc",
 	"max-delete",
 	"max-size",
@@ -1160,6 +1166,8 @@ const RSYNC_VALUE_OPTIONS: ReadonlySet<string> = new Set([
 	"timeout",
 	"usermap",
 	"write-batch",
+	"zc",
+	"zl",
 ]);
 /** The short `rsync` options that take a value: `-e`, `-B`, `-T`, `-f`, `-M`, `-@`. */
 const RSYNC_VALUE_LETTERS = new Set("eBTfM@");
@@ -1208,7 +1216,9 @@ function rsyncWrites(args: ShellOperand[], cwd: string): ShellWrites {
 	const operands = rsyncOperands(args);
 	const dest = operands.length >= 2 ? operands[operands.length - 1] : undefined;
 	if (!dest || isRemoteRsyncOperand(dest.text)) return { files: [], dirs: [] };
-	return isUnreadableOperand(dest) || isDirectoryOperand(dest, cwd)
+	if (isUnreadableOperand(dest))
+		return { files: [], dirs: [cwd], guessed: true };
+	return isDirectoryOperand(dest, cwd)
 		? { files: [], dirs: [scopeDirectory(dest, cwd)] }
 		: { files: [dest], dirs: [] };
 }
@@ -1227,7 +1237,9 @@ function tarWrites(args: ShellOperand[], cwd: string): ShellWrites {
 	let extract = false;
 	let at = cwd;
 	const dirs: string[] = [];
+	let guessed = false;
 	const enter = (operand: ShellOperand | undefined) => {
+		if (!operand || isUnreadableOperand(operand)) guessed = true;
 		at = operand ? scopeDirectory(operand, at) : cwd;
 		dirs.push(at);
 	};
@@ -1256,7 +1268,11 @@ function tarWrites(args: ShellOperand[], cwd: string): ShellWrites {
 		}
 	}
 	if (!extract) return { files: [], dirs: [] };
-	return { files: [], dirs: dirs.length > 0 ? dirs : [cwd] };
+	return {
+		files: [],
+		dirs: dirs.length > 0 ? dirs : [cwd],
+		...(guessed ? { guessed: true as const } : {}),
+	};
 }
 
 /**
@@ -1829,6 +1845,12 @@ export interface ShellWriteScan {
 	 */
 	writtenDirs: string[];
 	/**
+	 * A directory in `writtenDirs` is the working directory standing in for one
+	 * the scan could not read (`"$D"`, `-C "$(mktemp -d)"`): the credit it
+	 * grants rests on a guess (#5552).
+	 */
+	scopeGuessed: boolean;
+	/**
 	 * Absolute directories the command's `cd`/`pushd` names, in command order,
 	 * read from the words `directoryEffect` reads (#4713 R8-1). #2050: opaque recovery takes its baseline in each of these
 	 * that is a checkout of the session's own repository, so a write in a
@@ -1866,6 +1888,7 @@ export function scanShellWriteScopes(
 ): ShellWriteScan {
 	const out = new Set<string>();
 	const outDirs = new Set<string>();
+	let scopeGuessed = false;
 	const cdTargets: string[] = [];
 	const seenCdTargets = new Set<string>();
 	// The working directory in effect for the segment being read, which a `cd`
@@ -1894,6 +1917,7 @@ export function scanShellWriteScopes(
 	const addWrites = (writes: ShellWrites) => {
 		for (const file of writes.files) add(file);
 		for (const dir of writes.dirs) outDirs.add(dir);
+		if (writes.guessed) scopeGuessed = true;
 	};
 	// Every directory a `cd`/`pushd` names is a candidate recovery root,
 	// whether or not the scan can certify that the shell stayed there.
@@ -2141,6 +2165,7 @@ export function scanShellWriteScopes(
 	return {
 		written: Array.from(out),
 		writtenDirs: Array.from(outDirs),
+		scopeGuessed,
 		cdTargets,
 	};
 }

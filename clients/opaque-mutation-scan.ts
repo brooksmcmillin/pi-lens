@@ -455,6 +455,8 @@ export interface OpaqueRecoveryRoots {
 	 * (`rsync`, `tar x`, #5552): the scopes a recovery credits by content.
 	 */
 	writtenDirs: string[];
+	/** A scope in `writtenDirs` is the working directory standing in for an unreadable one. */
+	scopeGuessed: boolean;
 }
 
 /**
@@ -535,7 +537,13 @@ export function resolveOpaqueRecoveryRoots(
 		admitted.add(rootKey);
 		roots.push(checkout.root);
 	}
-	return { roots, refused, capped, writtenDirs: scan.writtenDirs };
+	return {
+		roots,
+		refused,
+		capped,
+		writtenDirs: scan.writtenDirs,
+		scopeGuessed: scan.scopeGuessed,
+	};
 }
 
 const ROOT_REFUSAL_REASONS: Record<OpaqueRootRefusal, string> = {
@@ -1004,7 +1012,7 @@ export interface GitRecoveryOptions {
 	 * A named path in it keeps the mtime rule: a recognized `cp -n` may have
 	 * written nothing over a file the user edited. `undefined` (git could not
 	 * answer, or the root took no dirty capture) leaves every named path on the
-	 * mtime rule.
+	 * mtime rule, and so does a set cut at {@link SAME_HEAD_DIRTY_SET_CAP}.
 	 */
 	dirtyBefore?: readonly string[] | undefined;
 }
@@ -1301,8 +1309,21 @@ export async function recoverOpaqueChangesViaGit(
 			normalizeMapKey(realpathOrResolve(file)),
 		),
 	);
+	// A set at the cap was cut by {@link captureGitDirtyPaths}: a path absent
+	// from it may have been dirty all along, so "clean before" is unknown for
+	// every path and nothing is credited by name or scope (#5552 r2). The
+	// capture counts a set of exactly the cap as cut, which fails closed.
+	const dirtySetCut =
+		options.dirtyBefore !== undefined &&
+		options.dirtyBefore.length >= SAME_HEAD_DIRTY_SET_CAP;
+	if (dirtySetCut && namedPaths.size > 0)
+		recordDegradationOnce({
+			kind: "named-write-credit-withheld",
+			subject: normalizeMapKey(path.resolve(root)),
+			reason: `${SAME_HEAD_DIRTY_SET_CAP} or more working-tree paths were dirty before a bash call, so no file can be shown clean before it; a write that keeps an old mtime (mv, cp -p, rsync -a, tar x) is not recovered by name for this call`,
+		});
 	const cleanBefore =
-		options.dirtyBefore === undefined
+		options.dirtyBefore === undefined || dirtySetCut
 			? undefined
 			: new Set(options.dirtyBefore);
 	// Both sides are one form (`normalizeMapKey` of a real path), so the

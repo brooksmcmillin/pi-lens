@@ -54,12 +54,14 @@ import type { ProjectChangeEntry } from "../../clients/project-changes.js";
 
 import {
 	captureFileStats,
+	captureGitDirtyPaths,
 	diffFileStats,
 	OPAQUE_BASELINE_PENDING_CAP,
 	OpaqueBaselineStore,
 	OPAQUE_SCAN_MAX_FILES,
 	recoverOpaqueChangesViaGit,
 	resetOpaqueMutationState,
+	SAME_HEAD_DIRTY_SET_CAP,
 } from "../../clients/opaque-mutation-scan.js";
 import { extractWrittenPathsFromCommand } from "../../clients/bash-file-access.js";
 import {
@@ -462,6 +464,60 @@ describe("recoverOpaqueChangesViaGit (real git repo)", () => {
 			expect(outcome).toMatchObject({ verdict: "recovered", paths: [] });
 			expect(outcome.namedCredited).toBeUndefined();
 		},
+	);
+
+	// Recurrence prevented (#5552 review r1 F1): the baseline keeps only the
+	// first SAME_HEAD_DIRTY_SET_CAP dirty paths, so a user-dirty file past the
+	// cut read as "clean before" and a directory scope credited it as the
+	// command's write at any mtime (600 dirty files, a bare `tar x`: 88 of the
+	// user's files dispatched, and the commit blocked as the agent's). A cut
+	// set proves nothing about the rest, so nothing is credited and the call
+	// stays on the mtime rule, with one record of why.
+	it.each([
+		{ dirty: SAME_HEAD_DIRTY_SET_CAP - 1, credits: true },
+		{ dirty: SAME_HEAD_DIRTY_SET_CAP, credits: false },
+		{ dirty: SAME_HEAD_DIRTY_SET_CAP + 88, credits: false },
+	])(
+		"credits a named directory only while the dirty set is whole: $dirty dirty files, credits $credits (#5552)",
+		async ({ dirty, credits }) => {
+			resetDegradationLedger();
+			const userDir = path.join(repoDir, "user");
+			fs.mkdirSync(userDir, { recursive: true });
+			for (let i = 0; i < dirty; i += 1)
+				fs.writeFileSync(path.join(userDir, `u${i}.ts`), "v1\n", "utf8");
+			execSync("git add -A && git commit -qm users", { cwd: repoDir });
+			const startedAt = Date.now();
+			const old = new Date(startedAt - 3 * 86_400_000);
+			for (let i = 0; i < dirty; i += 1) {
+				const file = path.join(userDir, `u${i}.ts`);
+				fs.writeFileSync(file, "user edit\n", "utf8");
+				fs.utimesSync(file, old, old);
+			}
+			const dirtyBefore = await captureGitDirtyPaths(repoDir);
+			// The command: a `tar x` into user/ lands one old-mtime file.
+			const extracted = path.join(userDir, "extracted.ts");
+			fs.writeFileSync(extracted, "from the archive\n", "utf8");
+			fs.utimesSync(extracted, old, old);
+
+			const outcome = await recoverOpaqueChangesViaGit(repoDir, startedAt, {
+				namedPaths: [userDir],
+				dirtyBefore,
+			});
+
+			expect(outcome.verdict).toBe("recovered");
+			if (credits) {
+				expect(outcome.paths).toEqual([normalizeMapKey(extracted)]);
+				expect(outcome.namedCredited).toEqual([normalizeMapKey(extracted)]);
+			} else {
+				expect(outcome.paths).toEqual([]);
+				expect(outcome.namedCredited).toBeUndefined();
+			}
+			const withheld = getDegradationSummary().filter(
+				(group) => group.kind === "named-write-credit-withheld",
+			);
+			expect(withheld).toHaveLength(credits ? 0 : 1);
+		},
+		60_000,
 	);
 
 	it("recovers a fresh intent-to-add entry from git add -N", async () => {
@@ -931,6 +987,36 @@ describe("partial-recognition recovery (#2000 PR-B)", () => {
 			fs.rmSync(scriptFile, { force: true });
 		}
 	});
+
+	// Recurrence prevented (#5552 review r1 F2): `tar x -C "$D"` fell back to the
+	// working directory with nothing on record, so a credit that rests on a
+	// guessed scope looked like one that rests on a named path. One record per
+	// root per session; a failed command credits no scope, so it records none.
+	it.each([
+		{ name: "a succeeding command", isError: false, rows: 1 },
+		{ name: "a failed command", isError: true, rows: 0 },
+	])(
+		"records an unreadable tar -C destination once for $name (#5552)",
+		async ({ isError, rows }) => {
+			resetDegradationLedger();
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = repoDir;
+			runtime.setTelemetryIdentity({ sessionId: "scope-guessed" });
+			const command = 'tar -xf a.tar -C "$D"';
+			for (let call = 0; call < 2; call += 1) {
+				await runHandlerExpectingNoThrow(() =>
+					handleToolCall(callDeps(runtime, command)),
+				);
+				await handleToolResult(depsFor(runtime, command, isError));
+			}
+			const guessedRows = getDegradationSummary().filter(
+				(group) => group.kind === "bash-write-scope-guessed",
+			);
+			expect(guessedRows.map((group) => group.count)).toEqual(
+				rows === 0 ? [] : [1],
+			);
+		},
+	);
 
 	it("recognized-only command without baseline emits explicit coverage-unknown", async () => {
 		// latency.log writes are guarded by PI_LENS_TEST_MODE; scope the opt-out

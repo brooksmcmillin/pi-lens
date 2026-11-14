@@ -41,6 +41,9 @@ function scan(command: string, cwd = tmp) {
 	return { written, writtenDirs };
 }
 
+const guessed = (command: string) =>
+	scanShellWriteScopes(command, tmp).scopeGuessed;
+
 describe("a directory destination of cp, mv and install (#5552)", () => {
 	// Recurrence prevented: `mv a.ts src/` named the directory, which the scan
 	// dropped as no source file, so the moved bytes were never credited.
@@ -145,6 +148,18 @@ describe("rsync (#5552)", () => {
 		},
 	);
 
+	// Recurrence prevented (#5552 review r1 F9): the value list says it follows
+	// `rsync --help` 3.4.1 yet omitted that help's own `(aka ...)` spellings, so
+	// `--zl 9` after the operands read `9` as the destination and named no scope.
+	it.each([
+		"rsync -a in/ src/ --zl 9",
+		"rsync -a in/ src/ --zc zlib",
+		"rsync -a in/ src/ --cc md5",
+		"rsync -a in/ src/ --log-format '%n'",
+	])("%s reads the alias value as no operand", (command) => {
+		expect(scan(command)).toEqual({ written: [], writtenDirs: [at("src")] });
+	});
+
 	// A remote destination and a listing write nothing on this host.
 	it.each([
 		"rsync -a in/ host:dir/",
@@ -229,6 +244,31 @@ describe("tar x (#5552)", () => {
 		"echo tar -xf a.tar",
 	])("%s writes no directory scope", (command) => {
 		expect(scan(command).writtenDirs).toEqual([]);
+	});
+});
+
+// Recurrence prevented (#5552 review r1 F2): an unreadable destination
+// widened the scope to the working directory with no mark, so an authorship
+// credit that rests on a guess looked like one that rests on a named path.
+describe("a scope the scan had to guess says so (#5552)", () => {
+	it.each([
+		'rsync -a in/ "$D"',
+		"rsync -a in/ $D",
+		'tar -xf a.tar -C "$D"',
+		"tar -xf a.tar -C",
+	])("%s is a guessed scope", (command) => {
+		expect(guessed(command)).toBe(true);
+	});
+
+	it.each([
+		"rsync -a in/ src/",
+		"tar -xf a.tar -C src",
+		"tar -xf a.tar",
+		"mv a.ts src/",
+		"tar tf a.tar",
+		"echo hi",
+	])("%s is not", (command) => {
+		expect(guessed(command)).toBe(false);
 	});
 });
 
