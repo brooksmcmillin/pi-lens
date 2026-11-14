@@ -520,6 +520,36 @@ describe("recoverOpaqueChangesViaGit (real git repo)", () => {
 		60_000,
 	);
 
+	// Same recurrence, the named FILE reader of the same set (#5581): a file the
+	// command named that sits past the cut is not shown clean either.
+	it("credits no named file once the dirty set is cut (#5552)", async () => {
+		const target = path.join(repoDir, "src", "base.ts");
+		const startedAt = Date.now();
+		fs.writeFileSync(target, "moved\n", "utf8");
+		const old = new Date(startedAt - 10_000);
+		fs.utimesSync(target, old, old);
+		const full = Array.from(
+			{ length: SAME_HEAD_DIRTY_SET_CAP },
+			(_, i) => `/elsewhere/${i}.ts`,
+		);
+
+		await expect(
+			recoverOpaqueChangesViaGit(repoDir, startedAt, {
+				namedPaths: [target],
+				dirtyBefore: full,
+			}),
+		).resolves.toMatchObject({ verdict: "recovered", paths: [] });
+		await expect(
+			recoverOpaqueChangesViaGit(repoDir, startedAt, {
+				namedPaths: [target],
+				dirtyBefore: full.slice(1),
+			}),
+		).resolves.toMatchObject({
+			verdict: "recovered",
+			paths: [normalizeMapKey(target)],
+		});
+	});
+
 	it("recovers a fresh intent-to-add entry from git add -N", async () => {
 		const intentPath = path.join(repoDir, "src", "intent.ts");
 		const startedAt = Date.now();
